@@ -30,7 +30,7 @@ COL = (
     r"\.self_attn\.o_proj\.",
 )
 REP = (
-    r"^lm_head\.", r"embed_tokens\.", r"^model\.language_model\.norm\.weight$",
+    r"^lm_head\.", r"embed_tokens\.", r"^model(\.language_model)?\.norm\.weight$",   # bare or merged final norm
     r"_layernorm\.weight$", r"\.hc_(attn|ffn)_(fn|base|scale)$", r"\.mlp\.gate\.(weight|e_score_correction_bias)$",
     r"\.self_attn\.indexer\.", r"\.self_attn\.(q_a_proj|kv_a_proj_with_mqa)\.", r"\.self_attn\.(f_a|g_a)_proj\.",
     r"\.self_attn\.o_norm\.weight$", r"\.(eh_proj)\.", r"\.(enorm|hnorm)\.weight$", r"\.shared_head\.norm\.weight$",
