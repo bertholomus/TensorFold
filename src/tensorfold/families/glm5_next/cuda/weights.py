@@ -248,9 +248,9 @@ class Weights:
 def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
     """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
 
-    from .split import RankReader
+    from .split import RankReader, WORLD
 
-    world = 2
+    world = int(os.environ.get("TF_TP_WORLD", "2"))
     cfg = Config.read(model_dir)
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
@@ -319,7 +319,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     def mlp(p: str) -> MLPW:
         gu = stack([p + "gate_proj", p + "up_proj"])
-        return MLPW(gu, q4(p + "down_proj"), gu.n // 2)
+        return MLPW(gu, q4(p + "down_proj"), gu.n // world)
 
     def expert_names(i: int) -> list[str]:
         """Layer ``i``'s expert tensors in the order ``moe`` reads them (none for a dense layer; ``cfg.layers``: MTP)."""

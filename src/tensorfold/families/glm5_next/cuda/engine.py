@@ -129,7 +129,9 @@ class GlmEngine:
         self.rank = rank
         self.policy = "0" if serial_only else policy
         self.serial_only = serial_only
-        self.comm = comm if comm is not None else NCCL(rank, 2, master, port)
+        world = int(os.environ.get("TF_TP_WORLD", "2"))
+        self.world = world
+        self.comm = comm if comm is not None else NCCL(rank, world, master, port)
         self.comm.barrier()
         cfg = Config.read(model_dir)
         # Without --context the window stays dense, attending every key without indexer work.
@@ -142,11 +144,11 @@ class GlmEngine:
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
-                                   lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
+                                   lambda text: mla_geometry(text, self.world, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
                                                              latent=LATENT, mtp=self.mtp_on),
-                                   weights_estimate, rank=rank, world=2, gather=self._gather_ints,
-                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
-                                   draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
+                                   weights_estimate, rank=rank, world=self.world, gather=self._gather_ints,
+                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, self.world),
+                                   draft_geometry=lambda text: dflash2_geometry(text, self.world, MAX_ROWS, ring=DRAFT_RING))
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
@@ -159,12 +161,12 @@ class GlmEngine:
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
         both = self._gather_ints(mine + [spare >> 20])
-        if both[0][:-1] != both[1][:-1]:
-            raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+        if any(b[:-1] != both[0][:-1] for b in both):
+            raise RuntimeError("the ranks were started with different settings (draft model, context, drafts, "
                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
-                               f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
-                               "(or pass --drafter none to both) and give both the same flags")
-        self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+                               f"rank 0 {both[0][:-1]} vs {[b[:-1] for b in both[1:]]}; pull the draft model on every "
+                               "machine (or pass --drafter none everywhere) and give all the same flags")
+        self.cache_bytes = min(b[-1] for b in both) << 20
         plan["kept_bytes"] = self.cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
             plan[key] = plan[key] + self.cache_bytes

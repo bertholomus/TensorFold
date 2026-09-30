@@ -233,7 +233,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     from tensorfold import hub
 
     if args.tp == 2 and not args.master:
-        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+        raise ValueError("--tp 2 or 4 needs --master: rank 0's address on the link between the machines")
     if args.tp == 1 and args.rank != 0:
         raise ValueError("--rank 1 needs --tp 2")
     started = time.perf_counter()
