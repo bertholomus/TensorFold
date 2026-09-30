@@ -46,9 +46,17 @@ SMALL = ("config.json", "generation_config.json", "tokenizer.json", "tokenizer_c
 
 
 # EXL3 gate/up split tile columns and svh; down splits tile rows and suh; each replicates the remaining tensors.
-EXL3_EXPERT = re.compile(r"\.mlp\.experts\.\d+\.(gate|up|down)_proj\.(trellis|suh|svh|mcg)$")
+EXL3_EXPERT = re.compile(r"\.mlp\.experts\.\d+\.(gate|up|down)_proj\.(trellis|suh|svh|mcg|mul1|3inst)$")
 EXL3_RULES = {("gate", "trellis"): "dim1", ("gate", "suh"): "rep", ("gate", "svh"): "row",
               ("down", "trellis"): "row", ("down", "suh"): "row", ("down", "svh"): "rep"}
+# Any other EXL3 group (attention, dense and shared MLPs, head, MTP projections): its plain weight's rule decides.
+# A trellis is [K/16, N/16, words] (input tiles first), the transpose of a plain [N, K] weight: an output split
+# ("row") cuts the trellis's second axis and svh, an input split ("col") its first axis and suh; the codebook
+# marker and the other scale vector are replicated. Rank parts stay whole 128-column Hadamard blocks when the
+# split dimension divides by 128 * world (every GLM-5.3 projection at TP4 does).
+EXL3_PART = re.compile(r"\.(trellis|suh|svh|su|sv|mcg|mul1|3inst|bias)$")
+EXL3_BY_KIND = {"row": {"trellis": "dim1", "svh": "row", "sv": "row", "bias": "row"},
+                "col": {"trellis": "row", "suh": "row", "su": "row"}}
 
 
 def rule(name: str) -> str:
@@ -57,10 +65,16 @@ def rule(name: str) -> str:
     m = EXL3_EXPERT.search(name)
     if m:
         proj, part = m.groups()
-        return "rep" if part == "mcg" else EXL3_RULES[("gate" if proj == "up" else proj, part)]
-    hits = [kind for kind, pats in (("row", ROW), ("col", COL), ("rep", REP)) if any(re.search(p, name) for p in pats)]
+        return EXL3_RULES.get(("gate" if proj == "up" else proj, part), "rep")
+    base = name
+    p = EXL3_PART.search(name)
+    if p:
+        base = name[:p.start()] + ".weight"
+    hits = [kind for kind, pats in (("row", ROW), ("col", COL), ("rep", REP)) if any(re.search(r, base) for r in pats)]
     if len(hits) != 1:
         raise ValueError(f"{name}: split rule is ambiguous or missing ({hits})")
+    if p:
+        return EXL3_BY_KIND.get(hits[0], {}).get(p.group(1), "rep")
     return hits[0]
 
 

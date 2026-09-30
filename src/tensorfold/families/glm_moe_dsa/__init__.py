@@ -8,40 +8,35 @@ from typing import Any
 MODEL_TYPES = ("glm_moe_dsa",)
 TITLE = "GLM-5.3"
 LANES = False
-# TensorFold's only EXL3 read path: 4-bit mcg-codebook routed experts, BF16 attention, dense MLPs,
-# shared experts, router and vocabulary head. Modeled on Mia's GLM-5.3-Flash EXL3 conversion.
-MODELS = ("Mia-AiLab/GLM-5.3-EXL3-TR3-4bpw-routed",)
+# ExLlamaV3 conversions of GLM-5.3: routed experts on the universal EXL3 experts kernel (any codebook, a width per
+# matrix) and every other trellis group (attention, dense and shared MLPs, MTP, head) on the EXL3 linear; the
+# tensors the conversion keeps plain (kv_b, the indexer's wk / weights_proj, the router, norms) are read as stored.
+MODELS = ("bertholomus/GLM-5.3-EXL3-3.0bpw",)
 KERNEL_PACKAGE = "tensorfold.kernels.glm.flash.v1"   # the shared GLM CUDA kernels (qmm, glue, experts)
 KERNEL_DEPENDENCIES = ("tensorfold.families.glm5_next.cuda.qmm", "tensorfold.families.glm5_next.cuda.glue")
 KERNEL_VERSION = "v1"
 QUANT_METHODS = {"cuda": ("exl3",)}
-# 4-bit trellis, the "mcg" codebook, routed experts only (the same variant the Flash family's CUDA engine reads)
-EXL3_VARIANT = {"bits": 4, "codebook": "mcg", "scope": "glm53_routed_experts_only"}
+# every EXL3 codebook and width the shared module reads (tensorfold.families.EXL3_VARIANT_ANY)
+EXL3_VARIANT = "any"
 # the draft model is optional: without it the engine drafts with the checkpoint's own MTP head
 DRAFTER = ""
 
 
 def check(model_dir: str | Path) -> None:
-    """Refuse what the engine does not read: anything but EXL3 4-bit mcg routed experts with BF16 elsewhere."""
+    """Refuse what the engine does not read: a checkpoint that is not EXL3, or states a codebook or width it cannot read."""
 
     from tensorfold.families import OWN_MODEL_HELP, quant_method, read_config
 
     config = read_config(model_dir)
     if quant_method(config) != "exl3":
-        raise ValueError(f"GLM-5.3's CUDA engine reads EXL3 checkpoints with 4-bit mcg-codebook routed experts "
-                         f"and BF16 elsewhere ({MODELS[0]}); this checkpoint is not EXL3-quantized. {OWN_MODEL_HELP}")
+        raise ValueError(f"GLM-5.3's CUDA engine reads ExLlamaV3 (EXL3) conversions ({MODELS[0]}); this checkpoint is "
+                         f"not EXL3-quantized. {OWN_MODEL_HELP}")
     from tensorfold.families.glm_moe_dsa.config import Config
 
     cfg = Config.from_dict(config)                     # the architecture checks (rope, indexer, routing)
     from tensorfold.cuda.exl3 import format as exl3_format
 
-    fields = exl3_format.require_config(config, where="NVIDIA GPUs (CUDA)", tested=", ".join(MODELS),
-                                        help=OWN_MODEL_HELP)
-    if int(fields.get("bits") or 4) != EXL3_VARIANT["bits"] \
-            or str(fields.get("codebook") or "mcg").lower() != EXL3_VARIANT["codebook"]:
-        raise ValueError(f"GLM-5.3's CUDA engine reads EXL3 checkpoints with 4-bit mcg-codebook routed experts "
-                         f"and BF16 elsewhere ({MODELS[0]}); this one states "
-                         f"{fields.get('bits')} bits with the {fields.get('codebook')!r} codebook. {OWN_MODEL_HELP}")
+    exl3_format.require_config(config, where="NVIDIA GPUs (CUDA)", tested=", ".join(MODELS), help=OWN_MODEL_HELP)
     missing = sorted(set(cfg.missing_tensors({"_model_dir": str(model_dir)})))
     if missing:
         raise ValueError(f"this checkpoint lacks {len(missing)} tensor(s) the architecture needs, {missing[0]} "

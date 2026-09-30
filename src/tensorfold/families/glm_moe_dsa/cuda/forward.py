@@ -16,18 +16,53 @@ from .weights import LayerW, Weights
 
 # the Flash buffers' DSA block is reused where the shapes match; the indexer differs (no k-pool)
 from tensorfold.families.glm5_next.cuda.forward import (  # noqa: F401
-    Buffers as FlashBuffers, State as FlashState, gather, mm, out_proj,
+    Buffers as FlashBuffers, State as FlashState, gather, mm as flash_mm,
 )
+
+from .x3 import X3, X3Pair, X3Scratch
+
+
+def mm(b, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False) -> torch.Tensor:
+    """A projection: an EXL3 group on the row-invariant EXL3 linear (prompt GEMM in chunks), else Flash's matmuls."""
+
+    if isinstance(q, (X3, X3Pair)):
+        if f32 and out.dtype != torch.float32:
+            raise ValueError("mm: an f32 projection needs an fp32 output buffer")
+        return q(x, out, b.x3, prefill=b.prefill)
+    return flash_mm(b, x, q, xs, out, f32=f32)
+
+
+def out_proj(w, b, x: torch.Tensor, q, xs, R: int) -> torch.Tensor:
+    """A rank's fp32 partial of a row-split input (o_proj, MLP down) gathered over the ranks."""
+
+    mm(b, x, q, xs, b.part[:R], f32=True)
+    return gather(w, b, R)
 
 
 class Buffers(FlashBuffers):
     """Flash's buffers plus GLM-5.3's rope cos/sin rows and plain-residual state (no stream copies)."""
 
     def __init__(self, w: Weights, rows: int, capacity: int = 2560, *, prefill: bool = False) -> None:
-        super().__init__(w, rows, capacity, prefill=prefill)
+        import copy
+        import dataclasses
+
+        # Flash's constructor sizes its 4-bit-only EXL3 expert scratch when cfg.quant is "exl3" (GBs at prompt-chunk
+        # rows); this family runs routed experts on the universal kernel, so build Flash's part from a plain view
+        view = copy.copy(w)
+        view.cfg = dataclasses.replace(w.cfg, quant="plain")
+        super().__init__(view, rows, capacity, prefill=prefill)
         c = w.cfg
         dev = w.device
         bf = torch.bfloat16
+        f32 = torch.float32
+        del self.ey, self.plan, self.eact
+        self.exl3 = None
+        # the shared expert's MLP rows (Flash allocates these only on its EXL3 path)
+        sl = c.shared_width // w.world
+        self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
+        self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
+        self.sxs = torch.empty((rows, sl // 64), dtype=f32, device=dev)
+        self.sy = torch.empty((rows, c.hidden), dtype=f32, device=dev)
         # raw-token selection list: index_topk entries plus the current row's tail
         self.tokens = torch.empty((rows, c.index_topk + 1), dtype=torch.int32, device=dev)
         self.counts = torch.empty((rows,), dtype=torch.int32, device=dev)
@@ -37,6 +72,16 @@ class Buffers(FlashBuffers):
         # no hyper-connections: x holds one stream
         self.x = torch.empty((rows, c.hidden), dtype=bf, device=dev)
         del self.taps, self.tap_at
+        # kv_a's output is the latent then the shared rope key (kv_lora + qk_rope): Flash's buffer has no rope part
+        self.lat = torch.empty((rows, c.kv_lora + c.qk_rope), dtype=bf, device=dev)
+        # EXL3 groups (attention, MLPs, MTP, head) share one scratch; the routed experts run on the universal kernel
+        self.x3 = X3Scratch(w.meta.get("x3", []), dev, prefill=prefill)
+        self.moe = None
+        first = next((l.moe.experts for l in w.layers if l.moe is not None), None)
+        if first is not None and first.ex is not None:
+            from tensorfold.cuda.exl3 import experts as x3experts
+
+            self.moe = x3experts.Scratch(first.ex, rows, c.top_k + 1, device=dev)
 
 
 class State(FlashState):
@@ -124,7 +169,8 @@ def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor
         mm(b, b.normed[:R], a.q_a, b.xs[:R], b.qr[:R])
         glue.rmsnorm(b.qr[:R], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
         mm(b, b.normed[:R], a.kv_a, b.xs[:R], b.lat[:R])
-        glue.rmsnorm(b.lat[:R], a.kv_norm, c.eps, b.lat[:R], b.xs_lat[:R])
+        # kv_a_layernorm covers the latent only; the rope key after it stays as projected
+        glue.rmsnorm(b.lat[:R, :c.kv_lora], a.kv_norm, c.eps, b.lat[:R, :c.kv_lora], b.xs_lat[:R])
     with prof.timed("dsa: rope"):
         rope_mod.apply(b.qr[:R], b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
     with prof.timed("dsa: q_b"):
@@ -173,23 +219,30 @@ def mlp_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
 
 
 def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
-    from tensorfold.cuda import experts as grouped
-    from tensorfold.families.glm5_next.cuda import exl3_mm
+    """Routed experts on ``tensorfold.cuda.exl3.experts`` (any width and codebook), then the shared expert, in fp32.
+
+    The routed slots' weighted sum comes out of one fused launch in slot order (the shared expert's slot, id E,
+    is skipped there); the shared expert's output is added last, the same order as Flash's combine.
+    """
+
+    import math
+
+    from tensorfold.cuda.exl3 import experts as x3experts
 
     c = w.cfg
     m = layer.moe
     with prof.timed("moe: route"):
         glue.router(b.normed[:R], m.router, b.mlog[:R])
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
-        grouped.route(b.pick[:R], b.plan)
-    # GLM-5.3 clamps nothing (no swiglu_limit): the Flash EXL3 kernel's clamp passes with a bound nothing reaches
-    exl3_mm.routed(b.normed[:R], b.pick, b.plan, m.experts, b.exl3, b.ey.view(-1, c.hidden), R, 1e30)
+    with prof.timed("moe: routed"):
+        # GLM-5.3 has no swiglu_limit; the bf16 activation roundings are the GLM family's
+        x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], m.experts.ex, b.moe, b.part[:R], R,
+                         limit=math.inf, act_mode=x3experts.ACT_BF16)
     s = m.shared
     mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
     glue.silu_mul(b.sgu[:R], b.sact[:R], b.sxs[:R])
     mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
-    b.ey[:R, c.top_k].copy_(b.sy[:R])
-    glue.combine(b.ey[:R], b.wts[:R], b.part[:R])
+    b.part[:R].add_(b.sy[:R])
     with prof.timed("moe: all-gather"):
         return gather(w, b, R)
 

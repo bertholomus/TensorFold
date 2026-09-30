@@ -1,4 +1,5 @@
-"""Load one rank of GLM-5.3's EXL3 checkpoint: 4-bit trellis routed experts, BF16 everywhere else, world-parameterized."""
+"""Load one rank of GLM-5.3's EXL3 checkpoint: trellis groups wherever the conversion made them (routed experts at any
+width and codebook, and ExLlamaV3's attention, MLP, MTP and head groups), stored weights elsewhere, world-parameterized."""
 
 from __future__ import annotations
 
@@ -12,9 +13,10 @@ import torch
 
 from tensorfold.cuda import experts as grouped
 
-from tensorfold.families.glm5_next.cuda.exl3_mm import Exl3Experts, words as exl3_words
 from tensorfold.families.glm5_next.cuda import latent
 from tensorfold.families.glm5_next.cuda.qmm import B16, make_b16, stack_b16
+
+from .x3 import X3, X3Pair
 
 PREFIX = "model.language_model."      # also bare "model." (the reference layout): both tried below
 
@@ -89,7 +91,7 @@ class IndexW:
     """One full-indexer layer's weights: key projection, LayerNorm, per-head scoring weights, query projection."""
 
     kw: B16                   # [index_dim, hidden] bf16
-    qb: B16                   # [heads * index_dim, q_lora] bf16
+    qb: B16 | X3              # [heads * index_dim, q_lora]
     ln_w: torch.Tensor        # [index_dim] bf16
     ln_b: torch.Tensor        # [index_dim] bf16
     weights: torch.Tensor     # [heads, hidden] bf16 (raw per-head weights; the scorer folds the scales)
@@ -99,12 +101,12 @@ class IndexW:
 class DSAW:
     """One MLA layer's weights, with kv_b's per-head key/value blocks kept whole (BF16, never quantized)."""
 
-    q_a: B16                  # [q_lora, hidden]
-    q_b: B16                  # [heads * qk_dim, q_lora]
-    kv_a: B16                 # [kv_lora + qk_rope, hidden]
+    q_a: B16 | X3             # [q_lora, hidden]
+    q_b: B16 | X3             # [heads * qk_dim, q_lora]
+    kv_a: B16 | X3            # [kv_lora + qk_rope, hidden] (an EXL3 group pads it to 640; X3 crops)
     kv_k: B16                 # [heads * qk_dim, kv_lora] key rows of kv_b
     kv_v: B16                 # [heads * v_dim, kv_lora] value rows
-    o: B16                    # [hidden, heads * v_dim]
+    o: B16 | X3               # [hidden, heads * v_dim]
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
     heads: int
@@ -114,17 +116,33 @@ class DSAW:
 
 @dataclass
 class MLPW:
-    gu: B16                   # this rank's [gate | up] rows
-    down: B16                 # [hidden, this rank's width]
+    gu: B16 | X3Pair          # this rank's [gate | up] rows
+    down: B16 | X3            # [hidden, this rank's width]
     width: int
+
+
+@dataclass
+class RoutedW:
+    """One layer's routed experts on this rank for ``tensorfold.cuda.exl3.experts`` (any codebook, a width per matrix).
+
+    ``ex`` is the prepared layer (trellis pointers, widths, stacked scales); on a CPU load (the tests) it stays None
+    and ``parts`` keeps the rank's (trellis, suh, svh) triples so shapes can be checked without a GPU.
+    """
+
+    count: int                # E
+    dims: int                 # D (model width)
+    width: int                # I on this rank
+    codebook: str
+    ex: Any = None            # tensorfold.cuda.exl3.experts.Exl3RoutedExperts
+    parts: dict | None = None
 
 
 @dataclass
 class MoEW:
     router: torch.Tensor      # [E, hidden] bf16
     bias: torch.Tensor        # [E] fp32
-    experts: Exl3Experts      # the E routed experts (4-bit trellis)
-    shared: MLPW | None       # the shared expert (BF16)
+    experts: RoutedW          # the E routed experts (EXL3, any width)
+    shared: MLPW | None       # the shared expert (EXL3 group or BF16)
 
 
 @dataclass
@@ -156,7 +174,7 @@ class Weights:
     embed: torch.Tensor       # [vocab, hidden] bf16 (replicated)
     layers: list[LayerW]
     norm: torch.Tensor
-    head: B16                 # this rank's [vocab/world, hidden] slice
+    head: B16 | X3            # this rank's vocabulary slice (an EXL3 head pads every rank to one width)
     mtp: MTPW | None
     rank: int
     world: int
@@ -167,7 +185,8 @@ class Weights:
 
     @property
     def vocab_offset(self) -> int:
-        return self.rank * (self.cfg.vocab // self.world)
+        per = self.meta.get("vocab_per_rank")         # an EXL3 head: whole 128-column blocks a rank
+        return self.rank * (int(per) if per else self.cfg.vocab // self.world)
 
     def nbytes(self) -> int:
         total = 0
@@ -178,12 +197,16 @@ class Weights:
             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
                 seen.add(t.data_ptr())
                 total += t.numel() * t.element_size()
-            elif isinstance(t, (B16, Exl3Experts, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
+            elif isinstance(t, (X3, X3Pair)):
+                total += t.nbytes()
+            elif isinstance(t, (B16, RoutedW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
                 for v in vars(t).values():
                     add(v)
             elif isinstance(t, (list, tuple)):
                 for v in t:
                     add(v)
+            elif hasattr(t, "gate_ptr"):                  # a prepared Exl3RoutedExperts
+                add([v for v in vars(t).values() if isinstance(v, (torch.Tensor, list))])
             elif isinstance(t, dict):
                 for v in t.values():
                     add(v)
@@ -197,15 +220,23 @@ class Weights:
 
 
 def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
-    """Read one of ``TF_TP_WORLD`` ranks from a full checkpoint or rank folder, MTP layer included."""
+    """Read one of ``TF_TP_WORLD`` ranks from a full checkpoint or rank folder, MTP layer included.
+
+    Each projection is read the way the checkpoint stores it: an EXL3 trellis group (``X.trellis`` with its scales and
+    codebook marker) becomes an ``X3`` on the row-invariant EXL3 linear, a stored ``X.weight`` a BF16 ``B16``. The
+    split rules (``split.rule``) hand each rank its share of either form.
+    """
 
     from tensorfold.families.glm5_next.cuda.split import RankReader
+
+    from . import x3 as x3mod
 
     world = int(os.environ.get("TF_TP_WORLD", "2"))
     cfg = Config.read(model_dir)
     dev = torch.device(device)
     rd = RankReader(model_dir, rank)
     HL = cfg.heads // world
+    x3_users: list = []
 
     def name(raw: str) -> str:
         """The checkpoint's name for a model tensor: bare (the reference layout) or prefixed (a merged conversion)."""
@@ -218,11 +249,43 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
             return raw
         raise KeyError(f"{raw}: the checkpoint holds no such tensor")
 
+    def has(raw: str) -> bool:
+        try:
+            name(raw)
+            return True
+        except KeyError:
+            return False
+
     def t(raw: str, dtype: torch.dtype | None = None) -> torch.Tensor:
         x = rd.get(name(raw))
         if dtype is not None:
             x = x.to(dtype)
         return x.to(dev)
+
+    def group(p: str) -> dict:
+        """An EXL3 group's parts on this rank (trellis, in/out scales, codebook marker, bias)."""
+
+        got = {"trellis": rd.get(name(p + "trellis"))}
+        for part in ("suh", "su", "svh", "sv", "bias", "mul1", "mcg", "3inst"):
+            if has(p + part):
+                got[part] = rd.get(name(p + part))
+        return got
+
+    def x3(p: str, crop: int = 0, n_pad: int = 0) -> X3:
+        g = group(p)
+        suh = g.get("suh", g.get("su"))
+        svh = g.get("svh", g.get("sv"))
+        lin = x3mod.make(g["trellis"], suh, svh, x3mod.codebook(g), dev, bias=g.get("bias")).lin
+        out = X3(lin, n_pad=n_pad, crop=crop)
+        x3_users.append(out)
+        return out
+
+    def proj(p: str, crop: int = 0) -> B16 | X3:
+        """``p`` (``...q_a_proj.``): its EXL3 group when the checkpoint made one, else its stored weight."""
+
+        if has(p + "trellis"):
+            return x3(p, crop=crop)
+        return make_b16(t(p + "weight").contiguous())
 
     def b16(raw: str) -> B16:
         return make_b16(t(raw).contiguous())
@@ -232,44 +295,55 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
 
     def indexer(i: int) -> IndexW:
         p = f"layers.{i}.self_attn.indexer."
-        return IndexW(b16(p + "wk.weight"), b16(p + "wq_b.weight"), t(p + "k_norm.weight"),
-                      t(p + "k_norm.bias"), t(p + "weights_proj.weight").view(cfg.index_heads, cfg.hidden))
+        return IndexW(b16(p + "wk.weight"), proj(p + "wq_b."), t(p + "k_norm.weight", torch.bfloat16),
+                      t(p + "k_norm.bias", torch.bfloat16),
+                      t(p + "weights_proj.weight", torch.bfloat16).view(cfg.index_heads, cfg.hidden))
 
     def dsa(i: int, full: bool = True) -> DSAW:
         p = f"layers.{i}.self_attn."
         # kv_b_proj is stored [H * (qk_nope + v_dim), kv_lora]: per-head blocks of key rows then value rows
-        w = t(p + "kv_b_proj.weight")
+        w = t(p + "kv_b_proj.weight", torch.bfloat16)
         kv_k = make_b16(w[:HL * cfg.qk_nope].contiguous())
         kv_v = make_b16(w[HL * cfg.qk_nope:].contiguous())
         absorb = latent.AbsorbW.from_rows(w[:HL * cfg.qk_nope].float(), w[HL * cfg.qk_nope:].float(), HL)
-        return DSAW(b16(p + "q_a_proj.weight"), b16(p + "q_b_proj.weight"), b16(p + "kv_a_proj_with_mqa.weight"),
-                    kv_k, kv_v, b16(p + "o_proj.weight"), t(p + "q_a_layernorm.weight"),
-                    t(p + "kv_a_layernorm.weight"), HL, indexer(i) if full else None, absorb)
+        return DSAW(proj(p + "q_a_proj."), proj(p + "q_b_proj."),
+                    proj(p + "kv_a_proj_with_mqa.", crop=cfg.kv_lora + cfg.qk_rope),
+                    kv_k, kv_v, proj(p + "o_proj."), t(p + "q_a_layernorm.weight", torch.bfloat16),
+                    t(p + "kv_a_layernorm.weight", torch.bfloat16), HL, indexer(i) if full else None, absorb)
 
     def mlp(p: str) -> MLPW:
+        if has(p + "gate_proj.trellis"):
+            gu = X3Pair(x3(p + "gate_proj."), x3(p + "up_proj."))
+            return MLPW(gu, x3(p + "down_proj."), gu.gate.n)
         gu = stack([p + "gate_proj.weight", p + "up_proj.weight"])
         return MLPW(gu, make_b16(t(p + "down_proj.weight").contiguous()), gu.n // world)
 
     def moe(p: str) -> MoEW:
+        from tensorfold.cuda.exl3 import experts as x3experts
+
         router = t(p + "gate.weight", torch.bfloat16).contiguous()
         bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
-        parts: dict[str, tuple] = {}
-        for proj in ("gate_proj", "up_proj", "down_proj"):
-            ts, us, vs = [], [], []
+        parts: dict[str, list] = {}
+        cb = None
+        for proj_name in ("gate_proj", "up_proj", "down_proj"):
+            rows = []
             for e in range(cfg.experts):
-                raw = f"{p}experts.{e}.{proj}."
-                ts.append(exl3_words(rd.get(name(raw + "trellis"))))
-                us.append(rd.get(name(raw + "suh")))
-                vs.append(rd.get(name(raw + "svh")))
-            parts[proj] = (torch.stack(ts).to(dev), torch.stack(us).to(dev), torch.stack(vs).to(dev))
-            del ts, us, vs
-        (gt, sg, vg), (ut, su, vu), (dt, sd, vd) = parts["gate_proj"], parts["up_proj"], parts["down_proj"]
-        return MoEW(router, bias,
-                    Exl3Experts(gt, ut, dt, sg, su, vg, vu, sd, vd, cfg.experts, int(vg.shape[1]), int(vd.shape[1])),
-                    None if not cfg.shared else mlp(p + "shared_experts."))
+                g = group(f"{p}experts.{e}.{proj_name}.")
+                cb = cb or x3mod.codebook(g)
+                rows.append((g["trellis"].to(dev).contiguous(), g.get("suh", g.get("su")).to(dev, torch.float16),
+                             g.get("svh", g.get("sv")).to(dev, torch.float16)))
+            parts[proj_name] = rows
+        D = parts["gate_proj"][0][0].shape[0] * 16
+        I = parts["gate_proj"][0][0].shape[1] * 16
+        ex = None
+        if dev.type == "cuda":
+            ex = x3experts.prepare(parts["gate_proj"], parts["up_proj"], parts["down_proj"], cb, device=dev)
+        routed = RoutedW(cfg.experts, D, I, cb, ex, None if ex is not None else parts)
+        return MoEW(router, bias, routed, None if not cfg.shared else mlp(p + "shared_experts."))
 
     def layer(i: int) -> LayerW:
-        lw = LayerW(i, "dsa", t(f"layers.{i}.input_layernorm.weight"), t(f"layers.{i}.post_attention_layernorm.weight"))
+        lw = LayerW(i, "dsa", t(f"layers.{i}.input_layernorm.weight", torch.bfloat16),
+                    t(f"layers.{i}.post_attention_layernorm.weight", torch.bfloat16))
         lw.dsa = dsa(i, full=cfg.indexer_types[i] == "full")
         if cfg.mlp_kinds[i] == "dense":
             lw.mlp = mlp(f"layers.{i}.mlp.")
@@ -277,23 +351,45 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
             lw.moe = moe(f"layers.{i}.mlp.")
         return lw
 
+    def lm_head(meta: dict) -> B16 | X3:
+        """This rank's vocabulary slice: BF16 rows vocab/world, or an EXL3 head in whole 128-column blocks."""
+
+        if "lm_head.trellis" in rd.index:
+            g = {"trellis": rd.get("lm_head.trellis")}
+            for part in ("suh", "su", "svh", "sv", "mul1", "mcg", "3inst"):
+                if "lm_head." + part in rd.index:
+                    g[part] = rd.get("lm_head." + part)
+            blocks = g["trellis"].shape[1] // 8                     # the trellis's 16-column tiles, 8 a block
+            lo, mine, per = x3mod.vocab_slice(blocks, world, rank)
+            svh = g.get("svh", g.get("sv"))
+            tr = g["trellis"][:, lo * 8:(lo + mine) * 8].contiguous()
+            head = X3(x3mod.make(tr, g.get("suh", g.get("su")), svh[lo * 128:(lo + mine) * 128].contiguous(),
+                                 x3mod.codebook(g), dev).lin, n_pad=per * 128,
+                      crop=max(0, min(mine * 128, cfg.vocab - lo * 128)))
+            x3_users.append(head)
+            meta["vocab_per_rank"] = per * 128
+            return head
+        vl = cfg.vocab // world
+        return make_b16(t("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev).contiguous())
+
     embed = t("embed_tokens.weight", torch.bfloat16).contiguous().to(dev)
     try:
         built = [layer(i) for i in range(cfg.layers)]
-        vl = cfg.vocab // world
-        head = make_b16(t("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev).contiguous())
+        meta: dict = {}
+        head = lm_head(meta)
         mtpw = None
-        if cfg.mtp_layers:
+        if cfg.mtp_layers and has(f"layers.{cfg.layers}.enorm.weight"):
             i = cfg.layers
-            mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"),
-                        b16(f"layers.{i}.eh_proj.weight"), t(f"layers.{i}.shared_head.norm.weight"),
-                        LayerW(i, "dsa", t(f"layers.{i}.input_layernorm.weight"),
-                               t(f"layers.{i}.post_attention_layernorm.weight")))
+            mtpw = MTPW(t(f"layers.{i}.enorm.weight", torch.bfloat16), t(f"layers.{i}.hnorm.weight", torch.bfloat16),
+                        proj(f"layers.{i}.eh_proj."), t(f"layers.{i}.shared_head.norm.weight", torch.bfloat16),
+                        LayerW(i, "dsa", t(f"layers.{i}.input_layernorm.weight", torch.bfloat16),
+                               t(f"layers.{i}.post_attention_layernorm.weight", torch.bfloat16)))
             mtpw.layer.dsa = dsa(i, full=True)
             mtpw.layer.moe = moe(f"layers.{i}.mlp.")
-        w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev)
-        w.meta.update(layers=list(range(cfg.layers)))
+        w = Weights(cfg, embed, built, t("norm.weight", torch.bfloat16), head, mtpw, rank, world, dev)
+        w.meta.update(layers=list(range(cfg.layers)), x3=x3_users, **meta)
     finally:
         rd.close()
-    torch.cuda.empty_cache()
+    if dev.type == "cuda":
+        torch.cuda.empty_cache()
     return w

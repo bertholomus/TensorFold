@@ -291,7 +291,18 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
                       int64_t slots, int64_t E) {
     TORCH_CHECK(E <= GROUP_THREADS * GROUP_PER_THREAD, "too many experts for the grouping kernel");
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+    // The picks are staged in dynamic shared memory: prompt chunks (2048 rows x 9 slots = 72 KiB) pass the
+    // 48 KiB a launch gets by default, so opt in up to the device's per-block limit (GB10: 99 KiB) and refuse
+    // clearly past it rather than failing the launch with "invalid argument".
     const size_t smem = (size_t)R * slots * sizeof(int);
+    if (smem > 48 * 1024) {
+        int dev = 0, limit = 0;
+        C10_CUDA_CHECK(cudaGetDevice(&dev));
+        C10_CUDA_CHECK(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+        TORCH_CHECK(smem <= (size_t)limit, "grouping ", R, " rows x ", slots, " slots needs ", smem,
+                    " bytes of shared memory; this device allows ", limit, " a block");
+        C10_CUDA_CHECK(cudaFuncSetAttribute(group_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    }
     group_kernel<<<1, GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
         pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
         (int)slots, (int)E, (int)members.size(1));

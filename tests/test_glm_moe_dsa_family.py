@@ -157,8 +157,9 @@ def test_tiny_checkpoint_check_gate(tmp_path):
     check(write_checkpoint(tmp_path))               # must not raise
 
 
-def test_exl3_variant_check_rejects_wrong_bits(tmp_path):
-    """A checkpoint whose quantization_config lacks the mcg 4-bit variant is refused before any load."""
+def test_exl3_check_accepts_any_width_and_refuses_an_unknown_codebook(tmp_path):
+    """The universal EXL3 kernels read every width and codebook: 3.0 bpw mul1 (our quant) passes, a made-up codebook
+    or an out-of-range average is refused before any load."""
 
     from glm_dsa_fakes import write_checkpoint
 
@@ -166,10 +167,15 @@ def test_exl3_variant_check_rejects_wrong_bits(tmp_path):
 
     folder = write_checkpoint(tmp_path)
     config = json.loads((folder / "config.json").read_text())
-    config["quantization_config"] = {"bits": 8, "codebook": "mcg", "quant_method": "exl3"}
-    (folder / "config.json").write_text(json.dumps(config))
-    with pytest.raises(ValueError):
+    for good in ({"bits": 3.0, "head_bits": 6, "mtp_bits": 4, "codebook": "mul1"}, {"bits": 4, "codebook": "mcg"}):
+        config["quantization_config"] = {**good, "quant_method": "exl3"}
+        (folder / "config.json").write_text(json.dumps(config))
         check(folder)
+    for bad in ({"bits": 3.0, "codebook": "nf4"}, {"bits": 12, "codebook": "mul1"}):
+        config["quantization_config"] = {**bad, "quant_method": "exl3"}
+        (folder / "config.json").write_text(json.dumps(config))
+        with pytest.raises(ValueError):
+            check(folder)
 
 
 # ---------------------------------------------------------------- the loader on a real-shaped tiny checkpoint
@@ -203,12 +209,15 @@ def test_loader_builds_every_layer_from_the_tiny_checkpoint(tmp_path, monkeypatc
         if a.index is not None:
             assert a.index.weights.shape == (CFG["index_n_heads"], CFG["hidden_size"])
         if layer.moe is not None:
-            assert layer.moe.experts.count == CFG["n_routed_experts"]
+            ex = layer.moe.experts
+            assert ex.count == CFG["n_routed_experts"]
             assert layer.moe.shared is not None
-            # the routed experts' down trellis per rank: [E, (moe_width/world)/16, hidden/16, 32 words]
-            assert tuple(layer.moe.experts.dt.shape) == (CFG["n_routed_experts"], CFG["moe_intermediate_size"] // 2 // 16,
-                                                         CFG["hidden_size"] // 16, 32)
-            assert layer.moe.experts.width == CFG["moe_intermediate_size"] // 2    # this rank's expert columns
+            assert ex.ex is None and ex.parts is not None       # a CPU load keeps the rank's triples
+            # this rank's down trellis per expert: [(moe_width/world)/16, hidden/16, 16 * bits] int16
+            dt, suh, svh = ex.parts["down_proj"][0]
+            assert tuple(dt.shape) == (CFG["moe_intermediate_size"] // 2 // 16, CFG["hidden_size"] // 16, 64)
+            assert suh.shape[0] == CFG["moe_intermediate_size"] // 2 and svh.shape[0] == CFG["hidden_size"]
+            assert ex.width == CFG["moe_intermediate_size"] // 2    # this rank's expert columns
     assert w.mtp is not None
     assert w.mtp.layer.dsa.index is not None          # the MTP layer scores with its own indexer
     assert w.mtp.eh.weight.shape == (CFG["hidden_size"], 2 * CFG["hidden_size"])
@@ -346,3 +355,77 @@ def test_kernel_glue_imports_stay_lazy():
     import torch
 
     assert not torch.cuda.is_initialized()
+
+
+# ---------------------------------------------------------------- our 3.0 bpw conversion's layout (headers only)
+
+QUANT_WORK = Path("/tank/projects/deepspec-cache/quants/glm53-exl3-3.0bpw-work/qtensors")
+
+
+def _headers(path: Path) -> dict:
+    import struct
+
+    with path.open("rb") as f:
+        n = struct.unpack("<Q", f.read(8))[0]
+        return {k: v for k, v in json.loads(f.read(n)).items() if k != "__metadata__"}
+
+
+@pytest.mark.skipif(not (QUANT_WORK / "model.layers.21.safetensors").is_file(), reason="the 3.0 bpw work dir is absent")
+def test_split_rules_cover_the_quant_and_keep_hadamard_blocks_whole_at_tp4():
+    """Every tensor of a dense and a sparse layer of our conversion has one split rule, and each rank's share of an
+    EXL3 group at TP4 is whole 128-column blocks (so each rank's slice is a valid EXL3 linear of its own)."""
+
+    from tensorfold.families.glm5_next.cuda.split import rule
+
+    seen = {}
+    for layer in (2, 21):
+        for name, meta in _headers(QUANT_WORK / f"model.layers.{layer}.safetensors").items():
+            kind = rule(name)
+            assert kind in ("row", "col", "rep", "dim1"), name
+            seen[name] = (kind, meta["shape"])
+            if name.endswith(".trellis") and kind in ("row", "dim1"):
+                axis = 0 if kind == "row" else 1
+                tiles = meta["shape"][axis]                          # 16-wide tiles on the split axis
+                assert tiles % (4 * 8) == 0, (name, meta["shape"])   # 4 ranks x 8 tiles a 128-column block
+    # the attention groups follow their plain weights' split (q_b/kv_b by head rows, o_proj by input columns)
+    assert seen["model.layers.21.self_attn.q_b_proj.trellis"][0] == "dim1"
+    assert seen["model.layers.21.self_attn.q_b_proj.svh"][0] == "row"
+    assert seen["model.layers.21.self_attn.q_b_proj.suh"][0] == "rep"
+    assert seen["model.layers.21.self_attn.o_proj.trellis"][0] == "row"
+    assert seen["model.layers.21.self_attn.o_proj.suh"][0] == "row"
+    assert seen["model.layers.21.self_attn.o_proj.svh"][0] == "rep"
+    assert seen["model.layers.21.self_attn.q_a_proj.trellis"][0] == "rep"
+    assert seen["model.layers.21.self_attn.kv_b_proj.weight"][0] == "row"
+    assert seen["model.layers.21.mlp.experts.7.gate_proj.mul1"][0] == "rep"
+    assert seen["model.layers.21.mlp.shared_experts.down_proj.trellis"][0] == "row"
+    assert seen["model.layers.2.mlp.gate_proj.trellis"][0] == "dim1"
+
+
+@pytest.mark.skipif(not (QUANT_WORK / "model.layers.21.safetensors").is_file(), reason="the 3.0 bpw work dir is absent")
+def test_quant_layers_hold_every_tensor_the_loader_asks_for():
+    """The names the loader reads for a dense and a sparse layer (trellis groups or stored weights) all exist."""
+
+    from tensorfold.families.glm_moe_dsa.config import _forms
+
+    for layer, dense in ((2, True), (21, False)):
+        have = set(_headers(QUANT_WORK / f"model.layers.{layer}.safetensors"))
+        p = f"model.layers.{layer}"
+        need = [f"{p}.self_attn.{x}_proj.weight" for x in ("q_a", "q_b", "o")] + \
+               [f"{p}.self_attn.kv_a_proj_with_mqa.weight", f"{p}.self_attn.kv_b_proj.weight"]
+        if dense:
+            need += [f"{p}.mlp.{x}_proj.weight" for x in ("gate", "up", "down")]
+        else:
+            need += [f"{p}.mlp.shared_experts.{x}_proj.weight" for x in ("gate", "up", "down")]
+            need += [f"{p}.mlp.experts.{e}.{x}_proj.trellis" for e in (0, 255) for x in ("gate", "up", "down")]
+        for n in need:
+            assert any(f in have for f in _forms(n)), n
+
+
+def test_vocab_slice_covers_the_head_in_whole_blocks():
+    from tensorfold.families.glm_moe_dsa.cuda.x3 import vocab_slice
+
+    blocks = 154880 // 128                                  # GLM-5.3's head: 1,210 blocks
+    got = [vocab_slice(blocks, 4, r) for r in range(4)]
+    assert [g[1] for g in got] == [303, 303, 303, 301] and all(g[2] == 303 for g in got)
+    assert [g[0] for g in got] == [0, 303, 606, 909]
+    assert sum(g[1] for g in got) == blocks

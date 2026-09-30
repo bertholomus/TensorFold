@@ -144,10 +144,14 @@ class Config:
                      f"{p}.self_attn.kv_a_proj_with_mqa.weight", f"{p}.self_attn.kv_b_proj.weight",
                      f"{p}.self_attn.o_proj.weight", f"{p}.self_attn.indexer.wq_b.weight",
                      f"{p}.mlp.gate.weight", f"{p}.shared_head.norm.weight"]
-        return [n for n in need if n not in have and _plain(n) not in have]
+        return [n for n in need if not any(alt in have for alt in _forms(n))]
 
 
-def _plain(trellis_name: str) -> str:
-    """A trellis-pack name's plain-weight equivalent (``X.trellis`` -> ``X.weight``), for non-EXL3 checkpoints."""
+def _forms(name: str) -> tuple[str, ...]:
+    """A matrix's accepted names: its plain ``X.weight`` or its EXL3 group's ``X.trellis``, either way round."""
 
-    return trellis_name[:-len(".trellis")] + ".weight" if trellis_name.endswith(".trellis") else trellis_name
+    if name.endswith(".trellis"):
+        return (name, name[:-len(".trellis")] + ".weight")
+    if name.endswith(".weight") and not name.endswith(("norm.weight", "gate.weight")) and ".norm." not in name:
+        return (name, name[:-len(".weight")] + ".trellis")
+    return (name,)
