@@ -474,7 +474,7 @@ def test_engine_world_plumbing_via_stubbed_init(monkeypatch, tmp_path):
     monkeypatch.setattr(engine, "split_weights", lambda *a: None, raising=False)
     monkeypatch.setattr(engine, "draft_geometry", lambda *a, **kw: None, raising=False)
 
-    def fake_load(model_dir, *, rank, device="cuda"):
+    def fake_load(model_dir, *, rank, device="cuda", mtp=True):
         world_seen["load_rank"] = rank
         raise _StopLoad()
 
@@ -517,7 +517,7 @@ def test_engine_setting_mismatch_rejected_across_world(monkeypatch, tmp_path):
         "context_window": 2051, "cache_slots": 2560, "budget_bytes": 94 * 2**30,
         "total_bytes_estimate": 80 * 2**30, "serving_peak_bytes_estimate": 80 * 2**30})
 
-    def fake_load(model_dir, *, rank, device="cuda"):
+    def fake_load(model_dir, *, rank, device="cuda", mtp=True):
         return "WEIGHTS"
 
     import tensorfold.families.glm5_next.cuda.weights as weights_mod
@@ -548,3 +548,29 @@ def test_cli_tp4_choices():
     assert getattr(args, "tp", None) == 4 and args.rank == 3
     with pytest.raises(SystemExit):
         parser.parse_args(["serve", "/tmp", "--backend", "cuda", "--tp", "3"])
+
+def test_rankreader_uses_call_time_world_not_stale_import_global():
+    """Regression (ddb8167 follow-up): RankReader._span must use call-time TF_TP_WORLD, not the
+    import-time WORLD global. If env is set after import (engine.py does this), the stale global
+    computed wrong byte offsets -> silent rank corruption. Found via test-order dependence in the
+    glm_moe_dsa family suite (kv_v rows collapsed to 0)."""
+
+    import importlib
+
+    old = os.environ.get("TF_TP_WORLD")
+    os.environ.pop("TF_TP_WORLD", None)
+    try:
+        import tensorfold.families.glm5_next.cuda.split as split_fresh
+        importlib.reload(split_fresh)                      # WORLD baked as 2, env unset
+        shape = [8, 64]                                    # 8 rows divide by both 2 and 4
+        raw = np.arange(8 * 64, dtype=np.int32)
+        os.environ["TF_TP_WORLD"] = "4"                    # set AFTER import, like engine.py does
+        part, part_shape = split_fresh.split_bytes(raw, shape, 4, "row", 3)
+        assert part_shape == [2, 64]                       # world 4 honored at call time
+        assert part.tolist() == raw[6 * 64:8 * 64].tolist()  # rank 3 of 4, not rank 1 of 2
+    finally:
+        if old is None:
+            os.environ.pop("TF_TP_WORLD", None)
+        else:
+            os.environ["TF_TP_WORLD"] = old
+

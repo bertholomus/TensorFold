@@ -74,11 +74,25 @@ def read_header(path: str | Path) -> tuple[dict, int]:
 WORLD = int(os.environ.get("TF_TP_WORLD", "2"))    # ranks the checkpoint is split across
 
 
+def _world() -> int:
+    """Ranks the checkpoint is split across: per-call env wins over the import-time default.
+
+    Import-time WORLD is baked before TF_TP_WORLD may exist (e.g. engine sets it at runtime), so
+    helpers that receive world=None must not trust the stale global. Callers that pass world
+    explicitly are unaffected.
+    """
+
+    try:
+        return int(os.environ.get("TF_TP_WORLD", WORLD))
+    except ValueError:
+        return WORLD
+
+
 def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int,
                 world: int | None = None) -> tuple[np.ndarray, list[int]]:
     """A tensor's bytes -> rank's part of them and its shape."""
 
-    W = WORLD if world is None else world
+    W = _world() if world is None else world
     n = shape[0] if kind == "row" else (shape[1] if kind in ("col", "dim1") else 0)
     if kind != "rep" and (n % W or rank >= W):
         raise ValueError(f"{kind} split of {shape} into {W} ranks")
@@ -106,7 +120,7 @@ def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, ran
 def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, world: int | None = None):
     """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
 
-    W = WORLD if world is None else world
+    W = _world() if world is None else world
     if kind == "rep":
         return raw.clone(), list(shape)
     if kind == "row":
@@ -199,9 +213,10 @@ class RankReader:
             raise KeyError(f"{name} is not used by the engine")
         a, b = info["data_offsets"]
         shape = list(info["shape"])
-        if kind == "row" and shape and shape[0] % WORLD == 0:   # the rank's rows are one run: read only those
-            per = (b - a) // shape[0] * (shape[0] // WORLD)
-            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // WORLD] + shape[1:]
+        W = _world()
+        if kind == "row" and shape and shape[0] % W == 0:   # the rank's rows are one run: read only those
+            per = (b - a) // shape[0] * (shape[0] // W)
+            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // W] + shape[1:]
         return file, base + a, base + b, kind, shape, info["dtype"]
 
     def _tensor(self, raw: np.ndarray, span: tuple, own: bool):
