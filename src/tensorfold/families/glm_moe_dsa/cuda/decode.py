@@ -7,7 +7,7 @@ from typing import Sequence
 import torch
 
 from tensorfold.families.glm5_next.cuda.decode import (  # noqa: F401
-    DecodeResult, DepthPolicy, absorb, draft, mtp_decode, sample_rows,
+    DecodeResult, DepthPolicy, absorb, draft, sample_rows,
     snapshot_bytes, row_bytes, save_rows, load_rows, restore, take_snapshot, _row_views,
 )
 
@@ -82,6 +82,73 @@ def serial_decode(e: "Engine", pending: int, count: int, sampling, *, stop_eos: 
             on_tokens([tok])
     torch.cuda.synchronize()
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
+
+
+@torch.no_grad()
+def mtp_decode(e: "Engine", pending: int, count: int, sampling, *, policy: DepthPolicy | None = None,
+               stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+    """Flash's verify loop (pending + MTP drafts, kept through the first mismatch) over this family's commit.
+
+    Flash's own ``mtp_decode`` commits through its KDA state (``st.cur`` ping-pong); GLM-5.3 has none, so the loop is
+    restated here verbatim with this family's ``commit`` (advance the position; latent rows past ``keep`` are simply
+    overwritten by the next window).
+    """
+
+    import time
+
+    from . import forward as fwd
+
+    w, st, b = e.w, e.st, e.buf
+    policy = policy or DepthPolicy()
+    out = [pending]
+    stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+    rounds = drafted = accepted = 0
+    depths: list[int] = []
+    keeps: list[int] = []
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    t0 = time.perf_counter()
+    depth = min(policy.next(0, 0), count - len(out))
+    drafts = draft(e, e.last_hidden, [pending], st.pos + 1, depth, sampling, policy.confidence) if depth > 0 else []
+    stages["draft"] += time.perf_counter() - t0
+    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+        t0 = time.perf_counter()
+        tokens = e.verify_window([out[-1]] + drafts)
+        drafts = tokens[1:]
+        R = len(tokens)
+        logits = e.forward(tokens)
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+        keep = 1
+        for i, d in enumerate(drafts):
+            if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
+                break
+            keep += 1
+        t2 = time.perf_counter()
+        fwd.commit(w, st, b, R, keep)
+        t3 = time.perf_counter()
+        rounds += 1
+        drafted += len(drafts)
+        accepted += keep - 1
+        depths.append(len(drafts))
+        keeps.append(keep)
+        e.follow(sampled[:keep])
+        out.extend(sampled[:keep])
+        if on_tokens is not None:
+            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        stages["forward"] += t1 - t0
+        stages["sample"] += t2 - t1
+        stages["commit"] += t3 - t2
+        if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
+            break
+        t4 = time.perf_counter()
+        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+        drafts = (draft(e, e.main_hidden(slice(0, keep)), sampled[:keep], st.pos + 1, depth, sampling,
+                        policy.confidence) if depth > 0 else [])
+        stages["draft"] += time.perf_counter() - t4
+    torch.cuda.synchronize()
+    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
 
 
 class Engine:

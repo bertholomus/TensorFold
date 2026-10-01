@@ -181,6 +181,9 @@ class GlmEngine:
                                on_tokens=on_tokens))
         stats.update(decode_s=res.seconds, rounds=res.rounds, tokens_per_second=round(res.tokens_per_second, 3),
                      sha256=__import__("hashlib").sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
+        if self.w.comm is None or self.w.rank == 0:
+            print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
+                  f" drafted {res.drafted} accepted {res.accepted}", flush=True)
         return stats
 
 
