@@ -186,9 +186,9 @@ class Weights:
 
     @property
     def vocab_offset(self) -> int:
-        per = self.meta.get("vocab_per_rank")         # an EXL3 head: whole 128-column blocks a rank
-        if per is not None:
-            return min(self.rank * int(per), self.cfg.vocab)   # padded tails of last ranks hold no rows
+        lo = self.meta.get("vocab_lo")                # an EXL3 head: the rank's whole-128-column-block span start
+        if lo is not None:
+            return int(lo)                            # balanced uneven spans: NOT rank * per (303/303/302/302)
         return share_lo(self.cfg.vocab, self.world, self.rank)
 
     def nbytes(self) -> int:
@@ -391,6 +391,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
                       crop=max(0, min(mine * 128, cfg.vocab - lo * 128)))
             x3_users.append(head)
             meta["vocab_per_rank"] = per * 128
+            meta["vocab_lo"] = lo * 128                             # this rank's first token id (uneven spans)
             return head
         vl = share(cfg.vocab, world, rank)
         lo = share_lo(cfg.vocab, world, rank)

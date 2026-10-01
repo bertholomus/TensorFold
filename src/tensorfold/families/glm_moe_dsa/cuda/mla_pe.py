@@ -117,15 +117,34 @@ def gather_pe(q: torch.Tensor, qk_nope: int, out: torch.Tensor) -> torch.Tensor:
 
 def attention(qa: torch.Tensor, qp: torch.Tensor, cache: torch.Tensor, pcache: torch.Tensor, pos: torch.Tensor,
               s: LatentScratch, *, scale: float, nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
-    """Dense causal attention of rows (qa [R, H, 512], qp [R, H, 64]) through pos + R - 1 in nch 512-key chunks."""
+    """Dense causal attention of rows (qa [R, H, 512], qp [R, H, 64]) through pos + R - 1 in nch 512-key chunks.
 
+    A prompt chunk's scratch holds ``part_rows`` rows of partials: longer windows run in row blocks, each at its first
+    row's device position (same bits a row as one call: rows never see each other's partials).
+    """
+
+    R = qa.shape[0]
+    # 16 heads a program always: the rope operand pushes HB_WIDE's 32-head tile past GB10's 99 KiB shared memory,
+    # and a TP4 rank holds 16 heads, so one program still reads each key once (16- and 32-head tiles: same bits)
+    hb = HB if hb is None else hb
+    step = s.part_rows
+    if R <= step:
+        return _attention(qa, qp, cache, pcache, pos, s, scale=scale, nch=nch, out=out, hb=hb)
+    for r0 in range(0, R, step):
+        r1 = min(R, r0 + step)
+        at = pos if r0 == 0 else pos + r0
+        _attention(qa[r0:r1], qp[r0:r1], cache, pcache, at, s, scale=scale, nch=nch, out=out[r0:r1], hb=hb)
+    return out
+
+
+def _attention(qa: torch.Tensor, qp: torch.Tensor, cache: torch.Tensor, pcache: torch.Tensor, pos: torch.Tensor,
+               s: LatentScratch, *, scale: float, nch: int, out: torch.Tensor, hb: int) -> torch.Tensor:
     R, H, LW = qa.shape
     PW = qp.shape[2]
     if nch > s.nch or R > s.part_rows or LW != s.lw:
         raise ValueError(f"latent attention: {R} rows, {nch} chunks, width {LW} past the scratch's "
                          f"{s.part_rows}, {s.nch}, {s.lw}")
     n = nch * R * H
-    hb = head_block(R) if hb is None else hb
     if hb not in (HB, HB_WIDE):
         raise ValueError(f"latent attention: {hb} heads a program, not {HB} or {HB_WIDE}")
     _dense_chunks_pe[(R, triton.cdiv(H, hb), nch)](qa, qp, cache, pcache, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R,
@@ -147,7 +166,7 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache: torch.Tensor, pc
     po = torch.empty((n * LW,), dtype=torch.float32, device=qa.device)
     pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
-    hb = head_block(R)
+    hb = HB                                       # see attention(): the rope tile stays within shared memory
     _sparse_chunks_pe[(R, triton.cdiv(H, hb), nch)](qa, qp, cache, pcache, tokens, counts, po, pm, pl, R, W=W, H=H,
                                                     LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
                                                     num_warps=8, num_stages=1)

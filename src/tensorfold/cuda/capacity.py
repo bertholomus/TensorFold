@@ -94,8 +94,11 @@ def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path]
         if other:
             raise ValueError("checkpoint contains another rank's split weights; use this rank's folder")
         index = path / "model.safetensors.index.json"
-        files = ([path / n for n in sorted(set(json.loads(index.read_text())["weight_map"].values()))]
-                 if index.exists() else sorted(path.glob("*.safetensors")))
+        owner = json.loads(index.read_text())["weight_map"] if index.exists() else None
+        files = ([path / n for n in sorted(set(owner.values()))]
+                 if owner is not None else sorted(path.glob("*.safetensors")))
+    else:
+        owner = None
     if not files:
         raise ValueError("startup memory estimate needs the checkpoint tensor headers")
     out = {}
@@ -107,6 +110,9 @@ def headers(model_dir: str | Path, *, rank: int | None = None, files: list[Path]
             entries = json.loads(stream.read(size))
         for name, info in entries.items():
             if name == "__metadata__":
+                continue
+            # an index names each tensor's file: a copy elsewhere (an ExLlamaV3 override leaves one) is not read
+            if owner is not None and owner.get(name, file.name) != file.name:
                 continue
             if name in out:
                 raise ValueError(f"duplicate checkpoint tensor: {name}")
