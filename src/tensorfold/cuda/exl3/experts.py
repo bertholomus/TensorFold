@@ -15,6 +15,8 @@ ACT_BF16, ACT_F32 = 0, 1          # SwiGLU with the GLM family's bf16 roundings 
 # Half-bits a value: 1..8 bits (2, 4, .. 16) and every half-integer rate 1.5..7.5 (3, 5, .. 15).
 K2_SUPPORTED = tuple(range(2, 17))
 
+# windows of this many rows or more (prompt chunks) size their member tiles to the busiest expert (a host read)
+EXACT_ROWS = 64
 # (n tiles a block, warps, K splits, tiles in flight): GLM's settings, whose arithmetic order this keeps bit for bit
 GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
@@ -182,6 +184,11 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if R > s.rows:
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
+    if group and R >= EXACT_ROWS:
+        # a prompt chunk: member tiles for the busiest expert's rows only (one host read). Sized for R rows, the grouped
+        # grids launched an expert's 16-row tiles for every row (2.6M mostly empty blocks a layer at 2,048 rows).
+        busiest = int(torch.bincount(pick[:R].reshape(-1).long(), minlength=E + 1)[:E].max())
+        members = s.members_buf[:ids.shape[0] * max(16, -(-busiest // 16) * 16)].view(ids.shape[0], -1)
     if group:
         ext.group(pick, ids, s.count, members, R, slots, E)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
