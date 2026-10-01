@@ -13,5 +13,5 @@ for n in 4 3 2 1; do
   else
     cmd="tensorfold serve $M --tp 4 --rank $r --master 10.200.10.1 --master-port 29661 $EXTRA --context $CTX"
   fi
-  ssh -o BatchMode=yes -n ascent-0$n "cd ~/ai/glm53-tf && docker rm -f tf-tp4 >/dev/null 2>&1; NCCL_SOCKET_IFNAME=enp1s0f0np0 NCCL_IB_HCA=${HCA[$n]} NCCL_NET_PLUGIN=spcx TF_TP_WORLD=4 ./tfrun.sh tf-tp4 \"$cmd\" >/dev/null && echo \$(hostname) rank $r started" 2>&1 | grep -v local/bin/env
+  ssh -o BatchMode=yes -n ascent-0$n "cd ~/ai/glm53-tf && docker rm -f tf-tp4 >/dev/null 2>&1; NCCL_SOCKET_IFNAME=enp1s0f0np0 NCCL_IB_HCA=${HCA[$n]} NCCL_NET_PLUGIN=spcx TF_NCCL_GATHER=${TF_NCCL_GATHER:-} NCCL_GRAPH_MIXING_SUPPORT=${NCCL_GRAPH_MIXING_SUPPORT:-} TF_TP_WORLD=4 ./tfrun.sh tf-tp4 \"$cmd\" >/dev/null && echo \$(hostname) rank $r started" 2>&1 | grep -v local/bin/env
 done
