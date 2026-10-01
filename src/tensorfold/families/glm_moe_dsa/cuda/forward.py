@@ -11,6 +11,8 @@ from tensorfold.families.glm5_next.cuda.qmm import B16
 
 from tensorfold.families.glm5_next.cuda import latent as latent_mod, prof
 
+from tensorfold.cuda.geometry import share
+
 from . import glue, rope as rope_mod, select as select_mod
 from .weights import LayerW, Weights
 
@@ -58,7 +60,7 @@ class Buffers(FlashBuffers):
         del self.ey, self.plan, self.eact
         self.exl3 = None
         # the shared expert's MLP rows (Flash allocates these only on its EXL3 path)
-        sl = c.shared_width // w.world
+        sl = share(c.shared_width, w.world)
         self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
         self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
         self.sxs = torch.empty((rows, sl // 64), dtype=f32, device=dev)

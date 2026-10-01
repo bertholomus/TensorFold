@@ -51,7 +51,7 @@ class GlmEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: self._geometry(text, world),
-                                   split_weights(rule), rank=rank, world=world, gather=self._gather_ints)
+                                   split_weights(rule, world), rank=rank, world=world, gather=self._gather_ints)
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit

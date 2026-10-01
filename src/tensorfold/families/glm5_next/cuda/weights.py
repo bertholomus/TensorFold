@@ -11,6 +11,7 @@ from typing import Any
 import torch
 
 from tensorfold.cuda import experts as grouped
+from tensorfold.cuda.geometry import share, share_lo
 
 from .exl3_mm import Exl3Experts, words as exl3_words
 from . import latent
@@ -28,6 +29,7 @@ class Config:
     heads: int
     q_lora: int
     kv_lora: int
+    qk_nope: int
     qk_dim: int
     v_dim: int
     lin_heads: int
@@ -79,6 +81,7 @@ class Config:
             hidden=int(t["hidden_size"]), layers=n, vocab=int(t["vocab_size"]), eps=float(t["rms_norm_eps"]),
             heads=int(t["num_attention_heads"]), q_lora=int(t["q_lora_rank"]), kv_lora=int(t["kv_lora_rank"]),
             qk_dim=int(t["qk_nope_head_dim"]) + int(t.get("qk_rope_head_dim", 0)), v_dim=int(t["v_head_dim"]),
+            qk_nope=int(t["qk_nope_head_dim"]),
             lin_heads=int(lin.get("num_heads", t.get("linear_num_heads", 64))),
             lin_dim=int(lin.get("head_dim", t.get("linear_head_dim", 128))),
             conv=int(lin.get("short_conv_kernel_size", t.get("linear_conv_kernel_dim", 4))),
@@ -216,7 +219,7 @@ class Weights:
 
     @property
     def vocab_offset(self) -> int:
-        return self.rank * (self.cfg.vocab // self.world)
+        return share_lo(self.cfg.vocab, self.world, self.rank)
 
     def nbytes(self) -> int:
         total = 0
@@ -257,9 +260,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
     dev = torch.device(device)
-    rd = RankReader(model_dir, rank)
-    HL = cfg.heads // world
-    LL = cfg.lin_heads // world
+    rd = RankReader(model_dir, rank, cfg_hint={"qk_dim": cfg.qk_dim, "qk_nope": cfg.qk_nope, "v_dim": cfg.v_dim})
+    HL = share(cfg.heads, world, rank)                # 64 heads: 16 a rank at TP4, 11/.../10 at TP6
+    LL = share(cfg.lin_heads, world)
 
     def t(name: str, dtype: torch.dtype | None = None) -> torch.Tensor:
         x = rd.get(PREFIX + name)
@@ -320,7 +323,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
 
     def mlp(p: str) -> MLPW:
         gu = stack([p + "gate_proj", p + "up_proj"])
-        return MLPW(gu, q4(p + "down_proj"), gu.n // world)
+        return MLPW(gu, q4(p + "down_proj"), share(gu.n, world))
 
     def expert_names(i: int) -> list[str]:
         """Layer ``i``'s expert tensors in the order ``moe`` reads them (none for a dense layer; ``cfg.layers``: MTP)."""
@@ -415,16 +418,18 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     try:                                          # a failed load still cancels the reads queued ahead
         which = list(range(cfg.layers))
         built = [layer(i) for i in which]
-        vl = cfg.vocab // world
+        vl = share(cfg.vocab, world, rank)
         draft_head = None
         if exl3:
-            head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
+            head = make_b16(rd.get("lm_head.weight")[share_lo(cfg.vocab, world, rank):
+                                                       share_lo(cfg.vocab, world, rank) + vl].to(dev))
             # Draft steps use the quantized head; verification keeps the original head.
             draft_head = quantize4(head.weight)
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
-            head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
-                           hb[rank * vl:(rank + 1) * vl].to(dev))
+            lo = share_lo(cfg.vocab, world, rank)
+            head = make_q4(as_i32(hw[lo:lo + vl]).to(dev), hs[lo:lo + vl].to(dev),
+                           hb[lo:lo + vl].to(dev))
         mtpw = None
         if cfg.mtp_layers and mtp:
             i = cfg.layers

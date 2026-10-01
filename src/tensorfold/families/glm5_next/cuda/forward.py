@@ -11,6 +11,7 @@ import triton.language as tl
 
 from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+from tensorfold.cuda.geometry import share                                    # balanced uneven TP shares
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
 from . import glue, kda as kda_mod, latent, prof, qmm, sparse
@@ -35,8 +36,8 @@ class Buffers:
         dev = w.device
         bf, f32 = torch.bfloat16, torch.float32
         D, S = c.hidden, c.streams
-        HL = c.heads // w.world
-        LL = c.lin_heads // w.world
+        HL = share(c.heads, w.world)
+        LL = share(c.lin_heads, w.world)
         self.rows, self.prefill = rows, prefill
         head_rows = 1 if prefill else rows
         self.world = w.world
@@ -85,13 +86,13 @@ class Buffers:
         self.igr = torch.empty((rows, c.index_dim), dtype=f32, device=dev)
         self.qi = torch.empty((rows, c.index_heads * c.index_dim), dtype=bf, device=dev)
         # dense MLP
-        dl = c.dense_width // w.world
+        dl = share(c.dense_width, w.world)
         self.gu = torch.empty((rows, 2 * dl), dtype=bf, device=dev)
         self.act = torch.empty((rows, dl), dtype=bf, device=dev)
         self.xs_act = torch.empty((rows, dl // 64), dtype=f32, device=dev)
         # MoE
         slots = c.top_k + 1
-        ml = c.moe_width // w.world
+        ml = share(c.moe_width, w.world)
         self.mlog = torch.empty((rows, c.experts), dtype=f32, device=dev)
         self.pick = torch.empty((rows, slots), dtype=torch.int32, device=dev)
         self.wts = torch.empty((rows, slots), dtype=f32, device=dev)
@@ -103,7 +104,7 @@ class Buffers:
         if c.quant == "exl3":            # EXL3 routed experts, and the shared expert as a BF16 MLP
             from .exl3_mm import Scratch
 
-            sl = c.shared_width // w.world
+            sl = share(c.shared_width, w.world)
             self.exl3 = Scratch(rows, slots, D, ml, dev)
             self.sgu = torch.empty((rows, 2 * sl), dtype=bf, device=dev)
             self.sact = torch.empty((rows, sl), dtype=bf, device=dev)
@@ -150,8 +151,8 @@ class State:
     def __init__(self, w: Weights, capacity: int, rows: int) -> None:
         c = w.cfg
         dev = w.device
-        HL = c.heads // w.world
-        LL = c.lin_heads // w.world
+        HL = share(c.heads, w.world)
+        LL = share(c.lin_heads, w.world)
         self.capacity = capacity
         self.pos = 0
         self.pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)

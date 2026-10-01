@@ -12,6 +12,7 @@ from typing import Any
 import torch
 
 from tensorfold.cuda import experts as grouped
+from tensorfold.cuda.geometry import share, share_lo
 
 from tensorfold.families.glm5_next.cuda import latent
 from tensorfold.families.glm5_next.cuda.qmm import B16, make_b16, stack_b16
@@ -186,7 +187,9 @@ class Weights:
     @property
     def vocab_offset(self) -> int:
         per = self.meta.get("vocab_per_rank")         # an EXL3 head: whole 128-column blocks a rank
-        return self.rank * (int(per) if per else self.cfg.vocab // self.world)
+        if per is not None:
+            return min(self.rank * int(per), self.cfg.vocab)   # padded tails of last ranks hold no rows
+        return share_lo(self.cfg.vocab, self.world, self.rank)
 
     def nbytes(self) -> int:
         total = 0
@@ -234,8 +237,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
     world = int(os.environ.get("TF_TP_WORLD", "2"))
     cfg = Config.read(model_dir)
     dev = torch.device(device)
-    rd = RankReader(model_dir, rank)
-    HL = cfg.heads // world
+    rd = RankReader(model_dir, rank, cfg_hint={"qk_dim": cfg.qk_dim, "qk_nope": cfg.qk_nope, "v_dim": cfg.v_dim})
+    HL = share(cfg.heads, world, rank)                # 64 heads: 16 a rank at TP4, 11/.../10 at TP6
     x3_users: list = []
 
     def name(raw: str) -> str:
@@ -316,29 +319,39 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
             gu = X3Pair(x3(p + "gate_proj."), x3(p + "up_proj."))
             return MLPW(gu, x3(p + "down_proj."), gu.gate.n)
         gu = stack([p + "gate_proj.weight", p + "up_proj.weight"])
-        return MLPW(gu, make_b16(t(p + "down_proj.weight").contiguous()), gu.n // world)
+        return MLPW(gu, make_b16(t(p + "down_proj.weight").contiguous()), share(gu.n, world))
 
     def moe(p: str) -> MoEW:
         from tensorfold.cuda.exl3 import experts as x3experts
 
         router = t(p + "gate.weight", torch.bfloat16).contiguous()
         bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
+        # the experts are integer-split over the ranks (43/.../42 at TP6): this rank's contiguous span
+        mine = share(cfg.experts, world, rank)
+        first = share_lo(cfg.experts, world, rank)
+        experts_of = range(first, first + mine)
         parts: dict[str, list] = {}
         cb = None
+        D = I = 0
         for proj_name in ("gate_proj", "up_proj", "down_proj"):
             rows = []
-            for e in range(cfg.experts):
+            for e in experts_of:
                 g = group(f"{p}experts.{e}.{proj_name}.")
                 cb = cb or x3mod.codebook(g)
-                rows.append((g["trellis"].to(dev).contiguous(), g.get("suh", g.get("su")).to(dev, torch.float16),
+                trellis = g["trellis"].to(dev).contiguous()
+                if proj_name == "gate_proj":
+                    D, I = trellis.shape[0] * 16, trellis.shape[1] * 16
+                rows.append((trellis, g.get("suh", g.get("su")).to(dev, torch.float16),
                              g.get("svh", g.get("sv")).to(dev, torch.float16)))
             parts[proj_name] = rows
-        D = parts["gate_proj"][0][0].shape[0] * 16
-        I = parts["gate_proj"][0][0].shape[1] * 16
+        if not mine:
+            # a rank with no routed experts (only possible below the real scale): a zero-width layer
+            return MoEW(router, bias, RoutedW(0, D or cfg.hidden, I or cfg.moe_width, cb or "mul1", None, parts),
+                        None if not cfg.shared else mlp(p + "shared_experts."))
         ex = None
         if dev.type == "cuda":
             ex = x3experts.prepare(parts["gate_proj"], parts["up_proj"], parts["down_proj"], cb, device=dev)
-        routed = RoutedW(cfg.experts, D, I, cb, ex, None if ex is not None else parts)
+        routed = RoutedW(mine, D, I, cb, ex, None if ex is not None else parts)
         return MoEW(router, bias, routed, None if not cfg.shared else mlp(p + "shared_experts."))
 
     def layer(i: int) -> LayerW:
@@ -369,8 +382,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
             x3_users.append(head)
             meta["vocab_per_rank"] = per * 128
             return head
-        vl = cfg.vocab // world
-        return make_b16(t("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev).contiguous())
+        vl = share(cfg.vocab, world, rank)
+        lo = share_lo(cfg.vocab, world, rank)
+        return make_b16(t("lm_head.weight")[lo:lo + vl].to(dev).contiguous())
 
     embed = t("embed_tokens.weight", torch.bfloat16).contiguous().to(dev)
     try:

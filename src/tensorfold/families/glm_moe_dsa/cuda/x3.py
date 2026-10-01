@@ -16,6 +16,8 @@ from dataclasses import dataclass
 
 import torch
 
+from tensorfold.cuda.geometry import share, share_lo
+
 ROWS = 128               # most rows one call of the EXL3 linear takes
 
 
@@ -168,10 +170,11 @@ def vocab_slice(blocks: int, world: int, rank: int) -> tuple[int, int, int]:
     """(first 128-column block, blocks on this rank, blocks every rank pads to) of a head split over ``world`` ranks.
 
     The EXL3 linear works in whole 128-column Hadamard blocks, and GLM-5.3's 154,880-token vocabulary is 1,210
-    blocks: 302.5 a rank at TP4. Ranks take ceil(blocks / world) blocks each (the last takes the rest) and pad
-    their logits to the same width with -inf, so every rank's slice starts at ``rank * per * 128``.
+    blocks. Ranks take a balanced uneven span (first blocks % world ranks one extra: 302/302/302/302/301/301
+    at TP6 over 302.5 a rank at TP4), pad their logits to ``per`` blocks wide with -inf, and keep whole spans:
+    rank ``r``'s slice starts at ``share_lo(blocks, world, r) * 128`` rows of the head.
     """
 
     per = -(-blocks // world)
-    lo = min(rank * per, blocks)
-    return lo, min(per, blocks - lo), per
+    lo = share_lo(blocks, world, rank)
+    return lo, share(blocks, world, rank), per

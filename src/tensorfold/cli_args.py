@@ -112,11 +112,11 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
     cuda = serve.add_argument_group("NVIDIA GPUs (DGX Spark)")
     cuda.add_argument("--backend", choices=("auto", "mlx", "cuda"), default="auto",
                       help="auto: MLX on macOS, CUDA elsewhere")
-    cuda.add_argument("--tp", type=int, choices=(1, 2, 4), default=1,
+    cuda.add_argument("--tp", type=int, choices=(1, 2, 4, 6), default=1,
                       help="GPUs (one per machine) the model is split over; run the same command on each")
     cuda.add_argument("--rank", type=int, default=0,
-                      help="with --tp 2 or 4: this machine's rank; rank 0 serves HTTP, the others follow it")
-    cuda.add_argument("--master", default="", help="with --tp 2 or 4: rank 0's address on the link between the machines")
+                      help="with --tp 2, 4 or 6: this machine's rank; rank 0 serves HTTP, the others follow it")
+    cuda.add_argument("--master", default="", help="with --tp 2, 4 or 6: rank 0's address on the link between the machines")
     cuda.add_argument("--master-port", type=int, default=29551, help="with --tp 2 or 4: rank 0's rendezvous port")
     cuda.add_argument("--kv-dtype", choices=("bf16", "int8", "int4"), default="bf16",
                       help="KV cache: bf16 (the default), int8, or int4. Quantized keys and values use one "
