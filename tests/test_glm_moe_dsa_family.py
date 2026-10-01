@@ -191,6 +191,8 @@ def test_loader_builds_every_layer_from_the_tiny_checkpoint(tmp_path, monkeypatc
 
     from tensorfold.families.glm_moe_dsa.cuda import weights as W
 
+    from tensorfold.cuda.geometry import share
+
     folder = write_checkpoint(tmp_path)
     monkeypatch.setenv("TF_TP_WORLD", "2")
     w = W.load(folder, rank=0, device="cpu")
@@ -210,7 +212,8 @@ def test_loader_builds_every_layer_from_the_tiny_checkpoint(tmp_path, monkeypatc
             assert a.index.weights.shape == (CFG["index_n_heads"], CFG["hidden_size"])
         if layer.moe is not None:
             ex = layer.moe.experts
-            assert ex.count == CFG["n_routed_experts"]
+            assert ex.count == share(CFG["n_routed_experts"], 2)      # this rank's experts (uneven splits OK)
+            assert ex.count == (CFG["n_routed_experts"] + 1) // 2
             assert layer.moe.shared is not None
             assert ex.ex is None and ex.parts is not None       # a CPU load keeps the rank's triples
             # this rank's down trellis per expert: [(moe_width/world)/16, hidden/16, 16 * bits] int16
@@ -422,10 +425,24 @@ def test_quant_layers_hold_every_tensor_the_loader_asks_for():
 
 
 def test_vocab_slice_covers_the_head_in_whole_blocks():
+    """The EXL3 head split: whole 128-column blocks, a balanced span per rank, every block covered once.
+
+    TP4 keeps the padded ceil-split the engine has always run (302.5 a rank -> 303/303/303/301);
+    TP6 is the balanced uneven span (1210 = 6 * 201 + 4 -> 202/202/202/202/201/201), covering
+    1210 blocks exactly with no third rank taking a piece of a second span.
+    """
+
     from tensorfold.families.glm_moe_dsa.cuda.x3 import vocab_slice
 
     blocks = 154880 // 128                                  # GLM-5.3's head: 1,210 blocks
     got = [vocab_slice(blocks, 4, r) for r in range(4)]
-    assert [g[1] for g in got] == [303, 303, 303, 301] and all(g[2] == 303 for g in got)
-    assert [g[0] for g in got] == [0, 303, 606, 909]
+    assert [g[1] for g in got] == [303, 303, 302, 302] and all(g[2] == 303 for g in got)
+    assert [g[0] for g in got] == [0, 303, 606, 908]
+    assert sum(g[1] for g in got) == blocks                 # the stored-block total the TP4 table prices
+    six = [vocab_slice(blocks, 6, r) for r in range(6)]
+    assert [g[1] for g in six] == [202, 202, 202, 202, 201, 201]
+    assert [g[0] for g in six] == [0, 202, 404, 606, 808, 1009]
+    assert all(g[2] == 202 for g in six)
+    assert sum(g[1] for g in six) == blocks                 # every block on exactly one rank
+    assert all(six[i + 1][0] == six[i][0] + six[i][1] for i in range(5))   # contiguous
     assert sum(g[1] for g in got) == blocks

@@ -69,3 +69,52 @@ KV cache and prefill scratch.**
 69.859 GiB weights leaves ~24 GiB of the 94 GiB/rank budget for KV (DSA latent cache is
 512-wide per head, 16 heads/rank) and scratch. TP4 fits comfortably; the same recipe at
 TP2 would need ~139 GiB/rank of weights alone and does not fit 121 GiB devices.
+
+## W=6: balanced uneven partition (4x 200G + 2x 200G members)
+
+World 6 divides three dimensions unevenly; every split takes the balanced uneven share
+(first n % 6 ranks one extra item, spans contiguous, shares differ by at most 1):
+
+| dim | shares |
+|---|---|
+| q heads (64) | 11 / 11 / 11 / 11 / 10 / 10 |
+| routed experts (256) | 43 / 43 / 43 / 43 / 42 / 42 |
+| expert width rows (2048) | 342 / 342 / 341 / 341 / 341 / 341 |
+| lm_head vocab rows (154,880) | 25,814 / 25,814 / 25,813 / 25,813 / 25,813 / 25,813 |
+| dense intermediate (12,288) | 2048 each (divides) |
+
+The EXL3 head keeps whole 128-column Hadamard blocks: 1,210 blocks split
+202/202/202/202/201/201 (the padded width every rank computes with is ceil = 202 blocks,
+tails masked with -inf), so every rank's head slice is a valid EXL3 linear of its own.
+Indexer (32 heads), q_a/kv_a, embed_tokens, norms and routers stay replicated, immune
+to the uneven split exactly as at TP4.
+
+### Per-rank GiB table at TP6 (rank 0, the heavy 43-expert split; same recipe)
+
+| component | bytes/rank | GiB/rank |
+|---|---:|---:|
+| routed experts (75 layers x 43 experts x 3 x 342 rows x 6144, 3.0 bpw) | 7,623,590,400 | 7.100 |
+| shared expert (75 layers, 342 rows, 3.0 bpw) | 177,292,800 | 0.165 |
+| dense MLP (3 layers, 4 bpw) | 56,623,104 | 0.053 |
+| q_b_proj (11 heads, 5 bpw) | 281,149,440 | 0.262 |
+| kv_b_proj (11 heads, 5 bpw) | 140,574,720 | 0.131 |
+| o_proj (11 heads of cols, 5 bpw) | 843,448,320 | 0.786 |
+| q_a + kv_a (replicated, 5 bpw) | 785,940,480 | 0.732 |
+| indexer wk + weights_proj + wq_b (replicated, BF16) | 1,461,977,088 | 1.362 |
+| norms, routers, hc (replicated) | 922,196,808 | 0.859 |
+| lm_head (25,814 vocab rows, 6 bpw) | 118,950,912 | 0.111 |
+| embed_tokens (replicated, BF16) | 1,903,165,440 | 1.772 |
+| final norm | 12,288 | 0.000 |
+| MTP layer (norms + eh_proj + DSA attn 5 bpw, 43 experts x 342 rows, 3.0 bpw) | 243,635,712 | 0.227 |
+| **TOTAL per rank (rank 0)** | **14,440,362,312** | **13.449** |
+
+Rank byte totals: 14,440,362,312 / 14,440,362,312 / 14,417,592,488 / 14,417,592,488 /
+14,123,455,416 / 14,123,455,416 — max - min = 316,912,896 B (0.295 GiB), the balanced
+guarantee in bytes. The table above amortizes nothing: embed_tokens is held in full on
+every rank (the TP4 table divides it by 4; both conventions are per-rank accounting of
+the same replicated tensor). At the TP4 table's amortized convention rank 0 carries
+12,972,586,312 B = 12.082 GiB.
+
+**Fit: 13.449 GiB weights/rank against the 94 GiB/rank budget — TP6 fits with ~80.5 GiB
+spare for KV + scratch. The binding constraints at TP6 are KV per rank (10 heads vs 16 at
+TP4 reduces it) and cross-rank latency of the 6-way all-gathers, not weight memory.**

@@ -217,40 +217,53 @@ def test_split_device_row_world_4_exact_values():
 # ---------------------------------------------------------------- split.py: errors on non-divisible shapes
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [1, 2, 4, 6])
 @pytest.mark.parametrize("kind,shape", [
-    ("row", [3, 4]),           # 3 divisible by neither
-    ("row", [6, 4]),           # 6 % 4 (only 4-rank fails, 2-rank passes)
-    ("col", [4, 3]),
-    ("col", [4, 6]),           # 6 % 4
-    ("dim1", [2, 5, 2]),
+    ("row", [0, 4]),           # an empty axis splits no bytes
+    ("col", [4, 0]),
+    ("dim1", [2, 0, 2]),
+    ("row", [4, 4]),           # rank past the world
+    ("diag", [4, 4]),          # an unknown kind
 ])
-def test_split_bytes_rejects_non_divisible(kind, shape, world):
+def test_split_bytes_rejects_degenerate_splits(kind, shape, world):
     split = import_split()
     raw = np.zeros(int(np.prod(shape)) * 4, dtype=np.uint8)
-    divisible = (shape[0] if kind == "row" else shape[1]) % world == 0
-    if divisible:
-        return                  # world 2 divides these shapes; only world 4 must reject
-    with pytest.raises(ValueError):
-        split.split_bytes(raw, list(shape), 4, kind, 0, world=world)
+    bad = kind == "diag" or (shape[0] if kind == "row" else shape[1]) == 0
+    rank = world if kind != "diag" and bad else 0
+    if kind == "diag":
+        with pytest.raises(ValueError):
+            split.split_bytes(raw, list(shape), 4, kind, 0, world=world)
+    elif bad:
+        with pytest.raises(ValueError):
+            split.split_bytes(raw, list(shape), 4, kind, rank, world=world)
+    else:
+        with pytest.raises(ValueError):
+            split.split_bytes(raw, list(shape), 4, kind, world, world=world)   # rank out of world
 
 
-@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("world", [1, 2, 4, 6])
 @pytest.mark.parametrize("kind,shape", [
-    ("row", [3, 4]),
-    ("row", [6, 4]),
-    ("col", [4, 3]),
-    ("col", [4, 6]),
-    ("dim1", [2, 5, 2]),
+    ("row", [0, 4]),
+    ("col", [4, 0]),
+    ("dim1", [2, 0, 2]),
 ])
-def test_split_device_rejects_non_divisible(kind, shape, world):
+def test_split_device_rejects_degenerate_splits(kind, shape, world):
     split = import_split()
     raw = torch.zeros(int(np.prod(shape)) * 4, dtype=torch.uint8)
-    divisible = (shape[0] if kind == "row" else shape[1]) % world == 0
-    if divisible:
-        return                  # world 2 divides these shapes; only world 4 must reject
     with pytest.raises(ValueError):
         split.split_device(raw, list(shape), 4, kind, 0, world=world)
+
+
+def test_split_bytes_rank_out_of_world_all_kinds():
+    """rank >= world is refused for every kind (the uneven split needs a valid rank)."""
+
+    split = import_split()
+    raw = np.zeros(64, dtype=np.uint8)
+    for kind in ("row", "col", "dim1"):
+        with pytest.raises(ValueError):
+            split.split_bytes(raw, [4, 4], 4, kind, 6, world=6)
+    with pytest.raises(ValueError):
+        split.split_device(torch.zeros(64, dtype=torch.uint8), [4, 4], 4, "row", 6, world=6)
 
 
 def test_split_bytes_rejects_rank_out_of_world():
@@ -549,6 +562,193 @@ def test_cli_tp4_choices():
     with pytest.raises(SystemExit):
         parser.parse_args(["serve", "/tmp", "--backend", "cuda", "--tp", "3"])
 
+# ---------------------------------------------------------------- W=6: balanced uneven partitioning
+
+
+UNEVEN_CASES = [(64, [11, 11, 11, 11, 10, 10]), (256, [43, 43, 43, 43, 42, 42]),
+                (154880, [25814, 25814, 25813, 25813, 25813, 25813]), (2048, [342, 342, 341, 341, 341, 341])]
+
+
+def test_share_properties_w6():
+    """The balanced partition: covers all items, contiguous spans, max - min <= 1, divisible dims unchanged."""
+
+    from tensorfold.cuda.geometry import share, share_lo
+
+    for n, want in UNEVEN_CASES:
+        shares = [share(n, 6, r) for r in range(6)]
+        assert shares == want
+        assert sum(shares) == n                          # every item on exactly one rank
+        assert max(shares) - min(shares) <= 1            # balanced
+        los = [share_lo(n, 6, r) for r in range(6)]
+        assert los[0] == 0 and los[-1] + shares[-1] == n
+        assert all(los[i + 1] == los[i] + shares[i] for i in range(5))   # contiguous, no gaps or overlap
+    # byte-identity of the old even path: divisible n keeps n // world for every rank
+    for n in (16, 64, 154880 // 4, 12288):
+        for w in (1, 2, 4):
+            assert all(share(n, w, r) == n // w for r in range(w))
+
+
+def test_split_bytes_w6_roundtrip_all_kinds():
+    """Every kind splits unevenly at W=6 and reassembles byte-exact; rank shapes differ by <= 1 item."""
+
+    split = import_split()
+    os.environ["TF_TP_WORLD"] = "6"
+    try:
+        for kind, shape, itemsize in [("row", [64, 2048], 2), ("row", [256, 6144], 2),
+                                      ("col", [6144, 2048], 2), ("dim1", [2, 64, 16], 2)]:
+            logical = int(np.prod(shape))
+            words = (np.arange(logical, dtype=np.int64) % 251).astype(np.uint16)   # one word a logical item
+            raw = words.view(np.uint8).reshape(-1)
+            parts = [split.split_bytes(raw, list(shape), itemsize, kind, r, world=6) for r in range(6)]
+            axis = 0 if kind == "row" else 1
+            sizes = [p[1][axis] for p in parts]
+            assert sum(sizes) == shape[axis] and max(sizes) - min(sizes) <= 1, (kind, sizes)
+            assert all(p[0].size == int(np.prod(p[1])) * itemsize for p in parts)
+            got = np.concatenate([p[0].view(np.uint16).reshape(p[1]) for p in parts], axis=axis)
+            assert np.array_equal(got, words.reshape(shape)), kind
+    finally:
+        os.environ.pop("TF_TP_WORLD", None)
+
+
+def test_split_device_w6_roundtrip():
+    split = import_split()
+    words = torch.arange(64 * 2048 * 2 // 4, dtype=torch.int32).view(torch.uint32)
+    raw = words.view(torch.uint8).clone()
+    parts = [split.split_device(raw, [64, 2048], 2, "row", r, world=6) for r in range(6)]
+    assert [p[1][0] for p in parts] == [11, 11, 11, 11, 10, 10]
+    got = torch.cat([p[0] for p in parts]).view(torch.uint32)
+    assert torch.equal(got, words)
+    for data, _ in parts:      # fresh storage, never a view of raw
+        assert data.data_ptr() != raw.data_ptr()
+
+
+def test_tp4_exact_bytes_regression():
+    """The TP4 ground truth: per-rank byte totals from SHAPE-MATH.md, exact to the byte.
+
+    The recipe: routed experts 3.0 bpw, attention 5 bpw, dense MLP 4 bpw, head 6 bpw. Routed
+    experts, shared expert, dense MLP, the three attention matrices and lm_head split by 4; the
+    rest is replicated (embed BF16 once per rank, indexer BF16 replicated)."""
+
+    D, L, H, IH, IDIM = 6144, 78, 64, 32, 128
+    QL, KV, QK, VD = 2048, 512, 256, 256
+    E, IE, ID_, DENSE, V = 256, 2048, 12288, 3, 154880
+    moe_layers = L - DENSE                                    # 75
+
+    routed = moe_layers * E * 3 * IE * D * 3 // 8             # 67,947,724,800
+    shared = moe_layers * 3 * IE * D * 3 // 8                 # 265,420,800 (gate + up + down rows)
+    dense = DENSE * 3 * ID_ * D * 4 // 8                      # 169,869,312
+    q_b = L * H * QK * QL * 5 // 8                            # 1,635,778,560
+    kv_b = L * H * (QK + VD) * KV * 5 // 8                    # 817,889,280
+    o = L * D * H * VD * 5 // 8                               # 4,907,335,680
+    q_a_kv_a = L * (QL + KV + 64) * D * 5 // 8                # 785,940,480
+    indexer = L * ((IDIM * D) + (IH * D) + (IH * IDIM * QL)) * 2   # 1,461,977,088
+    misc = L * (D * 2 + 4 + 2) * 2 + L * (E * D + E) * (2 + 4)     # norms + routers
+    hc = L * (24 * 4 * D + 24 * 4 + 3 * 4) * 2 * 2                 # hc fn/base/scale
+    lm_head = V * D * 6 // 8                                  # 713,687,040
+    embed = V * D * 2                                         # 1,903,165,440
+    norm = D * 2                                              # 12,288
+
+    per_rank = {
+        "routed experts": routed // 4,
+        "shared expert": shared // 4,
+        "dense MLP": dense // 4,
+        "q_b_proj": q_b // 4,
+        "kv_b_proj": kv_b // 4,
+        "o_proj": o // 4,
+        "q_a + kv_a": q_a_kv_a,
+        "indexer": indexer,
+        "norms, routers, hc": misc + hc,
+        "lm_head": lm_head // 4,
+        "embed_tokens": embed // 4,                           # the table amortizes the replicated embed /4
+        "final norm": norm,
+        # the MTP line prices its experts /4 like every other expert tensor
+        "MTP": (2 * D + D) * 2 + D * (2 * D) * 4 // 8
+            + (H * QK * QL + H * (QK + VD) * KV + D * H * VD + (QL + KV) * D) * 5 // 8
+            + E * 3 * IE * D * 3 // 8 // 4,                   # 1,047,957,504
+    }
+    want = {
+        "routed experts": 67_947_724_800,
+        "shared expert": 265_420_800,
+        "dense MLP": 84_934_656,
+        "q_b_proj": 408_944_640,
+        "kv_b_proj": 204_472_320,
+        "o_proj": 1_226_833_920,
+        "q_a + kv_a": 785_940_480,
+        "indexer": 1_461_977_088,
+        "norms, routers, hc": 922_196_808,
+        "lm_head": 178_421_760,
+        "embed_tokens": 475_791_360,
+        "final norm": 12_288,
+    }
+    # derived checks first (the table's own math), then the exact SHAPE-MATH numbers
+    assert per_rank["routed experts"] == want["routed experts"]
+    for name in want:
+        assert per_rank[name] == want[name], name
+    total = sum(per_rank.values())                            # the dict already holds the MTP line
+    assert total == 75_010_628_424                            # SHAPE-MATH.md's TOTAL per rank at TP4
+    assert abs(total / 2 ** 30 - 69.859) < 0.001
+
+
+def test_tp6_exact_bytes_table():
+    """The W=6 table (SHAPE-MATH.md's W=6 section), rank 0 of the 43/43/43/43/42/42 expert split.
+
+    Same recipe as TP4; every split dim takes its balanced uneven share (43 experts x 342 rows on
+    ranks 0-3, 42 x 341 on ranks 4-5; 11 heads vs 10; 25,814 vs 25,813 vocab rows). Rank 0's total
+    rank carries 12,972,586,312 B = 12.082 GiB (embed amortized /6 like the TP4 table), far under
+    the 94 GiB budget.
+    """
+
+    from tensorfold.cuda.geometry import share, share_lo
+
+    D, L, H, IH, IDIM = 6144, 78, 64, 32, 128
+    QL, KV, QK, VD = 2048, 512, 256, 256
+    E, IE, ID_, DENSE, V = 256, 2048, 12288, 3, 154880
+    W = 6
+    moe_layers = L - DENSE
+
+    e_r, i_r, h_r, v_r, d_r = (share(E, W, 0), share(IE, W, 0), share(H, W, 0), share(V, W, 0),
+                               share(ID_, W, 0))
+    assert (e_r, i_r, h_r, v_r, d_r) == (43, 342, 11, 25814, 2048)
+    assert [share(E, W, r) for r in range(W)] == [43, 43, 43, 43, 42, 42]
+    assert [share(H, W, r) for r in range(W)] == [11, 11, 11, 11, 10, 10]
+    assert [share(IE, W, r) for r in range(W)] == [342, 342, 341, 341, 341, 341]
+    assert [share(V, W, r) for r in range(W)] == [25814, 25814, 25813, 25813, 25813, 25813]
+
+    routed = moe_layers * e_r * 3 * i_r * D * 3 // 8          # 7,623,590,400
+    shared = moe_layers * 3 * i_r * D * 3 // 8                # 177,292,800 (gate + up + down rows)
+    dense = DENSE * 3 * d_r * D * 4 // 8                      # 56,623,104
+    q_b = L * h_r * QK * QL * 5 // 8                          # 281,149,440
+    kv_b = L * h_r * (QK + VD) * KV * 5 // 8                  # 140,574,720
+    o = L * D * h_r * VD * 5 // 8                             # 843,448,320
+    q_a_kv_a = L * (QL + KV + 64) * D * 5 // 8                # 785,940,480
+    indexer = L * ((IDIM * D) + (IH * D) + (IH * IDIM * QL)) * 2   # 1,461,977,088
+    misc = L * (D * 2 + 4 + 2) * 2 + L * (E * D + E) * (2 + 4)     # 861,043,208
+    hc = L * (24 * 4 * D + 24 * 4 + 3 * 4) * 2 * 2                 # 61,153,600
+    lm_head = v_r * D * 6 // 8                                # 118,950,912
+    embed = V * D * 2 // W                                    # 317,194,240 (replicated embed amortized /6, like TP4's table)
+    norm = D * 2                                              # 12,288
+    mtp_attn = (H * QK * QL + H * (QK + VD) * KV + D * H * VD + (QL + KV) * D) * 5 // 8
+    mtp = (2 * D + D) * 2 + D * (2 * D) * 4 // 8 + mtp_attn + e_r * 3 * i_r * D * 3 // 8   # 243,635,712
+
+    total = routed + shared + dense + q_b + kv_b + o + q_a_kv_a + indexer + misc + hc \
+        + lm_head + embed + norm + mtp
+    assert total == 12_972_586_312
+    assert abs(total / 2 ** 30 - 12.082) < 0.001
+    # the light ranks (42 experts x 341 rows, 10 heads, 25,813 vocab rows) sit 0.295 GiB lower:
+    # max - min stays under a third of a GiB, the balanced-split guarantee in bytes
+    per = []
+    for r in range(W):
+        er, ir, hr, vr, dr = (share(E, W, r), share(IE, W, r), share(H, W, r), share(V, W, r),
+                              share(ID_, W, r))
+        per.append(moe_layers * er * 3 * ir * D * 3 // 8 + moe_layers * 3 * ir * D * 3 // 8
+                   + DENSE * 3 * dr * D * 4 // 8 + L * hr * (QK * QL + (QK + VD) * KV + D * VD) * 5 // 8
+                   + vr * D * 6 // 8 + (2 * D + D) * 2 + D * (2 * D) * 4 // 8 + mtp_attn
+                   + er * 3 * ir * D * 3 // 8 + q_a_kv_a + indexer + misc + hc + embed + norm)
+    assert max(per) - min(per) == 317_258_496                # the replicated part cancels in the difference
+    assert per[:2] == [12_972_586_312, 12_972_586_312]       # ranks 0-3, the heavy split
+    assert per[4:] == [12_655_327_816, 12_655_327_816]       # ranks 4-5, 0.295 GiB lighter
+
+
 def test_rankreader_uses_call_time_world_not_stale_import_global():
     """Regression (ddb8167 follow-up): RankReader._span must use call-time TF_TP_WORLD, not the
     import-time WORLD global. If env is set after import (engine.py does this), the stale global
@@ -574,3 +774,57 @@ def test_rankreader_uses_call_time_world_not_stale_import_global():
         else:
             os.environ["TF_TP_WORLD"] = old
 
+
+
+def test_glm_moe_dsa_loader_w6_on_the_tiny_checkpoint(tmp_path, monkeypatch):
+    """End-to-end W=6: weights.load walks the tiny EXL3 checkpoint at TF_TP_WORLD=6, every rank.
+
+    The tiny config's dims divide unevenly exactly like the real model's (4 heads, 4 experts,
+    32-width experts, 256-token vocab over 6 ranks), so this exercises the balanced spans through
+    the real loader: kv_b head blocks, expert integer split, BF16 vocab rows, MLPW widths.
+    """
+
+    from glm_dsa_fakes import CFG, write_checkpoint
+
+    from tensorfold.cuda.geometry import share, share_lo
+    from tensorfold.families.glm_moe_dsa.cuda import weights as W
+
+    folder = write_checkpoint(tmp_path)
+    monkeypatch.setenv("TF_TP_WORLD", "6")
+    assert [share(CFG["num_attention_heads"], 6, r) for r in range(6)] == [1, 1, 1, 1, 0, 0]   # 4 heads over 6
+    loaded = []
+    for rank in range(6):
+        w = W.load(folder, rank=rank, device="cpu")
+        loaded.append(w)
+        hl = share(CFG["num_attention_heads"], 6, rank)
+        a = w.layers[0].dsa
+        # kv_b holds this rank's heads' rows, whole heads (the real model's kv_b has no EXL3 pad, so the
+        # grouped row span lands exactly on head boundaries; an ungrouped uneven split would cut mid-head)
+        assert a.kv_k.weight.shape[0] == hl * CFG["qk_nope_head_dim"]
+        assert a.kv_v.weight.shape[0] == hl * CFG["v_head_dim"]
+        # the tiny checkpoint's q_b is an EXL3 group padded to 128 columns (the real model's q_b, 16384
+        # rows at 64 x 256, is not padded), so its width here is the padded share, not a head count
+        assert a.q_b.n > 0 or hl == 0
+        if w.layers[1].moe is not None:
+            ex = w.layers[1].moe.experts
+            assert ex.count == share(CFG["n_routed_experts"], 6, rank)
+            # the routed-expert width splits in whole 16-row trellis tiles (the tiny scale has 2 tiles:
+            # ranks 0-1 hold one, ranks 2-5 none); the real 2048 rows split 352/352/336/336/336/336.
+            # A rank with no experts keeps the full-width zero-count placeholder (the real scale never
+            # hits this: 128 tiles // 6 leaves every rank >= 21 tiles)
+            assert ex.count == share(CFG["n_routed_experts"], 6, rank)
+            if ex.count:
+                assert ex.width % 16 == 0
+                assert ex.width == 16 * share(CFG["moe_intermediate_size"] // 16, 6, rank)
+        # lm_head: this rank's contiguous vocab span under the balanced split
+        vl = share(CFG["vocab_size"], 6, rank)
+        assert w.head.weight.shape == (vl, CFG["hidden_size"])
+        assert w.vocab_offset == share_lo(CFG["vocab_size"], 6, rank)
+    # every vocab row on exactly one rank, contiguous
+    assert sum(w.head.weight.shape[0] for w in loaded) == CFG["vocab_size"]
+    offsets = [w.vocab_offset for w in loaded]
+    assert offsets[0] == 0
+    assert all(offsets[i + 1] == offsets[i] + loaded[i].head.weight.shape[0] for i in range(5))
+    assert offsets[-1] + loaded[-1].head.weight.shape[0] == CFG["vocab_size"]
+    # experts: 1/1/1/1/0/0 over the 4 tiny experts, spans contiguous
+    assert [w.layers[1].moe.experts.count for w in loaded] == [1, 1, 1, 1, 0, 0]
