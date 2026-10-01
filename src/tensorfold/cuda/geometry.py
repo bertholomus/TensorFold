@@ -97,6 +97,41 @@ def indexed_weights(world: int, mtp: bool, mapped_tables: bool = True):
     return transform
 
 
+def share(n: int, world: int, rank: int = 0) -> int:
+    """The balanced uneven share of ``n`` items for one rank: first n % world ranks get one extra.
+
+    The identity every split helper builds on: sum_r share(n, W, r) == n for every W, the shares
+    differ by at most one, and share(n, W, r) == n // W whenever W divides n (W in {1, 2, 4} at
+    every divisible dim of GLM-5.3 keeps today's numbers byte for byte).
+    """
+
+    if world < 1 or not 0 <= rank < world:
+        raise ValueError(f"rank {rank} of {world}")
+    base, extra = divmod(n, world)
+    return base + (1 if rank < extra else 0)
+
+
+def share_lo(n: int, world: int, rank: int) -> int:
+    """The first item (row / head / expert) ``rank`` owns of ``n`` under ``share``: a contiguous span."""
+
+    base, extra = divmod(n, world)
+    return rank * base + min(rank, extra)
+
+
+def share_tile(n: int, world: int, rank: int, tile: int) -> int:
+    """``share`` on whole ``tile``-sized blocks of ``n``: a rank's span never cuts a block.
+
+    Tensor-parallel widths read by tile-granular kernels (an EXL3 trellis's 16-column tiles) split
+    in whole tiles: first n // tile % world ranks get one extra tile. When world divides n / tile
+    every rank gets n // world exactly (W in {1, 2, 4} at every divisible dim is unchanged); at W=6
+    GLM-5.3's 2048-row expert width becomes 352/352/336/336/336/336 (max - min one tile).
+    """
+
+    if n % tile:
+        raise ValueError(f"{n} does not divide into tiles of {tile}")
+    return tile * share(n // tile, world, rank)
+
+
 def split_weights(rule, world: int = 2):
     def transform(name: str, info: dict) -> tuple[int, int]:
         kind = rule(name)
@@ -105,11 +140,9 @@ def split_weights(rule, world: int = 2):
         shape = list(info["shape"])
         if not info.get("split") and kind != "rep":
             axis = {"row": 0, "col": -1, "dim1": 1}[kind]
-            if shape[axis] % world:
-                raise ValueError(f"checkpoint tensor does not split evenly: {name}")
-            shape[axis] //= world
+            shape[axis] = share(shape[axis], world)      # balanced uneven: exact for every divisible dim
         if name.startswith("lm_head."):
-            shape[0] //= world
+            shape[0] = share(shape[0], world)
         cast = name.endswith((".A_log", ".dt_bias", ".hc_attn_base", ".hc_attn_scale", ".hc_ffn_base",
                               ".hc_ffn_scale", ".e_score_correction_bias"))
         total = padded(info, shape, float32=cast, name=name)

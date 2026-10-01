@@ -49,6 +49,8 @@ class AbsorbW:
     def from_rows(cls, k_rows: torch.Tensor, v_rows: torch.Tensor, heads: int) -> "AbsorbW":
         """k_rows [heads * qk_dim, latent], v_rows [heads * v_dim, latent], float, in head order."""
         lw = k_rows.shape[1]
+        if heads == 0 or k_rows.numel() == 0:      # a rank with no heads (uneven world, tiny model)
+            return cls(torch.zeros((0, 0, lw)), torch.zeros((0, 0, lw)))
         return cls(k_rows.reshape(heads, -1, lw), v_rows.reshape(heads, -1, lw))
 
     def nbytes(self) -> int:

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 
+from tensorfold.cuda.geometry import share, share_lo
+
 ROW = (
     r"\.mlp\.experts\.\d+\.(gate|up)_proj\.",
     r"\.mlp\.shared_experts\.(gate|up)_proj\.",
@@ -78,6 +80,25 @@ def rule(name: str) -> str:
     return hits[0]
 
 
+HEAD_GROUP = (
+    (re.compile(r"\.self_attn\.q_b_proj\."), lambda c: c["qk_dim"]),
+    (re.compile(r"\.self_attn\.kv_b_proj\."), lambda c: c["qk_nope"] + c["v_dim"]),
+)
+
+
+def head_group(name: str, cfg: dict) -> int:
+    """The rows one head contributes to ``name`` (0: not head-major), so uneven worlds split by whole heads.
+
+    ``cfg``: the model config's qk_dim (nope + rope), qk_nope and v_dim. q_b's rows are head-major
+    qk_dim a head; kv_b's are qk_nope + v_dim a head (key rows then value rows, per head).
+    """
+
+    for pat, rows_of in HEAD_GROUP:
+        if pat.search(name):
+            return int(rows_of(cfg))
+    return 0
+
+
 def read_header(path: str | Path) -> tuple[dict, int]:
     with open(path, "rb") as f:
         n = struct.unpack("<Q", f.read(8))[0]
@@ -103,51 +124,66 @@ def _world() -> int:
 
 
 def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int,
-                world: int | None = None) -> tuple[np.ndarray, list[int]]:
-    """A tensor's bytes -> rank's part of them and its shape."""
+                world: int | None = None, group: int = 1) -> tuple[np.ndarray, list[int]]:
+    """A tensor's bytes -> rank's part of them and its shape (a balanced uneven share of the split axis).
+
+    ``group``: the split axis's items travel in whole groups of this many rows/columns (a head-major
+    tensor's rows: one head's 512 kv_b rows). The balanced partition then runs on the group count, so
+    a rank's span never lands inside a group — its shape stays a whole number of heads at uneven W.
+    """
 
     W = _world() if world is None else world
+    if kind == "col" and len(shape) != 2:
+        raise ValueError(f"col split needs a 2-D tensor, got {shape}")
     n = shape[0] if kind == "row" else (shape[1] if kind in ("col", "dim1") else 0)
-    if kind != "rep" and (n % W or rank >= W):
+    if kind != "rep" and (not 0 < n or rank >= W or rank < 0):
         raise ValueError(f"{kind} split of {shape} into {W} ranks")
     if kind == "rep":
         return raw, list(shape)
     if kind == "row":
         rows = shape[0]
-        per = raw.size // rows
-        part = rows // W
-        return raw[rank * part * per:(rank + 1) * part * per], [part] + list(shape[1:])
+        if rows % group:
+            raise ValueError(f"row split of {shape} in groups of {group}")
+        per = raw.size // rows * group        # one group's bytes
+        groups = rows // group
+        lo, take = share_lo(groups, W, rank), share(groups, W, rank)
+        return raw[lo * per:(lo + take) * per], [take * group] + list(shape[1:])
     if kind == "col":
         view = raw.reshape(shape[0], shape[1] * itemsize)
-        w = shape[1] // W
-        part = np.ascontiguousarray(view[:, rank * w * itemsize:(rank + 1) * w * itemsize])
+        w, lo = share(shape[1], W, rank), share_lo(shape[1], W, rank)
+        part = np.ascontiguousarray(view[:, lo * itemsize:(lo + w) * itemsize])
         return part.reshape(-1), [shape[0], w]
     if kind == "dim1":                                   # the second axis of a 2-D or higher tensor
         inner = int(np.prod(shape[2:])) * itemsize
         view = raw.reshape(shape[0], shape[1] * inner)
-        w = shape[1] // W
-        part = np.ascontiguousarray(view[:, rank * w * inner:(rank + 1) * w * inner])
+        w, lo = share(shape[1], W, rank), share_lo(shape[1], W, rank)
+        part = np.ascontiguousarray(view[:, lo * inner:(lo + w) * inner])
         return part.reshape(-1), [shape[0], w] + list(shape[2:])
     raise ValueError(kind)
 
 
-def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, world: int | None = None):
-    """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
+def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, world: int | None = None,
+                 group: int = 1):
+    """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape.
+
+    ``group``: whole-group spans on the split axis, as in ``split_bytes`` (head-major rows).
+    """
 
     W = _world() if world is None else world
     if kind == "rep":
         return raw.clone(), list(shape)
     if kind == "row":
-        if shape[0] % W:
-            raise ValueError(f"row split of leading dim {shape} into {W}")
-        per, part = raw.numel() // shape[0], shape[0] // W
-        return raw[rank * part * per:(rank + 1) * part * per].clone(), [part] + list(shape[1:])
+        if shape[0] <= 0 or shape[0] % group:
+            raise ValueError(f"row split of leading dim {shape} into {W} in groups of {group}")
+        per = raw.numel() // shape[0] * group
+        lo, take = share_lo(shape[0] // group, W, rank), share(shape[0] // group, W, rank)
+        return raw[lo * per:(lo + take) * per].clone(), [take * group] + list(shape[1:])
     if kind in ("col", "dim1"):
-        if len(shape) < 2 or shape[1] % W or (kind == "col" and len(shape) != 2):
-            raise ValueError(f"{kind} split needs a {W}-divisible second dim, got {shape}")
+        if len(shape) < 2 or (kind == "col" and len(shape) != 2) or shape[1] <= 0:
+            raise ValueError(f"{kind} split needs a non-empty second dim, got {shape}")
         inner = int(np.prod(shape[2:])) * itemsize
-        w = shape[1] // W
-        part = raw.view(shape[0], shape[1] * inner)[:, rank * w * inner:(rank + 1) * w * inner]
+        w, lo = share(shape[1], W, rank), share_lo(shape[1], W, rank)
+        part = raw.view(shape[0], shape[1] * inner)[:, lo * inner:(lo + w) * inner]
         return part.contiguous().reshape(-1), [shape[0], w] + list(shape[2:])
     raise ValueError(kind)
 
@@ -167,10 +203,13 @@ def rank_files(model_dir: str | Path, rank: int) -> list[Path]:
 class RankReader:
     """Read stored-dtype CPU tensors for one rank from the full checkpoint or its pre-split folder."""
 
-    def __init__(self, model_dir: str | Path, rank: int) -> None:
+    def __init__(self, model_dir: str | Path, rank: int, cfg_hint: dict | None = None) -> None:
+        """``cfg_hint``: the model config's ``qk_dim`` / ``v_head_dim`` (head-major group sizes at uneven worlds)."""
+
         from tensorfold.cuda.direct_read import ReadAhead, Reader, SafeTensors
 
         self.dir, self.rank = Path(model_dir), rank
+        self.cfg_hint = cfg_hint
         self.io = Reader()                                # O_DIRECT reads where the file system allows them
         self.reads = ReadAhead(self.io, READERS, RUN, GAP)
         mine, other = rank_files(self.dir, rank), rank_files(self.dir, 1 - rank)
@@ -211,12 +250,12 @@ class RankReader:
     def close(self) -> None:
         self.reads.close()
 
-    def _span(self, name: str) -> tuple[str, int, int, str, list[int], str]:
+    def _span(self, name: str) -> tuple[str, int, int, str, list[int], str, int]:
         """(file, first byte, end byte, split kind, shape, dtype) of the bytes this rank reads for ``name``."""
 
         if self.split:                                    # a rank folder holds the rank's tensors as they are
             path, begin, n, dtype, shape = self.folder.where[name]
-            return str(path), begin, begin + n, "rep", list(shape), dtype
+            return str(path), begin, begin + n, "rep", list(shape), dtype, 0
         file = str(self.dir / self.index[name])
         if file not in self.files:
             self.files[file] = read_header(file)
@@ -229,17 +268,34 @@ class RankReader:
         shape = list(info["shape"])
         W = _world()
         if kind == "row" and shape and shape[0] % W == 0:   # the rank's rows are one run: read only those
-            per = (b - a) // shape[0] * (shape[0] // W)
-            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // W] + shape[1:]
-        return file, base + a, base + b, kind, shape, info["dtype"]
+            per = (b - a) // shape[0] * share(shape[0], W)
+            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [share(shape[0], W)] + shape[1:]
+        group = self._group(name, shape)
+        return file, base + a, base + b, kind, shape, info["dtype"], group
+
+    def _group(self, name: str, shape: list[int]) -> int:
+        """The head-major group size of ``name`` (0: none) when the world splits its heads unevenly.
+
+        Head-major tensors (q_b, kv_b) at a world that does not divide their head count need
+        whole-head spans: the raw row share of an uneven split lands inside a head and the
+        loader's per-head key/value slices would mix heads. When the world divides the head
+        count (or the tensor is not head-major) the plain row split applies (group 0).
+        """
+
+        if self.split or not shape:
+            return 0
+        group = head_group(name, self.cfg_hint or {})
+        if not group or shape[0] % group:
+            return 0
+        return 0 if (shape[0] // group) % _world() == 0 else group
 
     def _tensor(self, raw: np.ndarray, span: tuple, own: bool):
         """The rank's tensor from the span's bytes; ``own``: never a view of ``raw`` (a shared read's buffer)."""
 
         import torch
 
-        _, _, _, kind, shape, dtype = span
-        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+        _, _, _, kind, shape, dtype, group = span
+        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, group=group or 1)
         if own and np.may_share_memory(data, raw):
             data = data.copy()
         return torch.from_numpy(data).view(torch_dtype(dtype)).reshape(shape)
@@ -255,8 +311,8 @@ class RankReader:
 
         if not raw.is_cuda:
             return self._tensor(raw.numpy(), span, own=True)
-        _, _, _, kind, shape, dtype = span
-        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+        _, _, _, kind, shape, dtype, group = span
+        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, group=group or 1)
         return data.view(torch_dtype(dtype)).reshape(shape)
 
 def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], metadata: dict | None) -> None:
