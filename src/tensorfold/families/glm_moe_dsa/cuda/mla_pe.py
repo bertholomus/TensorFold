@@ -170,7 +170,9 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache: torch.Tensor, pc
     pm = torch.empty((n,), dtype=torch.float32, device=qa.device)
     pl = torch.empty((n,), dtype=torch.float32, device=qa.device)
     hb = HB                                       # see attention(): the rope tile stays within shared memory
+    # 4 warps with 3 load stages keep the 8-warp single-stage launch's bits (tools/check_sparse_cfg.py) and take 29
+    # instead of 40 us a decode row over 2,048 selected tokens on GB10
     _sparse_chunks_pe[(R, triton.cdiv(H, hb), nch)](qa, qp, cache, pcache, tokens, counts, po, pm, pl, R, W=W, H=H,
                                                     LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
-                                                    num_warps=8, num_stages=1)
+                                                    num_warps=4, num_stages=3)
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)

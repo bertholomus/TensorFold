@@ -275,4 +275,18 @@ class Graphs:
                     with torch.cuda.graph(g, pool=self.pool):
                         mtp_compute(w, st, e.mbuf, n)
                     self.mtp[n] = g
+            if st.index is not None:
+                # past the dense limit every row attends to its selected tokens: a graph a window and scored-token
+                # bucket, the eager path's kernels and shapes (Engine.forward looks up sparse_bucket(pos, R))
+                from .select import sparse_buckets
+
+                for bucket in sparse_buckets(st.capacity, w.cfg.dense_limit):
+                    for R in main_rows:
+                        for _ in range(2):
+                            fwd.compute(w, st, e.buf, R, sparse_np=bucket)
+                        torch.cuda.synchronize()
+                        g = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g, pool=self.pool):
+                            fwd.compute(w, st, e.buf, R, sparse_np=bucket)
+                        self.sparse[(R, 0, bucket)] = g
         torch.cuda.synchronize()

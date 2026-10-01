@@ -55,6 +55,17 @@ def sparse_bucket(pos: int, R: int) -> int:
     return max(2048, 1 << (visible - 1).bit_length())
 
 
+def sparse_buckets(capacity: int, dense_limit: int) -> list[int]:
+    """Every value ``sparse_bucket`` gives a window starting at or past the dense limit within ``capacity`` slots."""
+
+    out, bucket = [], sparse_bucket(dense_limit, 1)
+    while True:
+        out.append(bucket)
+        if bucket >= capacity:
+            return out
+        bucket *= 2
+
+
 def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: int | None, R: int,
                   topk: int, pos_dev: torch.Tensor, *, tokens: torch.Tensor, counts: torch.Tensor,
                   bucket: int | None = None) -> None:
