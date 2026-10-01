@@ -107,11 +107,56 @@ def main() -> None:
             say(f"             tokens a round (keep: rounds) {keeps}")
         say(f"   replays {e.replays}")
 
+    if "policy" in SECTIONS:
+        say("== MTP depth policies on the same prompts (tok/s a prompt, all tokens / all seconds)")
+        grid = [tuple(float(x) for x in item.split(":")) for item in
+                (os.environ.get("TF_PROFILE_POLICIES") or "3:0,4:0,3:0.3,4:0.3,5:0.3,6:0.3,4:0.5,5:0.5,6:0.5").split(",")]
+        for most, conf in grid:
+            rates, toks, secs, rounds = [], 0, 0.0, 0
+            for p in prompts:
+                first = dec.prefill(e, p, None)
+                m = dec.mtp_decode(e, first, TOKENS, None, policy=dec.DepthPolicy(int(most), fixed=True,
+                                                                                 confidence=conf), stop_eos=True)
+                rates.append(m.tokens_per_second)
+                toks += len(m.tokens) - 1
+                secs += m.seconds
+                rounds += m.rounds
+            say(f"   most {int(most)} confidence {conf:.2f}: " + " / ".join(f"{r:.2f}" for r in rates)
+                + f"  all {toks / secs:.2f} tok/s, {toks / rounds:.2f} tok a round")
+
     if "graphs" in SECTIONS:
         say(f"== main graph replay per window (pos {st.pos})")
         for R in sorted(e.graphs.main):
             g = e.graphs.main[R]
             say(f"   R={R[0]}: {timeit(g.replay):.2f} ms")
+
+    if "side" in SECTIONS and getattr(e.buf, "side", None) is not None:
+        say(f"== side stream (keys beside queries, shared expert beside routed): shipped graphs vs one stream (pos {st.pos})")
+        side, e.buf.side = e.buf.side, None
+        pool = torch.cuda.graph_pool_handle()
+        one = {}
+        try:
+            for R in (1, 2, 4):
+                for _ in range(2):
+                    fwd.compute(w, st, e.buf, R)
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=pool):
+                    fwd.compute(w, st, e.buf, R)
+                one[R] = g
+        finally:
+            e.buf.side = side
+        for R in (1, 2, 4):
+            two = e.graphs.main[(R, 0)]
+            two.replay()
+            torch.cuda.synchronize()
+            a = e.buf.logits[:R].clone()
+            one[R].replay()
+            torch.cuda.synchronize()
+            b = e.buf.logits[:R].clone()
+            say(f"   R={R}: two streams {timeit(two.replay):.2f} ms, one stream {timeit(one[R].replay):.2f} ms;"
+                f" logits equal: {torch.equal(a.view(torch.int16), b.view(torch.int16))}")
+        one.clear()
 
     if "mtp" in SECTIONS:
         say(f"== MTP step: eager vs graph (mtp_len {st.mtp_len})")
@@ -202,14 +247,33 @@ def main() -> None:
         first = dec.prefill(e, p, None)
         torch.cuda.synchronize()
         say(f"   prefill {time.perf_counter() - t:.1f}s ({len(p) / (time.perf_counter() - t):.0f} tok/s)")
+        from tensorfold.families.glm_moe_dsa.cuda.select import sparse_bucket
+
+        g = e.graphs.sparse.get((1, 0, sparse_bucket(st.pos, 1))) if e.graphs is not None else None
+        if g is not None:                      # one step two ways at the same state: graph logits vs eager logits
+            fwd.stage(w, st, e.buf, [first])
+            g.replay()
+            torch.cuda.synchronize()
+            a = e.buf.logits[:1].clone()
+            fwd.compute(w, st, e.buf, 1, nch=fwd.chunks_for(st, 1), host_pos=st.pos)
+            torch.cuda.synchronize()
+            b = e.buf.logits[:1].clone()
+            say(f"   sparse graph logits == eager logits: {torch.equal(a.view(torch.int16), b.view(torch.int16))}")
         r0 = dict(e.replays)
         s = dec.serial_decode(e, first, 48, None, stop_eos=False)
         say(f"   serial 48 tok {s.tokens_per_second:.2f} tok/s; replays now {e.replays} (before {r0})")
+        graphs, e.graphs = e.graphs, None
         first = dec.prefill(e, p, None)
-        m = dec.mtp_decode(e, first, 48, None, policy=dec.DepthPolicy(3, fixed=True), stop_eos=False)
-        mst = ", ".join(f"{k} {1e3 * v / max(1, m.rounds):.2f}" for k, v in m.stages.items())
-        say(f"   mtp3 48 tok {m.tokens_per_second:.2f} tok/s rounds {m.rounds} accepted {m.accepted} [ms/round: {mst}]"
-            f" same={s.tokens == m.tokens}")
+        s2 = dec.serial_decode(e, first, 48, None, stop_eos=False)
+        e.graphs = graphs
+        say(f"   serial eager 48 tok {s2.tokens_per_second:.2f} tok/s; same tokens as graphs: {s.tokens == s2.tokens}")
+        for most, conf in ((3, 0.0), (4, 0.3)):
+            first = dec.prefill(e, p, None)
+            m = dec.mtp_decode(e, first, 48, None, policy=dec.DepthPolicy(most, fixed=True, confidence=conf),
+                               stop_eos=False)
+            mst = ", ".join(f"{k} {1e3 * v / max(1, m.rounds):.2f}" for k, v in m.stages.items())
+            say(f"   mtp {most}/{conf} 48 tok {m.tokens_per_second:.2f} tok/s rounds {m.rounds} accepted {m.accepted}"
+                f" [ms/round: {mst}] same={s.tokens == m.tokens}")
     eng.comm.barrier()
     say("== done")
 
