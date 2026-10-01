@@ -284,7 +284,7 @@ def _select(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, R: int, top
     H = wts.shape[1]                                            # wts [R, heads]: each row's per-head weights
     D = qi.shape[1] // H
     wscale = H ** -0.5
-    rb = 16 if R >= 16 else 1                                   # rows a scoring program (same bits a row)
+    rb = 16 if R >= 16 else R                                   # rows a scoring program: each key tile read once (same bits a row)
     scores = torch.empty((R, np_max), dtype=torch.float32, device=qi.device)
     _scores[(triton.cdiv(R, rb), triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), keys, scores, pos_dev, R, np_max,
                                                            D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)),
