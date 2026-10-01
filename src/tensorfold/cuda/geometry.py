@@ -138,6 +138,8 @@ def split_weights(rule, world: int = 2):
         if kind == "drop":
             return 0, 0
         shape = list(info["shape"])
+        if not shape:                                    # 0-d markers (EXL3 codebook tags): replicated, tiny
+            return padded(info, shape, float32=False, name=name), 0
         if not info.get("split") and kind != "rep":
             axis = {"row": 0, "col": -1, "dim1": 1}[kind]
             shape[axis] = share(shape[axis], world)      # balanced uneven: exact for every divisible dim

@@ -8,6 +8,9 @@ import torch
 import triton
 import triton.language as tl
 
+# Flash's row-invariant kernels that GLM-5.3 uses unchanged: RMSNorm (+64-group sums), the plain residual add of a
+# rank-gathered fp32 partial, the fp32 router matmul, and sigmoid noaux_tc top-k with the shared expert appended.
+from tensorfold.families.glm5_next.cuda.glue import residual_add, rmsnorm, router, select  # noqa: F401
 
 # -- LayerNorm (biased, the indexer key norm) -----------------------------------------------------------------
 @triton.jit

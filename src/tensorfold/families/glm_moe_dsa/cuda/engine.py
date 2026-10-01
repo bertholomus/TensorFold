@@ -138,8 +138,6 @@ class GlmEngine:
         """Follower rank: mirror every request rank 0 serves, forever."""
 
         from tensorfold.engine.exact_sampling import Sampling
-        from tensorfold.families.glm5_next.cuda.decode import (DepthPolicy, mtp_decode, prefill, serial_decode)
-
         while True:
             (max_tokens, stop_eos, draft, _cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi,
              shaped, kind, most, _a, _b) = self._share(None)
@@ -160,8 +158,6 @@ class GlmEngine:
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
              on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool, constraint=None) -> dict[str, Any]:
-        from tensorfold.families.glm5_next.cuda.decode import DepthPolicy, mtp_decode, prefill, serial_decode
-
         self.e.constraint, self.e.window = constraint, None       # every rank walks and masks the same rows
         try:
             return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, draft)
@@ -170,7 +166,7 @@ class GlmEngine:
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool) -> dict[str, Any]:
-        from tensorfold.families.glm5_next.cuda.decode import DepthPolicy, mtp_decode, prefill, serial_decode
+        from .decode import DepthPolicy, mtp_decode, prefill, serial_decode
 
         t0 = time.perf_counter()
         first = prefill(self.e, prompt, sampling)

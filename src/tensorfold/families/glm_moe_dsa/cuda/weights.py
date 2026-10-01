@@ -304,11 +304,19 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
 
     def dsa(i: int, full: bool = True) -> DSAW:
         p = f"layers.{i}.self_attn."
-        # kv_b_proj is stored [H * (qk_nope + v_dim), kv_lora]: per-head blocks of key rows then value rows
+        # kv_b_proj is stored head-major [H * (qk_nope + v_dim), kv_lora]: each head's qk_nope key rows, then its
+        # v_dim value rows (ExLlamaV3 views it [H, nope + v, kv_lora]). The absorb kernel dots a head's whole
+        # qk_dim query against wk [H, qk_dim, kv_lora]: the rope rows are zero, so it computes q_nope . W_UK and the
+        # rope term comes from the separate q_pe . k_pe score (mla_pe).
         w = t(p + "kv_b_proj.weight", torch.bfloat16)
-        kv_k = make_b16(w[:HL * cfg.qk_nope].contiguous())
-        kv_v = make_b16(w[HL * cfg.qk_nope:].contiguous())
-        absorb = latent.AbsorbW.from_rows(w[:HL * cfg.qk_nope].float(), w[HL * cfg.qk_nope:].float(), HL)
+        per = w.view(HL, cfg.qk_nope + cfg.v_dim, cfg.kv_lora)
+        k_nope = per[:, :cfg.qk_nope]                                     # [HL, qk_nope, kv_lora]
+        v_rows = per[:, cfg.qk_nope:]                                     # [HL, v_dim, kv_lora]
+        wk = torch.zeros((HL, cfg.qk_dim, cfg.kv_lora), dtype=torch.float32, device=w.device)
+        wk[:, :cfg.qk_nope] = k_nope.float()
+        kv_k = make_b16(k_nope.reshape(HL * cfg.qk_nope, cfg.kv_lora).contiguous())
+        kv_v = make_b16(v_rows.reshape(HL * cfg.v_dim, cfg.kv_lora).contiguous())
+        absorb = latent.AbsorbW(wk, v_rows.float())
         return DSAW(proj(p + "q_a_proj."), proj(p + "q_b_proj."),
                     proj(p + "kv_a_proj_with_mqa.", crop=cfg.kv_lora + cfg.qk_rope),
                     kv_k, kv_v, proj(p + "o_proj."), t(p + "q_a_layernorm.weight", torch.bfloat16),
@@ -326,10 +334,12 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
 
         router = t(p + "gate.weight", torch.bfloat16).contiguous()
         bias = t(p + "gate.e_score_correction_bias", torch.float32).contiguous()
-        # the experts are integer-split over the ranks (43/.../42 at TP6): this rank's contiguous span
-        mine = share(cfg.experts, world, rank)
-        first = share_lo(cfg.experts, world, rank)
-        experts_of = range(first, first + mine)
+        # every rank holds ALL routed experts, each at its share of the width (the split rules cut gate/up
+        # trellis columns and down rows: EXL3_RULES). The router picks global expert ids, so the expert set must
+        # stay whole on every rank; the rank's fp32 partial is summed over ranks by the all-gather.
+        # (An expert-subset split would need a per-rank id remap AND unsplit expert reads; it is not wired.)
+        mine = cfg.experts
+        experts_of = range(cfg.experts)
         parts: dict[str, list] = {}
         cb = None
         D = I = 0

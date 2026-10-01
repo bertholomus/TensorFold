@@ -68,7 +68,7 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: 
 
     if qi.stride(0) != qi.shape[1] or wts.stride(1) != 1:
         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
-    H = wts.shape[0]
+    H = wts.shape[1]                                            # wts [R, heads]: each row's per-head weights
     D = qi.shape[1] // H
     wscale = H ** -0.5
     np_max = bucket if bucket is not None else sparse_bucket(int(pos) if pos is not None

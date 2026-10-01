@@ -13,7 +13,7 @@ from tensorfold.families.glm5_next.cuda import latent as latent_mod, prof
 
 from tensorfold.cuda.geometry import share
 
-from . import glue, rope as rope_mod, select as select_mod
+from . import glue, mla_pe, rope as rope_mod, select as select_mod
 from .weights import LayerW, Weights
 
 # the Flash buffers' DSA block is reused where the shapes match; the indexer differs (no k-pool)
@@ -71,6 +71,8 @@ class Buffers(FlashBuffers):
         self.cos = torch.empty((rows, c.qk_rope // 2), dtype=torch.float32, device=dev)
         self.sin = torch.empty((rows, c.qk_rope // 2), dtype=torch.float32, device=dev)
         self.ik = torch.empty((rows, c.index_dim), dtype=bf, device=dev)          # the window's indexer keys
+        self.qp = torch.empty((rows, share(c.heads, w.world, w.rank), c.qk_rope), dtype=bf, device=dev)  # rope slices
+        self.iw = torch.empty((rows, c.index_heads), dtype=bf, device=dev)        # indexer head weights per token
         # no hyper-connections: x holds one stream
         self.x = torch.empty((rows, c.hidden), dtype=bf, device=dev)
         del self.taps, self.tap_at
@@ -100,11 +102,14 @@ class State(FlashState):
         self.dsa_index = {l.index: i for i, l in enumerate(dsa_layers)}
         self.latent = latent_mod.ENABLED
         self.kc = [torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+        # the shared rope key per token (q_pe . k_pe is the second score term; Flash has qk_rope 0 and no such cache)
+        self.pc = [torch.zeros((capacity, c.qk_rope), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
         self.vc = [None for _ in dsa_layers]
         self.mtp_len = 0
         self.mtp_drafted = 0
         if w.mtp is not None:
             self.mtp_kc = torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)
+            self.mtp_pc = torch.zeros((capacity, c.qk_rope), dtype=torch.bfloat16, device=dev)
             self.mtp_vc = None
         # one indexer key plane per full-indexer group (and the MTP layer, last): a "shared" layer
         # reads the nearest preceding full layer's keys, so a group shares one plane
@@ -144,18 +149,20 @@ class State(FlashState):
         other.pos_dev = self.pos_dev.clone()
         other.mtp_pos_dev = self.mtp_pos_dev.clone()
         other.kc = [x.clone() for x in self.kc]
+        other.pc = [x.clone() for x in self.pc]
         other.vc = [None for _ in self.kc]
         if self.index is not None:
             other.index = [x.clone() for x in self.index]
         if hasattr(self, "mtp_kc"):
             other.mtp_kc = self.mtp_kc.clone()
+            other.mtp_pc = self.mtp_pc.clone()
             other.mtp_vc = None
         return other
 
 
 def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int,
               nch: int | None, index: torch.Tensor | None, host_pos: int | None,
-              sparse_np: int | None = None) -> torch.Tensor:
+              sparse_np: int | None = None, pc: torch.Tensor | None = None) -> torch.Tensor:
     """MLA over the latent cache with GLM-5.3's rope, indexer update on full layers, raw-token sparse selection.
 
     A "shared" indexer layer passes ``index=None``: its selection reuse is expressed by scoring and
@@ -173,35 +180,50 @@ def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor
         mm(b, b.normed[:R], a.kv_a, b.xs[:R], b.lat[:R])
         # kv_a_layernorm covers the latent only; the rope key after it stays as projected
         glue.rmsnorm(b.lat[:R, :c.kv_lora], a.kv_norm, c.eps, b.lat[:R, :c.kv_lora], b.xs_lat[:R])
-    with prof.timed("dsa: rope"):
-        rope_mod.apply(b.qr[:R], b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
     with prof.timed("dsa: q_b"):
-        mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
+        q2 = b.q[:R].view(R, HL * c.qk_dim)
+        mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], q2)
+    with prof.timed("dsa: rope"):
+        # heads are [qk_nope | qk_rope]: rotate each head's rope slice, and the shared rope key past the latent
+        rope_mod.apply_q(q2, b.cos[:R], b.sin[:R], c, HL)
+        rope_mod.apply_key(b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
     with prof.timed("dsa: latent write"):
         latent_mod.latent_write(b.lat[:R, :c.kv_lora], lc, pos_dev)
+        latent_mod.latent_write(b.lat[:R, c.kv_lora:], pc, pos_dev)      # the rope key, its own [cap, qk_rope] cache
+    long_ctx = bool(w.meta.get("long_context"))
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
-    sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
+    sparse_rows = long_ctx and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
     if index is not None:
         with prof.timed("dsa: indexer update"):
             ix = a.index
             mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
             glue.layernorm(b.ik[:R], ix.ln_w, ix.ln_b, c.eps, b.ik[:R])
-            at = host_pos if host_pos is not None else int(pos_dev.item())
-            index[at:at + R].copy_(b.ik[:R])
+            rope_mod.apply_index(b.ik[:R], b.cos[:R], b.sin[:R], c, 1)
+            if host_pos is not None:
+                index[host_pos:host_pos + R].copy_(b.ik[:R])
+            else:
+                latent_mod.latent_write(b.ik[:R], index, pos_dev)
     with prof.timed("dsa: absorb"):
-        qa = latent_mod.absorb_q(b.q[:R], a.absorb, s.qa[:R])
+        qa = latent_mod.absorb_q(b.q[:R], a.absorb, s.qa[:R])          # rope columns of wk are zero: q_nope . W_UK
+        qp = mla_pe.gather_pe(b.q[:R], c.qk_nope, b.qp[:R])
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
     if not all_sparse:
         with prof.timed("dsa: dense attention"):
-            latent_mod.attention(qa, lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
+            mla_pe.attention(qa, qp, lc, pc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
     if sparse_rows:
-        with prof.timed("dsa: select tokens"):
-            mm(b, b.qr[:R], a.index.qb, b.xs_qr[:R], b.qi[:R])
-            select_mod.select_tokens(b.qi[:R], a.index.weights, index, host_pos, R, c.index_topk, pos_dev,
-                                     tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np)
+        if a.index is not None:
+            with prof.timed("dsa: select tokens"):
+                ix = a.index
+                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+                rope_mod.apply_index(b.qi[:R], b.cos[:R], b.sin[:R], c, c.index_heads)
+                # per-token head weights: weights_proj applied to the layer input (the scorer folds the scales)
+                torch.mm(b.normed[:R], ix.weights.t(), out=b.iw[:R])
+                select_mod.select_tokens(b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev,
+                                         tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np)
+        # a "shared" layer attends the tokens its group's full layer selected for these rows (still in b.tokens)
         with prof.timed("dsa: sparse attention"):
-            latent_mod.sparse_attention(qa, lc, b.tokens[:R], b.counts[:R], ol, scale)
+            mla_pe.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], ol, scale)
     with prof.timed("dsa: expand"):
         o = latent_mod.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
@@ -252,14 +274,19 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
 def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
                   host_pos: int | None = None, sparse_np: int | None = None) -> None:
     di = st.dsa_index[layer.index]
+    c = w.cfg
     with prof.timed("dsa (total)"):
+        # pre-attention RMSNorm (input_layernorm): the block reads b.normed / b.xs
+        glue.rmsnorm(b.x[:R], layer.in_norm, c.eps, b.normed[:R], b.xs[:R])
         # a "shared" indexer layer scores and selects nothing of its own: it reuses the owning full
         # layer's selection, which the same window computed one block earlier into the buffers
         idx = st.index[st.index_slot[layer.index]] if getattr(st, "index", None) is not None \
             and layer.dsa.index is not None else None
-        g = dsa_block(layer, w, st.kc[di], st.pos_dev, b, R, nch, idx, host_pos, sparse_np)
+        g = dsa_block(layer, w, st.kc[di], st.pos_dev, b, R, nch, idx, host_pos, sparse_np, pc=st.pc[di])
     glue.residual_add(b.x[:R], b.x[:R], g)
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
+        # post-attention RMSNorm before the MLP / MoE
+        glue.rmsnorm(b.x[:R], layer.post_norm, c.eps, b.normed[:R], b.xs[:R])
         g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
     glue.residual_add(b.x[:R], b.x[:R], g)
 
@@ -295,7 +322,7 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
 
     c = w.cfg
     fglue.embed(b.ids[:R], w.embed, c.hidden, 1, b.x[:R])
-    rope_mod.table(b.cos[:R], b.sin[:R], st.pos, R, c.rope_theta, c.qk_rope)
+    rope_mod.table(b.cos[:R], b.sin[:R], st.pos_dev, R, c.rope_theta, c.qk_rope)   # device position: graph-safe
     for layer in w.layers:
         layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
     if not logits:

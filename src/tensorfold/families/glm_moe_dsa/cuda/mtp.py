@@ -43,11 +43,12 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = 
     glue.rmsnorm(b.me[:n], m.enorm, c.eps, b.mcat[:n, :D])
     glue.rmsnorm(b.hin[:n], m.hnorm, c.eps, b.mcat[:n, D:])
     mm(b, b.mcat[:n], m.eh, None if b.prefill else _group_sums(b, b.mcat[:n]), b.mx[:n])
-    rope_mod.table(b.cos[:n], b.sin[:n], st.mtp_len, n, c.rope_theta, c.qk_rope)
+    rope_mod.table(b.cos[:n], b.sin[:n], st.mtp_pos_dev, n, c.rope_theta, c.qk_rope)
     layer = m.layer
     glue.rmsnorm(b.mx[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
     g = dsa_block(layer, w, st.mtp_kc, st.mtp_pos_dev, b, n, nch,
-                  st.index[-1] if getattr(st, "index", None) is not None else None, host_pos, sparse_np)
+                  st.index[-1] if getattr(st, "index", None) is not None else None, host_pos, sparse_np,
+                  pc=st.mtp_pc)
     glue.residual_add(b.mx[:n], b.mx[:n], g)
     glue.rmsnorm(b.mx[:n], layer.post_norm, c.eps, b.normed[:n], b.xs[:n])
     g = moe_block(layer, w, b, n)

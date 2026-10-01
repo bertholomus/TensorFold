@@ -7,12 +7,81 @@ from typing import Sequence
 import torch
 
 from tensorfold.families.glm5_next.cuda.decode import (  # noqa: F401
-    DecodeResult, DepthPolicy, absorb, draft, mtp_decode, prefill, serial_decode, sample_rows,
+    DecodeResult, DepthPolicy, absorb, draft, mtp_decode, sample_rows,
     snapshot_bytes, row_bytes, save_rows, load_rows, restore, take_snapshot, _row_views,
 )
 
 from .forward import Buffers, State, check_room, stage, commit  # noqa: F401
 from .select import sparse_bucket  # noqa: F401
+
+
+@torch.no_grad()
+def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
+    """Commit the prompt in prompt chunks (this family's forward and state; no KDA, no taps) and sample its first token.
+
+    MTP: the prompt's rows are absorbed into the MTP head's cache chunk by chunk, as Flash does, when the
+    checkpoint has the head (``--no-drafts`` serves still absorb nothing: the MTP cache stays unused).
+    """
+
+    from . import forward as fwd
+
+    if not prompt:
+        raise ValueError("prefill requires at least one token")
+    w, st, b = e.w, e.st, e.pbuf
+    e.reset()
+    last = None
+    use_mtp = w.mtp is not None and not getattr(e, "serial_only", False)
+    for start in range(0, len(prompt), e.prefill_rows):
+        chunk = list(prompt[start:start + e.prefill_rows])
+        R = fwd.stage(w, st, b, chunk)
+        last = fwd.compute(w, st, b, R, nch=fwd.chunks_for(st, R), host_pos=st.pos).clone()
+        e.last_hidden = b.fnormed[R - 1:R].clone()
+        if use_mtp:
+            nxt = list(prompt[start + 1:start + R + 1])
+            if nxt:
+                from .mtp import mtp_forward
+
+                mtp_forward(w, st, b, nxt, b.fnormed[:len(nxt)])
+                st.set_mtp_len(st.mtp_len + len(nxt))
+        fwd.commit(w, st, b, R, R)
+    if e.constraint is not None:
+        e.window = e.constraint.window([0], [-1])
+    first = e.sample(last, [len(prompt)], sampling)[0]
+    e.follow([first])
+    return first
+
+
+@torch.no_grad()
+def serial_decode(e: "Engine", pending: int, count: int, sampling, *, stop_eos: bool = False,
+                  on_tokens=None) -> DecodeResult:
+    """One token a step through this family's forward (a CUDA graph when captured) and the shared sampler."""
+
+    import time
+
+    from . import forward as fwd
+
+    w, st, b = e.w, e.st, e.buf
+    out = [pending]
+    stages = dict(forward=0.0, sample=0.0, commit=0.0)
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+        t0 = time.perf_counter()
+        logits = e.forward(e.verify_window([out[-1]]))
+        torch.cuda.synchronize()
+        t1 = time.perf_counter()
+        tok = e.sample(logits[:1], [st.pos + 1], sampling)[0]
+        e.follow([tok])
+        t2 = time.perf_counter()
+        fwd.commit(w, st, b, 1, 1)
+        stages["forward"] += t1 - t0
+        stages["sample"] += t2 - t1
+        stages["commit"] += time.perf_counter() - t2
+        out.append(tok)
+        if on_tokens is not None:
+            on_tokens([tok])
+    torch.cuda.synchronize()
+    return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
 
 
 class Engine:
@@ -78,7 +147,7 @@ class Engine:
                probs: list | None = None) -> list[int]:
         from tensorfold.families.glm5_next.cuda.decode import sample_rows
 
-        return sample_rows(self.w, logits, positions, sampling, draft=draft, probs=probs)
+        return sample_rows(self.w, logits, positions, sampling, probs=probs)
 
     def verify_window(self, tokens: list[int]) -> list[int]:
         """The window a reply's grammar keeps (a chain cut at its first rejected draft), masked at the next sample."""
