@@ -89,9 +89,14 @@ class GlmEngine:
 
     @staticmethod
     def _geometry(text: dict, world: int):
-        """The Flash MLA geometry minus the KDA and hyper-connection terms, with the MTP head counted."""
+        """The Flash MLA geometry minus the KDA and hyper-connection terms, with the MTP head counted, and this family's
+        own cache a slot: Flash counts a 512-wide latent and three indexer planes a layer, this family keeps the latent
+        plus a 64-wide rope key a layer (and the MTP head's) and one indexer key plane a full-indexer layer (96,640 B a
+        slot at TP4 against Flash's 126,912), and its token selection holds at most select.SELECT_BYTES at once."""
 
-        from tensorfold.cuda.geometry import mla_geometry
+        from tensorfold.cuda.geometry import Geometry, mla_geometry
+
+        from .select import SELECT_BYTES
 
         t = dict(text)
         t.pop("linear_attn_config", None)              # no KDA layers: drop its state terms
@@ -99,7 +104,19 @@ class GlmEngine:
         t["hc_mult"] = 1                               # plain residuals: one stream
         t["swiglu_limit"] = 0.0
         t.setdefault("index_kpool", 1)                 # raw-token selection: one token per pool in the estimate
-        return mla_geometry(t, world, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=True)
+        flash = mla_geometry(t, world, MAX_ROWS, minimum_slots=DENSE_CAPACITY, latent=True)
+        mtp = int(text.get("num_nextn_predict_layers") or 0) > 0
+        layers = int(text["num_hidden_layers"]) + int(mtp)
+        full = sum(kind == "full" for kind in text.get("indexer_types") or []) + int(mtp)
+        own = (layers * (int(text["kv_lora_rank"]) + int(text["qk_rope_head_dim"]))
+               + full * int(text.get("index_head_dim", 128))) * 2
+        lo, hi = 1 << 20, 1 << 21                      # Flash's bytes a slot past its dense window
+        flash_slot = (flash.bytes_at(hi) - flash.bytes_at(lo)) / (hi - lo)
+
+        def bytes_at(slots: int) -> int:
+            return int(flash.bytes_at(slots) + (own - flash_slot) * slots) + 3 * SELECT_BYTES
+
+        return Geometry(bytes_at, flash.reserve, flash.minimum_slots)
 
     def _gather_ints(self, values: list[int]) -> list[list[int]]:
         torch = self.torch
