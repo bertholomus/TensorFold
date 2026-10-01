@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Sequence
 
 import torch
@@ -23,15 +24,37 @@ from tensorfold.families.glm5_next.cuda.forward import (  # noqa: F401
 
 from .x3 import X3, X3Pair, X3Scratch
 
+# decode windows run independent work on a second stream: the latent / rope-key / indexer-key path beside the query
+# path, the shared expert beside the router and routed experts (TF_GLM_SIDE=0: one stream, as before)
+SIDE = os.environ.get("TF_GLM_SIDE", "1") != "0"
 
-def mm(b, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False) -> torch.Tensor:
+
+def mm(b, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False,
+       sc: X3Scratch | None = None) -> torch.Tensor:
     """A projection: an EXL3 group on the row-invariant EXL3 linear (prompt GEMM in chunks), else Flash's matmuls."""
 
     if isinstance(q, (X3, X3Pair)):
         if f32 and out.dtype != torch.float32:
             raise ValueError("mm: an f32 projection needs an fp32 output buffer")
-        return q(x, out, b.x3, prefill=b.prefill)
+        return q(x, out, b.x3 if sc is None else sc, prefill=b.prefill)
     return flash_mm(b, x, q, xs, out, f32=f32)
+
+
+def fork(b):
+    """The side stream after everything the current stream has queued so far (a context to queue the side work in)."""
+
+    ready = torch.cuda.Event()
+    ready.record(torch.cuda.current_stream())
+    b.side.wait_event(ready)
+    return torch.cuda.stream(b.side)
+
+
+def join(b) -> None:
+    """The current stream waits for the side stream's work so far."""
+
+    done = torch.cuda.Event()
+    done.record(b.side)
+    torch.cuda.current_stream().wait_event(done)
 
 
 def out_proj(w, b, x: torch.Tensor, q, xs, R: int) -> torch.Tensor:
@@ -81,6 +104,10 @@ class Buffers(FlashBuffers):
         # EXL3 groups (attention, MLPs, MTP, head) share one scratch; the routed experts run on the universal kernel
         self.x3 = X3Scratch(w.meta.get("x3", []), dev, prefill=prefill)
         self.moe = None
+        self.side = None                     # decode windows: the second stream and its own EXL3 scratch
+        if SIDE and not prefill and dev.type == "cuda":
+            self.side = torch.cuda.Stream(device=dev)
+            self.x3s = X3Scratch(w.meta.get("x3", []), dev, prefill=False)
         first = next((l.moe.experts for l in w.layers if l.moe is not None), None)
         if first is not None and first.ex is not None:
             from tensorfold.cuda.exl3 import experts as x3experts
@@ -174,35 +201,49 @@ def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor
     a = layer.dsa
     HL = a.heads
     s = b.lat_s
+
+    def keys(sc: X3Scratch | None) -> None:
+        """This window's latent, rope key and (full layers) indexer key, into their caches at the window's slots."""
+
+        with prof.timed("dsa: projections"):
+            mm(b, b.normed[:R], a.kv_a, b.xs[:R], b.lat[:R], sc=sc)
+            # kv_a_layernorm covers the latent only; the rope key after it stays as projected
+            glue.rmsnorm(b.lat[:R, :c.kv_lora], a.kv_norm, c.eps, b.lat[:R, :c.kv_lora], b.xs_lat[:R])
+        with prof.timed("dsa: rope"):
+            rope_mod.apply_key(b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
+        with prof.timed("dsa: latent write"):
+            latent_mod.latent_write(b.lat[:R, :c.kv_lora], lc, pos_dev)
+            latent_mod.latent_write(b.lat[:R, c.kv_lora:], pc, pos_dev)      # the rope key: its own [cap, qk_rope] cache
+        if index is not None:
+            with prof.timed("dsa: indexer update"):
+                ix = a.index
+                mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
+                glue.layernorm(b.ik[:R], ix.ln_w, ix.ln_b, c.eps, b.ik[:R])
+                rope_mod.apply_index(b.ik[:R], b.cos[:R], b.sin[:R], c, 1)
+                if host_pos is not None:
+                    index[host_pos:host_pos + R].copy_(b.ik[:R])
+                else:
+                    latent_mod.latent_write(b.ik[:R], index, pos_dev)
+
+    if b.side is not None:                   # the keys on the side stream while the queries project
+        with fork(b):
+            keys(b.x3s)
     with prof.timed("dsa: projections"):
         mm(b, b.normed[:R], a.q_a, b.xs[:R], b.qr[:R])
         glue.rmsnorm(b.qr[:R], a.q_norm, c.eps, b.qr[:R], b.xs_qr[:R])
-        mm(b, b.normed[:R], a.kv_a, b.xs[:R], b.lat[:R])
-        # kv_a_layernorm covers the latent only; the rope key after it stays as projected
-        glue.rmsnorm(b.lat[:R, :c.kv_lora], a.kv_norm, c.eps, b.lat[:R, :c.kv_lora], b.xs_lat[:R])
     with prof.timed("dsa: q_b"):
         q2 = b.q[:R].view(R, HL * c.qk_dim)
         mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], q2)
     with prof.timed("dsa: rope"):
-        # heads are [qk_nope | qk_rope]: rotate each head's rope slice, and the shared rope key past the latent
+        # heads are [qk_nope | qk_rope]: rotate each head's rope slice (the shared rope key rotates in keys())
         rope_mod.apply_q(q2, b.cos[:R], b.sin[:R], c, HL)
-        rope_mod.apply_key(b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
-    with prof.timed("dsa: latent write"):
-        latent_mod.latent_write(b.lat[:R, :c.kv_lora], lc, pos_dev)
-        latent_mod.latent_write(b.lat[:R, c.kv_lora:], pc, pos_dev)      # the rope key, its own [cap, qk_rope] cache
+    if b.side is not None:
+        join(b)
+    else:
+        keys(None)
     long_ctx = bool(w.meta.get("long_context"))
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
     sparse_rows = long_ctx and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
-    if index is not None:
-        with prof.timed("dsa: indexer update"):
-            ix = a.index
-            mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
-            glue.layernorm(b.ik[:R], ix.ln_w, ix.ln_b, c.eps, b.ik[:R])
-            rope_mod.apply_index(b.ik[:R], b.cos[:R], b.sin[:R], c, 1)
-            if host_pos is not None:
-                index[host_pos:host_pos + R].copy_(b.ik[:R])
-            else:
-                latent_mod.latent_write(b.ik[:R], index, pos_dev)
     with prof.timed("dsa: absorb"):
         qa = latent_mod.absorb_q(b.q[:R], a.absorb, s.qa[:R])          # rope columns of wk are zero: q_nope . W_UK
         qp = mla_pe.gather_pe(b.q[:R], c.qk_nope, b.qp[:R])
@@ -255,6 +296,16 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
 
     c = w.cfg
     m = layer.moe
+    s = m.shared
+
+    def shared(sc: X3Scratch | None) -> None:
+        mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R], sc=sc)
+        glue.silu_mul(b.sgu[:R], b.sact[:R], b.sxs[:R])
+        mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True, sc=sc)
+
+    if b.side is not None:                   # the shared expert on the side stream while the routed experts run
+        with fork(b):
+            shared(b.x3s)
     with prof.timed("moe: route"):
         glue.router(b.normed[:R], m.router, b.mlog[:R])
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
@@ -262,10 +313,10 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         # GLM-5.3 has no swiglu_limit; the bf16 activation roundings are the GLM family's
         x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], m.experts.ex, b.moe, b.part[:R], R,
                          limit=math.inf, act_mode=x3experts.ACT_BF16)
-    s = m.shared
-    mm(b, b.normed[:R], s.gu, b.xs[:R], b.sgu[:R])
-    glue.silu_mul(b.sgu[:R], b.sact[:R], b.sxs[:R])
-    mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True)
+    if b.side is not None:
+        join(b)
+    else:
+        shared(None)
     b.part[:R].add_(b.sy[:R])
     with prof.timed("moe: all-gather"):
         return gather(w, b, R)
