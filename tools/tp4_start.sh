@@ -5,7 +5,7 @@
 CTX=${1:-32768}
 EXTRA=${2:---no-drafts}
 M=/models/glm53-exl3-3.0bpw-full
-declare -A HCA=([1]=mlx5_0 [2]=mlx5_0 [3]=rocep1s0f0 [4]=rocep1s0f0)
+declare -A HCA=([1]=mlx5_0,mlx5_2 [2]=mlx5_0,mlx5_2 [3]=rocep1s0f0,roceP2p1s0f0 [4]=rocep1s0f0,roceP2p1s0f0)
 for n in 4 3 2 1; do
   r=$((n - 1))
   if [ $r -eq 0 ]; then

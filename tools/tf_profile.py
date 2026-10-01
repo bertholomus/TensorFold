@@ -236,6 +236,73 @@ def main() -> None:
         for R in (1, 2, 4):
             say(f"   with collectives R={R}: {timeit(e.graphs.main[(R, 0)].replay):.2f} ms")
 
+    if "prefill_ab" in SECTIONS:
+        from tensorfold.cuda.exl3 import experts as x3experts
+
+        n = int(os.environ.get("TF_PROFILE_PREFILL", "24000"))
+        filler = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(int(n / 13.6)))
+        p = app._prepare({"messages": [{"role": "user", "content": filler + "\n\nSummarize."}], "max_tokens": 8,
+                          "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, True).prompt
+        say(f"== prefill A/B on a {len(p)}-token prompt: expert member tiles for every row vs the busiest expert's")
+        shipped = x3experts.EXACT_ROWS
+        runs = {}
+        try:
+            for label, rows in (("all rows", 1 << 30), ("busiest", shipped)):
+                x3experts.EXACT_ROWS = rows
+                torch.cuda.synchronize()
+                t = time.perf_counter()
+                first = dec.prefill(e, p, None)
+                torch.cuda.synchronize()
+                dt = time.perf_counter() - t
+                n_ = len(p)
+                sums = torch.stack([kc[:n_].view(torch.int16).to(torch.int64).sum() for kc in st.kc]
+                                   + [pc[:n_].view(torch.int16).to(torch.int64).sum() for pc in st.pc]
+                                   + [ix[:n_].view(torch.int16).to(torch.int64).sum() for ix in (st.index or [])])
+                runs[label] = (first, sums.cpu(), e.last_hidden.clone())
+                say(f"   {label}: {dt:.1f} s ({n_ / dt:.0f} tok/s), first token {first}")
+        finally:
+            x3experts.EXACT_ROWS = shipped
+        a, b = runs["all rows"], runs["busiest"]
+        say(f"   same first token {a[0] == b[0]}, same cache checksums {torch.equal(a[1], b[1])}, same last hidden "
+            f"{torch.equal(a[2].view(torch.int16), b[2].view(torch.int16))}")
+
+    if "prefill" in SECTIONS:
+        from tensorfold.families.glm5_next.cuda import prof
+
+        n = int(os.environ.get("TF_PROFILE_PREFILL", "24000"))
+        filler = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(int(n / 13.6)))
+        p = app._prepare({"messages": [{"role": "user", "content": filler + "\n\nSummarize."}], "max_tokens": 8,
+                          "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, True).prompt
+        say(f"== prefill of a {len(p)}-token prompt, chunk by chunk (block times with syncs: TF_GLM_PROFILE=1)")
+        chunk_times = []
+        orig = fwd.compute
+
+        def timed_compute(*a, **k):
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            out = orig(*a, **k)
+            torch.cuda.synchronize()
+            if a[2].prefill:
+                chunk_times.append(time.perf_counter() - t0)
+            return out
+
+        fwd.compute = timed_compute
+        prof.active = prof.ENABLED
+        torch.cuda.reset_peak_memory_stats()
+        t = time.perf_counter()
+        try:
+            dec.prefill(e, p, None)
+        finally:
+            fwd.compute = orig
+            prof.active = False
+        torch.cuda.synchronize()
+        total = time.perf_counter() - t
+        say(f"   {len(p)} tokens in {total:.1f} s ({len(p) / total:.0f} tok/s); peak allocated "
+            f"{torch.cuda.max_memory_allocated() / 2**30:.1f} GiB; chunks (s): "
+            + " ".join(f"{x:.1f}" for x in chunk_times))
+        if prof.ENABLED:
+            prof.report(len(p))
+
     if "depth" in SECTIONS and DEPTH > 0:
         filler = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(DEPTH // 13))
         body = {"messages": [{"role": "user", "content": filler + "\n\nSummarize the list above in two sentences."}],
