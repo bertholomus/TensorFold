@@ -52,7 +52,8 @@ def _dense_chunks_pe(QA, QP, LC, PC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl
     if start <= limit:
         q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
         qp = tl.load(QP + (r * H + hh[:, None]) * PW + kq[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
-        for t in range(CH // KTT):
+        # a tile wholly past the row's last key leaves m, l and o as they are (alpha 1, p 0): stop before it
+        for t in range(tl.minimum(CH // KTT, (limit - start) // KTT + 1)):
             ki = start + t * KTT + tl.arange(0, KTT)
             ok = ki <= limit
             kv = tl.load(LC + ki[:, None].to(tl.int64) * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
@@ -147,9 +148,11 @@ def _attention(qa: torch.Tensor, qp: torch.Tensor, cache: torch.Tensor, pcache: 
     n = nch * R * H
     if hb not in (HB, HB_WIDE):
         raise ValueError(f"latent attention: {hb} heads a program, not {HB} or {HB_WIDE}")
+    # 4 warps with 3 load stages keep the 8-warp single-stage launch's bits (tools/check_mla_cfg.py) and take 21 instead
+    # of 35 us a decode row at 1-2k tokens on GB10
     _dense_chunks_pe[(R, triton.cdiv(H, hb), nch)](qa, qp, cache, pcache, pos, s.po[:n * LW], s.pm[:n], s.pl[:n], R,
                                                    H=H, LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
-                                                   num_warps=8, num_stages=1)
+                                                   num_warps=4, num_stages=3)
     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
     return out
 

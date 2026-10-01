@@ -42,7 +42,13 @@ class GlmEngine:
         self.serial_only = serial_only
         world = int(os.environ.get("TF_TP_WORLD", "2"))
         self.world = world
-        self.comm = comm if comm is not None else NCCL(rank, world, master, port)
+        if comm is None:
+            # every replay of a captured forward is synchronized before the next uncaptured collective (the decode
+            # loops sample after torch.cuda.synchronize()), so NCCL can skip its graph-mixing support; with grouped
+            # send/recv an in-graph all-gather of a [1, 6144] partial takes 35 us instead of 51 (tools/nccl_bench.py)
+            os.environ.setdefault("NCCL_GRAPH_MIXING_SUPPORT", "0")
+            comm = NCCL(rank, world, master, port, gather=os.environ.get("TF_NCCL_GATHER") or "p2p")
+        self.comm = comm
         self.comm.barrier()
         from tensorfold.families.glm_moe_dsa.cuda.weights import Config
 

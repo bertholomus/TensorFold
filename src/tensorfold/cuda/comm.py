@@ -1,4 +1,9 @@
-"""NCCL all-gather on the current stream so CUDA graphs capture it; a rank-order sum after it keeps ranks bit-equal."""
+"""NCCL all-gather on the current stream so CUDA graphs capture it; a rank-order sum after it keeps ranks bit-equal.
+
+``gather="p2p"`` moves the same bytes as grouped ncclSend/ncclRecv with every rank (itself included): one network hop
+instead of the ring's world - 1 steps. Across four GB10 nodes a [1, 6144] fp32 partial took 35 us inside a CUDA graph
+instead of 51 us (tools/nccl_bench.py), and the gathered tensor is the same.
+"""
 
 from __future__ import annotations
 
@@ -33,12 +38,14 @@ def _library() -> ctypes.CDLL:
 
 
 class NCCL:
-    def __init__(self, rank: int, world: int, master: str, port: int) -> None:
+    def __init__(self, rank: int, world: int, master: str, port: int, *, gather: str = "ring") -> None:
         from datetime import timedelta
 
         from torch.distributed import TCPStore
 
-        self.rank, self.world = rank, world
+        if gather not in ("ring", "p2p"):
+            raise ValueError(f"gather must be ring (ncclAllGather) or p2p (grouped send/recv), not {gather!r}")
+        self.rank, self.world, self.gather = rank, world, gather
         self.lib = _library()
         lib = self.lib
         lib.ncclGetErrorString.restype = ctypes.c_char_p
@@ -47,6 +54,9 @@ class NCCL:
         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
                                       ctypes.c_void_p]
+        for name in ("ncclSend", "ncclRecv"):
+            getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                                           ctypes.c_void_p, ctypes.c_void_p]
         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=600))
         uid = _UniqueId()
         if rank == 0:
@@ -69,6 +79,17 @@ class NCCL:
         if recv.numel() != send.numel() * self.world or send.dtype != recv.dtype:
             raise ValueError("all_gather: recv must hold world x send of the same dtype")
         stream = torch.cuda.current_stream().cuda_stream
+        if self.gather == "p2p":
+            n, kind, lib = send.numel(), _DTYPES[send.dtype], self.lib
+            step = n * send.element_size()
+            self._check(lib.ncclGroupStart())
+            try:
+                for peer in range(self.world):
+                    self._check(lib.ncclSend(send.data_ptr(), n, kind, peer, self.comm, stream))
+                    self._check(lib.ncclRecv(recv.data_ptr() + peer * step, n, kind, peer, self.comm, stream))
+            finally:
+                self._check(lib.ncclGroupEnd())
+            return
         self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
                                            self.comm, stream))
 
