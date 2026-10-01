@@ -48,6 +48,9 @@ class GlmEngine:
             # send/recv an in-graph all-gather of a [1, 6144] partial takes 35 us instead of 51 (tools/nccl_bench.py)
             os.environ.setdefault("NCCL_GRAPH_MIXING_SUPPORT", "0")
             comm = NCCL(rank, world, master, port, gather=os.environ.get("TF_NCCL_GATHER") or "p2p")
+            from tensorfold.families.glm_moe_dsa.cuda.weights import Config
+
+            comm = _rdma(comm, rank, world, MAX_ROWS * Config.read(model_dir).hidden * 4)
         self.comm = comm
         self.comm.barrier()
         from tensorfold.families.glm_moe_dsa.cuda.weights import Config
@@ -191,6 +194,25 @@ class GlmEngine:
             print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
                   f" drafted {res.drafted} accepted {res.accepted}", flush=True)
         return stats
+
+
+def _rdma(comm, rank: int, world: int, max_bytes: int):
+    """NCCL plus the RDMA gather (tensorfold.cuda.rdma) for fp32 all-gathers up to ``max_bytes`` (decode windows'
+    partials, sampling) when every rank opens it, else NCCL alone; TF_GLM_RDMA=0 keeps NCCL. Same bytes either way: a
+    decode window's 156 all-gathers take 23 instead of 35 us each at one row, 36 instead of 56 at four (rdma_bench.py)."""
+
+    if world < 2 or os.environ.get("TF_GLM_RDMA", "1") == "0":
+        return comm
+    from tensorfold.cuda.rdma import Hybrid, RdmaGather
+
+    try:
+        rdma = RdmaGather(comm.store, rank, world, max_bytes=max_bytes)
+    except Exception as exc:                  # noqa: BLE001  (every rank sees the same refusal)
+        print(f"[tensorfold] decode all-gathers stay on NCCL: {exc}", flush=True)
+        return comm
+    if rank == 0:
+        print(f"[tensorfold] decode all-gathers: RDMA writes over {', '.join(rdma.devices)}", flush=True)
+    return Hybrid(comm, rdma)
 
 
 def _f64_ints(x: float) -> list[int]:
