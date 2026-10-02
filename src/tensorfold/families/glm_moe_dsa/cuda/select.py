@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -20,22 +22,30 @@ def _scores(QI, W, w_stride, IK, OUT, POS, R, NT, scale, wscale, H: tl.constexpr
     tb = tl.program_id(1)
     P = tl.load(POS)
     t = tb * BT + tl.arange(0, BT)
-    d = tl.arange(0, D)
-    hh = tl.arange(0, HP)
-    hok = hh < H
-    k = tl.load(IK + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < (P + rb * RB + RB))[:, None],
-                other=0.0).to(tl.bfloat16)                                             # [BT, D]
-    for i in tl.static_range(RB):
-        r = rb * RB + i
-        if r < R:
-            bound = P + r + 1
-            q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None], other=0.0).to(tl.bfloat16)
-            kr = tl.where((t < bound)[:, None], k, 0.0)
-            dots = tl.dot(q, tl.trans(kr))                                             # [HP, BT] fp32
-            w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
-            sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
-            sc = tl.where(t < bound, sc, float("-inf"))
-            tl.store(OUT + r * NT + t, sc, mask=t < NT)
+    if tb * BT < P + rb * RB + RB:
+        d = tl.arange(0, D)
+        hh = tl.arange(0, HP)
+        hok = hh < H
+        k = tl.load(IK + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < (P + rb * RB + RB))[:, None],
+                    other=0.0).to(tl.bfloat16)                                         # [BT, D]
+        for i in tl.static_range(RB):
+            r = rb * RB + i
+            if r < R:
+                bound = P + r + 1
+                q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None],
+                            other=0.0).to(tl.bfloat16)
+                kr = tl.where((t < bound)[:, None], k, 0.0)
+                dots = tl.dot(q, tl.trans(kr))                                         # [HP, BT] fp32
+                w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
+                sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
+                sc = tl.where(t < bound, sc, float("-inf"))
+                tl.store(OUT + r * NT + t, sc, mask=t < NT)
+    else:
+        # every token of the block is past every row's last visible one: the scores the dot would give, -inf
+        for i in tl.static_range(RB):
+            r = rb * RB + i
+            if r < R:
+                tl.store(OUT + r * NT + t, tl.full((BT,), float("-inf"), tl.float32), mask=t < NT)
 
 
 def _order_key(scores: torch.Tensor) -> torch.Tensor:
@@ -243,6 +253,7 @@ def sparse_buckets(capacity: int, dense_limit: int) -> list[int]:
 
 
 SELECT_BYTES = 96 << 20     # a selection's scores and sort keys held at once: a prompt chunk selects in row blocks
+TRIM = os.environ.get("TF_GLM_SELECT_TRIM", "1") != "0"   # prompt chunks score up to their last visible token only
 RADIX_ROWS = 16             # blocks of this many rows or more select with _radix_topk (a program a row), fewer rows
                             # (decode windows) with _split_topk: the tokens torch.topk + sort pick, 5x faster for a
                             # 2,048-row chunk at 128k and ~10x for a decode row (check_select.py)
@@ -266,6 +277,10 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: 
         raise ValueError("select_tokens: index queries must be contiguous rows, weights unit-stride columns")
     np_max = bucket if bucket is not None else sparse_bucket(int(pos) if pos is not None
                                                              else int(pos_dev.item()), R)
+    if TRIM and bucket is None and pos is not None and R >= RADIX_ROWS:
+        # a prompt chunk (eager, host position known) scores only up to its last row's visible tokens: past them
+        # every score is -inf, which neither a selected row's top-k nor its order can contain (it sees > topk tokens)
+        np_max = min(np_max, -(-(int(pos) + R) // 64) * 64)
     np_max = min(np_max, keys.shape[0])
     per_row = 4 * np_max if R >= RADIX_ROWS else 12 * np_max      # the radix path keeps only the fp32 scores
     rows = max(1, min(R, SELECT_BYTES // per_row))
