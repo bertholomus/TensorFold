@@ -34,6 +34,55 @@ def rank_sum(qr: torch.Tensor, br: torch.Tensor) -> torch.Tensor:
     return br
 
 
+# -- the embedding split by vocabulary (weights.embed_span): a rank's own rows, then each token's from its holder ------
+@triton.jit
+def _embed_span(IDS, W, OUT, lo, n, D: tl.constexpr):
+    """Row r, group g: 64 values of token IDS[r]'s row when this rank holds it (table rows lo .. lo + n), else zeros."""
+
+    row = tl.program_id(0)
+    d = tl.program_id(1) * 64 + tl.arange(0, 64)
+    tok = tl.load(IDS + row).to(tl.int64) - lo
+    mine = (tok >= 0) & (tok < n)
+    v = tl.load(W + tl.where(mine, tok, 0) * D + d, mask=(d < D) & mine, other=0.0)
+    tl.store(OUT + row * D + d, v)
+
+
+def embed_span(ids: torch.Tensor, table: torch.Tensor, lo: int, out: torch.Tensor) -> torch.Tensor:
+    """out [R, D] bf16: the rows of the tokens this rank's table slice holds (its first token ``lo``), zeros for the
+    rest."""
+
+    rows, dims = out.shape
+    if not out.is_contiguous() or dims % 64:
+        raise ValueError("embed_span: out must be contiguous rows of a multiple of 64 values")
+    _embed_span[(rows, dims // 64)](ids, table, out, lo, table.shape[0], D=dims, num_warps=1)
+    return out
+
+
+@triton.jit
+def _embed_pick(IDS, G, OUT, R, SPAN, BIG, EXTRA, DIV, D: tl.constexpr):
+    """Row r, group g: token IDS[r]'s row from G [world, R, D], every rank's rows, taking the holder's: blocks of 128
+    tokens, the first EXTRA ranks SPAN blocks each (BIG blocks in all) and the rest DIV (weights.embed_owner)."""
+
+    row = tl.program_id(0)
+    d = tl.program_id(1) * 64 + tl.arange(0, 64)
+    block = tl.load(IDS + row).to(tl.int64) // 128
+    owner = tl.where(block < BIG, block // SPAN, EXTRA + (block - BIG) // DIV)
+    tl.store(OUT + row * D + d, tl.load(G + (owner * R + row) * D + d))
+
+
+def embed_pick(ids: torch.Tensor, gathered: torch.Tensor, out: torch.Tensor, vocab: int) -> torch.Tensor:
+    """out [R, D] bf16: each token's row from the rank that holds it, out of gathered [world, R, D] (every rank's
+    embed_span output)."""
+
+    world, rows, dims = gathered.shape
+    if not (out.is_contiguous() and gathered.is_contiguous()) or dims % 64:
+        raise ValueError("embed_pick: contiguous rows of a multiple of 64 values")
+    base, extra = divmod(-(-vocab // 128), world)
+    _embed_pick[(rows, dims // 64)](ids, gathered, out, rows, base + 1, extra * (base + 1), extra, max(base, 1),
+                                    D=dims, num_warps=1)
+    return out
+
+
 # -- LayerNorm (biased, the indexer key norm) -----------------------------------------------------------------
 @triton.jit
 def _layernorm(X, x_stride, W, B, OUT, o_stride, eps, D: tl.constexpr, BLOCK: tl.constexpr):

@@ -17,7 +17,7 @@ from tensorfold.cuda.geometry import share, share_lo
 from tensorfold.families.glm5_next.cuda import latent
 from tensorfold.families.glm5_next.cuda.qmm import B16, make_b16, stack_b16
 
-from .x3 import X3, X3Pair
+from .x3 import X3, X3Pair, vocab_slice
 
 PREFIX = "model.language_model."      # also bare "model." (the reference layout): both tried below
 
@@ -172,7 +172,7 @@ class MTPW:
 @dataclass
 class Weights:
     cfg: Config
-    embed: torch.Tensor       # [vocab, hidden] bf16 (replicated)
+    embed: torch.Tensor       # [rows, hidden] bf16: this rank's embed_span of the table (whole: world 1, or split off)
     layers: list[LayerW]
     norm: torch.Tensor
     head: B16 | X3            # this rank's vocabulary slice (an EXL3 head pads every rank to one width)
@@ -183,6 +183,7 @@ class Weights:
     comm: Any = None
     meta: dict = field(default_factory=dict)
     draft_head: None = None   # BF16 heads keep the verification head; no quantized copy is needed
+    embed_lo: int = 0         # the first token of this rank's embedding rows
 
     @property
     def vocab_offset(self) -> int:
@@ -220,6 +221,46 @@ class Weights:
         add(self.head)
         add(self.mtp)
         return total
+
+
+def embed_split() -> bool:
+    """Whether each rank holds only its embed_span of the embedding (TF_GLM_EMBED_SPLIT=0: the whole table on every
+    rank, as before; every rank must agree, and tools that run one rank without its peers keep the whole table)."""
+
+    return os.environ.get("TF_GLM_EMBED_SPLIT", "1") != "0"
+
+
+def embed_span(vocab: int, world: int, rank: int) -> tuple[int, int]:
+    """(first token, rows) of the embedding table one rank holds: the EXL3 head's vocabulary span (whole 128-row
+    blocks, x3.vocab_slice), so the rank that scores a token also holds its row. GLM-5.3 at TP4: 38,784 / 38,784 /
+    38,656 / 38,656 of 154,880 rows, 0.44 GiB a rank where every rank held the whole 1.77 GiB table."""
+
+    if not embed_split():
+        return 0, vocab
+    lo, mine, _ = vocab_slice(-(-vocab // 128), world, rank)
+    first = min(lo * 128, vocab)
+    return first, min((lo + mine) * 128, vocab) - first
+
+
+def embed_owner(token: int, vocab: int, world: int) -> int:
+    """The rank whose embed_span holds ``token``: glue.embed_pick's arithmetic (the first blocks % world ranks hold one
+    128-row block more than the others)."""
+
+    base, extra = divmod(-(-vocab // 128), world)
+    block, big = token // 128, extra * (base + 1)
+    return block // (base + 1) if block < big else extra + (block - big) // max(base, 1)
+
+
+def embed_transform(transform, vocab: int, world: int, rank: int):
+    """A startup weight transform that prices this rank's embed_span rows of the embedding, not the whole table."""
+
+    def priced(name: str, info: dict):
+        shape = info.get("shape") or []
+        if name.endswith("embed_tokens.weight") and len(shape) == 2:
+            return transform(name, {**info, "shape": [embed_span(vocab, world, rank)[1], shape[1]]})
+        return transform(name, info)
+
+    return priced
 
 
 def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
@@ -397,7 +438,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
         lo = share_lo(cfg.vocab, world, rank)
         return make_b16(t("lm_head.weight")[lo:lo + vl].to(dev).contiguous())
 
-    embed = t("embed_tokens.weight", torch.bfloat16).contiguous().to(dev)
+    # this rank's vocabulary span of the embedding only (forward.embed gathers the other ranks' rows)
+    e0, en = embed_span(cfg.vocab, world, rank)
+    embed = rd.get(name("embed_tokens.weight"))[e0:e0 + en].to(device=dev, dtype=torch.bfloat16, copy=True)
     try:
         built = [layer(i) for i in range(cfg.layers)]
         meta: dict = {}
@@ -411,7 +454,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
                                t(f"layers.{i}.post_attention_layernorm.weight", torch.bfloat16)))
             mtpw.layer.dsa = dsa(i, full=True)
             mtpw.layer.moe = moe(f"layers.{i}.mlp.")
-        w = Weights(cfg, embed, built, t("norm.weight", torch.bfloat16), head, mtpw, rank, world, dev)
+        w = Weights(cfg, embed, built, t("norm.weight", torch.bfloat16), head, mtpw, rank, world, dev, embed_lo=e0)
         w.meta.update(layers=list(range(cfg.layers)), x3=x3_users, **meta)
     finally:
         rd.close()

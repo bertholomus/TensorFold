@@ -9,7 +9,7 @@ import torch
 from tensorfold.families.glm5_next.cuda.weights import Weights as FlashWeights  # noqa: F401  (type docs)
 
 from . import glue, rope as rope_mod
-from .forward import Buffers, State, check_room, dsa_block, mm, moe_block, residual
+from .forward import Buffers, State, check_room, dsa_block, embed, mm, moe_block, residual
 from .weights import Weights
 
 
@@ -32,12 +32,10 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = 
                 nch: int | None = None, host_pos: int | None = None, sparse_np: int | None = None) -> torch.Tensor:
     """The MTP head's GPU work on staged rows (capturable)."""
 
-    from tensorfold.families.glm5_next.cuda import glue as fglue
-
     c = w.cfg
     m = w.mtp
     D = c.hidden
-    fglue.embed(b.ids[:n], w.embed, D, 1, b.me[:n])
+    embed(w, b, b.ids[:n], b.me[:n])
     if b.zero_first:
         b.me[0].zero_()
     glue.rmsnorm(b.me[:n], m.enorm, c.eps, b.mcat[:n, :D])

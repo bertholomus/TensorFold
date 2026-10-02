@@ -35,6 +35,8 @@ def main() -> None:
     from tensorfold.families.glm_moe_dsa.cuda.engine import GlmEngine
 
     fwd.PROMPT_REDUCE = "gather"
+    # alone, no rank holds the others' embedding rows: keep the whole table (real rows, real routing)
+    os.environ["TF_GLM_EMBED_SPLIT"] = "0"
     eng = GlmEngine(MODEL, rank=0, master="127.0.0.1", port=29999, policy="3", context=32768, context_explicit=True,
                     comm=Alone(0, int(os.environ.get("TF_TP_WORLD", "4"))), prefill_rows=max(ROWS_A, ROWS_B))
     e = eng.e

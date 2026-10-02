@@ -53,7 +53,7 @@ del model
 torch.cuda.empty_cache()
 
 from tensorfold.families.glm_moe_dsa.cuda import forward as fwd, glue, rope as rope_mod, mla_pe
-from tensorfold.families.glm5_next.cuda import glue as fglue, latent as latent_mod
+from tensorfold.families.glm5_next.cuda import latent as latent_mod
 from tensorfold.families.glm_moe_dsa.cuda.weights import load
 
 w = load(MODEL, rank=0)
@@ -70,7 +70,7 @@ a = layer.dsa
 HL = a.heads
 with torch.no_grad():
     n = fwd.stage(w, st, b, ids[0].tolist())
-    fglue.embed(b.ids[:n], w.embed, c.hidden, 1, b.x[:n])
+    fwd.embed(w, b, b.ids[:n], b.x[:n])
     M["x0"] = b.x[:n].float().clone()
     rope_mod.table(b.cos[:n], b.sin[:n], st.pos_dev, n, c.rope_theta, c.qk_rope)
     glue.rmsnorm(b.x[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
@@ -89,7 +89,7 @@ with torch.no_grad():
     # full block from the start, as the engine runs it
     st.reset()
     fwd.stage(w, st, b, ids[0].tolist())
-    fglue.embed(b.ids[:n], w.embed, c.hidden, 1, b.x[:n])
+    fwd.embed(w, b, b.ids[:n], b.x[:n])
     rope_mod.table(b.cos[:n], b.sin[:n], st.pos_dev, n, c.rope_theta, c.qk_rope)
     glue.rmsnorm(b.x[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
     g = fwd.dsa_block(layer, w, st.kc[0], st.pos_dev, b, n, fwd.chunks_for(st, n), None, st.pos, None, pc=st.pc[0])

@@ -511,14 +511,32 @@ def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:
     return R
 
 
+def embed(w: Weights, b, ids: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """The tokens' embedding rows into ``out`` ([R, D] bf16; capturable). Each rank holds one vocabulary span of the
+    table (weights.embed_span): it writes the rows it holds and zeros elsewhere, every rank gathers all ranks' rows
+    (bf16 pairs as fp32 words, so a decode window's rows take the RDMA gather) and keeps each token's row from the rank
+    that holds it. Only copies: the rows of the whole table, bit for bit."""
+
+    R, D = out.shape
+    if w.embed.shape[0] == w.cfg.vocab:                     # the whole table: one rank, or TF_GLM_EMBED_SPLIT=0
+        from tensorfold.families.glm5_next.cuda import glue as fglue
+
+        return fglue.embed(ids, w.embed, D, 1, out)
+    if w.embed.shape[0]:
+        glue.embed_span(ids, w.embed, w.embed_lo, out)
+    else:                                                  # a vocabulary smaller than a block a rank (tiny configs)
+        out.zero_()
+    got = b.gath[:w.world * R * D // 2]
+    w.comm.all_gather(out.view(torch.float32).view(-1), got)
+    return glue.embed_pick(ids, got.view(torch.bfloat16).view(w.world, R, D), out, w.cfg.vocab)
+
+
 def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, nch: int | None = None,
             host_pos: int | None = None, sparse_np: int | None = None):
     """Run capturable GPU work on static buffers and device positions."""
 
-    from tensorfold.families.glm5_next.cuda import glue as fglue
-
     c = w.cfg
-    fglue.embed(b.ids[:R], w.embed, c.hidden, 1, b.x[:R])
+    embed(w, b, b.ids[:R], b.x[:R])
     rope_mod.table(b.cos[:R], b.sin[:R], st.pos_dev, R, c.rope_theta, c.qk_rope)   # device position: graph-safe
     if b.prefill and R >= OVERLAP_ROWS and w.comm is not None and w.world > 2 and b.comm_stream is not None:
         prompt_layers(w, st, b, R, nch, host_pos, sparse_np)

@@ -443,3 +443,79 @@ def test_vocab_slice_covers_the_head_in_whole_blocks():
     assert sum(g[1] for g in six) == blocks                 # every block on exactly one rank
     assert all(six[i + 1][0] == six[i][0] + six[i][1] for i in range(5))   # contiguous
     assert sum(g[1] for g in got) == blocks
+
+
+# ---------------------------------------------------------------- the embedding split by vocabulary
+
+def test_embed_spans_tile_the_vocabulary_in_the_heads_blocks(monkeypatch):
+    """Each rank holds the EXL3 head's span of the embedding (whole 128-row blocks): the spans tile the vocabulary in
+    rank order, start where the head's columns do, and embed_owner (glue.embed_pick's arithmetic) names every token's
+    holder, for GLM-5.3's vocabulary and for vocabularies with a partial last block or fewer blocks than ranks.
+    TF_GLM_EMBED_SPLIT=0 gives every rank the whole table."""
+
+    from tensorfold.families.glm_moe_dsa.cuda.weights import embed_owner, embed_span
+
+    monkeypatch.setenv("TF_GLM_EMBED_SPLIT", "0")
+    assert [embed_span(154880, 4, r) for r in range(4)] == [(0, 154880)] * 4
+    monkeypatch.delenv("TF_GLM_EMBED_SPLIT")
+    from tensorfold.families.glm_moe_dsa.cuda.x3 import vocab_slice
+
+    assert [embed_span(154880, 4, r) for r in range(4)] == [(0, 38784), (38784, 38784), (77568, 38656),
+                                                             (116224, 38656)]
+    for vocab in (154880, 256, 300, 129, 100):
+        for world in (1, 2, 3, 4, 6, 8):
+            spans = [embed_span(vocab, world, r) for r in range(world)]
+            assert spans[0][0] == 0 and sum(n for _, n in spans) == vocab
+            owner = np.array([embed_owner(t, vocab, world) for t in range(vocab)])
+            for r, (first, n) in enumerate(spans):
+                if r:
+                    assert first == spans[r - 1][0] + spans[r - 1][1]           # contiguous, in rank order
+                if n:
+                    assert first == vocab_slice(-(-vocab // 128), world, r)[0] * 128     # the head's span start
+                assert (owner[first:first + n] == r).all(), (vocab, world, r)
+
+
+def test_embed_transform_prices_one_span_of_the_table(monkeypatch):
+    """The startup estimate prices a rank's embed_span rows of the embedding, every other tensor as the plain split
+    rule does: at TP4 a rank counts 0.44 GiB of embedding where the plain rule counts the whole 1.77 GiB table."""
+
+    monkeypatch.delenv("TF_GLM_EMBED_SPLIT", raising=False)
+    from tensorfold.cuda.geometry import split_weights
+    from tensorfold.families.glm5_next.cuda.split import rule
+    from tensorfold.families.glm_moe_dsa.cuda.weights import embed_transform
+
+    plain = split_weights(rule, 4)
+    table = {"dtype": "BF16", "shape": [154880, 6144]}
+    whole = plain("model.embed_tokens.weight", table)[0]
+    assert whole == 154880 * 6144 * 2                                  # replicated by the plain rule
+    priced = [embed_transform(plain, 154880, 4, r)("model.embed_tokens.weight", table)[0] for r in range(4)]
+    assert priced == [n * 6144 * 2 for n in (38784, 38784, 38656, 38656)]
+    assert sum(priced) == whole and whole - priced[0] > 1.32 * 2 ** 30
+    norm = {"dtype": "BF16", "shape": [6144]}
+    assert embed_transform(plain, 154880, 4, 1)("model.norm.weight", norm) == plain("model.norm.weight", norm)
+
+
+def test_loader_holds_its_vocabulary_span_of_the_embedding(tmp_path, monkeypatch):
+    """weights.load keeps this rank's embed_span rows of the tiny checkpoint's table (a copy, bit for bit), and the
+    whole table at world 1."""
+
+    from glm_dsa_fakes import CFG, write_checkpoint
+
+    from tensorfold.families.glm_moe_dsa.cuda import weights as W
+
+    folder = write_checkpoint(tmp_path)
+    V, D = CFG["vocab_size"], CFG["hidden_size"]
+    monkeypatch.delenv("TF_GLM_EMBED_SPLIT", raising=False)
+    monkeypatch.setenv("TF_TP_WORLD", "1")
+    whole = W.load(folder, rank=0, device="cpu")
+    assert whole.embed.shape == (V, D) and whole.embed_lo == 0
+    monkeypatch.setenv("TF_TP_WORLD", "2")
+    for rank in range(2):
+        w = W.load(folder, rank=rank, device="cpu")
+        first, n = W.embed_span(V, 2, rank)
+        assert (w.embed_lo, tuple(w.embed.shape)) == (first, (n, D)) == (128 * rank, (128, D))
+        assert torch.equal(w.embed.view(torch.int16), whole.embed[first:first + n].view(torch.int16))
+        assert w.embed.untyped_storage().nbytes() == n * D * 2              # its own rows, not a view of the table
+    monkeypatch.setenv("TF_GLM_EMBED_SPLIT", "0")                            # the switch: every rank the whole table
+    kept = W.load(folder, rank=1, device="cpu")
+    assert kept.embed_lo == 0 and torch.equal(kept.embed.view(torch.int16), whole.embed.view(torch.int16))

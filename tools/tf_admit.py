@@ -11,7 +11,7 @@ from tensorfold.cuda.capacity import admit
 from tensorfold.cuda.geometry import split_weights
 from tensorfold.families.glm5_next.cuda.split import rule
 from tensorfold.families.glm_moe_dsa.cuda.engine import GlmEngine
-from tensorfold.families.glm_moe_dsa.cuda.weights import Config
+from tensorfold.families.glm_moe_dsa.cuda.weights import Config, embed_transform
 
 model, world = Path(sys.argv[1]), int(os.environ.get("TF_TP_WORLD", "4"))
 torch.cuda.set_device(0)
@@ -22,7 +22,8 @@ print(f"KV state a token a rank as allocated: {per_token} B ({cfg.layers + 1} la
 geometry = GlmEngine._geometry
 for ctx in (32768, 65536, 131072, 196608, 262144, 327680, 393216, 524288, 1048576):
     try:
-        r = admit(model, ctx, True, torch, lambda text: geometry(text, world), split_weights(rule, world), rank=0,
+        r = admit(model, ctx, True, torch, lambda text: geometry(text, world),
+                  embed_transform(split_weights(rule, world), cfg.vocab, world, 0), rank=0,
                   world=world, gather=lambda s: [s] * world)
         print(f"{ctx:8d}: admitted, estimate {r['total_bytes_estimate'] / 2**30:.2f} GiB of {r['budget_bytes'] / 2**30:.2f}"
               f" (weights {r['weight_bytes_estimate'] / 2**30:.2f}, cache+workspace "

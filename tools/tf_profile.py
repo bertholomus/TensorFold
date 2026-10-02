@@ -103,6 +103,8 @@ def main() -> None:
     alone = os.environ.get("TF_PROFILE_LOCAL") == "1"
     if alone:
         fwd.PROMPT_REDUCE = "gather"
+        # alone, no rank holds the others' embedding rows: keep the whole table (real rows, real routing)
+        os.environ["TF_GLM_EMBED_SPLIT"] = "0"
     eng = GlmEngine(MODEL, rank=RANK, master=MASTER, port=PORT, policy="3", context=CONTEXT, context_explicit=True,
                     comm=Alone(RANK, int(os.environ.get("TF_TP_WORLD", "4"))) if alone else None)
     e, w = eng.e, eng.w

@@ -52,11 +52,10 @@ st.reset()
 mine = []
 with torch.no_grad():
     R = fwd.stage(w, st, b, ids[0].tolist())
-    from tensorfold.families.glm5_next.cuda import glue as fglue
     from tensorfold.families.glm_moe_dsa.cuda import glue, rope as rope_mod
 
     c = w.cfg
-    fglue.embed(b.ids[:R], w.embed, c.hidden, 1, b.x[:R])
+    fwd.embed(w, b, b.ids[:R], b.x[:R])
     mine.append(("embed", b.x[:R].float().clone()))
     rope_mod.table(b.cos[:R], b.sin[:R], st.pos_dev, R, c.rope_theta, c.qk_rope)
     nch = fwd.chunks_for(st, R)

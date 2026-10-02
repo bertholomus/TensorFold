@@ -57,23 +57,26 @@ class GlmEngine:
             comm = _rdma(comm, rank, world, MAX_ROWS * Config.read(model_dir).hidden * 4)
         self.comm = comm
         self.comm.barrier()
-        from tensorfold.families.glm_moe_dsa.cuda.weights import Config
+        from tensorfold.families.glm_moe_dsa.cuda.weights import Config, embed_split, embed_transform
 
         cfg = Config.read(model_dir)
         # GLM-5.3 has no k-pool: the dense limit is index_topk visible tokens
         explicit = context is not None if context_explicit is None else bool(context_explicit)
+        # each rank holds its vocabulary span of the embedding (weights.embed_span), not the whole table
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: self._geometry(text, world),
-                                   split_weights(rule, world), rank=rank, world=world, gather=self._gather_ints)
+                                   embed_transform(split_weights(rule, world), cfg.vocab, world, rank),
+                                   rank=rank, world=world, gather=self._gather_ints)
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
-                prefill_rows]
+                prefill_rows, int(embed_split())]
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
-            raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT):"
+            raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
+                               " TF_GLM_EMBED_SPLIT):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
         w = load(model_dir, rank=rank)
         w.comm = self.comm
