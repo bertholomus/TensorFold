@@ -264,11 +264,13 @@ __global__ void combine_kernel(const float* __restrict__ y, const float* __restr
 
 // down_epilogue_kernel then combine_kernel in one launch, the same arithmetic in the same order (the same bits). With
 // store_y the routed slots' outputs go to y and a non-routed slot's comes from it (the caller's); without (prompt
-// chunks: nothing reads them after the combine) y is neither written nor read and a non-routed slot adds w * 0.
+// chunks: nothing reads them after the combine) y is neither written nor read and a non-routed slot adds w * 0. With
+// add (a [rows, D] fp32 term, e.g. the shared expert's output) each combined row gets it added last, the add the
+// caller would make after this launch.
 __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                     const half* __restrict__ svh_d, float* __restrict__ y,
-                                    const float* __restrict__ wts, float* __restrict__ out, int P, int D, int SK,
-                                    int E, int slots, int store_y) {
+                                    const float* __restrict__ wts, const float* __restrict__ add,
+                                    float* __restrict__ out, int P, int D, int SK, int E, int slots, int store_y) {
     __shared__ float4 part[32][32];                 // [slot][lane]: the slot's 4 outputs of the lane
     const int r = blockIdx.x, blk = blockIdx.y;
     const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -307,7 +309,8 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
         acc[3] = fmaf(w, u.w, acc[3]);
     }
 #pragma unroll
-    for (int j = 0; j < 4; ++j) out[(size_t)r * D + n + j] = acc[j];
+    for (int j = 0; j < 4; ++j)
+        out[(size_t)r * D + n + j] = add ? __fadd_rn(acc[j], add[(size_t)r * D + n + j]) : acc[j];
 }
 
 }  // namespace
@@ -517,13 +520,13 @@ void exl3x_combine_cuda(const at::Tensor& y, const at::Tensor& wts, at::Tensor& 
 }
 
 void exl3x_down_combine_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor& y,
-                             const at::Tensor& wts, at::Tensor& out, int64_t rows, int64_t P, int64_t D, int64_t SK,
-                             int64_t slots, int64_t E, int64_t store_y) {
+                             const at::Tensor& wts, const at::Tensor& add, at::Tensor& out, int64_t rows, int64_t P,
+                             int64_t D, int64_t SK, int64_t slots, int64_t E, int64_t store_y, int64_t has_add) {
     TORCH_CHECK(slots <= 32, "at most 32 slots a row");
     dim3 grid((unsigned)rows, (unsigned)(D / 128));
     down_combine_kernel<<<grid, (unsigned)(32 * slots), 0, at::cuda::getCurrentCUDAStream()>>>(
         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
-        y.data_ptr<float>(), wts.data_ptr<float>(), out.data_ptr<float>(), (int)P, (int)D, (int)SK, (int)E,
-        (int)slots, (int)store_y);
+        y.data_ptr<float>(), wts.data_ptr<float>(), has_add ? add.data_ptr<float>() : nullptr, out.data_ptr<float>(),
+        (int)P, (int)D, (int)SK, (int)E, (int)slots, (int)store_y);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

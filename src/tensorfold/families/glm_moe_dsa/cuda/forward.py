@@ -37,6 +37,10 @@ PROMPT_REDUCE = os.environ.get("TF_GLM_PROMPT_REDUCE") or "rows"
 # stream beside the other's compute (TF_GLM_PROMPT_OVERLAP=0: one batch); every row keeps its bits
 OVERLAP_ROWS = 256 if os.environ.get("TF_GLM_PROMPT_OVERLAP", "1") != "0" else 1 << 30
 COMM_PRIORITY = int(os.environ.get("TF_GLM_COMM_PRIORITY", "-1"))   # the comm stream's priority (lower is higher)
+# prompt chunks run the shared expert before the routed experts and the routed combine adds its output (one pass over
+# the fp32 partial less; the same add); TF_GLM_SHARED_INLINE=0: after them, then part += sy. (On a stream of its own
+# beside the routed experts it was slower: 41.1 vs 40.4-40.9 s at 26k tokens on TP4.)
+SHARED_INLINE = os.environ.get("TF_GLM_SHARED_INLINE", "1") != "0"
 
 
 class Rows:
@@ -389,7 +393,8 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     """Routed experts on ``tensorfold.cuda.exl3.experts`` (any width and codebook), then the shared expert, in fp32.
 
     The routed slots' weighted sum comes out of one fused launch in slot order (the shared expert's slot, id E,
-    is skipped there); the shared expert's output is added last, the same order as Flash's combine.
+    is skipped there); the shared expert's output is added last, the same order as Flash's combine (a prompt chunk
+    computes it first and the fused launch adds it: the same add, without another pass over the partial).
     """
 
     import math
@@ -405,21 +410,25 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         glue.silu_mul(b.sgu[:R], b.sact[:R], b.sxs[:R])
         mm(b, b.sact[:R], s.down, b.sxs[:R], b.sy[:R], f32=True, sc=sc)
 
+    inline = SHARED_INLINE and b.prefill and b.side is None   # a prompt chunk: the shared expert first
     if b.side is not None:                   # the shared expert on the side stream while the routed experts run
         with fork(b):
             shared(b.x3s)
+    elif inline:
+        shared(None)
     with prof.timed("moe: route"):
         glue.router(b.normed[:R], m.router, b.mlog[:R])
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
     with prof.timed("moe: routed"):
         # GLM-5.3 has no swiglu_limit; the bf16 activation roundings are the GLM family's
         x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], m.experts.ex, b.moe, b.part[:R], R,
-                         limit=math.inf, act_mode=x3experts.ACT_BF16)
+                         limit=math.inf, act_mode=x3experts.ACT_BF16, add=b.sy[:R] if inline else None)
     if b.side is not None:
         join(b)
-    else:
+    elif not inline:
         shared(None)
-    b.part[:R].add_(b.sy[:R])
+    if not inline:
+        b.part[:R].add_(b.sy[:R])
     with prof.timed("moe: all-gather"):
         return gather(w, b, R)
 

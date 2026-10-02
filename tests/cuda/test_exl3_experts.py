@@ -404,6 +404,27 @@ def test_fused_down_and_combine_equal_the_separate_launches(slots):
         assert torch.equal(fused.view(torch.int32), apart.view(torch.int32)), (slots, R)
 
 
+def test_combine_adds_a_term_last():
+    """routed(..., add=t) (prompt chunks pass the shared expert's output) equals routed() + t, bit for bit, on the
+    one-tile and the prompt paths."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK = 24, 1024, 256, 6
+    _, cb, kfun = MIXED[2]
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=77)
+    g = torch.Generator().manual_seed(3)
+    R = 300
+    x = torch.randn((R, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _picks(E, R, TOPK, g, shared=True)
+    t = (torch.randn((R, D), generator=g) * 0.3).float().cuda()
+    scratch = experts.Scratch(ex, R, TOPK + 1)
+    for prompt in (False, True):
+        plain = experts.routed(x, sel, w, ex, scratch, None, R, prompt=prompt).clone()
+        added = experts.routed(x, sel, w, ex, scratch, None, R, prompt=prompt, add=t).clone()
+        assert torch.equal(added.view(torch.int32), (plain + t).view(torch.int32)), prompt
+
+
 # -------------------------------------------------------------------------------------------------- the lane map
 
 def test_lane_map_extracts_every_window():

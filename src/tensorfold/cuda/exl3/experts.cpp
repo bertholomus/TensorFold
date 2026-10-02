@@ -27,7 +27,8 @@ void exl3x_down_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Te
                               int64_t, int64_t, int64_t, int64_t);
 void exl3x_combine_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_down_combine_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, const at::Tensor&,
-                             at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+                             const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                             int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -192,8 +193,8 @@ void combine(const at::Tensor& y, const at::Tensor& wts, at::Tensor out, int64_t
 }
 
 void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, at::Tensor y,
-                  const at::Tensor& wts, at::Tensor out, int64_t rows, int64_t P, int64_t D, int64_t SK, int64_t slots,
-                  int64_t E, int64_t store_y) {
+                  const at::Tensor& wts, const at::Tensor& add, at::Tensor out, int64_t rows, int64_t P, int64_t D,
+                  int64_t SK, int64_t slots, int64_t E, int64_t store_y, int64_t has_add) {
     check(Z, at::kFloat, "Z");
     check(pick, at::kInt, "pick");
     check(svh_d, at::kHalf, "svh_d");
@@ -201,8 +202,12 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
     check(wts, at::kFloat, "wts");
     check(out, at::kFloat, "out");
     TORCH_CHECK(D % 128 == 0, "D must be a multiple of 128");
+    if (has_add) {
+        check(add, at::kFloat, "add");
+        TORCH_CHECK(add.numel() >= rows * D, "add too small");
+    }
     c10::cuda::CUDAGuard guard(Z.device());
-    exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, out, rows, P, D, SK, slots, E, store_y);
+    exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, add, out, rows, P, D, SK, slots, E, store_y, has_add);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

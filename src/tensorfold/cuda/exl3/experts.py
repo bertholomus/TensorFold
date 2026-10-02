@@ -192,8 +192,9 @@ class Scratch:
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True, prompt: bool | None = None) -> torch.Tensor:
-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``.
+           group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None) -> torch.Tensor:
+    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts`` (plus
+    ``add`` [R, D] fp32 added last, in the same launch, when given).
 
     Decode windows make no host sync. Prompt chunks (``group`` and R >= EXACT_ROWS) read the busiest expert's row count
     once; with ``prompt`` (default TF_EXL3_PROMPT_TILES) they group in parallel and decode each weight tile once for
@@ -266,7 +267,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two); a prompt
     # chunk leaves the per-slot outputs unwritten (453 MB a layer at 2,048 rows that nothing reads)
-    ext.down_combine(s.z, pick, ex.svh_d, s.no_y if fast else s.y, wts, out, R, P, D, dsk, slots, E, 0 if fast else 1)
+    ext.down_combine(s.z, pick, ex.svh_d, s.no_y if fast else s.y, wts, s.no_y if add is None else add, out, R, P, D,
+                     dsk, slots, E, 0 if fast else 1, int(add is not None))
     return out
 
 
