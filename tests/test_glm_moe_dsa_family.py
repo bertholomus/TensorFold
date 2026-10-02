@@ -191,8 +191,6 @@ def test_loader_builds_every_layer_from_the_tiny_checkpoint(tmp_path, monkeypatc
 
     from tensorfold.families.glm_moe_dsa.cuda import weights as W
 
-    from tensorfold.cuda.geometry import share
-
     folder = write_checkpoint(tmp_path)
     monkeypatch.setenv("TF_TP_WORLD", "2")
     w = W.load(folder, rank=0, device="cpu")
@@ -212,8 +210,7 @@ def test_loader_builds_every_layer_from_the_tiny_checkpoint(tmp_path, monkeypatc
             assert a.index.weights.shape == (CFG["index_n_heads"], CFG["hidden_size"])
         if layer.moe is not None:
             ex = layer.moe.experts
-            assert ex.count == share(CFG["n_routed_experts"], 2)      # this rank's experts (uneven splits OK)
-            assert ex.count == (CFG["n_routed_experts"] + 1) // 2
+            assert ex.count == CFG["n_routed_experts"]      # every rank holds every expert (5b128db)
             assert layer.moe.shared is not None
             assert ex.ex is None and ex.parts is not None       # a CPU load keeps the rank's triples
             # this rank's down trellis per expert: [(moe_width/world)/16, hidden/16, 16 * bits] int16

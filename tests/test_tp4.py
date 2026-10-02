@@ -807,15 +807,14 @@ def test_glm_moe_dsa_loader_w6_on_the_tiny_checkpoint(tmp_path, monkeypatch):
         assert a.q_b.n > 0 or hl == 0
         if w.layers[1].moe is not None:
             ex = w.layers[1].moe.experts
-            assert ex.count == share(CFG["n_routed_experts"], 6, rank)
+            # every rank holds the whole expert set (5b128db: the router picks global expert ids), each expert
+            # at the rank's share of the width
+            assert ex.count == CFG["n_routed_experts"]
             # the routed-expert width splits in whole 16-row trellis tiles (the tiny scale has 2 tiles:
-            # ranks 0-1 hold one, ranks 2-5 none); the real 2048 rows split 352/352/336/336/336/336.
-            # A rank with no experts keeps the full-width zero-count placeholder (the real scale never
-            # hits this: 128 tiles // 6 leaves every rank >= 21 tiles)
-            assert ex.count == share(CFG["n_routed_experts"], 6, rank)
-            if ex.count:
-                assert ex.width % 16 == 0
-                assert ex.width == 16 * share(CFG["moe_intermediate_size"] // 16, 6, rank)
+            # ranks 0-1 hold one, ranks 2-5 none); the real 2048 rows split 352/352/336/336/336/336
+            # (128 tiles // 6 leaves every rank >= 21 tiles)
+            assert ex.width % 16 == 0
+            assert ex.width == 16 * share(CFG["moe_intermediate_size"] // 16, 6, rank)
         # lm_head: this rank's contiguous vocab span under the balanced split
         vl = share(CFG["vocab_size"], 6, rank)
         assert w.head.weight.shape == (vl, CFG["hidden_size"])
@@ -826,5 +825,6 @@ def test_glm_moe_dsa_loader_w6_on_the_tiny_checkpoint(tmp_path, monkeypatch):
     assert offsets[0] == 0
     assert all(offsets[i + 1] == offsets[i] + loaded[i].head.weight.shape[0] for i in range(5))
     assert offsets[-1] + loaded[-1].head.weight.shape[0] == CFG["vocab_size"]
-    # experts: 1/1/1/1/0/0 over the 4 tiny experts, spans contiguous
-    assert [w.layers[1].moe.experts.count for w in loaded] == [1, 1, 1, 1, 0, 0]
+    # experts: all 4 tiny experts on every rank, their width in whole tiles 16/16/0/0/0/0
+    assert [w.layers[1].moe.experts.count for w in loaded] == [4] * 6
+    assert [w.layers[1].moe.experts.width for w in loaded] == [16, 16, 0, 0, 0, 0]
