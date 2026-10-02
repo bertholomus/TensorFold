@@ -245,7 +245,7 @@ def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
     sparse_rows = long_ctx and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
     with prof.timed("dsa: absorb"):
-        qa = latent_mod.absorb_q(b.q[:R], a.absorb, s.qa[:R])          # rope columns of wk are zero: q_nope . W_UK
+        qa = mla_pe.absorb_q(b.q[:R], a.absorb, s.qa[:R])              # rope columns of wk are zero: q_nope . W_UK
         qp = mla_pe.gather_pe(b.q[:R], c.qk_nope, b.qp[:R])
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
@@ -266,7 +266,7 @@ def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor
         with prof.timed("dsa: sparse attention"):
             mla_pe.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], ol, scale)
     with prof.timed("dsa: expand"):
-        o = latent_mod.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+        o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
 
 

@@ -8,6 +8,9 @@ Values stay the latent (the rope key is never a value), so the chunk partials an
 
 from __future__ import annotations
 
+import os
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -176,3 +179,96 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache: torch.Tensor, pc
                                                     LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=hb, KTT=KT,
                                                     num_warps=4, num_stages=3)
     _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
+
+
+# -- prompt chunks' absorb (q_nope . W_UK) and expand (o_lat . W_UV): latent's kernels, a row block a program ------------
+# latent._absorb_q / _expand_v run a program per (head, column block) over every row of the window: 256 programs for a
+# whole prompt chunk. These are the same programs over RB rows each (program id 2): each row's tile, product and tl.sum
+# are latent's (same shapes, BN and warps), so every row gets the same bits; a chunk gets R / RB times the programs.
+PROMPT_RB = 64
+# "cuda": latent_rows.cu, the Triton kernels' sums in their order without a barrier a row (bf16 weights, 256 -> 512 ->
+# 256 per head); "triton": _absorb_rows / _expand_rows (TF_GLM_ABSORB)
+ABSORB = os.environ.get("TF_GLM_ABSORB") or "cuda"
+
+
+@lru_cache(maxsize=1)
+def _rows_ext():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    return load(name="tensorfold_glm_latent_rows_v1", sources=[str(Path(__file__).parent / "latent_rows.cu")],
+                extra_cuda_cflags=["-O3"], verbose=False)
+
+
+def _exact_shapes(a) -> bool:
+    return (a.wk.dtype == torch.bfloat16 and a.wv.dtype == torch.bfloat16 and a.wk.shape[1] == 256
+            and a.lw == 512 and a.v_dim % 16 == 0)
+
+
+@triton.jit
+def _absorb_rows(Q, WK, QA, R, H: tl.constexpr, D: tl.constexpr, LW: tl.constexpr, BN: tl.constexpr,
+                 RB: tl.constexpr):
+    """Program (head, column block, row block): QA[r, h, n] = sum_k Q[r, h, k] WK[h, k, n], latent._absorb_q's sum."""
+
+    h = tl.program_id(0)
+    n0 = tl.program_id(1) * BN
+    r0 = tl.program_id(2) * RB
+    k = tl.arange(0, D)
+    n = n0 + tl.arange(0, BN)
+    w = tl.load(WK + (h * D + k[:, None]) * LW + n[None, :]).to(tl.float32)            # [D, BN]
+    for r in range(r0, tl.minimum(r0 + RB, R)):
+        q = tl.load(Q + (r * H + h) * D + k).to(tl.float32)
+        acc = tl.sum(q[:, None] * w, axis=0)
+        tl.store(QA + (r * H + h) * LW + n, acc.to(tl.bfloat16))
+
+
+@triton.jit
+def _expand_rows(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.constexpr, BN: tl.constexpr,
+                 RB: tl.constexpr):
+    """Program (head, output block, row block): OUT[r, h, n] = sum_k OL[r, h, k] WV[h, n, k], latent._expand_v's sum."""
+
+    h = tl.program_id(0)
+    n0 = tl.program_id(1) * BN
+    r0 = tl.program_id(2) * RB
+    k = tl.arange(0, LW)
+    n = n0 + tl.arange(0, BN)
+    w = tl.load(WV + (h * DV + n[:, None]) * LW + k[None, :]).to(tl.float32)          # [BN, LW]
+    for r in range(r0, tl.minimum(r0 + RB, R)):
+        o = tl.load(OL + (r * H + h) * LW + k).to(tl.float32)
+        acc = tl.sum(w * o[None, :], axis=1)
+        tl.store(OUT + (r * H + h) * DV + n, acc.to(tl.bfloat16))
+
+
+def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
+    """latent.absorb_q (q [R, H, qk_dim] -> out [R, H, latent]); a prompt chunk's rows split over programs."""
+
+    from tensorfold.families.glm5_next.cuda import latent
+
+    R, H, D = q.shape
+    if R <= PROMPT_RB or isinstance(a, latent.AbsorbQ4):
+        return latent.absorb_q(q, a, out)
+    if ABSORB == "cuda" and _exact_shapes(a) and q.is_contiguous() and out.is_contiguous():
+        _rows_ext().absorb(q, a.wk, out, PROMPT_RB)
+        return out
+    BN = 32                                              # latent.absorb_q's: the same tile, the same sum
+    _absorb_rows[(H, a.lw // BN, triton.cdiv(R, PROMPT_RB))](q, a.wk, out, R, H=H, D=D, LW=a.lw, BN=BN,
+                                                             RB=PROMPT_RB, num_warps=4)
+    return out
+
+
+def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
+    """latent.expand_v (o_lat [R, H, latent] -> out [R, H, v_dim]); a prompt chunk's rows split over programs."""
+
+    from tensorfold.families.glm5_next.cuda import latent
+
+    R, H, _ = o_lat.shape
+    if R <= PROMPT_RB or isinstance(a, latent.AbsorbQ4):
+        return latent.expand_v(o_lat, a, out)
+    if ABSORB == "cuda" and _exact_shapes(a) and o_lat.is_contiguous() and out.is_contiguous():
+        _rows_ext().expand(o_lat, a.wv, out, PROMPT_RB)
+        return out
+    BN = 16                                              # latent.expand_v's
+    _expand_rows[(H, a.v_dim // BN, triton.cdiv(R, PROMPT_RB))](o_lat, a.wv, out, R, H=H, DV=a.v_dim, LW=a.lw,
+                                                                BN=BN, RB=PROMPT_RB, num_warps=4)
+    return out
