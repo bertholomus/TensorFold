@@ -77,6 +77,15 @@ class Alone:
         torch.cuda.synchronize()
 
 
+def plane_sum(x, n: int) -> torch.Tensor:
+    """An int64 checksum of a cache plane's first n rows (bf16 bits, or an FP8 plane's codes and scales)."""
+
+    from tensorfold.families.glm_moe_dsa.cuda.kv8 import Kv8
+    from tensorfold.families.glm_moe_dsa.cuda.kvq import KvQ
+
+    return x.checksum(n) if isinstance(x, (Kv8, KvQ)) else x[:n].view(torch.int16).to(torch.int64).sum()
+
+
 def kernel_table(prof, top: int = 28) -> None:
     times: dict[str, float] = defaultdict(float)
     counts: dict[str, int] = defaultdict(int)
@@ -335,10 +344,8 @@ def main() -> None:
                 dt = time.perf_counter() - t
                 prof.active = False
                 n_ = len(p)
-                sums = torch.stack([kc[:n_].view(torch.int16).to(torch.int64).sum() for kc in st.kc]
-                                   + [pc[:n_].view(torch.int16).to(torch.int64).sum() for pc in st.pc]
-                                   + [ix[:n_].view(torch.int16).to(torch.int64).sum() for ix in (st.index or [])]
-                                   + [st.mtp_kc[:n_].view(torch.int16).to(torch.int64).sum()])
+                sums = torch.stack([plane_sum(kc, n_) for kc in st.kc] + [plane_sum(pc, n_) for pc in st.pc]
+                                   + [plane_sum(ix, n_) for ix in (st.index or [])] + [plane_sum(st.mtp_kc, n_)])
                 runs.append((first, sums.cpu(), e.last_hidden.clone()))
                 a, b_ = runs[0], runs[-1]
                 say(f"   {v}: {dt:.1f} s ({n_ / dt:.0f} tok/s), first token {first}; vs the first: same first token "

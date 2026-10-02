@@ -19,9 +19,10 @@ def sparse(stages: int, warps: int):
         W = tokens.shape[1]
         nch = triton.cdiv(W, CHUNK)
         po, pm, pl = scratch
-        mla_pe._sparse_chunks_pe[(R, triton.cdiv(H, HB), nch)](qa, qp, cache, pcache, tokens, counts, po, pm, pl, R,
-                                                               W=W, H=H, LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=HB,
-                                                               KTT=KT, num_warps=warps, num_stages=stages)
+        mla_pe._sparse_chunks_pe[(R, triton.cdiv(H, HB), nch)](qa, qp, cache, cache, cache, pcache, tokens, counts,
+                                                               po, pm, pl, R, W=W, H=H, LW=LW, PW=PW, CH=CHUNK,
+                                                               SCALE=scale, HBT=HB, KTT=KT, KV8=False, QB=0,
+                                                               num_warps=warps, num_stages=stages)
         _merge[(R, H)](po, pm, pl, out, counts, R, H=H, LW=LW, NCH=nch, SPARSE=True, num_warps=4)
     return run
 

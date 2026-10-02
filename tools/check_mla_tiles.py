@@ -64,9 +64,10 @@ def staged_attention(stages: int, warps: int = 8):
         R, H, LW = qa.shape
         PW = qp.shape[2]
         n = nch * R * H
-        mla_pe._dense_chunks_pe[(R, triton.cdiv(H, HB), nch)](qa, qp, cache, pcache, pos, s.po[:n * LW], s.pm[:n],
-                                                              s.pl[:n], R, H=H, LW=LW, PW=PW, CH=CHUNK, SCALE=scale,
-                                                              HBT=HB, KTT=KT, num_warps=warps, num_stages=stages)
+        mla_pe._dense_chunks_pe[(R, triton.cdiv(H, HB), nch)](qa, qp, cache, cache, cache, pcache, pos,
+                                                              s.po[:n * LW], s.pm[:n], s.pl[:n], R, H=H, LW=LW, PW=PW,
+                                                              CH=CHUNK, SCALE=scale, HBT=HB, KTT=KT, KV8=False, QB=0,
+                                                              num_warps=warps, num_stages=stages)
         _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
         return out
     return run

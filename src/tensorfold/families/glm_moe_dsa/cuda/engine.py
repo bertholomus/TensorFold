@@ -31,7 +31,7 @@ class GlmEngine:
         from tensorfold.families.glm5_next.cuda import latent
         from tensorfold.families.glm5_next.cuda.split import rule
 
-        from . import forward as fwd
+        from . import forward as fwd, kv8
         from .decode import Engine as Decoder
         from .weights import load
 
@@ -72,12 +72,18 @@ class GlmEngine:
         long_context = self.limit > cfg.dense_limit
         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
-                prefill_rows, int(embed_split())]
+                prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE)]
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
             raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
-                               " TF_GLM_EMBED_SPLIT):"
+                               " TF_GLM_EMBED_SPLIT, TF_GLM_KV):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
+        if rank == 0 and kv8.parse(kv8.MODE) != ("bf16", "bf16"):
+            lat, idx = kv8.parse(kv8.MODE)
+            name = {"bf16": "bf16", "fp8": "FP8 (e4m3, a power-of-two scale a token)"}
+            print(f"[tensorfold] cache TF_GLM_KV={kv8.MODE}: the latent "
+                  f"{name.get(lat) or f'in exllamav3 {lat[1:]}-bit groups (H32-rotated)'}, the indexer keys "
+                  f"{name.get(idx) or f'in exllamav3 {idx[1:]}-bit groups (H32-rotated)'}, the rope key bf16", flush=True)
         w = load(model_dir, rank=rank)
         w.comm = self.comm
         w.meta["long_context"] = long_context
@@ -95,14 +101,16 @@ class GlmEngine:
         self.live: list[int] = []
 
     @staticmethod
-    def _geometry(text: dict, world: int):
+    def _geometry(text: dict, world: int, kv: str | None = None):
         """The Flash MLA geometry minus the KDA and hyper-connection terms, with the MTP head counted, and this family's
         own cache a slot: Flash counts a 512-wide latent and three indexer planes a layer, this family keeps the latent
         plus a 64-wide rope key a layer (and the MTP head's) and one indexer key plane a full-indexer layer (96,640 B a
-        slot at TP4 against Flash's 126,912), and its token selection holds at most select.SELECT_BYTES at once."""
+        slot at TP4 against Flash's 126,912; TF_GLM_KV idx8 93,912, fp8 53,780, q8 55,992, q6 45,880, q5 40,824, q4
+        35,768), and its token selection holds at most select.SELECT_BYTES at once."""
 
         from tensorfold.cuda.geometry import Geometry, mla_geometry
 
+        from . import kv8
         from .select import SELECT_BYTES
 
         t = dict(text)
@@ -115,8 +123,8 @@ class GlmEngine:
         mtp = int(text.get("num_nextn_predict_layers") or 0) > 0
         layers = int(text["num_hidden_layers"]) + int(mtp)
         full = sum(kind == "full" for kind in text.get("indexer_types") or []) + int(mtp)
-        own = (layers * (int(text["kv_lora_rank"]) + int(text["qk_rope_head_dim"]))
-               + full * int(text.get("index_head_dim", 128))) * 2
+        own = kv8.slot_bytes(layers, int(text["kv_lora_rank"]), int(text["qk_rope_head_dim"]), full,
+                             int(text.get("index_head_dim", 128)), kv or kv8.MODE)
         lo, hi = 1 << 20, 1 << 21                      # Flash's bytes a slot past its dense window
         flash_slot = (flash.bytes_at(hi) - flash.bytes_at(lo)) / (hi - lo)
 

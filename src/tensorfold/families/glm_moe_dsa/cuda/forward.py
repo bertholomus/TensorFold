@@ -14,7 +14,9 @@ from tensorfold.families.glm5_next.cuda import latent as latent_mod, prof, qmm a
 
 from tensorfold.cuda.geometry import share
 
-from . import glue, mla_pe, rope as rope_mod, select as select_mod
+from . import glue, kv8, kvq, mla_pe, rope as rope_mod, select as select_mod
+from .kv8 import Kv8
+from .kvq import KvQ
 from .weights import LayerW, Weights
 
 # the Flash buffers' DSA block is reused where the shapes match; the indexer differs (no k-pool)
@@ -216,11 +218,25 @@ class Buffers(FlashBuffers):
 
 
 class State(FlashState):
-    """Latent caches per DSA layer (plus the MTP layer's); no KDA state, indexer planes per full layer."""
+    """Latent caches per DSA layer (plus the MTP layer's); no KDA state, indexer planes per full layer.
 
-    def __init__(self, w: Weights, capacity: int, rows: int) -> None:
+    ``kv`` (default TF_GLM_KV, kv8.parse): the latent planes and the indexer planes each bf16, FP8 (kv8.Kv8) or
+    quantized (kvq.KvQ); the rope key stays bf16."""
+
+    def __init__(self, w: Weights, capacity: int, rows: int, kv: str | None = None) -> None:
         c = w.cfg
         dev = w.device
+        self.kv = kv8.check_mode(kv or kv8.MODE)
+        lat8, idx8, bits = kv8.latent_fp8(self.kv), kv8.index_fp8(self.kv), kv8.latent_bits(self.kv)
+        ibits = kv8.index_bits(self.kv)
+
+        def latent_plane():
+            if bits:
+                return KvQ(capacity, c.kv_lora, bits, dev)
+            if lat8:
+                return Kv8(capacity, c.kv_lora, dev)
+            return torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)
+
         self.capacity = capacity
         self.pos = 0
         self.pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
@@ -228,14 +244,14 @@ class State(FlashState):
         dsa_layers = [l for l in w.layers if l.kind == "dsa"]
         self.dsa_index = {l.index: i for i, l in enumerate(dsa_layers)}
         self.latent = latent_mod.ENABLED
-        self.kc = [torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+        self.kc = [latent_plane() for _ in dsa_layers]
         # the shared rope key per token (q_pe . k_pe is the second score term; Flash has qk_rope 0 and no such cache)
         self.pc = [torch.zeros((capacity, c.qk_rope), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
         self.vc = [None for _ in dsa_layers]
         self.mtp_len = 0
         self.mtp_drafted = 0
         if w.mtp is not None:
-            self.mtp_kc = torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)
+            self.mtp_kc = latent_plane()
             self.mtp_pc = torch.zeros((capacity, c.qk_rope), dtype=torch.bfloat16, device=dev)
             self.mtp_vc = None
         # one indexer key plane per full-indexer group (and the MTP layer, last): a "shared" layer
@@ -249,7 +265,8 @@ class State(FlashState):
                     slot += 1
                 self.index_slot[i] = slot
             n_idx = slot + 1 + (1 if w.mtp is not None else 0)
-            self.index = [torch.zeros((capacity, c.index_dim), dtype=torch.bfloat16, device=dev)
+            self.index = [KvQ(capacity, c.index_dim, ibits, dev) if ibits else Kv8(capacity, c.index_dim, dev)
+                          if idx8 else torch.zeros((capacity, c.index_dim), dtype=torch.bfloat16, device=dev)
                           for _ in range(n_idx)]
 
     def reset(self) -> None:
@@ -287,8 +304,20 @@ class State(FlashState):
         return other
 
 
-def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int,
-              nch: int | None, index: torch.Tensor | None, host_pos: int | None,
+def write_rows(rows: torch.Tensor, cache, pos_dev: torch.Tensor) -> None:
+    """Window rows into a cache plane at slots pos_dev .. (bf16 rows, an FP8 plane's codes and scales, or a quantized
+    plane's)."""
+
+    if isinstance(cache, Kv8):
+        kv8.write(rows, cache, pos_dev)
+    elif isinstance(cache, KvQ):
+        kvq.write(rows, cache, pos_dev)
+    else:
+        latent_mod.latent_write(rows, cache, pos_dev)
+
+
+def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, R: int,
+              nch: int | None, index, host_pos: int | None,
               sparse_np: int | None = None, pc: torch.Tensor | None = None) -> torch.Tensor:
     """MLA over the latent cache with GLM-5.3's rope, indexer update on full layers, raw-token sparse selection.
 
@@ -312,18 +341,18 @@ def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor
         with prof.timed("dsa: rope"):
             rope_mod.apply_key(b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
         with prof.timed("dsa: latent write"):
-            latent_mod.latent_write(b.lat[:R, :c.kv_lora], lc, pos_dev)
-            latent_mod.latent_write(b.lat[:R, c.kv_lora:], pc, pos_dev)      # the rope key: its own [cap, qk_rope] cache
+            write_rows(b.lat[:R, :c.kv_lora], lc, pos_dev)
+            write_rows(b.lat[:R, c.kv_lora:], pc, pos_dev)                  # the rope key: its own [cap, qk_rope] cache
         if index is not None:
             with prof.timed("dsa: indexer update"):
                 ix = a.index
                 mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
                 glue.layernorm(b.ik[:R], ix.ln_w, ix.ln_b, c.eps, b.ik[:R])
                 rope_mod.apply_index(b.ik[:R], b.cos[:R], b.sin[:R], c, 1)
-                if host_pos is not None:
+                if host_pos is not None and isinstance(index, torch.Tensor):
                     index[host_pos:host_pos + R].copy_(b.ik[:R])
                 else:
-                    latent_mod.latent_write(b.ik[:R], index, pos_dev)
+                    write_rows(b.ik[:R], index, pos_dev)
 
     if b.side is not None:                   # the keys on the side stream while the queries project
         with fork(b):

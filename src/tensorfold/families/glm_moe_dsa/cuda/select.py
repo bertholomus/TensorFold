@@ -8,14 +8,19 @@ import torch
 import triton
 import triton.language as tl
 
+from .kvq import rotate as _q_rotate, tile as _q_tile
+
 
 @triton.jit
-def _scores(QI, W, w_stride, IK, OUT, POS, R, NT, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
-            D: tl.constexpr, BT: tl.constexpr, RB: tl.constexpr):
+def _scores(QI, W, w_stride, IK, IS, HQ, OUT, POS, R, NT, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
+            D: tl.constexpr, BT: tl.constexpr, RB: tl.constexpr, KV8: tl.constexpr, QB: tl.constexpr):
     """Program (RB rows, token block): s_t = sum_h w_h relu(scale * qi_h . k_t) up to each row's position.
 
     The reference (exllamav3's dsa_indexer_scores) folds D_i**-0.5 and H_i**-0.5 into one scale and
     sums relu(q.k) * w_h over the heads in head order; the same order here keeps a row's bits fixed.
+    KV8: the keys are FP8 codes (IK, bf16 in registers) with a power-of-two scale a token (IS) folded into each
+    token's dot products. QB: the keys are kvq's QB-bit groups (IK codes, IS fp16 scales, HQ the +-1 H32), read as
+    rotated fp16 values against each query head rotated alike.
     """
 
     rb = tl.program_id(0)
@@ -26,16 +31,27 @@ def _scores(QI, W, w_stride, IK, OUT, POS, R, NT, scale, wscale, H: tl.constexpr
         d = tl.arange(0, D)
         hh = tl.arange(0, HP)
         hok = hh < H
-        k = tl.load(IK + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < (P + rb * RB + RB))[:, None],
-                    other=0.0).to(tl.bfloat16)                                         # [BT, D]
+        if KV8:
+            k = tl.load(IK + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < (P + rb * RB + RB))[:, None],
+                        other=0).to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)       # [BT, D]
+            ks = tl.load(IS + t.to(tl.int64), mask=t < (P + rb * RB + RB), other=0.0)
+        elif QB > 0:
+            k = _q_tile(IK, IS, t.to(tl.int64), t < (P + rb * RB + RB), D, QB, BT)    # [BT, D] fp16, rotated
+        else:
+            k = tl.load(IK + t[:, None].to(tl.int64) * D + d[None, :], mask=(t < (P + rb * RB + RB))[:, None],
+                        other=0.0).to(tl.bfloat16)                                     # [BT, D]
         for i in tl.static_range(RB):
             r = rb * RB + i
             if r < R:
                 bound = P + r + 1
                 q = tl.load(QI + (r * H + hh[:, None]) * D + d[None, :], mask=hok[:, None],
                             other=0.0).to(tl.bfloat16)
+                if QB > 0:
+                    q = _q_rotate(q.to(tl.float32), HQ, HP, D).to(tl.float16)
                 kr = tl.where((t < bound)[:, None], k, 0.0)
                 dots = tl.dot(q, tl.trans(kr))                                         # [HP, BT] fp32
+                if KV8:
+                    dots = dots * ks[None, :]
                 w = tl.load(W + r * w_stride + hh, mask=hok, other=0.0).to(tl.float32) * wscale
                 sc = tl.sum(w[:, None] * tl.maximum(dots * scale, 0.0), axis=0)
                 sc = tl.where(t < bound, sc, float("-inf"))
@@ -259,10 +275,12 @@ RADIX_ROWS = 16             # blocks of this many rows or more select with _radi
                             # 2,048-row chunk at 128k and ~10x for a decode row (check_select.py)
 
 
-def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: int | None, R: int,
+def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys, pos: int | None, R: int,
                   topk: int, pos_dev: torch.Tensor, *, tokens: torch.Tensor, counts: torch.Tensor,
                   bucket: int | None = None) -> None:
     """Each row's attended tokens [R, width] ascending (-1 padded) and their count past the dense limit.
+
+    ``keys`` is the layer group's bf16 indexer key plane, its FP8 plane (kv8.Kv8) or its quantized one (kvq.KvQ).
 
     ``bucket`` fixes the scored token count for captured graphs; without it the visible count is
     rounded up to a power of two so the allocator reuses a few sizes. Scores, top-k membership and
@@ -292,18 +310,25 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, pos: 
         _select(qi[r0:r1], wts[r0:r1], keys, r1 - r0, topk, pos_dev + r0, tokens[r0:r1], counts[r0:r1], np_max)
 
 
-def _select(qi: torch.Tensor, wts: torch.Tensor, keys: torch.Tensor, R: int, topk: int, pos_dev: torch.Tensor,
+def _select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, pos_dev: torch.Tensor,
             tokens: torch.Tensor, counts: torch.Tensor, np_max: int) -> None:
     """select_tokens for rows at pos_dev .. pos_dev + R - 1 over np_max scored tokens."""
+
+    from .kv8 import Kv8
+    from .kvq import KvQ
 
     H = wts.shape[1]                                            # wts [R, heads]: each row's per-head weights
     D = qi.shape[1] // H
     wscale = H ** -0.5
     rb = 16 if R >= 16 else R                                   # rows a scoring program: each key tile read once (same bits a row)
     scores = torch.empty((R, np_max), dtype=torch.float32, device=qi.device)
-    _scores[(triton.cdiv(R, rb), triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), keys, scores, pos_dev, R, np_max,
-                                                           D ** -0.5, wscale, H=H, HP=max(16, triton.next_power_of_2(H)),
-                                                           D=D, BT=64, RB=rb, num_warps=4)
+    kv8, qb = isinstance(keys, Kv8), keys.bits if isinstance(keys, KvQ) else 0
+    ik, isc = (keys.codes, keys.scales) if kv8 or qb else (keys, keys)
+    hq = keys.h if qb else isc
+    _scores[(triton.cdiv(R, rb), triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), ik, isc, hq, scores, pos_dev, R,
+                                                           np_max, D ** -0.5, wscale, H=H,
+                                                           HP=max(16, triton.next_power_of_2(H)), D=D, BT=64, RB=rb,
+                                                           KV8=kv8, QB=qb, num_warps=4)
     width = tokens.shape[1]
     k = min(topk, np_max)
     if R >= RADIX_ROWS and tokens.stride(1) == 1:

@@ -519,3 +519,32 @@ def test_loader_holds_its_vocabulary_span_of_the_embedding(tmp_path, monkeypatch
     monkeypatch.setenv("TF_GLM_EMBED_SPLIT", "0")                            # the switch: every rank the whole table
     kept = W.load(folder, rank=1, device="cpu")
     assert kept.embed_lo == 0 and torch.equal(kept.embed.view(torch.int16), whole.embed.view(torch.int16))
+
+
+@pytest.mark.skipif(not REAL_CONFIG.is_file(), reason="the banked GLM-5.3 checkpoint is not on this host")
+def test_admission_counts_each_cache_format_a_slot():
+    """The startup estimate grows by exactly the bytes State allocates a slot, in every TF_GLM_KV format."""
+
+    from tensorfold.families.glm_moe_dsa.cuda import kv8
+    from tensorfold.families.glm_moe_dsa.cuda.engine import GlmEngine
+
+    text = json.loads(REAL_CONFIG.read_text())
+
+    def per_slot(kv: str) -> float:
+        g = GlmEngine._geometry(text, 4, kv)
+        return (g.bytes_at(1 << 22) - g.bytes_at(1 << 21)) / (1 << 21)
+
+    for kv, want in (("bf16", 96640), ("idx8", 93912), ("fp8", 53780), ("q8", 55992), ("q6b", 48608),
+                     ("q4/q8", 79 * (4 * 64 + 32 + 128) + 22 * 136)):
+        assert kv8.slot_bytes(79, 512, 64, 22, 128, kv) == want
+        assert per_slot(kv) == pytest.approx(want, abs=1e-6)
+
+
+def test_cache_modes_parse_and_refuse():
+    from tensorfold.families.glm_moe_dsa.cuda import kv8
+
+    assert kv8.parse("fp8") == ("fp8", "fp8") and kv8.parse("q5b") == ("q5", "bf16")
+    assert kv8.parse("bf16/q8") == ("bf16", "q8")
+    for bad in ("fp16", "q1", "q9", "q8/q6", "q8/"):
+        with pytest.raises(ValueError):
+            kv8.parse(bad)

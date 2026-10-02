@@ -48,8 +48,8 @@ def main() -> None:
             np_max = min(bucket, cap)
             scores = torch.empty((R, np_max), dtype=torch.float32, device=dev)
             scoring = graph_us(lambda: select._scores[(R, triton.cdiv(np_max, 64))](
-                qi, wts, wts.stride(0), keys, scores, pos_dev, R, np_max, D ** -0.5, H ** -0.5, H=H, HP=32, D=D,
-                BT=64, RB=1, num_warps=4))
+                qi, wts, wts.stride(0), keys, keys, keys, scores, pos_dev, R, np_max, D ** -0.5, H ** -0.5, H=H,
+                HP=32, D=D, BT=64, RB=1, KV8=False, QB=0, num_warps=4))
             print(f"R={R} pos {pos:7d} bucket {bucket:7d}: select_tokens {whole:8.1f} us (scores kernel {scoring:7.1f})",
                   flush=True)
 
