@@ -57,7 +57,7 @@ class GlmEngine:
             comm = _rdma(comm, rank, world, MAX_ROWS * Config.read(model_dir).hidden * 4)
         self.comm = comm
         self.comm.barrier()
-        from tensorfold.families.glm_moe_dsa.cuda.weights import Config, embed_split, embed_transform
+        from tensorfold.families.glm_moe_dsa.cuda.weights import Config, draft_vocab, embed_split, embed_transform
 
         cfg = Config.read(model_dir)
         # GLM-5.3 has no k-pool: the dense limit is index_topk visible tokens
@@ -72,11 +72,11 @@ class GlmEngine:
         long_context = self.limit > cfg.dense_limit
         prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
-                prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE)]
+                prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab()]
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
             raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
-                               " TF_GLM_EMBED_SPLIT, TF_GLM_KV):"
+                               " TF_GLM_EMBED_SPLIT, TF_GLM_KV, TF_GLM_DRAFT_VOCAB):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
         if rank == 0 and kv8.parse(kv8.MODE) != ("bf16", "bf16"):
             lat, idx = kv8.parse(kv8.MODE)

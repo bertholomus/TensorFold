@@ -183,7 +183,7 @@ class Weights:
     device: torch.device
     comm: Any = None
     meta: dict = field(default_factory=dict)
-    draft_head: None = None   # BF16 heads keep the verification head; no quantized copy is needed
+    draft_head: X3 | None = None   # TF_GLM_DRAFT_VOCAB: the MTP drafts' head over this rank's share of the draft ids
     embed_lo: int = 0         # the first token of this rank's embedding rows
 
     @property
@@ -222,6 +222,15 @@ class Weights:
         add(self.head)
         add(self.mtp)
         return total
+
+
+def draft_vocab() -> int:
+    """TF_GLM_DRAFT_VOCAB=N: MTP drafts score only the lowest N token ids (a BPE vocabulary's earliest merges: its most
+    frequent tokens), split over the ranks in whole 128-column blocks of the EXL3 head, so a draft step reads about
+    N / vocab of the head on every rank instead of a quarter of it. A token outside them is never drafted (speed, never
+    correctness: drafts are proposals). 0 (default): the whole head. Every rank must agree (checked at startup)."""
+
+    return int(os.environ.get("TF_GLM_DRAFT_VOCAB") or 0)
 
 
 def embed_split() -> bool:
@@ -434,6 +443,15 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
             x3_users.append(head)
             meta["vocab_per_rank"] = per * 128
             meta["vocab_lo"] = lo * 128                             # this rank's first token id (uneven spans)
+            n = min(draft_vocab(), cfg.vocab)
+            if n > 0:                                               # the draft ids' blocks, split like the head's
+                dlo, dmine, dper = x3mod.vocab_slice(-(-n // 128), world, rank)
+                dhead = X3(x3mod.make(g["trellis"][:, dlo * 8:(dlo + dmine) * 8].contiguous(), g.get("suh", g.get("su")),
+                                      svh[dlo * 128:(dlo + dmine) * 128].contiguous(), x3mod.codebook(g), dev).lin,
+                           n_pad=dper * 128, crop=max(0, min(dmine * 128, n - dlo * 128)))
+                x3_users.append(dhead)
+                meta["draft_head"] = dhead
+                meta["draft_lo"] = dlo * 128                        # this rank's first draft id
             return head
         vl = share(cfg.vocab, world, rank)
         lo = share_lo(cfg.vocab, world, rank)
@@ -455,7 +473,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
                                t(f"layers.{i}.post_attention_layernorm.weight", torch.bfloat16)))
             mtpw.layer.dsa = dsa(i, full=True)
             mtpw.layer.moe = moe(f"layers.{i}.mlp.")
-        w = Weights(cfg, embed, built, t("norm.weight", torch.bfloat16), head, mtpw, rank, world, dev, embed_lo=e0)
+        w = Weights(cfg, embed, built, t("norm.weight", torch.bfloat16), head, mtpw, rank, world, dev, embed_lo=e0,
+                    draft_head=meta.pop("draft_head", None))
         w.meta.update(layers=list(range(cfg.layers)), x3=x3_users, **meta)
     finally:
         rd.close()

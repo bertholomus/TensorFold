@@ -7,7 +7,7 @@ from typing import Sequence
 import torch
 
 from tensorfold.families.glm5_next.cuda.decode import (  # noqa: F401
-    DecodeResult, DepthPolicy, absorb, draft, sample_rows,
+    DecodeResult, DepthPolicy, absorb, sample_rows,
     snapshot_bytes, row_bytes, save_rows, load_rows, restore, take_snapshot, _row_views,
 )
 
@@ -49,6 +49,36 @@ def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
     first = e.sample(last, [len(prompt)], sampling)[0]
     e.follow([first])
     return first
+
+
+def draft(e: "Engine", hidden: torch.Tensor, next_tokens: Sequence[int], position: int, count: int, sampling,
+          confidence: float = 0.0) -> list[int]:
+    """Flash's draft chain (absorb the kept rows, then one-row MTP steps while the chain's confidence holds), with
+    the MTP layer's selection shared by the chain's later steps when MTP_REUSE is on."""
+
+    from .mtp import MTP_REUSE
+
+    st = e.st
+    logits = absorb(e, hidden, next_tokens)
+    drafts: list[int] = []
+    n = len(next_tokens)
+    chain = 1.0
+    for j in range(count):
+        probs: list[float] = []
+        d = e.sample(logits[:1], [position + j], sampling, draft=True, probs=probs if confidence > 0 else None)[0]
+        if confidence > 0 and j > 0 and chain * probs[0] < confidence:
+            break
+        drafts.append(d)
+        if confidence > 0:
+            chain *= probs[0]
+            if chain < confidence:            # a further draft could not pass either: skip its MTP step
+                break
+        if j + 1 < count:
+            prev = e.draft_hidden(n - 1 if j == 0 else 0)
+            logits = e.mtp([d], prev, reuse=MTP_REUSE != "0")
+            st.set_mtp_len(st.mtp_len + 1)
+            st.mtp_drafted += 1
+    return drafts
 
 
 @torch.no_grad()
@@ -176,7 +206,7 @@ class Engine:
         self.st = fwd.State(w, capacity, max_rows)
         self.last_hidden: torch.Tensor | None = None
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
-        self.draft_n = w.head.n
+        self.draft_n = (w.head if w.draft_head is None else w.draft_head).n
         self.graphs = None
         self.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}
         if graphs:
@@ -205,16 +235,19 @@ class Engine:
         self.replays["eager"] += 1
         return fwd.compute(self.w, self.st, self.buf, R, nch=fwd.chunks_for(self.st, R), host_pos=self.st.pos)
 
-    def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor) -> torch.Tensor:
+    def mtp(self, next_tokens: Sequence[int], hidden: torch.Tensor, reuse: bool = False) -> torch.Tensor:
         from .mtp import mtp_forward
 
-        return mtp_forward(self.w, self.st, self.mbuf, next_tokens, hidden)
+        return mtp_forward(self.w, self.st, self.mbuf, next_tokens, hidden, reuse=reuse)
 
     def sample(self, logits: torch.Tensor, positions: Sequence[int], sampling, *, draft: bool = False,
                probs: list | None = None) -> list[int]:
         from tensorfold.families.glm5_next.cuda.decode import sample_rows
 
-        return sample_rows(self.w, logits, positions, sampling, probs=probs)
+        # a draft's logits come from the draft head (TF_GLM_DRAFT_VOCAB) when there is one: its columns start at
+        # this rank's first draft id
+        offset = self.w.meta["draft_lo"] if draft and self.w.draft_head is not None else None
+        return sample_rows(self.w, logits, positions, sampling, offset, probs=probs)
 
     def verify_window(self, tokens: list[int]) -> list[int]:
         """The window a reply's grammar keeps (a chain cut at its first rejected draft), masked at the next sample."""

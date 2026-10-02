@@ -318,12 +318,14 @@ def write_rows(rows: torch.Tensor, cache, pos_dev: torch.Tensor) -> None:
 
 def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, R: int,
               nch: int | None, index, host_pos: int | None,
-              sparse_np: int | None = None, pc: torch.Tensor | None = None) -> torch.Tensor:
+              sparse_np: int | None = None, pc: torch.Tensor | None = None, reuse: bool = False) -> torch.Tensor:
     """MLA over the latent cache with GLM-5.3's rope, indexer update on full layers, raw-token sparse selection.
 
     A "shared" indexer layer passes ``index=None``: its selection reuse is expressed by scoring and
     selecting in the owning full layer (which runs the same rows either just before or within the
     same window), so the shared layer reads that layer's tokens from the buffers below.
+    ``reuse`` (an MTP draft step after the first): the rows attend the tokens already in b.tokens / b.counts, and
+    neither score nor write indexer keys (a draft row's key is overwritten before any selection could see it).
     """
 
     c = w.cfg
@@ -343,7 +345,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         with prof.timed("dsa: latent write"):
             write_rows(b.lat[:R, :c.kv_lora], lc, pos_dev)
             write_rows(b.lat[:R, c.kv_lora:], pc, pos_dev)                  # the rope key: its own [cap, qk_rope] cache
-        if index is not None:
+        if index is not None and not reuse:
             with prof.timed("dsa: indexer update"):
                 ix = a.index
                 mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
@@ -382,7 +384,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         with prof.timed("dsa: dense attention"):
             mla_pe.attention(qa, qp, lc, pc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
     if sparse_rows:
-        if a.index is not None:
+        if a.index is not None and not reuse:
             with prof.timed("dsa: select tokens"):
                 ix = a.index
                 mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
