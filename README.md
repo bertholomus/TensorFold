@@ -1,5 +1,10 @@
 # TensorFold
 
+> **This is a fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold).** TensorFold is ashhart's engine.
+> Branch `glm-dsa-tp4` adds the `glm_moe_dsa` family (full GLM-5.3, non-Flash) on CUDA tensor-parallel ranks, by
+> [bertholomus](https://github.com/bertholomus). Deployment recipe and measurements:
+> [bertholomus/glm-5.3-tensorfold-tp4-4xgb10](https://github.com/bertholomus/glm-5.3-tensorfold-tp4-4xgb10).
+
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
 
