@@ -93,6 +93,23 @@ class NCCL:
         self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
                                            self.comm, stream))
 
+    def grouped(self, sends, recvs) -> None:
+        """One NCCL group of point-to-point transfers on the current stream: each (tensor, peer) of ``sends`` to that
+        peer and each of ``recvs`` from it (contiguous tensors; a peer may be this rank; empty ones are skipped)."""
+
+        stream = torch.cuda.current_stream().cuda_stream
+        lib = self.lib
+        self._check(lib.ncclGroupStart())
+        try:
+            for t, peer in sends:
+                if t.numel():
+                    self._check(lib.ncclSend(t.data_ptr(), t.numel(), _DTYPES[t.dtype], peer, self.comm, stream))
+            for t, peer in recvs:
+                if t.numel():
+                    self._check(lib.ncclRecv(t.data_ptr(), t.numel(), _DTYPES[t.dtype], peer, self.comm, stream))
+        finally:
+            self._check(lib.ncclGroupEnd())
+
     def ready(self, label: str, *, every: float = 60.0, timeout: float = 3600.0) -> None:
         """Every rank finishes ``label`` before any goes on; a rank missing after ``timeout`` s is named."""
 

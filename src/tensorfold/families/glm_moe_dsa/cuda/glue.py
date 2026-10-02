@@ -12,6 +12,28 @@ import triton.language as tl
 # rank-gathered fp32 partial, the fp32 router matmul, and sigmoid noaux_tc top-k with the shared expert appended.
 from tensorfold.families.glm5_next.cuda.glue import residual_add, rmsnorm, router, select  # noqa: F401
 
+# -- prompt chunks' partials summed by row shares: residual_add's branch arithmetic, a share of the rows on each rank ---
+@triton.jit
+def _rank_sum(QR, BR, n, WORLD: tl.constexpr, BLOCK: tl.constexpr):
+    """bf16(every rank's fp32 partial summed rank 0 first): QR [world, n] -> BR [n]."""
+
+    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    ok = i < n
+    acc = tl.load(QR + i, mask=ok, other=0.0)
+    for k in tl.static_range(1, WORLD):
+        acc = acc + tl.load(QR + k * n + i, mask=ok, other=0.0)
+    tl.store(BR + i, acc.to(tl.bfloat16), mask=ok)
+
+
+def rank_sum(qr: torch.Tensor, br: torch.Tensor) -> torch.Tensor:
+    """qr [world, n] fp32 -> br [n] bf16: residual_add's branch (the partials summed in rank order) for these values."""
+
+    n = br.numel()
+    block = 1024
+    _rank_sum[(triton.cdiv(n, block),)](qr, br, n, WORLD=qr.shape[0], BLOCK=block, num_warps=4)
+    return br
+
+
 # -- LayerNorm (biased, the indexer key norm) -----------------------------------------------------------------
 @triton.jit
 def _layernorm(X, x_stride, W, B, OUT, o_stride, eps, D: tl.constexpr, BLOCK: tl.constexpr):

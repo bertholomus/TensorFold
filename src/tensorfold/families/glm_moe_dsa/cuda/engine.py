@@ -47,6 +47,10 @@ class GlmEngine:
             # loops sample after torch.cuda.synchronize()), so NCCL can skip its graph-mixing support; with grouped
             # send/recv an in-graph all-gather of a [1, 6144] partial takes 35 us instead of 51 (tools/nccl_bench.py)
             os.environ.setdefault("NCCL_GRAPH_MIXING_SUPPORT", "0")
+            # one channel: a prompt chunk's row-share reductions run beside the other micro-batch's compute, and with
+            # fewer NCCL blocks (and less staging traffic at once) more of them hide (26k-token prefill on TP4 with two
+            # micro-batches: 41.0 s at 1 channel, 41.4 at 2, 41.8 at 4); decode partials go over RDMA (rdma.py)
+            os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
             comm = NCCL(rank, world, master, port, gather=os.environ.get("TF_NCCL_GATHER") or "p2p")
             from tensorfold.families.glm_moe_dsa.cuda.weights import Config
 

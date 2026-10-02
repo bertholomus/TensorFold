@@ -9,7 +9,7 @@ import torch
 from tensorfold.families.glm5_next.cuda.weights import Weights as FlashWeights  # noqa: F401  (type docs)
 
 from . import glue, rope as rope_mod
-from .forward import Buffers, State, check_room, dsa_block, mm, moe_block
+from .forward import Buffers, State, check_room, dsa_block, mm, moe_block, residual
 from .weights import Weights
 
 
@@ -49,10 +49,10 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = 
     g = dsa_block(layer, w, st.mtp_kc, st.mtp_pos_dev, b, n, nch,
                   st.index[-1] if getattr(st, "index", None) is not None else None, host_pos, sparse_np,
                   pc=st.mtp_pc)
-    glue.residual_add(b.mx[:n], b.mx[:n], g)
+    residual(b.mx[:n], b.mx[:n], g)
     glue.rmsnorm(b.mx[:n], layer.post_norm, c.eps, b.normed[:n], b.xs[:n])
     g = moe_block(layer, w, b, n)
-    glue.residual_add(b.mx[:n], b.mx[:n], g)
+    residual(b.mx[:n], b.mx[:n], g)
     lo = n - 1 if last_only else 0
     k = n - lo
     glue.rmsnorm(b.mx[lo:n], m.norm, c.eps, b.fnormed[:k], b.fxs[:k])

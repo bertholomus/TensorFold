@@ -19,7 +19,7 @@ from .weights import LayerW, Weights
 
 # the Flash buffers' DSA block is reused where the shapes match; the indexer differs (no k-pool)
 from tensorfold.families.glm5_next.cuda.forward import (  # noqa: F401
-    Buffers as FlashBuffers, State as FlashState, gather, mm as flash_mm,
+    Buffers as FlashBuffers, State as FlashState, gather as flash_gather, mm as flash_mm,
 )
 
 from .x3 import X3, X3Pair, X3Scratch
@@ -27,6 +27,96 @@ from .x3 import X3, X3Pair, X3Scratch
 # decode windows run independent work on a second stream: the latent / rope-key / indexer-key path beside the query
 # path, the shared expert beside the router and routed experts (TF_GLM_SIDE=0: one stream, as before)
 SIDE = os.environ.get("TF_GLM_SIDE", "1") != "0"
+# a prompt chunk's rank partials: "rows" sends each rank the fp32 partials of its share of the rows (contiguous, rank r
+# sums rows R r / world ..), sums them in rank order (residual_add's arithmetic) and gathers the bf16 sums back in row
+# order: 2.7x fewer bytes than "gather" (every fp32 partial to every rank, summed by residual_add), the same bits
+PROMPT_REDUCE = os.environ.get("TF_GLM_PROMPT_REDUCE") or "rows"
+
+
+# prompt chunks of this many rows or more run as two micro-batches, each one's collectives (rows mode) on a second
+# stream beside the other's compute (TF_GLM_PROMPT_OVERLAP=0: one batch); every row keeps its bits
+OVERLAP_ROWS = 256 if os.environ.get("TF_GLM_PROMPT_OVERLAP", "1") != "0" else 1 << 30
+COMM_PRIORITY = int(os.environ.get("TF_GLM_COMM_PRIORITY", "-1"))   # the comm stream's priority (lower is higher)
+
+
+class Rows:
+    """A prompt chunk's reduced partials as the bf16 branch residual_add would add, in row order (``done``: the comm
+    stream's event when the reduction runs beside compute)."""
+
+    def __init__(self, bg: torch.Tensor, done: torch.cuda.Event | None = None) -> None:
+        self.bg = bg                                    # [R, D] bf16
+        self.done = done
+
+
+def gather(w: Weights, b, R: int):
+    """Every rank's fp32 partial b.part[:R] in rank order ([world, R, D], summed by residual), or for a prompt chunk in
+    PROMPT_REDUCE "rows" mode the bf16 branch, reduced a share of the rows on each rank (Rows): the same bits after
+    residual."""
+
+    world = w.world
+    if not (b.prefill and PROMPT_REDUCE == "rows" and w.comm is not None and world > 2):
+        return flash_gather(w, b, R)                     # (two ranks would save a quarter of the bytes)
+    D = b.part.shape[1]
+    cut = [R * k // world for k in range(world + 1)]
+    n = cut[w.rank + 1] - cut[w.rank]
+    # the gather buffer (world x rows x D fp32) holds every rank's partial of this rank's rows (world n D words), their
+    # bf16 sum (n D / 2) and every rank's sums in row order (R D / 2)
+    qr = b.gath[:world * n * D].view(world, n, D)
+    off = world * n * D
+    br = b.gath[off:off + -(-n * D // 2)].view(torch.bfloat16)[:n * D].view(n, D)
+    off += -(-n * D // 2)
+    bg = b.gath[off:off + -(-R * D // 2)].view(torch.bfloat16)[:R * D].view(R, D)
+
+    def reduce() -> None:
+        part = b.part[:R]
+        w.comm.grouped([(part[cut[k]:cut[k + 1]], k) for k in range(world)], [(qr[k], k) for k in range(world)])
+        glue.rank_sum(qr.view(world, -1), br.view(-1))           # rank order, then bf16 (residual_add's branch)
+        w.comm.grouped([(br, k) for k in range(world)], [(bg[cut[k]:cut[k + 1]], k) for k in range(world)])
+
+    cs = getattr(b, "comm_stream", None)
+    if cs is None or not getattr(b, "micro", False):
+        reduce()
+        return Rows(bg)
+    ready = torch.cuda.Event()                          # this micro-batch's partial is written
+    ready.record()
+    cs.wait_event(ready)
+    with torch.cuda.stream(cs):
+        reduce()
+        done = torch.cuda.Event()
+        done.record()
+    return Rows(bg, done)
+
+
+def residual(x: torch.Tensor, xout: torch.Tensor, g) -> None:
+    """x + the gathered partials' bf16 sum (residual_add), from fp32 partials or Rows."""
+
+    if isinstance(g, Rows):
+        if g.done is not None:
+            torch.cuda.current_stream().wait_event(g.done)
+        glue.residual_add(x, xout, g.bg.view(1, *g.bg.shape))   # one bf16 "partial": x + the branch, as residual_add
+    else:
+        glue.residual_add(x, xout, g)
+
+
+def micro_batch(b, lo: int, hi: int, half: int, R: int):
+    """Rows lo..hi of a prompt chunk's R rows as buffers of their own (a shallow copy, every row-indexed tensor sliced),
+    with half ``half`` of the gather buffer for their collectives and ``full`` the whole chunk's buffers."""
+
+    import copy
+
+    def rows(obj):
+        view = copy.copy(obj)
+        for name, value in vars(obj).items():
+            if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == b.rows:
+                setattr(view, name, value[lo:hi])
+        return view
+
+    v = rows(b)
+    v.lat_s = rows(b.lat_s)
+    g = b.gath.numel() // 2
+    v.gath = b.gath[half * g:(half + 1) * g]
+    v.micro, v.full, v.chunk = True, b, R
+    return v
 
 
 def mm(b, x: torch.Tensor, q, xs: torch.Tensor | None, out: torch.Tensor, f32: bool = False,
@@ -105,6 +195,12 @@ class Buffers(FlashBuffers):
         self.x3 = X3Scratch(w.meta.get("x3", []), dev, prefill=prefill)
         self.moe = None
         self.side = None                     # decode windows: the second stream and its own EXL3 scratch
+        # prompt chunks: the stream a micro-batch's collectives run on beside the other's compute (high priority: its
+        # few blocks go ahead of the compute kernels' queued ones), and the device position of the second micro-batch's
+        # first row
+        self.comm_stream = (torch.cuda.Stream(device=dev, priority=COMM_PRIORITY) if prefill and dev.type == "cuda"
+                            else None)
+        self.pos_mb = torch.zeros((1,), dtype=torch.int32, device=dev)
         if SIDE and not prefill and dev.type == "cuda":
             self.side = torch.cuda.Stream(device=dev)
             self.x3s = X3Scratch(w.meta.get("x3", []), dev, prefill=False)
@@ -259,7 +355,13 @@ def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor
                 mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
                 rope_mod.apply_index(b.qi[:R], b.cos[:R], b.sin[:R], c, c.index_heads)
                 # per-token head weights: weights_proj applied to the layer input (the scorer folds the scales)
-                torch.mm(b.normed[:R], ix.weights.t(), out=b.iw[:R])
+                if getattr(b, "micro", False):
+                    # cuBLAS picks its kernel by the row count and a row's bits move with it: a micro-batch multiplies
+                    # the whole chunk's rows (the other's are recomputed when it gets here) and keeps its own
+                    f = b.full
+                    torch.mm(f.normed[:b.chunk], ix.weights.t(), out=f.iw[:b.chunk])
+                else:
+                    torch.mm(b.normed[:R], ix.weights.t(), out=b.iw[:R])
                 select_mod.select_tokens(b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev,
                                          tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np)
         # a "shared" layer attends the tokens its group's full layer selected for these rows (still in b.tokens)
@@ -322,8 +424,10 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         return gather(w, b, R)
 
 
-def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
-                  host_pos: int | None = None, sparse_np: int | None = None) -> None:
+def attn_part(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+              host_pos: int | None = None, sparse_np: int | None = None, pos_dev: torch.Tensor | None = None):
+    """A layer's attention half up to its gathered partials (residual() adds them); rows from pos_dev (default st's)."""
+
     di = st.dsa_index[layer.index]
     c = w.cfg
     with prof.timed("dsa (total)"):
@@ -333,13 +437,46 @@ def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch:
         # layer's selection, which the same window computed one block earlier into the buffers
         idx = st.index[st.index_slot[layer.index]] if getattr(st, "index", None) is not None \
             and layer.dsa.index is not None else None
-        g = dsa_block(layer, w, st.kc[di], st.pos_dev, b, R, nch, idx, host_pos, sparse_np, pc=st.pc[di])
-    glue.residual_add(b.x[:R], b.x[:R], g)
+        return dsa_block(layer, w, st.kc[di], st.pos_dev if pos_dev is None else pos_dev, b, R, nch, idx, host_pos,
+                         sparse_np, pc=st.pc[di])
+
+
+def ffn_part(layer: LayerW, w: Weights, b: Buffers, R: int):
+    """A layer's MLP / MoE half up to its gathered partials."""
+
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
         # post-attention RMSNorm before the MLP / MoE
-        glue.rmsnorm(b.x[:R], layer.post_norm, c.eps, b.normed[:R], b.xs[:R])
-        g = mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
-    glue.residual_add(b.x[:R], b.x[:R], g)
+        glue.rmsnorm(b.x[:R], layer.post_norm, w.cfg.eps, b.normed[:R], b.xs[:R])
+        return mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
+
+
+def layer_forward(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
+                  host_pos: int | None = None, sparse_np: int | None = None) -> None:
+    residual(b.x[:R], b.x[:R], attn_part(layer, w, st, b, R, nch, host_pos, sparse_np))
+    residual(b.x[:R], b.x[:R], ffn_part(layer, w, b, R))
+
+
+def prompt_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, host_pos: int | None,
+                  sparse_np: int | None) -> None:
+    """A prompt chunk's layers as two micro-batches of rows: each half-layer's collectives run on the comm stream
+    while the other micro-batch computes. Rows never depend on their window, so every row keeps its bits (the
+    second micro-batch attends the first's keys, written one half-layer earlier)."""
+
+    h = -(-R // 32) * 16                                  # about half the rows, a multiple of 16
+    b.pos_mb.copy_(st.pos_dev + h)
+    mbs = [(micro_batch(b, 0, h, 0, R), h, st.pos_dev, host_pos),
+           (micro_batch(b, h, R, 1, R), R - h, b.pos_mb, None if host_pos is None else host_pos + h)]
+    pend = [None, None]
+    for layer in w.layers:
+        for i, (v, r, pos, hp) in enumerate(mbs):
+            if pend[i] is not None:
+                residual(v.x[:r], v.x[:r], pend[i])
+            pend[i] = attn_part(layer, w, st, v, r, nch, hp, sparse_np, pos)
+        for i, (v, r, pos, hp) in enumerate(mbs):
+            residual(v.x[:r], v.x[:r], pend[i])
+            pend[i] = ffn_part(layer, w, v, r)
+    for i, (v, r, pos, hp) in enumerate(mbs):
+        residual(v.x[:r], v.x[:r], pend[i])
 
 
 def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
@@ -374,8 +511,11 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
     c = w.cfg
     fglue.embed(b.ids[:R], w.embed, c.hidden, 1, b.x[:R])
     rope_mod.table(b.cos[:R], b.sin[:R], st.pos_dev, R, c.rope_theta, c.qk_rope)   # device position: graph-safe
-    for layer in w.layers:
-        layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+    if b.prefill and R >= OVERLAP_ROWS and w.comm is not None and w.world > 2 and b.comm_stream is not None:
+        prompt_layers(w, st, b, R, nch, host_pos, sparse_np)
+    else:
+        for layer in w.layers:
+            layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
     if not logits:
         return None
     glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
