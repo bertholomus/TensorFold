@@ -17,6 +17,11 @@ import triton.language as tl
 
 from tensorfold.families.glm5_next.cuda.latent import CHUNK, HB, HB_WIDE, KT, LatentScratch, _merge, head_block
 
+# sparse attention of windows this wide or wider (prompt chunks) runs _sparse_rows_pe, partials merged in registers;
+# decode windows keep a program a chunk (more programs a row) and _merge (TF_GLM_SPARSE_FUSED=0: every window does)
+FUSED_ROWS = 64 if os.environ.get("TF_GLM_SPARSE_FUSED", "1") != "0" else 1 << 30
+FUSED_LAUNCH = (4, 3)             # _sparse_rows_pe's warps and load stages
+
 
 @triton.jit
 def _tile_pe(q, qp, kv, kp, m, l, o, valid, SCALE: tl.constexpr):
@@ -101,6 +106,48 @@ def _sparse_chunks_pe(QA, QP, LC, PC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, 
 
 
 @triton.jit
+def _sparse_rows_pe(QA, QP, LC, PC, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
+                    PW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr):
+    """Program (row, head block): _sparse_chunks_pe's chunk partials one after another, each folded in as _merge folds
+    it (the same arithmetic in the same order), so the partials never leave registers. Rows with CNT 0 are skipped,
+    chunks past the row's count and key tiles past its last token change nothing there and are not run."""
+
+    r = tl.program_id(0)
+    hb = tl.program_id(1)
+    n = tl.load(CNT + r)
+    if n > 0:
+        hh = hb * HBT + tl.arange(0, HBT)
+        hok = hh < H
+        k = tl.arange(0, LW)
+        kq = tl.arange(0, PW)
+        q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
+        qp = tl.load(QP + (r * H + hh[:, None]) * PW + kq[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
+        mm = tl.full((HBT,), float("-inf"), tl.float32)
+        ll = tl.zeros((HBT,), tl.float32)
+        oo = tl.zeros((HBT, LW), tl.float32)
+        for c in range(tl.cdiv(n, CH)):
+            m = tl.full((HBT,), float("-inf"), tl.float32)
+            l = tl.zeros((HBT,), tl.float32)
+            o = tl.zeros((HBT, LW), tl.float32)
+            for t in range(tl.minimum(CH // KTT, tl.cdiv(n - c * CH, KTT))):
+                idx = c * CH + t * KTT + tl.arange(0, KTT)
+                ok = idx < n
+                tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
+                kv = tl.load(LC + tok[:, None] * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+                kp = tl.load(PC + tok[:, None] * PW + kq[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
+                m, l, o = _tile_pe(q, qp, kv, kp, m, l, o, ok, SCALE)
+            # _merge's step for chunk c
+            active = l > 0.0
+            next_m = tl.where(active, tl.maximum(mm, m), mm)
+            a = tl.where(active, tl.where(mm == float("-inf"), 0.0, tl.exp(mm - next_m)), 1.0)
+            b = tl.where(active, tl.exp(m - next_m), 0.0)
+            oo = oo * a[:, None] + o * b[:, None]
+            ll = ll * a + l * b
+            mm = next_m
+        tl.store(OUT + (r * H + hh[:, None]) * LW + k[None, :], (oo / ll[:, None]).to(tl.bfloat16), mask=hok[:, None])
+
+
+@triton.jit
 def _gather_pe(Q, QP, R, H: tl.constexpr, D: tl.constexpr, OFF: tl.constexpr, PW: tl.constexpr):
     """QP[r, h] = Q[r, h, OFF:OFF + PW] (each head's rope slice into a contiguous [R, H, PW])."""
 
@@ -167,6 +214,12 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache: torch.Tensor, pc
     R, H, LW = qa.shape
     PW = qp.shape[2]
     W = tokens.shape[1]
+    if R >= FUSED_ROWS:
+        # a prompt chunk: a program a row and head block, partials merged in registers (the same bits)
+        _sparse_rows_pe[(R, triton.cdiv(H, HB))](qa, qp, cache, pcache, tokens, counts, out, W=W, H=H, LW=LW, PW=PW,
+                                                 CH=CHUNK, SCALE=scale, HBT=HB, KTT=KT, num_warps=FUSED_LAUNCH[0],
+                                                 num_stages=FUSED_LAUNCH[1])
+        return
     nch = triton.cdiv(W, CHUNK)
     n = nch * R * H
     po = torch.empty((n * LW,), dtype=torch.float32, device=qa.device)
