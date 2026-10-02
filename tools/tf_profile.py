@@ -4,7 +4,9 @@ usage (in the tf container, TF_TP_WORLD and NCCL_* set as tp4_start.sh sets them
   python3 tools/tf_profile.py MODEL RANK MASTER PORT [CONTEXT] [TOKENS] [DEPTH_TOKENS]
 Sections: end-to-end serial vs MTP decode of tf_greedy's prompts (stages, exactness), graph replay per window,
 MTP step eager vs graph, sampling, NCCL all-gather latency, forward without collectives, kernel time by name, and
-decode past the dense limit (DEPTH_TOKENS of filler, eager sparse path).
+decode past the dense limit (DEPTH_TOKENS of filler, eager sparse path); prefill_ab compares prompt-path variants
+(TF_PROFILE_AB) by time, first token and cache checksums. TF_PROFILE_LOCAL=1 runs one rank on its own node (collectives
+replaced by Alone): the compute of its share, no fabric.
 """
 
 from __future__ import annotations
@@ -56,6 +58,25 @@ class Local:
         recv.view(self.world, -1).copy_(send.view(1, -1).expand(self.world, -1))
 
 
+class Alone:
+    """TF_PROFILE_LOCAL=1: this rank on its own node, the others absent. fp32 partials gather as this rank's plus
+    zeros (sane activations, so routing and selection stay realistic); int settings gather as copies (every rank
+    agrees). The compute of this rank's share of each step, no fabric; prompt partials reduce in gather mode."""
+
+    def __init__(self, rank: int, world: int) -> None:
+        self.rank, self.world = rank, world
+
+    def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+        if send.dtype == torch.float32:
+            recv.zero_()
+            recv.view(self.world, -1)[self.rank].copy_(send.view(-1))
+        else:
+            recv.view(self.world, -1).copy_(send.view(1, -1).expand(self.world, -1))
+
+    def barrier(self) -> None:
+        torch.cuda.synchronize()
+
+
 def kernel_table(prof, top: int = 28) -> None:
     times: dict[str, float] = defaultdict(float)
     counts: dict[str, int] = defaultdict(int)
@@ -79,7 +100,11 @@ def main() -> None:
     from tensorfold.families.glm5_next.cuda.attention import CHUNK
 
     t = time.time()
-    eng = GlmEngine(MODEL, rank=RANK, master=MASTER, port=PORT, policy="3", context=CONTEXT, context_explicit=True)
+    alone = os.environ.get("TF_PROFILE_LOCAL") == "1"
+    if alone:
+        fwd.PROMPT_REDUCE = "gather"
+    eng = GlmEngine(MODEL, rank=RANK, master=MASTER, port=PORT, policy="3", context=CONTEXT, context_explicit=True,
+                    comm=Alone(RANK, int(os.environ.get("TF_TP_WORLD", "4"))) if alone else None)
     e, w = eng.e, eng.w
     st = e.st
     say(f"== loaded in {time.time() - t:.0f}s: limit {eng.limit}, slots {eng.capacity_plan['cache_slots']}, "
@@ -238,33 +263,90 @@ def main() -> None:
 
     if "prefill_ab" in SECTIONS:
         from tensorfold.cuda.exl3 import experts as x3experts
+        from tensorfold.families.glm5_next.cuda import prof
 
         n = int(os.environ.get("TF_PROFILE_PREFILL", "24000"))
         filler = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(int(n / 13.6)))
         p = app._prepare({"messages": [{"role": "user", "content": filler + "\n\nSummarize."}], "max_tokens": 8,
                           "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, True).prompt
-        say(f"== prefill A/B on a {len(p)}-token prompt: expert member tiles for every row vs the busiest expert's")
-        shipped = x3experts.EXACT_ROWS
-        runs = {}
+        # a variant is settings joined by "+": experts0 / experts1 / experts2 (prompt chunks' experts: one-tile
+        # launches, grouped_rows, grouped_mma), gather / rowred (prompt partials: fp32 all-gather vs row shares),
+        # overlap0 / overlap1 (one batch vs two micro-batches whose collectives overlap compute), absorb0 /
+        # absorb1 / absorb2 (absorb and expand: one program a column block, Triton row blocks, latent_rows.cu),
+        # sparse0 / sparse1 (sparse attention as chunk programs + merge vs a program a row merging in registers),
+        # select0 / select1 (prompt chunks score every bucket token vs up to their last visible one), shared0 /
+        # shared1 (the shared expert after the routed experts and added, vs first and added by their combine), profile
+        # (TF_GLM_PROFILE block times, with syncs: slower); every run is compared to the first. Before each timed run
+        # the same settings prefill a TF_PROFILE_WARM-token prompt (default 6000; 0: none), so first-use compiles land
+        # outside the timing.
+        variants = (os.environ.get("TF_PROFILE_AB")
+                    or "experts0+gather+overlap0+absorb0+sparse0+select0+shared0,"
+                       "experts2+rowred+overlap1+absorb2+sparse1+select1+shared1").split(",")
+        warm_n = int(os.environ.get("TF_PROFILE_WARM", "6000"))
+        warm = None
+        if warm_n > 0:
+            wf = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(int(warm_n / 13.6)))
+            warm = app._prepare({"messages": [{"role": "user", "content": wf + "\n\nSummarize."}], "max_tokens": 8,
+                                 "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, True).prompt
+        say(f"== prefill A/B on a {len(p)}-token prompt{f' (each after a {len(warm)}-token warm-up)' if warm else ''}: "
+            f"{', '.join(variants)}")
+        from tensorfold.families.glm_moe_dsa.cuda import mla_pe
+
+        from tensorfold.families.glm_moe_dsa.cuda import select as select_mod
+
+        shipped = (x3experts.PROMPT, x3experts.PROMPT_KERNEL, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
+                   mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE)
+        runs = []
         try:
-            for label, rows in (("all rows", 1 << 30), ("busiest", shipped)):
-                x3experts.EXACT_ROWS = rows
+            for v in variants:
+                (x3experts.PROMPT, x3experts.PROMPT_KERNEL, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
+                 mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE) = shipped
+                timed = False
+                for s in v.split("+"):
+                    if s in ("experts0", "experts1", "experts2"):
+                        x3experts.PROMPT = s != "experts0"
+                        x3experts.PROMPT_KERNEL = "mma" if s == "experts2" else "rows"
+                    elif s in ("gather", "rowred"):
+                        fwd.PROMPT_REDUCE = "rows" if s == "rowred" else s
+                    elif s in ("overlap0", "overlap1"):
+                        fwd.OVERLAP_ROWS = 256 if s == "overlap1" else 1 << 30
+                    elif s in ("absorb0", "absorb1", "absorb2"):
+                        mla_pe.PROMPT_RB = 1 << 30 if s == "absorb0" else 64
+                        mla_pe.ABSORB = "cuda" if s == "absorb2" else "triton"
+                    elif s in ("sparse0", "sparse1"):
+                        mla_pe.FUSED_ROWS = 64 if s == "sparse1" else 1 << 30
+                    elif s in ("select0", "select1"):
+                        select_mod.TRIM = s == "select1"
+                    elif s in ("shared0", "shared1"):
+                        fwd.SHARED_INLINE = s == "shared1"
+                    elif s == "profile":
+                        timed = True
+                    else:
+                        raise ValueError(f"unknown A/B setting {s!r}")
+                if warm is not None:
+                    dec.prefill(e, warm, None)
+                prof.active = timed and prof.ENABLED
                 torch.cuda.synchronize()
                 t = time.perf_counter()
                 first = dec.prefill(e, p, None)
                 torch.cuda.synchronize()
                 dt = time.perf_counter() - t
+                prof.active = False
                 n_ = len(p)
                 sums = torch.stack([kc[:n_].view(torch.int16).to(torch.int64).sum() for kc in st.kc]
                                    + [pc[:n_].view(torch.int16).to(torch.int64).sum() for pc in st.pc]
-                                   + [ix[:n_].view(torch.int16).to(torch.int64).sum() for ix in (st.index or [])])
-                runs[label] = (first, sums.cpu(), e.last_hidden.clone())
-                say(f"   {label}: {dt:.1f} s ({n_ / dt:.0f} tok/s), first token {first}")
+                                   + [ix[:n_].view(torch.int16).to(torch.int64).sum() for ix in (st.index or [])]
+                                   + [st.mtp_kc[:n_].view(torch.int16).to(torch.int64).sum()])
+                runs.append((first, sums.cpu(), e.last_hidden.clone()))
+                a, b_ = runs[0], runs[-1]
+                say(f"   {v}: {dt:.1f} s ({n_ / dt:.0f} tok/s), first token {first}; vs the first: same first token "
+                    f"{a[0] == first}, same cache checksums {torch.equal(a[1], b_[1])}, same last hidden "
+                    f"{torch.equal(a[2].view(torch.int16), b_[2].view(torch.int16))}")
+                if timed:
+                    prof.report(n_)
         finally:
-            x3experts.EXACT_ROWS = shipped
-        a, b = runs["all rows"], runs["busiest"]
-        say(f"   same first token {a[0] == b[0]}, same cache checksums {torch.equal(a[1], b[1])}, same last hidden "
-            f"{torch.equal(a[2].view(torch.int16), b[2].view(torch.int16))}")
+            (x3experts.PROMPT, x3experts.PROMPT_KERNEL, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
+             mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE) = shipped
 
     if "prefill" in SECTIONS:
         from tensorfold.families.glm5_next.cuda import prof
@@ -302,6 +384,26 @@ def main() -> None:
             + " ".join(f"{x:.1f}" for x in chunk_times))
         if prof.ENABLED:
             prof.report(len(p))
+
+    if "prefill_kernels" in SECTIONS:
+        # kernel time by name over one prefill (torch profiler, CUDA activity only), then the same prefill untimed
+        n = int(os.environ.get("TF_PROFILE_PREFILL", "24000"))
+        filler = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(int(n / 13.6)))
+        p = app._prepare({"messages": [{"role": "user", "content": filler + "\n\nSummarize."}], "max_tokens": 8,
+                          "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, True).prompt
+        dec.prefill(e, p[:6000], None)                    # first-use compiles outside the timing
+        torch.cuda.synchronize()
+        t = time.perf_counter()
+        dec.prefill(e, p, None)
+        torch.cuda.synchronize()
+        dt = time.perf_counter() - t
+        say(f"== prefill kernels, a {len(p)}-token prompt: {dt:.1f} s ({len(p) / dt:.0f} tok/s) without the profiler")
+        from torch.profiler import ProfilerActivity, profile
+
+        with profile(activities=[ProfilerActivity.CUDA]) as kp:
+            dec.prefill(e, p, None)
+            torch.cuda.synchronize()
+        kernel_table(kp, top=int(os.environ.get("TF_PROFILE_TOP", "40")))
 
     if "depth" in SECTIONS and DEPTH > 0:
         filler = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(DEPTH // 13))
