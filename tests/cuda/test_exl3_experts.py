@@ -205,6 +205,69 @@ def test_mixed_k_rows_are_independent_and_match_the_reference(name, cb, kfun):
     assert err < 1e-2, err
 
 
+def _hot(sel, E, every=4):
+    """The same picks with expert 0 in slot 0 of all but every ``every``-th row (a row's experts stay distinct)."""
+
+    hot = sel.clone()
+    for r in range(hot.shape[0]):
+        if r % every == 0:
+            continue
+        row = hot[r, :-1]
+        j = (row == 0).nonzero()
+        if len(j):
+            row[int(j[0])] = row[0].clone()
+        row[0] = 0
+    return hot.contiguous()
+
+
+@pytest.mark.parametrize("name,cb,kfun", MIXED, ids=[m[0] + str(i) for i, m in enumerate(MIXED)])
+def test_prompt_chunks_decode_once_equal_the_one_tile_launches(name, cb, kfun):
+    """Prompt chunks (64 rows or more) group in parallel and run grouped_rows (each weight tile decoded once for
+    several member tiles) or grouped_mma (once into shared memory for 64 member rows). Every row's output is
+    bit-identical to the one-tile launches at every tile setting of both, with balanced and skewed routing (one expert
+    in 3 rows of 4), at 64 to 600 rows; the parallel grouping lists the same experts and members as the one-block
+    grouping."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK = 24, 1024, 256, 6                     # chains of 4 k tiles both ways: the mma kernel applies
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=41 + cb)
+    g = torch.Generator().manual_seed(9)
+    ROWS = 600
+    x = torch.randn((ROWS, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _picks(E, ROWS, TOPK, g, shared=True)
+    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
+    ext = experts._ext()
+    saved = dict(experts.PROMPT_TILES), experts.PROMPT_KERNEL
+    try:
+        for picks in (sel, _hot(sel, E)):
+            for R in (64, 100, 128, 600):
+                p, wr = picks[:R].contiguous(), w[:R].contiguous()
+                ref = experts.routed(x[:R], p, wr, ex, scratch, None, R, prompt=False).clone()
+                assert torch.isfinite(ref).all()
+                experts.PROMPT_KERNEL = "rows"
+                for tiles in ((8, 1, 1), (8, 2, 1), (8, 1, 2), (4, 2, 2)):
+                    experts.PROMPT_TILES = {"gateup": tiles, "down": tiles}
+                    out = experts.routed(x[:R], p, wr, ex, scratch, None, R, prompt=True)
+                    assert torch.equal(out.view(torch.int32), ref.view(torch.int32)), (name, R, tiles)
+                experts.PROMPT_KERNEL = "mma"
+                out = experts.routed(x[:R], p, wr, ex, scratch, None, R, prompt=True)
+                assert torch.equal(out.view(torch.int32), ref.view(torch.int32)), (name, R, "mma")
+                # the grouping itself: the same experts in id order and the same members in row order
+                ids, members = scratch.window(R)
+                ext.group(p, ids, scratch.count, members, R, TOPK + 1, E)
+                want = (ids.clone(), scratch.count.clone(), members.clone())
+                ids.fill_(-7)
+                members.fill_(-7)
+                ext.group_count(p, scratch.counts, R, TOPK + 1, E)
+                ext.group_place(p, scratch.counts, ids, scratch.count, members, R, TOPK + 1, E)
+                n = int(want[1])
+                assert int(scratch.count) == n and torch.equal(ids[:n], want[0][:n]), (name, R)
+                assert torch.equal(members[:n], want[2][:n]), (name, R)
+    finally:
+        experts.PROMPT_TILES, experts.PROMPT_KERNEL = saved
+
+
 def _glm_case(E, D, NI, rows_list, seed):
     from tensorfold.cuda import experts as grouped
     from tensorfold.cuda.exl3 import experts

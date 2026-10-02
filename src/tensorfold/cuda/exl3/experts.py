@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -20,6 +21,15 @@ EXACT_ROWS = 64
 # (n tiles a block, warps, K splits, tiles in flight): GLM's settings, whose arithmetic order this keeps bit for bit
 GLM_GATEUP = (8, 4, 4, 1)
 GLM_DOWN = (8, 4, 1, 1)
+# prompt chunks' grouped launches: (n tiles a block, tiles in flight, member tiles a program) for gate/up and down, the
+# weights decoded once for a program's member tiles; warps and K splits stay the window's (they fix each row's bits)
+PROMPT_TILES = {"gateup": (8, 1, 2), "down": (8, 1, 2)}
+PROMPT = os.environ.get("TF_EXL3_PROMPT_TILES", "1") != "0"
+# prompt chunks' kernel: "mma" (64 member rows a program, each weight tile decoded once into shared memory for all of
+# them) or "rows" (grouped_rows: member tiles in registers, PROMPT_TILES); both keep every row's bits. The mma kernel
+# takes K in steps of MMA_KB k tiles, which must divide the window's chains (K / 16 / (splits x warps)); else rows.
+PROMPT_KERNEL = os.environ.get("TF_EXL3_PROMPT_KERNEL") or "mma"
+MMA_KB = 4                        # experts_grouped.cuh's MMA_KB
 
 
 @lru_cache(maxsize=1)
@@ -28,7 +38,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v1", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -146,9 +156,14 @@ def default_config(K: int, N: int, gateup: bool) -> tuple[int, int, int, int]:
 
 
 class Scratch:
-    """Buffers for up to ``rows`` rows of ``slots`` slots; slots whose pick is not a routed expert are left to the caller."""
+    """Buffers for up to ``rows`` rows of ``slots`` slots; slots whose pick is not a routed expert are left to the caller.
 
-    def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda") -> None:
+    ``prompt``: buffers for prompt chunks, whose combine adds nothing for non-routed slots and keeps no per-slot outputs
+    (``y`` is allocated on first use by a one-tile call: the A/B against the decode-once path).
+    """
+
+    def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda",
+                 prompt: bool = False) -> None:
         D, I = ex.dims, ex.width
         self.cfg_gu = cfg_gu or default_config(D, I, True)
         self.cfg_d = cfg_d or default_config(I, D, False)
@@ -158,11 +173,14 @@ class Scratch:
         self.xd = torch.zeros((P, I), dtype=torch.float16, device=device)
         # gate and up write 2 * splits * P * I partials, down splits * P * D
         self.z = torch.zeros((max(2 * self.cfg_gu[2] * I, self.cfg_d[2] * D) * P,), dtype=torch.float32, device=device)
-        self.y = torch.zeros((P, D), dtype=torch.float32, device=device)
+        self.y = None if prompt else torch.zeros((P, D), dtype=torch.float32, device=device)
+        self.no_y = torch.zeros((1,), dtype=torch.float32, device=device)       # a pointer for calls that skip y
         maxu = min(P, ex.count)
         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
-        self.members_buf = torch.full((maxu * rows,), -1, dtype=torch.int32, device=device)
+        self.counts = torch.zeros((ex.count,), dtype=torch.int32, device=device)     # members an expert (prompt chunks)
+        # prompt chunks pad an expert's members to whole program groups (up to 8 tiles of 16)
+        self.members_buf = torch.full((maxu * -(-rows // 128) * 128,), -1, dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
 
     def window(self, R: int):
@@ -174,8 +192,13 @@ class Scratch:
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True) -> torch.Tensor:
-    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``; no host sync."""
+           group: bool = True, prompt: bool | None = None) -> torch.Tensor:
+    """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts``.
+
+    Decode windows make no host sync. Prompt chunks (``group`` and R >= EXACT_ROWS) read the busiest expert's row count
+    once; with ``prompt`` (default TF_EXL3_PROMPT_TILES) they group in parallel and decode each weight tile once for
+    several member rows (PROMPT_KERNEL), every row's arithmetic the one-tile launch's (the same bits).
+    """
 
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
@@ -184,28 +207,66 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if R > s.rows:
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
-    if group and R >= EXACT_ROWS:
+    chunk = group and R >= EXACT_ROWS
+    fast = chunk and (PROMPT if prompt is None else prompt) and all(
+        n % (16 * t[0]) == 0 for n, t in ((I, PROMPT_TILES["gateup"]), (D, PROMPT_TILES["down"])))
+    if fast:
+        # a prompt chunk: experts' member counts on the device, the busiest one read back once to size the member
+        # groups, then each used expert lists its members (the grouping of any number of rows, in parallel)
+        ext.group_count(pick, s.counts, R, slots, E)
+        busiest = int(s.counts.max())
+        tile = 16 * max(PROMPT_TILES["gateup"][2], PROMPT_TILES["down"][2])
+        members = s.members_buf[:ids.shape[0] * max(tile, -(-busiest // tile) * tile)].view(ids.shape[0], -1)
+        ext.group_place(pick, s.counts, ids, s.count, members, R, slots, E)
+    elif chunk:
         # a prompt chunk: member tiles for the busiest expert's rows only (one host read). Sized for R rows, the grouped
         # grids launched an expert's 16-row tiles for every row (2.6M mostly empty blocks a layer at 2,048 rows).
         busiest = int(torch.bincount(pick[:R].reshape(-1).long(), minlength=E + 1)[:E].max())
         members = s.members_buf[:ids.shape[0] * max(16, -(-busiest // 16) * 16)].view(ids.shape[0], -1)
-    if group:
+    if group and not fast:
         ext.group(pick, ids, s.count, members, R, slots, E)
+    if s.y is None and not (fast and wts is not None):        # prompt buffers: the one-tile path's per-slot outputs
+        s.y = torch.zeros((s.rows * slots, D), dtype=torch.float32, device=x.device)
     ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
     nt, w, sk, pf = s.cfg_gu
-    ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
-    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, sk, slots, E, float(limit), act_mode)
+    mma = fast and PROMPT_KERNEL == "mma" and I % 64 == 0 and D % 64 == 0 and all(
+        (k // 16) % (cfg[1] * cfg[2] * MMA_KB) == 0 for k, cfg in ((D, s.cfg_gu), (I, s.cfg_d)))
+    if mma:
+        # every split's chains in one program, their sum from 0 as the epilogue would add them
+        ext.grouped_mma(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
+                        P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], 1)
+    elif fast:
+        # one program runs the K splits in order and writes their sum from 0, as the epilogue would add them
+        pnt, ppf, pg = PROMPT_TILES["gateup"]
+        ext.grouped_rows(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
+                         I, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_gu[0], ex.k2_gu[1], 1)
+    else:
+        ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
+                    P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
+    ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1 if fast else sk, slots, E,
+                        float(limit), act_mode)
     nt, w, sk, pf = s.cfg_d
-    ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
+    dsk = sk                          # the down partials' splits as down_combine reads them
+    if mma:
+        # one split is written as is; several are folded in order from 0 (down_combine's order) into one
+        ext.grouped_mma(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
+                        I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1))
+        dsk = 1
+    elif fast:
+        pnt, ppf, pg = PROMPT_TILES["down"]
+        ext.grouped_rows(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
+                         I, D, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_d[0], ex.k2_d[1], 0)
+    else:
+        ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
+                    D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
     if wts is None:
-        ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, sk, slots, E)
+        ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, dsk, slots, E)
         return s.y[:P]
     if out is None:
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
-    # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two)
-    ext.down_combine(s.z, pick, ex.svh_d, s.y, wts, out, R, P, D, sk, slots, E)
+    # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two); a prompt
+    # chunk leaves the per-slot outputs unwritten (453 MB a layer at 2,048 rows that nothing reads)
+    ext.down_combine(s.z, pick, ex.svh_d, s.no_y if fast else s.y, wts, out, R, P, D, dsk, slots, E, 0 if fast else 1)
     return out
 
 

@@ -112,7 +112,7 @@ class Buffers(FlashBuffers):
         if first is not None and first.ex is not None:
             from tensorfold.cuda.exl3 import experts as x3experts
 
-            self.moe = x3experts.Scratch(first.ex, rows, c.top_k + 1, device=dev)
+            self.moe = x3experts.Scratch(first.ex, rows, c.top_k + 1, device=dev, prompt=prefill)
 
 
 class State(FlashState):
