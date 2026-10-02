@@ -10,7 +10,7 @@ import triton
 
 from tensorfold.families.glm5_next.cuda.qmm import B16
 
-from tensorfold.families.glm5_next.cuda import latent as latent_mod, prof
+from tensorfold.families.glm5_next.cuda import latent as latent_mod, prof, qmm as flash_qmm
 
 from tensorfold.cuda.geometry import share
 
@@ -364,8 +364,13 @@ def dsa_block(layer: LayerW, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor
                     # the whole chunk's rows (the other's are recomputed when it gets here) and keeps its own
                     f = b.full
                     torch.mm(f.normed[:b.chunk], ix.weights.t(), out=f.iw[:b.chunk])
-                else:
+                elif b.prefill:
                     torch.mm(b.normed[:R], ix.weights.t(), out=b.iw[:R])
+                else:
+                    # decode windows: the row-invariant BF16 matmul, so a verify window's row gets the 1-row step's
+                    # weights (cuBLAS by row count gave them different bits, near-tie selections moved, and past the
+                    # dense limit MTP drafts' output parted from serial decoding: tools/check_window_rows.py)
+                    flash_qmm.matmul(b.normed[:R], ix.w16, None, out=b.iw[:R], part=b.sk)
                 select_mod.select_tokens(b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev,
                                          tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np)
         # a "shared" layer attends the tokens its group's full layer selected for these rows (still in b.tokens)

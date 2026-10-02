@@ -96,6 +96,7 @@ class IndexW:
     ln_w: torch.Tensor        # [index_dim] bf16
     ln_b: torch.Tensor        # [index_dim] bf16
     weights: torch.Tensor     # [heads, hidden] bf16 (raw per-head weights; the scorer folds the scales)
+    w16: B16 | None = None    # the same weights for the row-invariant matmul decode windows take
 
 
 @dataclass
@@ -339,9 +340,9 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
 
     def indexer(i: int) -> IndexW:
         p = f"layers.{i}.self_attn.indexer."
+        weights = t(p + "weights_proj.weight", torch.bfloat16).view(cfg.index_heads, cfg.hidden)
         return IndexW(b16(p + "wk.weight"), proj(p + "wq_b."), t(p + "k_norm.weight", torch.bfloat16),
-                      t(p + "k_norm.bias", torch.bfloat16),
-                      t(p + "weights_proj.weight", torch.bfloat16).view(cfg.index_heads, cfg.hidden))
+                      t(p + "k_norm.bias", torch.bfloat16), weights, make_b16(weights))
 
     def dsa(i: int, full: bool = True) -> DSAW:
         p = f"layers.{i}.self_attn."
