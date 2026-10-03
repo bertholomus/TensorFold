@@ -335,13 +335,16 @@ class DsEngine:
             except StopIteration as done:
                 return done.value
 
-    def prefill_steps(self, sc, dc, prompt: list[int], image: tuple | None = None):
+    def prefill_steps(self, sc, dc, prompt: list[int], image: tuple | None = None, start: int = 0, snap=None):
         """``prefill`` one chunk a step (a generator: each ``next`` runs one chunk; its return value is the last
-        row's logits), so a concurrent lane can decode between a long prompt's chunks."""
+        row's logits), so a concurrent lane can decode between a long prompt's chunks. ``start`` (a chunk boundary):
+        the caches already hold the prompt's rows before it, a kept prompt's (``multi``), and its chunks are a fresh
+        prefill's own from there; ``snap(end)`` runs after each chunk that ends on a chunk boundary."""
 
         m = self.model
-        sc.length = 0
-        sc.host.clear()
+        assert start % PREFILL_CHUNK == 0 and start < len(prompt), (start, len(prompt))
+        sc.length = start
+        del sc.host[start:]
         use_drafts = dc is not None
         if use_drafts:
             dc.absorbed = 0
@@ -356,7 +359,7 @@ class DsEngine:
             host = list(prompt)
             for p in positions:
                 host[p] = -1                  # Engram's hashing: no n-gram reaches into an image span
-        for s in range(0, len(prompt), PREFILL_CHUNK):
+        for s in range(start, len(prompt), PREFILL_CHUNK):
             e = min(len(prompt), s + PREFILL_CHUNK)
             ids = torch.tensor(prompt[s:e], dtype=torch.long, device="cuda")
             taps: list | None = [] if use_drafts else None
@@ -376,6 +379,8 @@ class DsEngine:
                 last = out
             if use_drafts and taps:
                 self.drafter.absorb(dc, sc, torch.cat(taps, -1), m.taps_start)
+            if snap is not None and e % PREFILL_CHUNK == 0:
+                snap(e)
             if e < len(prompt):
                 yield e
         return last

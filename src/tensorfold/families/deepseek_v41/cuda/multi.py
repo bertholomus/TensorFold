@@ -15,6 +15,14 @@ verify window in one forward a round, each reply exactly its solo run.
   (``Link``) before running it; every rank checks the step's digest with one small all-gather before its model
   collectives (``OutOfStep``: the step fails on every rank at the same point). ``Watchdog``: a lost rank breaks the
   lane on every rank instead of hanging it.
+- **Kept prompts** (``TF_DS_KEEP``). A finished stream's prompt stays in the window (``Kept``): its extent's rows up
+  to its last kept chunk boundary, and its slot's rings at its kept boundaries (the window keys and compressor inputs
+  are a slot's, not an extent's). A later prompt that starts the same continues from the longest boundary they share:
+  its rows are copied into its own extent (or it grows the kept extent in place), the rings come back, and its chunks
+  from there are a fresh prefill's own chunks, so its reply is the fresh reply; usage's ``cached_tokens`` is that
+  boundary. Only prompt rows are kept (a verify round's rows are not a prompt chunk's bits); with replay prefill the
+  boundary stays a window below the prompt's end (the decoder layers' rows there are the prompt's own). Kept entries
+  give their room back, oldest first, whenever an admission needs it.
 
 Ported from our GLM-5.3 fork's ``glm_moe_dsa/cuda/multi.py`` (the same design, pipeline/CONCURRENCY-DESIGN.md).
 Structured output and logprobs are not served with ``--parallel``.
@@ -31,6 +39,8 @@ import torch
 
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
+
+from .model import RAW
 
 # the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the drafter's block of five
 # alone or beside one other, three at three or four streams: 16 rows at four), capped by the engine's --mtp-drafts
@@ -53,6 +63,12 @@ DRAFT_MS = float(os.environ.get("TF_DS_DRAFT_MS") or 5.3)
 # 200 rounds (the DSpark acceptance report)
 CONF_LOG = os.environ.get("TF_DS_CONF_LOG", "0") == "1"
 STEP_TIMEOUT = float(os.environ.get("TF_DS_STEP_TIMEOUT") or 900.0)
+# TF_DS_KEEP=1 (default): finished prompts stay in the window for later prompts that start the same (``Kept``), at
+# most KEEP_ENTRIES of them, each with its rings at KEEP_MARKS chunk boundaries at most (the doubling ones from the first
+# chunk, the prompt's last two, the ones it continued from)
+KEEP = os.environ.get("TF_DS_KEEP", "1") == "1"
+KEEP_ENTRIES = int(os.environ.get("TF_DS_KEEP_ENTRIES") or 8)
+KEEP_MARKS = int(os.environ.get("TF_DS_KEEP_MARKS") or 10)
 
 
 ALIGN = 2048                     # extents start and end on multiples of this many positions
@@ -78,6 +94,16 @@ class Extents:
                 self.gaps[i:i + 1] = [(a + n, b)] if b - a > n else []
                 return a
         return None
+
+    def take_at(self, start: int, rows: int) -> bool:
+        """``rows`` (aligned up) from ``start`` if they are free."""
+
+        n = self.size(rows)
+        for i, (a, b) in enumerate(self.gaps):
+            if a <= start and start + n <= b:
+                self.gaps[i:i + 1] = [g for g in ((a, start), (start + n, b)) if g[1] > g[0]]
+                return True
+        return False
 
     def give(self, start: int, rows: int) -> None:
         merged: list[tuple[int, int]] = []
@@ -269,6 +295,30 @@ class Slot:
         self.index, self.sc, self.dc = index, None, dc
 
 
+class Kept:
+    """A finished stream's prompt kept in the window: positions [base, base + size) hold the compressed and indexer
+    rows (and token ids) of its first ``top`` prompt tokens; ``snaps`` its slot's rings and compressor inputs at each
+    kept chunk boundary; ``host`` the prompt's host ids to ``top`` (Engram's n-grams); ``keys`` (rank 0 only) the
+    prompt's ids to ``top`` with each image span's positions keyed by its picture; ``tick`` when it was last used."""
+
+    def __init__(self, eid: int, base: int, size: int, top: int, host: list, snaps: dict, replay: bool, keys,
+                 tick: int) -> None:
+        self.eid, self.base, self.size, self.top, self.host = eid, base, size, top, host
+        self.snaps, self.replay, self.keys, self.tick, self.hits = snaps, replay, keys, tick, 0
+
+
+def _picture_key(pic) -> int:
+    """A picture's 62-bit key (its patches and grids), kept on the picture."""
+
+    key = getattr(pic, "_tf_key", None)
+    if key is None:
+        h = hashlib.sha256(repr((pic.n_vit_h, pic.n_vit_w, pic.n_llm_h, pic.n_llm_w)).encode())
+        h.update(pic.patches.contiguous().view(torch.int16).numpy().tobytes())
+        key = int.from_bytes(h.digest()[:8], "big") >> 2
+        pic._tf_key = key
+    return key
+
+
 class MultiDecoder:
     """Rounds over the live streams; ``slots`` streams at most, each with ``cap`` cache rows."""
 
@@ -308,6 +358,9 @@ class MultiDecoder:
         self.conf_depth = [[0, 0] for _ in range(8)]     # CONF_LOG: (drafts reached, kept) by depth
         self.conf_bins = [[0, 0] for _ in range(10)]     # CONF_LOG: (drafts, kept) by sigmoid(confidence) tenths
         self.conf_rounds = 0
+        self.kept: dict[int, Kept] = {}                  # kept prompts by id
+        self.next_kept, self.ticks = 0, 0
+        self.keep_stats: dict[str, int] = {}             # admissions that continued a kept prompt, by placement
 
     def warm(self, buckets=(1024, 2048, 4096, 8192)) -> None:
         """Before serving, on every rank in the same order: round graphs for 1 .. 16 rows at the small context
@@ -387,7 +440,187 @@ class MultiDecoder:
     def _shape(self) -> list:
         return [self.next_id, list(self.free), list(self.extents.gaps),
                 [[s.sid, s.st.index, s.st.sc.length, len(s.out), bool(s.done)] for s in self.streams.values()],
-                [[s.sid, s.st.index, s.filled] for s in self.filling]]
+                [[s.sid, s.st.index, s.filled] for s in self.filling],
+                [[k.eid, k.base, k.size, k.top, k.tick, sorted(k.snaps)] for k in self.kept.values()]]
+
+    # -- kept prompts ---------------------------------------------------------------------------------------------
+    def _replay(self) -> bool:
+        from . import engine as eng
+
+        return bool(getattr(self.e, "replay_mode", eng.REPLAY))
+
+    def _keys(self, s: Stream):
+        """Rank 0: the prompt's ids, each image span's positions keyed by its picture instead (int64)."""
+
+        import numpy as np
+
+        keys = np.asarray(s.prompt, dtype=np.int64).copy()
+        for start, pic in (s.vision.spans if s.vision is not None and getattr(s.vision, "spans", None) else []):
+            keys[start:start + pic.tokens] = -2 - _picture_key(pic)
+        return keys
+
+    def _match(self, s: Stream, keys) -> list | None:
+        """Rank 0: [kept id, boundary] for the kept prompt this one continues the furthest (the most recent of
+        equals), else None. The boundary is one of its kept ones, within the prompts' shared start, and below the
+        prompt's last row (with replay prefill, a window below)."""
+
+        import numpy as np
+
+        replay = self._replay()
+        limit = len(s.prompt) - (self.m.cfg.window if replay else 1)
+        best = None
+        for k in self.kept.values():
+            if k.replay != replay or k.keys is None:
+                continue
+            n = min(len(k.keys), len(keys))
+            diff = np.flatnonzero(k.keys[:n] != keys[:n])
+            common = int(diff[0]) if diff.size else n
+            cut = max((b for b in k.snaps if b <= min(common, limit)), default=0)
+            if cut and (best is None or (cut, k.tick) > (best[1], best[0].tick)):
+                best = (k, cut)
+        return None if best is None else [best[0].eid, best[1]]
+
+    def _marks(self, n: int) -> set[int]:
+        """The chunk boundaries a prompt of n tokens keeps its rings at: doubling from the first, and its last two."""
+
+        from .engine import PREFILL_CHUNK as C
+
+        marks = set(range(C, n + 1, C)[-2:])
+        b = C
+        while b <= n:
+            marks.add(b)
+            b *= 2
+        return marks
+
+    def _snapshot(self, index: int):
+        """Slot ``index``'s window rings (with replay prefill the encoder layers' only: a resumed prompt's decoder
+        layers read no window key before its replay row) and compressor inputs, copied."""
+
+        RS, n = self.pool.ring_size, len(self.pool.ring)
+        layers = range(self.m.cfg.n_layers // 2) if self._replay() else range(n)
+        ring = torch.stack([self.pool.ring[i][index * RS:(index + 1) * RS] for i in layers])
+        raw = [torch.stack([x[index * RAW:(index + 1) * RAW] for x in pair])
+               for _, pair in sorted(self.pool.comp_raw.items())]
+        return ring, (torch.stack(raw) if raw else None)
+
+    def _restore(self, index: int, snap) -> None:
+        ring, raw = snap
+        RS = self.pool.ring_size
+        for i in range(ring.shape[0]):
+            self.pool.ring[i][index * RS:(index + 1) * RS].copy_(ring[i])
+        if raw is not None:
+            for j, (_, pair) in enumerate(sorted(self.pool.comp_raw.items())):
+                for h, x in enumerate(pair):
+                    x[index * RAW:(index + 1) * RAW].copy_(raw[j, h])
+
+    def _copy_rows(self, src: int, dst: int, n: int) -> None:
+        """Positions [src, src + n) of the window's compressed, indexer and token rows to [dst, dst + n) (through a
+        copy where the two overlap)."""
+
+        if src == dst:
+            return
+        c = self.m.cfg
+        overlap = src < dst + n and dst < src + n
+        for planes in (self.pool.comp, self.pool.index_k):
+            for i, x in planes.items():
+                r = c.compress_ratios[i]
+                a, b, k = src // r, dst // r, n // r
+                for t in (x if isinstance(x, tuple) else (x,)):
+                    t[b:b + k].copy_(t[a:a + k].clone() if overlap else t[a:a + k])
+        t = self.pool.tokens
+        t[dst:dst + n].copy_(t[src:src + n].clone() if overlap else t[src:src + n])
+
+    def _forget(self, k: Kept, give: bool = True) -> None:
+        self.kept.pop(k.eid, None)
+        if give:
+            self.extents.give(k.base, k.size)
+
+    def _room(self, need: int) -> bool:
+        """Rank 0: whether ``need`` positions fit once every kept prompt gave its room back."""
+
+        ex = Extents(0, self.extents.align)
+        ex.total, ex.gaps = self.extents.total, list(self.extents.gaps)
+        for k in self.kept.values():
+            ex.give(k.base, k.size)
+        return any(b - a >= ex.size(need) for a, b in ex.gaps)
+
+    def _place(self, need: int, src: Kept | None) -> tuple[int | None, str]:
+        """An extent for ``need`` positions (every rank the same): a free one (``src``'s rows get copied in, "copy"),
+        else ``src``'s own extent grown in place ("here"), else after the oldest other kept prompts give theirs back;
+        last, anywhere once ``src`` gave its own back too (its rows move, "move"). Without ``src``: "fresh"."""
+
+        while True:
+            base = self.extents.take(need)
+            if base is not None:
+                return base, "copy" if src is not None else "fresh"
+            if src is not None:
+                self.extents.give(src.base, src.size)
+                if self.extents.take_at(src.base, need):
+                    self._forget(src, give=False)
+                    return src.base, "here"
+                if not self.extents.take_at(src.base, src.size):
+                    raise RuntimeError("a kept prompt's extent was not free to take back")
+            others = sorted((k for k in self.kept.values() if k is not src), key=lambda k: k.tick)
+            if others:
+                self._forget(others[0])
+                continue
+            if src is None:
+                return None, "fresh"
+            self._forget(src)
+            base = self.extents.take(need)
+            return base, "move" if base is not None else "fresh"
+
+    @staticmethod
+    def _kept_marks(snaps: dict) -> list[int]:
+        """The boundaries a finished stream keeps, KEEP_MARKS at most: the doubling ones, its last two, then the
+        earliest."""
+
+        from .engine import PREFILL_CHUNK as C
+
+        marks = sorted(snaps)
+        if len(marks) > KEEP_MARKS:
+            must = {b for b in marks if (b // C) & (b // C - 1) == 0} | set(marks[-2:])
+            rest = [b for b in marks if b not in must]
+            marks = sorted(must | set(rest[:max(0, KEEP_MARKS - len(must))]))
+        return marks
+
+    def _keep(self, s: Stream) -> None:
+        """A finished stream's prompt into ``kept``: its extent's rows to its last kept boundary stay, the rest goes
+        back."""
+
+        marks = self._kept_marks(s.snaps)
+        top = marks[-1]
+        size = self.extents.size(top)
+        self.free.append(s.st.index)
+        self.free.sort()
+        if s.size > size:
+            self.extents.give(s.base + size, s.size - size)
+        keys = getattr(s, "keys", None)
+        k = Kept(self.next_kept, s.base, size, top, list(s.st.sc.host[:top]), {b: s.snaps[b] for b in marks},
+                 self._replay(), None if keys is None else keys[:top], self.ticks)
+        self.kept[k.eid] = k
+        self.next_kept += 1
+        s.st.sc = None
+        s.snaps = None
+
+    def _covered(self, done: list[Stream]) -> list[int]:
+        """Rank 0: the kept prompts the finishing streams' prompts will cover (the same ids to their top, every kept
+        boundary of theirs kept again)."""
+
+        import numpy as np
+
+        drops: list[int] = []
+        for s in done:
+            snaps, keys = getattr(s, "snaps", None), getattr(s, "keys", None)
+            if not snaps or keys is None or s.sid not in self.streams:
+                continue
+            marks = set(self._kept_marks(snaps))
+            top = max(marks)
+            for k in self.kept.values():
+                if (k.eid not in drops and k.keys is not None and k.top <= top and k.replay == self._replay()
+                        and set(k.snaps) <= marks and np.array_equal(k.keys, keys[:k.top])):
+                    drops.append(k.eid)
+        return drops
 
     def _ends(self, s: Stream) -> tuple[int, ...]:
         return self.eos if s.stop_eos else ()
@@ -405,30 +638,36 @@ class MultiDecoder:
         s.count = max(1, min(s.count, room))
         if not self.free:
             raise NoRoom("every stream slot is busy")
-        if not any(b - a >= self.extents.size(self._need(s)) for a, b in self.extents.gaps):
+        if not self._room(self._need(s)):
             raise NoRoom("the window's free extents are too small for this request now")
         positions = s.vision.positions() if s.vision is not None and getattr(s.vision, "spans", None) else []
         index = self.free[0]
+        s.keys = self._keys(s) if KEEP else None
+        reuse = self._match(s, s.keys) if KEEP and self.kept else None
         self._send(["admit", list(s.prompt), s.count, _pack(s.sampling), bool(s.draft), bool(s.stop_eos), index,
-                    positions])
-        self._admit(s, index, positions)
+                    positions, reuse])
+        self._admit(s, index, positions, reuse)
 
     def _need(self, s: Stream) -> int:
         """A stream's positions: its prompt, its reply, a round's rows and its extent's scratch row (a group long)."""
 
         return len(s.prompt) + s.count + self.max_rows + 8 + 4
 
-    def _admit(self, s: Stream, index: int, positions: list[int]) -> None:
+    def _admit(self, s: Stream, index: int, positions: list[int], reuse: list | None = None) -> None:
         """Its slot, its extent, its image rows (shared from rank 0) and its prompt's chunk steps; ``_fill`` runs
-        them."""
+        them. ``reuse`` [kept id, boundary]: the prompt continues that kept prompt from the boundary."""
 
         e = self.e
         self._step(True)
         try:
             self._agree("admission", [self._shape(), list(s.prompt), s.count, _pack(s.sampling), bool(s.draft),
-                                      bool(s.stop_eos), index, positions])
+                                      bool(s.stop_eos), index, positions, reuse])
+            self.ticks += 1
             need = self._need(s)
-            base = self.extents.take(need)
+            src = self.kept.get(int(reuse[0])) if reuse else None
+            if reuse and src is None:
+                raise OutOfStep("an admission continues a kept prompt this rank does not hold")
+            base, how = self._place(need, src)
             if base is None:                             # (every rank at the same point: the same extents)
                 raise NoRoom("the window's free extents are too small for this request now")
             slot = self.slots[index]
@@ -437,15 +676,40 @@ class MultiDecoder:
             slot.sc = self.m.pool_view(self.pool, index, base, s.size)
             s.sid, s.st = self.next_id, slot
             self.next_id += 1
-            image = None
-            if positions:
-                rows = None
+            cut, s.snaps = 0, {}
+            if how != "fresh":
+                cut = int(reuse[1])
+                if how in ("copy", "move"):
+                    self._copy_rows(src.base, base, cut)
+                if how == "copy":
+                    src.tick, src.hits = self.ticks, src.hits + 1
+                self.keep_stats[how] = self.keep_stats.get(how, 0) + 1
                 if e.rank == 0:
-                    rows = torch.cat([e.tower.span_rows(pic) for _, pic in s.vision.spans])
-                image = (positions, e._share_rows(rows, len(positions)))
+                    print(f"[tensorfold] kept prompt {src.eid}: continued at {cut} of {len(s.prompt)} ({how})",
+                          flush=True)
+                self._restore(index, src.snaps[cut])
+                slot.sc.host = list(src.host[:cut])
+                s.snaps = {b: v for b, v in src.snaps.items() if b <= cut}
+            image = None
+            later = [p for p in positions if p >= cut]
+            if later:
+                rows = None
+                if e.rank == 0:                          # the tower runs only for the spans past the boundary
+                    rows = torch.cat([e.tower.span_rows(pic)[max(0, cut - start):] for start, pic in s.vision.spans
+                                      if start + pic.tokens > cut])
+                image = (later, e._share_rows(rows, len(later)))
             s.draft = bool(s.draft) and e.drafter is not None
-            s.steps = e.prefill_steps(slot.sc, slot.dc if s.draft else None, list(s.prompt), image)
-            s.filled, s.prefill_s, s.cached = 0, 0.0, 0
+            snap = None
+            if KEEP:
+                marks = self._marks(len(s.prompt))
+
+                def snap(end: int) -> None:
+                    if end in marks:
+                        s.snaps[end] = self._snapshot(index)
+
+            s.steps = e.prefill_steps(slot.sc, slot.dc if s.draft else None, list(s.prompt), image, start=cut,
+                                      snap=snap)
+            s.filled, s.prefill_s, s.cached = cut, 0.0, cut
             self.filling.append(s)
         finally:
             self._step(False)
@@ -660,8 +924,9 @@ class MultiDecoder:
         sids = [s.sid for s in done if s.sid in self.streams]
         if not sids:
             return
-        self._send(["finish", sids])
-        self._finish(sids)
+        drops = self._covered(done) if KEEP else []
+        self._send(["finish", sids, drops])
+        self._finish(sids, drops)
 
     def _release(self, s: Stream) -> None:
         self.free.append(s.st.index)
@@ -669,11 +934,23 @@ class MultiDecoder:
         self.extents.give(s.base, s.size)
         s.st.sc = None
 
-    def _finish(self, sids: list[int]) -> None:
+    def _finish(self, sids: list[int], drops: list[int] = ()) -> None:
+        """Finished streams give their slots and extents back; with KEEP their prompts stay as kept prompts, the
+        ``drops`` (kept prompts they cover) go, and so do the oldest past KEEP_ENTRIES."""
+
         for sid in sids:
             s = self.streams.pop(sid, None)
-            if s is not None:
+            if s is None:
+                continue
+            if KEEP and getattr(s, "snaps", None):
+                self._keep(s)
+            else:
                 self._release(s)
+        for eid in drops:
+            if int(eid) in self.kept:
+                self._forget(self.kept[int(eid)])
+        while len(self.kept) > KEEP_ENTRIES:
+            self._forget(min(self.kept.values(), key=lambda k: k.tick))
 
     def drop(self) -> list[Stream]:
         """Every live stream fails (a step raised); their slots are free again."""
@@ -691,6 +968,8 @@ class MultiDecoder:
             self._release(s)
         self.streams.clear()
         self.filling.clear()
+        for k in list(self.kept.values()):              # (the ranks may disagree about them now)
+            self._forget(k)
 
     # -- followers ----------------------------------------------------------------------------------------------
     def follow(self, link: Link) -> None:
@@ -703,16 +982,17 @@ class MultiDecoder:
             kind = op[0]
             try:
                 if kind == "admit":
-                    _, prompt, count, sampling, draft, stop_eos, index, positions = op
+                    _, prompt, count, sampling, draft, stop_eos, index, positions, reuse = op
                     s = Stream(list(prompt), int(count), _unpack(sampling), draft=bool(draft), stop_eos=bool(stop_eos))
                     s.emit = lambda new: None
-                    self._admit(s, int(index), list(positions))
+                    s.keys = None
+                    self._admit(s, int(index), list(positions), reuse)
                 elif kind == "fill":
                     self._fill(next(f for f in self.filling if f.sid == int(op[1])))
                 elif kind == "round":
                     self.round(told=op)
                 elif kind == "finish":
-                    self._finish([int(x) for x in op[1]])
+                    self._finish([int(x) for x in op[1]], [int(x) for x in op[2]])
                 elif kind == "drop":
                     self._drop()
             except OutOfStep as exc:
