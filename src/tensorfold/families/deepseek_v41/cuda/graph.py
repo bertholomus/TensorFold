@@ -9,6 +9,7 @@ context bucket (masked past each row's visible count), so the arithmetic of a ro
 from __future__ import annotations
 
 import os
+import time
 
 import torch
 
@@ -182,11 +183,58 @@ class GraphRunner:
         self.graphs: dict = {}
         self.pool = None
         self.sc = None
+        self.captures = 0          # graphs captured while serving (after warm): each one stalls its request
+        self.warmed = False
 
     def bind(self, sc: SeqCache) -> None:
         if self.sc is not sc:
             self.graphs.clear()
             self.sc = sc
+
+    def _capture(self, sc: SeqCache, n: int, b: int, taps: bool, ids, start: int, e_rows) -> StaticDecoder:
+        if self.pool is None:
+            self.pool = torch.cuda.graph_pool_handle()
+        g = StaticDecoder(self.m, sc, n, b, taps)
+        # capture with the step's inputs in place: the warm-up and capture write the caches for these rows, which the
+        # replay rewrites with the same values (synthetic rows at warm: a request rewrites every row it reads)
+        g.ids.copy_(torch.tensor(ids, dtype=torch.long))
+        g.pos.copy_(torch.arange(start, start + n, dtype=torch.long))
+        for i, t in (e_rows or {}).items():
+            g.e_in[i].copy_(t)
+        g.capture(self.pool)
+        self.graphs[(n, b, taps)] = g
+        return g
+
+    def buckets(self, limit: int, cap: int) -> list[int]:
+        """Every context bucket a window ending at or before ``limit`` tokens can use, largest first."""
+
+        out, b = set(), BUCKET_MIN
+        while b < limit:
+            out.add(bucket_for(b, cap))
+            b *= 2
+        out.add(bucket_for(limit, cap))
+        return sorted(out, reverse=True)
+
+    def warm(self, sc: SeqCache, limit: int) -> dict:
+        """Capture every graph a request can replay before serving: one row without taps (serial decode) and 2 ..
+        max_rows rows with taps (verify windows) at every context bucket, the largest bucket first so it sizes the
+        shared pool. Same order on every rank (each capture issues real gathers)."""
+
+        self.bind(sc)
+        t0 = time.perf_counter()
+        r0 = torch.cuda.memory_reserved()
+        n_new = 0
+        for b in self.buckets(limit, sc.cap):
+            for n in range(self.max_rows, 0, -1):
+                taps = n > 1
+                if (n, b, taps) in self.graphs:
+                    continue
+                self._capture(sc, n, b, taps, [0] * n, b - n, None)
+                n_new += 1
+        torch.cuda.synchronize()
+        self.warmed = True
+        return {"graphs": n_new, "seconds": round(time.perf_counter() - t0, 1),
+                "reserved_gib": round((torch.cuda.memory_reserved() - r0) / 2**30, 2)}
 
     def forward(self, sc: SeqCache, ids: list[int], start: int, taps: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
         m = self.m
@@ -204,17 +252,10 @@ class GraphRunner:
             e_rows = {i: m.engram.rows(i, hashes[:, m.cfg.engram_layers.index(i), lo:hi])
                       for i in m.cfg.engram_layers if i < len(m.w.layers)}
         if g is None:
-            if self.pool is None:
-                self.pool = torch.cuda.graph_pool_handle()
-            g = StaticDecoder(m, sc, n, b, taps)
-            # capture with this step's inputs in place: the warm-up and capture write the caches for these rows,
-            # which the replay below rewrites with the same values
-            g.ids.copy_(torch.tensor(ids, dtype=torch.long))
-            g.pos.copy_(torch.arange(start, start + n, dtype=torch.long))
-            for i, t in (e_rows or {}).items():
-                g.e_in[i].copy_(t)
-            g.capture(self.pool)
-            self.graphs[key] = g
+            if self.warmed:
+                self.captures += 1
+                print(f"[tensorfold] WARNING: graph {key} captured while serving", flush=True)
+            g = self._capture(sc, n, b, taps, ids, start, e_rows)
         out = g.run(ids, start, e_rows)
         sc.length = start + n
         return out, g.taps

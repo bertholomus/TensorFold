@@ -396,11 +396,21 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
     packed = has and isinstance(comp, tuple)
     codes, scales = (comp if packed else (comp, None)) if has else (wsrc, None)
     n_idx = idx.shape[1] if has else 0
-    nblk = window // bn + (triton.cdiv(n_idx, bn) if has else 0)
     # decode / verify windows split the keys (parallelism for a few rows); prompt chunks have rows enough
     sp = ATTN_SPLITS if rows <= 16 else 1
     groups = h // hb
     final = sp == 1
+    picks = triton.cdiv(n_idx, bn) if has else 0
+    if final and picks:
+        # prompt chunks: so that prompts of any length share five compiled variants, the pick list is padded with -1
+        # to a multiple of 16 entries and the pick blocks are rounded up to a power of two; a masked key or block
+        # leaves m, l and acc unchanged (alpha 1, p 0), so the bits are those of the exact count
+        if n_idx % 16:
+            idx = torch.nn.functional.pad(idx, (0, 16 - n_idx % 16), value=-1)
+            n_idx = idx.shape[1]
+        picks = triton.next_power_of_2(picks)
+    nblk = window // bn + picks
+    ring_size = wsrc.shape[0] if ring else 16          # only ring windows read it (a fixed value: one variant)
     if final:
         pm = pl = po = out
     else:
@@ -408,7 +418,7 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
         pl = torch.empty_like(pm)
         po = torch.empty((rows * groups * sp * hb * hd,), dtype=torch.float32, device=q.device)
     _sparse_attn_part[(rows, groups, sp)](q, wsrc, wlo, codes, scales if packed else wsrc, idx if has else pos, pos,
-                                          pm, pl, po, sink, out, scale, wsrc.shape[0], n_idx, H=h, HD=hd, HB=hb,
+                                          pm, pl, po, sink, out, scale, ring_size, n_idx, H=h, HD=hd, HB=hb,
                                           WIN=window, BN=bn, RING=ring, HAS_COMP=has, PACKED=packed, SPLITS=sp,
                                           NBLK=nblk, FINAL=final, num_warps=4, num_stages=1)
     if not final:

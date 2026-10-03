@@ -26,6 +26,14 @@ REPLAY = os.environ.get("TF_DS_REPLAY", "0") == "1"
 CHUNK_LOG = os.environ.get("TF_DS_CHUNK_LOG", "0") == "1"
 # drafts verified a round chosen from the confidence head's prefix survival and measured window costs (0: fixed k)
 ADAPTIVE = os.environ.get("TF_DS_ADAPTIVE", "0") == "1"
+# before serving: caches at full size, the Triton kernels prompt chunks use, every decode graph (each window size at each
+# context bucket) and the drafter's graph, so no request pays a kernel build or a graph capture
+WARM = os.environ.get("TF_DS_WARM", "1") != "0"
+# synthetic prompt lengths for the warm-up: row and key counts of 1, multiples of 16 and others (Triton specializes
+# integer arguments on those), short prompts on the window ring, every pick-block bucket of the prompt attention, prompts
+# past the decoder replay window at even and odd offsets (pointer alignment), a second chunk
+WARM_LENGTHS = tuple(int(v) for v in (os.environ.get("TF_DS_WARM_LENGTHS") or
+                                      "1,2,3,16,17,32,33,34,48,65,66,96,130,131,160,256,258,259,512,514,1024,2113").split(","))
 
 
 class DsEngine:
@@ -75,11 +83,58 @@ class DsEngine:
         self.max_rows = drafts + 1
         self.eos = (int(json.loads((Path(model_dir) / "config.json").read_text()).get("eos_token_id", 1)),)
         self.request = threading.local()
+        self.quiet = False
         if nccl is not None:
             nccl.barrier()
+        if WARM:
+            self.warm()
         if rank == 0:
             print(f"[tensorfold] DeepSeek-V4.1 engine ready: {world} rank(s), context {self.limit}, "
                   f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}", flush=True)
+
+    def warm(self) -> None:
+        """Same steps on every rank, in the same order (prefills and graph captures issue real collectives)."""
+
+        t0 = time.perf_counter()
+        m = self.model
+        self.sc = m.new_cache(self.limit + self.max_rows + 8)
+        if self.drafter is not None:
+            self.dc = self.drafter.new_cache()
+        ids = [1000 + (i * 7919) % 60000 for i in range(max(WARM_LENGTHS))]
+        self.quiet = True
+        try:
+            for n in WARM_LENGTHS:
+                if n + 8 <= self.limit:
+                    self._run(ids[:n], 6, None, False, lambda new: None, self.drafter is not None)
+            self._run(ids[:17], 3, None, False, lambda new: None, False)
+        finally:
+            self.quiet = False
+        t1 = time.perf_counter()
+        info = {}
+        if self.runner is not None:
+            info = self.runner.warm(self.sc, self.limit)
+            if self.drafter is not None:
+                self._draft_graph(self.sc, self.dc, 0, 0)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        if self.rank == 0:
+            print(f"[tensorfold] warm-up: {len(WARM_LENGTHS)} prompt lengths {t1 - t0:.1f}s, decode graphs {info}, "
+                  f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
+
+    def _draft_graph(self, sc, dc, tok: int, pos: int):
+        dg = getattr(self, "_dg", None)
+        if dg is None or dg.sc is not sc or dg.dc is not dc:
+            from .dspark import DraftGraph
+
+            if getattr(self.runner, "warmed", False):
+                print("[tensorfold] WARNING: drafter graph captured while serving", flush=True)
+            dg = self._dg = DraftGraph(self.drafter, sc, dc)
+            dg.token.fill_(tok)
+            dg.q0.fill_(pos)
+            if self.runner.pool is None:
+                self.runner.pool = torch.cuda.graph_pool_handle()
+            dg.capture(self.runner.pool)
+        return dg
 
     # -- request mirroring -----------------------------------------------------------------------------------------
     def _share(self, values: list[int] | None) -> list[int]:
@@ -175,7 +230,7 @@ class DsEngine:
         dt = time.perf_counter() - t1
         stats.update(decode_s=dt, tokens=len(out), tokens_per_second=(len(out) - 1) / dt if dt > 0 else 0.0,
                      sha256=hashlib.sha256(json.dumps(out).encode()).hexdigest()[:16])
-        if self.rank == 0:
+        if self.rank == 0 and not self.quiet:
             print(f"[tensorfold] prompt {len(prompt)} prefill {stats['prefill_s']:.2f}s decode {len(out)} tok "
                   f"{stats['tokens_per_second']:.2f} tok/s"
                   + (f" rounds {stats['rounds']} drafted {stats['drafted']} accepted {stats['accepted']}"
@@ -230,15 +285,7 @@ class DsEngine:
             P = sc.length
             ta = time.perf_counter()
             if self.runner is not None:
-                dg = getattr(self, "_dg", None)
-                if dg is None or dg.sc is not sc or dg.dc is not dc:
-                    from .dspark import DraftGraph
-
-                    dg = self._dg = DraftGraph(d, sc, dc)
-                    dg.token.fill_(tok)
-                    dg.q0.fill_(P)
-                    dg.capture(self.runner.pool)
-                drafts, _conf = dg.run(tok, P)
+                drafts, _conf = self._draft_graph(sc, dc, tok, P).run(tok, P)
             else:
                 drafts, _conf = d.draft(dc, sc, tok, P)
             tb = time.perf_counter()

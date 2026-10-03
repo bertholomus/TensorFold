@@ -33,7 +33,7 @@ class Drafter:
         self.noise = c.dspark_noise
         self.topk = c.dspark_topk
         self.ring_size = c.window + 16
-        self._block_idx = None
+        self._block_idx: dict[int, torch.Tensor] = {}   # per row count: a graph keeps the tensor it captured
 
     def new_cache(self) -> DraftCache:
         c = self.m.cfg
@@ -71,12 +71,13 @@ class Drafter:
         q = mm(lay.wq_b, qr).view(n, self.m.Hl, hd)
         K.rope_heads(q, cos, sin, pos, rd)
         kvb = K.kv_norm_rope(mm(lay.wkv, x), lay.kv_norm, cos, sin, pos, ring, self.m._neg(n), c.eps, KV_QUANT, rd)
-        if self._block_idx is None or self._block_idx.shape[0] != n:
-            self._block_idx = torch.arange(n, device=x.device).repeat(n, 1).contiguous()
+        bidx = self._block_idx.get(n)
+        if bidx is None:
+            bidx = self._block_idx[n] = torch.arange(n, device=x.device).repeat(n, 1).contiguous()
         if wpos is None:
             wpos = torch.full((n,), q0 - 1, dtype=torch.int64, device=x.device)
         # every row sees the 128 newest absorbed positions and every block row (no mask inside the block)
-        o = K.sparse_attn(q, lay.sink, ring, self.m._zero, True, kvb, self._block_idx, wpos, hd ** -0.5, c.window)
+        o = K.sparse_attn(q, lay.sink, ring, self.m._zero, True, kvb, bidx, wpos, hd ** -0.5, c.window)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
         og = o.view(n, len(lay.wo_a), -1)
         u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
