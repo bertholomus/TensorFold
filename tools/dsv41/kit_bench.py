@@ -233,6 +233,20 @@ def cmd_prefill(c: Client, a) -> list:
     return rows
 
 
+def cmd_depth(c: Client, a) -> list:
+    """Decode speed after a long cold prompt: greedy, ignore_eos, a.tokens tokens."""
+
+    rows = []
+    for length in [int(x) for x in a.lengths.split(",")]:
+        ids = filler_ids(c, length, seed=int(time.time() * 1000) ^ length)
+        r = c.stream({"prompt": ids, "max_tokens": a.tokens, "temperature": 0, "ignore_eos": True}, "/v1/completions")
+        row = {"length": length, "prompt_tokens": r["prompt_tokens"], "ttft_s": r["ttft_s"], "tokens": r["tokens"],
+               "decode_tps": r["decode_tps"]}
+        print(json.dumps(row), flush=True)
+        rows.append(row)
+    return rows
+
+
 def cmd_oracle(c: Client, a) -> None:
     with open(a.out, "w") as f:
         for i, (kind, text) in enumerate(ORACLE_SET_V1):
@@ -273,6 +287,7 @@ def main() -> None:
     s = sub.add_parser("concurrent"); s.add_argument("--streams", default="2,4"); s.add_argument("--tokens", type=int, default=256)
     s.add_argument("--reps", type=int, default=2)
     s = sub.add_parser("prefill"); s.add_argument("--lengths", default="8192,32768,131072"); s.add_argument("--reps", type=int, default=1)
+    s = sub.add_parser("depth"); s.add_argument("--lengths", default="131072"); s.add_argument("--tokens", type=int, default=256)
     s = sub.add_parser("oracle"); s.add_argument("--gen-tokens", type=int, default=64); s.add_argument("--topk", type=int, default=20)
     for s in sub.choices.values():
         s.add_argument("--out")
@@ -281,7 +296,8 @@ def main() -> None:
     if a.cmd == "oracle":
         cmd_oracle(c, a)
         return
-    out = {"ready": cmd_ready, "decode": cmd_decode, "concurrent": cmd_concurrent, "prefill": cmd_prefill}[a.cmd](c, a)
+    out = {"ready": cmd_ready, "decode": cmd_decode, "concurrent": cmd_concurrent, "prefill": cmd_prefill,
+           "depth": cmd_depth}[a.cmd](c, a)
     print(json.dumps(out)[:2000] if a.cmd == "ready" else "", flush=True)
     if a.out:
         with open(a.out, "w") as f:

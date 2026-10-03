@@ -147,4 +147,11 @@ s_p = K.index_score(iq, pi, wts, vis, 1500)
 res["index_score_packed_equal"] = [bool(torch.equal(s_b, s_p)), rel(s_p, s_b)]
 # direct check of the kernel-side dequant: a 1-row comp, idx pointing at it, compare against bf16 rows
 
+# prompt-chunk index scores (8 rows a program) vs the row kernel
+iq40 = torch.randn(40, 32, 128, device=dev).to(BF)
+w40 = torch.randn(40, 32, device=dev).to(BF)
+v40 = torch.randint(0, 1500, (40,), device=dev)
+a40 = K.index_score(iq40, pi, w40, v40, 1500)
+b40 = torch.cat([K.index_score(iq40[i:i + 1], pi, w40[i:i + 1], v40[i:i + 1], 1500) for i in range(40)])
+res["index_score_rows_vs_row"] = rel(a40, b40)
 print(json.dumps(res, indent=1))

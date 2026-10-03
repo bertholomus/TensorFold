@@ -536,7 +536,7 @@ class Model:
                     kk = min(c.idx_topk, n_comp_end)
                     cidx = torch.empty((n, kk), dtype=torch.int64, device=x.device)
                     # rows in blocks so the [rows, n_comp] score matrix stays bounded at long contexts
-                    rb = max(16, min(n, (1 << 28) // (4 * max(n_comp_end, 1))))
+                    rb = max(16, min(n, (1 << 26) // (4 * max(n_comp_end, 1))))
                     cand_parts = []
                     for r0 in range(0, n, rb):
                         r1 = min(n, r0 + rb)
@@ -554,6 +554,17 @@ class Model:
                 shared["topk"] = cidx
             cidx = shared["topk"]
             comp = sc.comp[src]
+            if isinstance(comp, tuple) and n > 16:
+                # a prompt chunk: dequantize the visible compressed rows once for this kv source's layers (the same
+                # bf16 values the packed kernel builds per row, so the same bits), instead of once a row
+                key = (src, n_comp_end, start)
+                if shared.get("comp16_key") != key:
+                    from ..ops import fp4_unpack
+
+                    m_ = max(n_comp_end, 1)
+                    shared["comp16"] = fp4_unpack(comp[0][:m_], comp[1][:m_], 16, True)
+                    shared["comp16_key"] = key
+                comp = shared["comp16"]
         o = K.sparse_attn(q, lay.sink, wsrc, wlo, ring_mode, comp, cidx, pos, hd ** -0.5, c.window)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
         if not ring_mode:

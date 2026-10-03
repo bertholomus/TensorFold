@@ -300,10 +300,10 @@ def _comp_keys(COMP, CSC, row, ok, hc, HD: tl.constexpr, BN: tl.constexpr, PACKE
 
 
 @triton.jit
-def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, scale, ring_size, n_idx,
+def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, SINK, OUT, scale, ring_size, n_idx,
                       H: tl.constexpr, HD: tl.constexpr, HB: tl.constexpr, WIN: tl.constexpr, BN: tl.constexpr,
                       RING: tl.constexpr, HAS_COMP: tl.constexpr, PACKED: tl.constexpr, SPLITS: tl.constexpr,
-                      NBLK: tl.constexpr):
+                      NBLK: tl.constexpr, FINAL: tl.constexpr):
     r = tl.program_id(0)
     hb = tl.program_id(1)
     sp = tl.program_id(2)
@@ -341,6 +341,12 @@ def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, scale, ring
             ok = ii >= 0
             k_lo, k_hi = _comp_keys(COMP, CSC, tl.where(ok, ii, 0), ok, hc, HD, BN, PACKED)
         m_i, l_i, acc_lo, acc_hi = _attn_step(q_lo, q_hi, k_lo, k_hi, ok, m_i, l_i, acc_lo, acc_hi, scale)
+    if FINAL:                         # one split (prompt chunks): the sink and the division here, no merge pass
+        l_i = l_i + tl.exp(tl.load(SINK + h) - m_i)
+        ob = OUT + r * (H * HD) + h[:, None] * HD
+        tl.store(ob + hc[None, :], (acc_lo / l_i[:, None]).to(tl.bfloat16))
+        tl.store(ob + HALF + hc[None, :], (acc_hi / l_i[:, None]).to(tl.bfloat16))
+        return
     base = (r * (H // HB) + hb) * SPLITS + sp
     tl.store(PM + base * HB + tl.arange(0, HB), m_i)
     tl.store(PL + base * HB + tl.arange(0, HB), l_i)
@@ -391,16 +397,22 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
     codes, scales = (comp if packed else (comp, None)) if has else (wsrc, None)
     n_idx = idx.shape[1] if has else 0
     nblk = window // bn + (triton.cdiv(n_idx, bn) if has else 0)
-    sp = ATTN_SPLITS
+    # decode / verify windows split the keys (parallelism for a few rows); prompt chunks have rows enough
+    sp = ATTN_SPLITS if rows <= 16 else 1
     groups = h // hb
-    pm = torch.empty((rows * groups * sp * hb,), dtype=torch.float32, device=q.device)
-    pl = torch.empty_like(pm)
-    po = torch.empty((rows * groups * sp * hb * hd,), dtype=torch.float32, device=q.device)
+    final = sp == 1
+    if final:
+        pm = pl = po = out
+    else:
+        pm = torch.empty((rows * groups * sp * hb,), dtype=torch.float32, device=q.device)
+        pl = torch.empty_like(pm)
+        po = torch.empty((rows * groups * sp * hb * hd,), dtype=torch.float32, device=q.device)
     _sparse_attn_part[(rows, groups, sp)](q, wsrc, wlo, codes, scales if packed else wsrc, idx if has else pos, pos,
-                                          pm, pl, po, scale, wsrc.shape[0], n_idx, H=h, HD=hd, HB=hb, WIN=window,
-                                          BN=bn, RING=ring, HAS_COMP=has, PACKED=packed, SPLITS=sp, NBLK=nblk,
-                                          num_warps=4, num_stages=1)
-    _sparse_attn_merge[(rows, groups)](pm, pl, po, sink, out, H=h, HD=hd, HB=hb, SPLITS=sp, num_warps=8)
+                                          pm, pl, po, sink, out, scale, wsrc.shape[0], n_idx, H=h, HD=hd, HB=hb,
+                                          WIN=window, BN=bn, RING=ring, HAS_COMP=has, PACKED=packed, SPLITS=sp,
+                                          NBLK=nblk, FINAL=final, num_warps=4, num_stages=1)
+    if not final:
+        _sparse_attn_merge[(rows, groups)](pm, pl, po, sink, out, H=h, HD=hd, HB=hb, SPLITS=sp, num_warps=8)
     return out
 
 
@@ -438,10 +450,49 @@ def _index_score(Q, K, KS, Wt, VIS, OUT, n, IH: tl.constexpr, ID: tl.constexpr, 
     tl.store(OUT + r * n + t, sc, mask=ok)
 
 
+@triton.jit
+def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr,
+                      RB: tl.constexpr, PACKED: tl.constexpr):
+    """Prompt chunks: RB rows a program share each key tile (dequantized once for all of them)."""
+
+    rb = tl.program_id(0)
+    b = tl.program_id(1)
+    HALF: tl.constexpr = ID // 2
+    rr = rb * RB + tl.arange(0, RB)
+    rok = rr < rows
+    hh = tl.arange(0, IH)
+    hc = tl.arange(0, HALF)
+    t = b * BN + tl.arange(0, BN)
+    ok = t < n
+    qrow = rr[:, None] * IH + hh[None, :]                               # [RB, IH]
+    qflat = tl.reshape(qrow, (RB * IH,))
+    q_lo = tl.load(Q + qflat[:, None] * ID + hc[None, :], mask=tl.reshape(tl.broadcast_to(rok[:, None], (RB, IH)), (RB * IH,))[:, None], other=0.0)
+    q_hi = tl.load(Q + qflat[:, None] * ID + HALF + hc[None, :], mask=tl.reshape(tl.broadcast_to(rok[:, None], (RB, IH)), (RB * IH,))[:, None], other=0.0)
+    if PACKED:
+        cb = tl.load(K + t[:, None] * HALF + hc[None, :], mask=ok[:, None], other=0).to(tl.int32)
+        g = tl.arange(0, HALF // 32)
+        el = tl.load(KS + t[:, None] * (ID // 32) + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
+        eh = tl.load(KS + t[:, None] * (ID // 32) + HALF // 32 + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
+        sl = (el << 23).to(tl.float32, bitcast=True)
+        sh = (eh << 23).to(tl.float32, bitcast=True)
+        k_lo = tl.reshape(tl.reshape(_e2m1(cb & 15), (BN, HALF // 32, 32)) * sl[:, :, None], (BN, HALF)).to(tl.bfloat16)
+        k_hi = tl.reshape(tl.reshape(_e2m1(cb >> 4), (BN, HALF // 32, 32)) * sh[:, :, None], (BN, HALF)).to(tl.bfloat16)
+    else:
+        k_lo = tl.load(K + t[:, None] * ID + hc[None, :], mask=ok[:, None], other=0.0)
+        k_hi = tl.load(K + t[:, None] * ID + HALF + hc[None, :], mask=ok[:, None], other=0.0)
+    s = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))      # [RB * IH, BN]
+    w = tl.load(Wt + qflat, mask=tl.reshape(tl.broadcast_to(rok[:, None], (RB, IH)), (RB * IH,)), other=0.0).to(tl.float32)
+    sc = tl.sum(tl.reshape(tl.maximum(s, 0.0) * w[:, None], (RB, IH, BN)), axis=1)    # [RB, BN]
+    vis = tl.load(VIS + rr, mask=rok, other=0)
+    sc = tl.where(t[None, :] < vis[:, None], sc, float("-inf"))
+    tl.store(OUT + rr[:, None] * n + t[None, :], sc, mask=rok[:, None] & ok[None, :])
+
+
 def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
                 out: torch.Tensor | None = None) -> torch.Tensor:
     """q [R, IH, ID] bf16, k bf16 [>= n, ID] or a packed FP4 pair (codes [N, ID/2], E8M0 [N, ID/32]),
-    w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r])."""
+    w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r]). Decode / verify windows (R <= 16) take one row a program
+    (row-invariant); prompt chunks share each key tile among 8 rows."""
 
     rows, ih, idim = q.shape
     if out is None:
@@ -449,8 +500,14 @@ def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
     packed = isinstance(k, tuple)
     codes, scales = k if packed else (k, k)
     bn = 64
-    _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, IH=ih, ID=idim, BN=bn, PACKED=packed,
-                                             num_warps=4)
+    if rows <= 16:
+        _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, IH=ih, ID=idim, BN=bn,
+                                                 PACKED=packed, num_warps=4)
+    else:
+        rbs = 8
+        _index_score_rows[(triton.cdiv(rows, rbs), triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, rows,
+                                                                          IH=ih, ID=idim, BN=bn, RB=rbs,
+                                                                          PACKED=packed, num_warps=8)
     return out
 
 

@@ -24,6 +24,8 @@ GRAPHS = os.environ.get("TF_DS_GRAPHS", "1") != "0"
 # prompt tokens; off by default (exact prefill) until its agreement and needle recall are measured
 REPLAY = os.environ.get("TF_DS_REPLAY", "0") == "1"
 CHUNK_LOG = os.environ.get("TF_DS_CHUNK_LOG", "0") == "1"
+# drafts verified a round chosen from the confidence head's prefix survival and measured window costs (0: fixed k)
+ADAPTIVE = os.environ.get("TF_DS_ADAPTIVE", "0") == "1"
 
 
 class DsEngine:
@@ -38,6 +40,10 @@ class DsEngine:
 
         torch.cuda.set_device(0)
         self.rank, self.world = rank, world
+        # NCCL only moves prompt chunks' partials ([2048, 5120] fp32): the Simple protocol on 4 channels took 3.8 ms a
+        # gather on the CX7 link against 7.1 with NCCL's choice (decode windows go over the RDMA gather)
+        os.environ.setdefault("NCCL_PROTO", "Simple")
+        os.environ.setdefault("NCCL_MIN_NCHANNELS", "4")
         nccl = NCCL(rank, world, master, port) if world > 1 else None
         self.nccl = nccl
         self.w = load(model_dir, rank, world, dspark=drafts > 0)
@@ -155,6 +161,7 @@ class DsEngine:
             if use_drafts and taps:
                 self.drafter.absorb(dc, sc, torch.cat(taps, -1), m.taps_start)
         self.last_prefill_logits = last
+        torch.cuda.empty_cache()          # a long prompt's chunk buffers back to the node (unified memory)
         first = self._sample(last, [len(prompt)], sampling)[0]
         stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0}
         t1 = time.perf_counter()
@@ -188,6 +195,26 @@ class DsEngine:
             on_tokens([tok])
         return out
 
+    def _choose_k(self, conf, kmax: int, draft_ms: float) -> int:
+        """The k in 1..kmax with the most expected tokens a millisecond: (1 + sum of prefix survivals) over the draft
+        plus the measured cost of a k-draft window (unmeasured sizes: the nearest measured one, + 7 ms a row)."""
+
+        surv = _survival(conf[:kmax])
+        cost = getattr(self, "vcost", {})
+        best, best_v = kmax, -1.0
+        for k in range(1, kmax + 1):
+            if k in cost:
+                c = cost[k]
+            elif cost:
+                near = min(cost, key=lambda q: abs(q - k))
+                c = cost[near] + 7.0 * (k - near)
+            else:
+                c = 33.0 + 7.0 * k
+            v = (1.0 + sum(surv[:k])) / (draft_ms + c)
+            if v > best_v:
+                best, best_v = k, v
+        return best
+
     def _spec(self, sc, dc, first, max_tokens, sampling, eos, on_tokens):
         """Drafts verified k at a time against the target's keyed samples (the serial rule)."""
 
@@ -215,6 +242,8 @@ class DsEngine:
             tb = time.perf_counter()
             t_draft += tb - ta
             kk = min(self.drafts, max_tokens - len(out), len(drafts))
+            if ADAPTIVE and kk > 1:
+                kk = self._choose_k(_conf, kk, (tb - ta) * 1000)
             window = [tok] + drafts[:kk]
             if self.runner is not None:
                 lg, tapt = self.runner.forward(sc, window, P, True)
@@ -226,6 +255,9 @@ class DsEngine:
             target = self._sample(lg, [P + 1 + i for i in range(kk + 1)], sampling)
             tc = time.perf_counter()
             t_verify += tc - tb
+            if ADAPTIVE:
+                cost = self.__dict__.setdefault("vcost", {})
+                cost[kk] = (tc - tb) * 1000 if kk not in cost else 0.8 * cost[kk] + 0.2 * (tc - tb) * 1000
             a = 0
             while a < kk and drafts[a] == target[a]:
                 a += 1
@@ -247,6 +279,16 @@ class DsEngine:
         self.last_spec_times = {"draft_ms": 1000 * t_draft / max(rounds, 1), "verify_ms": 1000 * t_verify / max(rounds, 1),
                                 "absorb_ms": 1000 * t_absorb / max(rounds, 1)}
         return out, (rounds, drafted, accepted)
+
+
+def _survival(conf) -> list[float]:
+    import math
+
+    out, s = [], 1.0
+    for c in conf:
+        s *= 1.0 / (1.0 + math.exp(-float(c)))
+        out.append(s)
+    return out
 
 
 def _default_engram(model_dir: Path) -> str | None:

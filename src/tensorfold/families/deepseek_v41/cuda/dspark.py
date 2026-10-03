@@ -175,6 +175,7 @@ class DraftGraph:
         conf_in = torch.cat([xc.float(), torch.stack(embs).float()], -1)
         self.out = out[1:]
         self.conf = (conf_in @ d.dw.conf.float().t())[:, 0]
+        self.packed = torch.cat([self.out.to(F32), self.conf])       # one host read a round (ids < 2^24)
 
     def capture(self, pool=None):
         s = torch.cuda.Stream()
@@ -192,7 +193,9 @@ class DraftGraph:
         self.token.fill_(token)
         self.q0.fill_(q0)
         self.graph.replay()
-        return self.out.tolist(), self.conf
+        v = self.packed.tolist()
+        n = self.d.size
+        return [int(x) for x in v[:n]], v[n:]
 
 
 @dataclass
