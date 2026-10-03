@@ -1,12 +1,17 @@
-"""Black-box measurements of an OpenAI-compatible DeepSeek-V4.1 server (the kit baseline, or ours).
+"""Black-box measurements of an OpenAI-compatible DeepSeek-V4.1 server.
+
+The same client measured both sides of the published comparison (this engine and the MiaAI-Lab vLLM kit,
+commit 6f7d1590ad49), on the same two nodes. It needs only the server's HTTP API: /v1/models, /v1/completions,
+/v1/chat/completions and vLLM's /tokenize.
 
 Standard library only, so it runs on a bare node. The API key is read from a file (KEY=value lines or
 a bare key) and never printed.
 
-  python3 kit_bench.py --base http://127.0.0.1:8889 --model M --key-file F ready  --timeout 3600
+  python3 kit_bench.py --base http://127.0.0.1:8000 --model M --key-file <API_KEY_FILE> ready --timeout 3600
   python3 kit_bench.py ... decode     --out decode.json
   python3 kit_bench.py ... concurrent --streams 2,4 --out conc.json
   python3 kit_bench.py ... prefill    --lengths 8192,32768,131072 --out prefill.json
+  python3 kit_bench.py ... depth      --lengths 131072 --tokens 256 --out depth.json
   python3 kit_bench.py ... oracle     --out oracle.jsonl
 
 Decode tok/s = (completion tokens - 1) / (last chunk time - first chunk time), first token excluded.
@@ -14,6 +19,8 @@ Prefill tok/s = prompt tokens / time to first token, with a fresh random prefix 
 The oracle records, for a fixed prompt set, the greedy continuation (64 tokens, top-20 logprobs per
 step) and the teacher-forced top-20 logprobs at every prompt+continuation position.
 """
+
+from __future__ import annotations
 
 import argparse
 import json
@@ -33,6 +40,16 @@ DECODE_PROMPTS = [
                    "department, title, salary (int), start_date (YYYY-MM-DD), manager_id (int or null) and "
                    "skills (array of strings). Output only the JSON, pretty-printed with two-space indents."),
 ]
+
+# A second decode set (--set b): a short coding task with tests, a 400-word essay and a counting task, the prompt classes
+# of other published 2x GB10 numbers for this model (our own wording); measured with --tokens 384.
+DECODE_PROMPTS_B = [
+    ("code", "Write a Python class LRUCache with get(key) and put(key, value), both O(1), using a dict and a doubly "
+             "linked list. Then write unittest test cases for it."),
+    ("prose", "Write a 400-word essay about the invention of the printing press and how it changed Europe."),
+    ("structured", "Count from 1 to 200. Write each number on its own line and nothing else."),
+]
+PROMPT_SETS = {"a": DECODE_PROMPTS, "b": DECODE_PROMPTS_B}
 
 # Fixed oracle set: chat-templated prompts (thinking off) and raw-text prompts. Never change these in
 # place; add a new set name instead, so earlier oracle files stay comparable.
@@ -164,11 +181,11 @@ def cmd_ready(c: Client, a) -> dict:
 
 def cmd_decode(c: Client, a) -> list:
     rows = []
-    for name, prompt in DECODE_PROMPTS:
+    for name, prompt in PROMPT_SETS[a.set]:
         c.stream(decode_body(prompt, 32), "/v1/chat/completions")  # warm-up
         runs = [c.stream(decode_body(prompt, a.tokens), "/v1/chat/completions") for _ in range(a.reps)]
         tps = [r["decode_tps"] for r in runs if r["decode_tps"]]
-        row = {"prompt": name, "max_tokens": a.tokens, "reps": a.reps,
+        row = {"set": a.set, "prompt": name, "max_tokens": a.tokens, "reps": a.reps,
                "decode_tps_median": statistics.median(tps), "decode_tps_all": [round(x, 3) for x in tps],
                "tokens_all": [r["tokens"] for r in runs], "chunks_all": [r["chunks"] for r in runs],
                "ttft_s_median": statistics.median(r["ttft_s"] for r in runs),
@@ -187,7 +204,8 @@ def cmd_concurrent(c: Client, a) -> list:
             barrier = threading.Barrier(n)
 
             def worker(i: int) -> None:
-                name, prompt = DECODE_PROMPTS[i % len(DECODE_PROMPTS)]
+                prompts = PROMPT_SETS[a.set]
+                name, prompt = prompts[i % len(prompts)]
                 barrier.wait()
                 results[i] = c.stream(decode_body(prompt + f" (variant {i})", a.tokens), "/v1/chat/completions")
 
@@ -284,7 +302,9 @@ def main() -> None:
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("ready"); s.add_argument("--timeout", type=float, default=3600)
     s = sub.add_parser("decode"); s.add_argument("--tokens", type=int, default=512); s.add_argument("--reps", type=int, default=3)
+    s.add_argument("--set", choices=sorted(PROMPT_SETS), default="a")
     s = sub.add_parser("concurrent"); s.add_argument("--streams", default="2,4"); s.add_argument("--tokens", type=int, default=256)
+    s.add_argument("--set", choices=sorted(PROMPT_SETS), default="a")
     s.add_argument("--reps", type=int, default=2)
     s = sub.add_parser("prefill"); s.add_argument("--lengths", default="8192,32768,131072"); s.add_argument("--reps", type=int, default=1)
     s = sub.add_parser("depth"); s.add_argument("--lengths", default="131072"); s.add_argument("--tokens", type=int, default=256)

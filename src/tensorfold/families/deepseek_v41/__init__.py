@@ -11,6 +11,7 @@ from typing import Any
 
 MODEL_TYPES = ("deepseek_v41",)
 TITLE = "DeepSeek-V4.1-Flash"
+CUDA_VISION = True          # --vision: the tower and image spans are this family's own (cuda/vision.py)
 LANES = False
 MODELS = ("Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw",)
 QUANT_METHODS = {"cuda": ("exl3",)}
@@ -49,7 +50,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 2, rank: 
         raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
     drafts = 0 if no_drafts else (3 if mtp_drafts is None else int(mtp_drafts))
     return DsEngine(Path(model_dir), rank=int(rank), world=int(tp), master=master, port=int(master_port),
-                    drafts=drafts, context=options.get("context"), engram_dir=os.environ.get("TF_DS_ENGRAM") or None)
+                    drafts=drafts, context=options.get("context"), engram_dir=os.environ.get("TF_DS_ENGRAM") or None,
+                    vision=bool(options.get("vision")), vision_urls=bool(options.get("vision_urls")))
 
 
 def __getattr__(name: str) -> Any:

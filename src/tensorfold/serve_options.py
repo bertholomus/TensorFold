@@ -32,7 +32,9 @@ def check(args: argparse.Namespace, family: Any, backend: str, config_dir: Any =
             raise ValueError("--vision-offload needs --vision")
         if backend != "cuda":
             raise ValueError("--vision-offload is for the CUDA backend; the Mac's image tower already shares host memory")
-    if getattr(args, "vision", False):             # only --vision reads the config here
+    if getattr(args, "vision", False) and backend == "cuda" and getattr(family.package, "CUDA_VISION", False):
+        pass                                       # a family with its own image path checks its config at load
+    elif getattr(args, "vision", False):           # only --vision reads the config here
         if family.model_type == "glm5_next" and backend != "mlx":
             raise ValueError("GLM-5.3-Flash image input is currently MLX-only")
         from tensorfold.families import read_config

@@ -149,6 +149,7 @@ class Layer:
     idx_k_norm: torch.Tensor | None = None
     gate_w: torch.Tensor | None = None       # [E, d] f32
     gate_b: torch.Tensor | None = None       # [E] f32
+    gate_b_vl: torch.Tensor | None = None    # [E] f32: the bias image-span tokens pick experts with (attach_vl_bias)
     experts: object = None                   # Exl3RoutedExperts: routed + the shared expert as the last entry
     engram_wkv: Exl3Linear | None = None     # local hash columns' input rows
     engram_qk: torch.Tensor | None = None    # q_weight * k_weight [hc, d] f32
@@ -291,3 +292,27 @@ def load(model_dir: str | Path, rank: int, world: int, n_layers: int | None = No
         log(f"[tensorfold] rank {rank}: DSpark ({n} stages) loaded, {torch.cuda.memory_allocated() / 2**30:.1f} GiB")
     sh.close()
     return w
+
+
+def attach_vl_bias(w: Weights, folders: list) -> int:
+    """The MoE gates' VL bias (``ffn.gate.bias_vl``: inside an image span the gate picks experts with it) from the
+    first folder that holds it; an EXL3 pack may leave it out (DeepSeek's original checkpoint has it). Returns the
+    number of gates given one."""
+
+    for folder in folders:
+        if not folder or not Path(folder).is_dir():
+            continue
+        sh = Shards(folder)
+        found = 0
+        blocks = list(w.layers) + (list(w.dspark.blocks) if w.dspark is not None else [])
+        for lay in blocks:
+            name = (f"layers.{lay.idx}" if lay.idx < w.cfg.n_layers else f"mtp.{lay.idx - w.cfg.n_layers}") + \
+                ".ffn.gate.bias_vl"
+            if name in sh:
+                lay.gate_b_vl = sh.get(name).to(torch.float32).contiguous().cuda()
+                found += 1
+        sh.close()
+        if found:
+            return found
+    return 0
+

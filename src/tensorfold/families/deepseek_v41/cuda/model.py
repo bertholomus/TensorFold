@@ -216,12 +216,17 @@ class Engram:
         c = self.cfg
         lb = c.engram_ngram - 1
         lo = max(0, start - lb)
-        comp = self.np_map[np.asarray(tokens[lo:start + n], dtype=np.int64)]
+        raw = np.asarray(tokens[lo:start + n], dtype=np.int64)
+        # an image span's positions (negative in the host list) are DEAD: an n-gram never reaches into or past one
+        dead = raw < 0
+        comp = np.where(dead, -1, self.np_map[np.where(dead, 0, raw)])
         pos = np.arange(start, start + n)
         toks = []
+        blocked = np.zeros(n, dtype=bool)
         for shift in range(c.engram_ngram):
             src = comp[np.clip(pos - shift - lo, 0, None)]
-            toks.append(np.where(pos < shift, self.pad, src))
+            blocked |= (pos < shift) | (src < 0)
+            toks.append(np.where(blocked, self.pad, src))
         toks = np.stack(toks, -1)                                              # [n, ngram]
         prod = toks[:, None, :] * self.np_mult[None]                           # [n, L, ngram]
         rolling, out = prod[..., 0], []
@@ -343,7 +348,11 @@ class Model:
         return out.to(y.dtype)
 
     # -- Engram ----------------------------------------------------------------------------------------------------
-    def engram_apply(self, lay, h: torch.Tensor, hashes: torch.Tensor) -> torch.Tensor:
+    def engram_apply(self, lay, h: torch.Tensor, hashes: torch.Tensor, img: torch.Tensor | None = None) -> torch.Tensor:
+        if img is not None:
+            out = self.engram_apply(lay, h, hashes)
+            out[img] = h[img]                 # Engram's gate is shut inside an image span: those rows pass unchanged
+            return out
         c = self.cfg
         lo, hi = self.engram.cols
         with _T("engram_rows"):
@@ -572,21 +581,32 @@ class Model:
         return t
 
     # -- MoE -------------------------------------------------------------------------------------------------------
-    def moe(self, lay, x: torch.Tensor, topk: int | None = None) -> torch.Tensor:
+    def moe(self, lay, x: torch.Tensor, topk: int | None = None, img: torch.Tensor | None = None) -> torch.Tensor:
         c = self.cfg
         n = x.shape[0]
         topk = topk or c.topk
         slots = topk + 1
         shared_id = lay.experts.count - 1
+        vl = getattr(lay, "gate_b_vl", None)
+        if img is not None and vl is None:
+            vl = lay.gate_b                   # no VL bias in this pack: image rows route as text (warned at load)
         if KERNELS:
             # decode / verify windows: the row-invariant matmul; prompt chunks: one cuBLAS GEMM
             logits = K.rowmm(x, lay.gate_w) if n <= 16 else (x.float() @ lay.gate_w.float().t())
             pick = torch.empty((n, slots), dtype=torch.int32, device=x.device)
             wts = torch.empty((n, slots), dtype=F32, device=x.device)
             K.route(logits, lay.gate_b, topk, c.route_scale, shared_id, pick, wts)
+            if img is not None:
+                # inside an image span the gate picks with its VL bias (a row a program: the other rows are unchanged)
+                ip = torch.empty((img.numel(), slots), dtype=torch.int32, device=x.device)
+                iw = torch.empty((img.numel(), slots), dtype=F32, device=x.device)
+                K.route(logits[img].contiguous(), vl, topk, c.route_scale, shared_id, ip, iw)
+                pick[img], wts[img] = ip, iw
         else:
             scores = F.softplus(x.to(F32) @ lay.gate_w.float().t()).sqrt()
-            ind = (scores + lay.gate_b).topk(topk, dim=-1).indices
+            bias = lay.gate_b if img is None else lay.gate_b.expand(n, -1).clone().index_copy_(
+                0, img, vl.expand(img.numel(), -1))
+            ind = (scores + bias).topk(topk, dim=-1).indices
             wts = scores.gather(1, ind)
             if topk > 1:
                 wts = wts / (wts.sum(-1, keepdim=True) + 1e-20)
@@ -637,14 +657,23 @@ class Model:
     # -- one block of rows ----------------------------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, sc: SeqCache, ids: torch.Tensor, start: int, all_logits: bool = False,
-                taps: list | None = None, host_ids: list[int] | None = None, replay: int | None = None):
-        """Rows ids [n] at positions start.. of one sequence -> fp32 logits [n or 1, V] (both ranks the same)."""
+                taps: list | None = None, host_ids: list[int] | None = None, replay: int | None = None,
+                image: tuple | None = None):
+        """Rows ids [n] at positions start.. of one sequence -> fp32 logits [n or 1, V] (both ranks the same).
+        ``image``: (rows [k] long, embeddings [k, dim] bf16), this block's image-span rows: their embeddings replace the
+        token's, the MoE gate picks their experts with its VL bias and Engram leaves them untouched (DeepSeek's
+        image_mask); ``host_ids`` then holds a negative id at each of them (no n-gram spans one)."""
 
         c, w = self.cfg, self.w
         n = ids.shape[0]
         assert start == sc.length, (start, sc.length)
         sc.tokens[start:start + n] = ids
-        h = w.embed[ids].to(BF16)[:, None, :].expand(-1, c.hc, -1).contiguous()
+        emb = w.embed[ids].to(BF16)
+        img = None
+        if image is not None and image[0].numel():
+            img = image[0]
+            emb[img] = image[1].to(BF16)
+        h = emb[:, None, :].expand(-1, c.hc, -1).contiguous()
         pre = torch.zeros((n, c.hc), dtype=F32, device="cuda")
         pre[:, 0] = 1.0
         hashes = None
@@ -656,10 +685,10 @@ class Model:
             hashes = self.engram.hashes(sc.host, start, n)                          # [n, L, cols] host
         shared: dict = {}
         if KERNELS:
-            return self._forward_k(sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay)
+            return self._forward_k(sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay, img)
         for lay in w.layers:
             if hashes is not None and lay.engram_wkv is not None:
-                h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)])
+                h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)], img)
             if taps is not None and lay.idx in c.dspark_taps:
                 taps.append(h.to(F32).mean(1).to(BF16))
             res = h
@@ -670,7 +699,7 @@ class Model:
             res = h
             f_pre, f_post, f_comb = self.hc_mixes(h, lay.hc_ffn)
             x = rms_norm(self.hc_pre(h, a_pre), lay.ffn_norm, c.eps)
-            y = self.comm.sum(self.moe(lay, x)).to(BF16)
+            y = self.comm.sum(self.moe(lay, x, img=img)).to(BF16)
             h = self.hc_post(y, res, f_post, f_comb)
             pre = f_pre
         sc.length = start + n
@@ -681,7 +710,7 @@ class Model:
         g = self.comm.gather(local)                                       # [world, n, V / world]
         return g.permute(1, 0, 2).reshape(local.shape[0], -1)
 
-    def _forward_k(self, sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay=None):
+    def _forward_k(self, sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay=None, img=None):
         """``replay`` (decoder SWA bounded replay, CED's prefill): the decoder layers run only for rows at positions
         >= replay, their window truncated there; the first decoder layer's kv source still covers every row."""
 
@@ -711,6 +740,9 @@ class Model:
                     h, pre = h[first:].contiguous(), pre[first:].contiguous()
                     start, n = start + first, n - first
                     pos = pos[first:]
+                    if img is not None:
+                        img = img[img >= first] - first
+                        img = img if img.numel() else None
                     x = torch.empty((n, c.dim), dtype=BF16, device=dev)
                     part = torch.empty((n * K.HC_BLOCKS * 32,), dtype=F32, device=dev)
                     pre_a = torch.empty((n, c.hc), dtype=F32, device=dev)
@@ -721,7 +753,8 @@ class Model:
                 floor, kv_done = replay, True
             if hashes is not None and lay.engram_wkv is not None:
                 with _T("engram"):
-                    h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)])
+                    rows = hashes[:, c.engram_layers.index(lay.idx)]
+                    h = self.engram_apply(lay, h, rows[-n:] if rows.shape[0] != n else rows, img)
             if taps is not None and lay.idx in c.dspark_taps:
                 taps.append(h.to(F32).mean(1).to(BF16))
             fn, scale, base = lay.hc_attn
@@ -739,7 +772,7 @@ class Model:
                 K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb,
                          part)
             with _T("moe"):
-                pm = self.moe(lay, x)
+                pm = self.moe(lay, x, img=img)
             with _T("gather"):
                 g = self.comm.gather(pm)
             with _T("hc"):

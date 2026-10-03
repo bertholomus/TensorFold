@@ -38,7 +38,8 @@ WARM_LENGTHS = tuple(int(v) for v in (os.environ.get("TF_DS_WARM_LENGTHS") or
 
 class DsEngine:
     def __init__(self, model_dir: Path, *, rank: int, world: int, master: str, port: int, drafts: int = 3,
-                 context: int | None = None, engram_dir: str | None = None) -> None:
+                 context: int | None = None, engram_dir: str | None = None, vision: bool = False,
+                 vision_urls: bool = False) -> None:
         from tensorfold.cuda.comm import NCCL
 
         from ..ops import compressed_token_map
@@ -74,6 +75,29 @@ class DsEngine:
         elif rank == 0:
             print("[tensorfold] WARNING: no Engram tables (TF_DS_ENGRAM): output will be degraded", flush=True)
         self.model = Model(self.w, Comm(nccl, world, rdma_bytes=8 << 20), eng)
+        # images (--vision): the tower runs on rank 0, which shares each image span's rows; every rank routes the span
+        # with the gates' VL bias and keeps Engram out of it
+        self.vision = None
+        self.tower = None
+        self.vcfg = None
+        if vision:
+            from .vision import DsVision, Tower, VisionConfig
+            from .weights import attach_vl_bias
+
+            self.vcfg = VisionConfig.read(json.loads((Path(model_dir) / "config.json").read_text()))
+            if self.vcfg is None:
+                raise ValueError("--vision: this checkpoint has no vision tower (vision_config)")
+            found = attach_vl_bias(self.w, [os.environ.get("TF_DS_VISION_EXTRA"), str(model_dir), engram_dir,
+                                            str(Path(model_dir).resolve().parent / "DeepSeek-V4.1-Flash-extra")])
+            if rank == 0:
+                if not found:
+                    print("[tensorfold] WARNING: no ffn.gate.bias_vl found (TF_DS_VISION_EXTRA): image tokens route "
+                          "with the text bias", flush=True)
+                before = torch.cuda.memory_allocated()
+                self.tower = Tower(self.vcfg, model_dir)
+                self.vision = DsVision(self.vcfg, allow_urls=bool(vision_urls))
+                print(f"[tensorfold] vision tower on rank 0: {(torch.cuda.memory_allocated() - before) / 2**30:.2f} "
+                      f"GiB; VL bias for {found} gates", flush=True)
         self.drafter = Drafter(self.model) if drafts > 0 and self.w.dspark is not None else None
         from .graph import GraphRunner
 
@@ -86,6 +110,11 @@ class DsEngine:
         self.quiet = False
         if nccl is not None:
             nccl.barrier()
+            mine = torch.tensor([int(self.vcfg is not None)], dtype=torch.int64, device="cuda")
+            every = torch.empty((world,), dtype=torch.int64, device="cuda")
+            nccl.all_gather(mine, every)
+            if len(set(every.tolist())) > 1:
+                raise ValueError("--vision must be given to every rank (rank 0 and the workers run the same steps)")
         if WARM:
             self.warm()
         if rank == 0:
@@ -107,6 +136,8 @@ class DsEngine:
                 if n + 8 <= self.limit:
                     self._run(ids[:n], 6, None, False, lambda new: None, self.drafter is not None)
             self._run(ids[:17], 3, None, False, lambda new: None, False)
+            if self.vcfg is not None:
+                self.vision_warm(ids)
         finally:
             self.quiet = False
         t1 = time.perf_counter()
@@ -120,6 +151,42 @@ class DsEngine:
         if self.rank == 0:
             print(f"[tensorfold] warm-up: {len(WARM_LENGTHS)} prompt lengths {t1 - t0:.1f}s, decode graphs {info}, "
                   f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
+
+    def vision_warm(self, ids: list[int]) -> None:
+        """The image paths' kernels on every rank (synthetic span rows, nothing shared), and the tower once at its
+        largest grid on rank 0 (its time and memory peak logged)."""
+
+        k = 70
+        prompt = list(ids[:k + 20])
+        prompt[5:5 + k] = [self.vcfg.image_token_id] * k
+        rows = torch.zeros((k, self.vcfg.model_dim), dtype=torch.bfloat16, device="cuda")
+        self._run(prompt, 4, None, False, lambda new: None, self.drafter is not None, image=(list(range(5, 5 + k)), rows))
+        if self.tower is not None:
+            from .vision import Picture, plan_grid
+
+            n_h, n_w, bh, bw = plan_grid(4096, 4096, self.vcfg)
+            p = self.vcfg.patch
+            pic = Picture(torch.zeros((bh // p * (bw // p), 3, p, p), dtype=torch.bfloat16), bh // p, bw // p, n_h, n_w)
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            base = torch.cuda.memory_allocated()
+            t0 = time.perf_counter()
+            self.tower.span_rows(pic)
+            torch.cuda.synchronize()
+            print(f"[tensorfold] vision warm-up: largest image ({pic.tokens} tokens, {bh}x{bw} px) "
+                  f"{1000 * (time.perf_counter() - t0):.0f} ms, peak +{(torch.cuda.max_memory_allocated() - base) / 2**30:.2f} "
+                  f"GiB", flush=True)
+
+    def _share_rows(self, rows: torch.Tensor | None, n: int) -> torch.Tensor:
+        """Rank 0's image-span rows [n, dim] bf16 on every rank."""
+
+        dim = self.w.cfg.dim
+        if self.world == 1:
+            return rows
+        send = rows.contiguous() if self.rank == 0 else torch.zeros((n, dim), dtype=torch.bfloat16, device="cuda")
+        recv = torch.empty((self.world * n * dim,), dtype=torch.bfloat16, device="cuda")
+        self.nccl.all_gather(send.view(-1), recv)
+        return recv[:n * dim].view(n, dim)
 
     def _draft_graph(self, sc, dc, tok: int, pos: int):
         dg = getattr(self, "_dg", None)
@@ -152,28 +219,44 @@ class DsEngine:
         return [int(v) for v in allv[:count].tolist()]
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None, **_: Any) -> dict[str, Any]:
+                 constraint=None, vision=None, **_: Any) -> dict[str, Any]:
         if constraint is not None:
             raise ValueError("structured output is not served by the DeepSeek-V4.1 engine yet")
         stop_eos = bool(getattr(self.request, "stop_eos", True))
+        positions, rows = [], None
+        if vision is not None and getattr(vision, "spans", None):
+            if self.tower is None:
+                raise ValueError("image input needs the server started with --vision")
+            positions = vision.positions()
+            if positions and positions[-1] >= len(prompt):
+                raise ValueError("an image span lies past the prompt")
+            rows = torch.cat([self.tower.span_rows(pic) for _, pic in vision.spans])
         seed = (sampling.seed if sampling else 0) & ((1 << 63) - 1)
         header = [max_tokens, int(stop_eos), int(draft), seed, *_f64(sampling.temperature if sampling else 0.0),
                   int(sampling.top_k) if sampling else 0, *_f64(sampling.top_p if sampling else 1.0),
-                  *_f64(sampling.min_p if sampling else 0.0)]
+                  *_f64(sampling.min_p if sampling else 0.0), len(positions)]
         self._share(header)
         self._share(list(prompt))
-        return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, draft)
+        image = None
+        if positions:
+            self._share(positions)
+            image = (positions, self._share_rows(rows, len(positions)))
+        return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, draft, image=image)
 
     def follow(self) -> None:
         from tensorfold.engine.exact_sampling import Sampling
 
         while True:
-            (max_tokens, stop_eos, draft, seed, t0, t1, top_k, p0, p1, m0, m1) = self._share(None)
+            (max_tokens, stop_eos, draft, seed, t0, t1, top_k, p0, p1, m0, m1, n_img) = self._share(None)
             prompt = self._share(None)
+            image = None
+            if n_img:
+                positions = self._share(None)
+                image = (positions, self._share_rows(None, n_img))
             temperature = _f64_back(t0, t1)
             sampling = (Sampling(seed, temperature, top_k, _f64_back(p0, p1), _f64_back(m0, m1))
                         if temperature > 0 else None)
-            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, bool(draft))
+            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, bool(draft), image=image)
 
     # -- one request -----------------------------------------------------------------------------------------------
     def _sample(self, logits: torch.Tensor, positions: list[int], sampling) -> list[int]:
@@ -182,7 +265,8 @@ class DsEngine:
         return sample_rows(logits, positions, sampling)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable,
-             draft: bool) -> dict[str, Any]:
+             draft: bool, image: tuple | None = None) -> dict[str, Any]:
+        """``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16)."""
         m = self.model
         eos = self.eos if stop_eos else ()
         if len(prompt) + max_tokens > self.limit:
@@ -203,11 +287,26 @@ class DsEngine:
         t0 = time.perf_counter()
         last = None
         replay = max(0, len(prompt) - self.w.cfg.window) if getattr(self, "replay_mode", REPLAY) else None
+        host = prompt
+        if image is not None:
+            import bisect
+
+            positions, rows = image
+            pos_dev = torch.tensor(positions, dtype=torch.long, device="cuda")
+            host = list(prompt)
+            for p in positions:
+                host[p] = -1                  # Engram's hashing: no n-gram reaches into an image span
         for s in range(0, len(prompt), PREFILL_CHUNK):
-            ids = torch.tensor(prompt[s:s + PREFILL_CHUNK], dtype=torch.long, device="cuda")
+            e = min(len(prompt), s + PREFILL_CHUNK)
+            ids = torch.tensor(prompt[s:e], dtype=torch.long, device="cuda")
             taps: list | None = [] if use_drafts else None
+            block = None
+            if image is not None:
+                i0, i1 = bisect.bisect_left(positions, s), bisect.bisect_left(positions, e)
+                if i1 > i0:
+                    block = (pos_dev[i0:i1] - s, rows[i0:i1])
             tc = time.perf_counter()
-            out = m.forward(sc, ids, s, taps=taps, host_ids=prompt[s:s + PREFILL_CHUNK], replay=replay)
+            out = m.forward(sc, ids, s, taps=taps, host_ids=host[s:e], replay=replay, image=block)
             if CHUNK_LOG:
                 torch.cuda.synchronize()
                 print(f"[tensorfold] rank {self.rank} chunk at {s}: {time.perf_counter() - tc:.2f}s, allocated "
