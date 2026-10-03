@@ -14,7 +14,7 @@ import torch
 
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
-from .model import KV_QUANT, RAW, Model, SeqCache, _candidates, mm
+from .model import KV_QUANT, RAW, Model, SeqCache, _candidates, apply_candidates, mm, store_rows
 
 BUCKET_MIN = int(os.environ.get("TF_DS_BUCKET_MIN") or 1024)
 
@@ -62,7 +62,8 @@ class StaticDecoder:
         comp, cidx = None, None
         if ratio:
             if lay.comp_wkv is not None:
-                scratch = sc.comp[lay.idx].shape[0] - 1
+                cc = sc.comp[lay.idx]
+                scratch = (cc[0] if isinstance(cc, tuple) else cc).shape[0] - 1
                 if ratio == 1:
                     lat = K.rmsnorm(mm(lay.comp_wkv, x), lay.comp_norm, c.eps)
                     groups = pos
@@ -84,15 +85,11 @@ class StaticDecoder:
                     k = K.rmsnorm(mm(lay.idx_wk, lat), lay.idx_k_norm, c.eps).view(n, 1, c.idx_dim)
                     K.rope_heads(k, cos, sin, groups * ratio, rd)
                     k = k.view(n, c.idx_dim)
-                    if KV_QUANT:
-                        k = fp4_qd(k, 32, e4m3_scale=False)
-                    sc.index_k[lay.idx][target] = k
+                    store_rows(sc.index_k[lay.idx], target, k, 32, False)
                 lat = lat.clone().view(n, 1, hd)
                 K.rope_heads(lat, cos, sin, groups * ratio, rd)
                 lat = lat.view(n, hd)
-                if KV_QUANT:
-                    lat = fp4_qd(lat, 16, e4m3_scale=True)
-                sc.comp[lay.idx][target] = lat
+                store_rows(sc.comp[lay.idx], target, lat, 16, True)
             src = shared["kv_layer"]
             nb = self.bucket // ratio
             vis = (pos + 1) // ratio
@@ -106,7 +103,7 @@ class StaticDecoder:
                 if lay.idx == c.cand_source:
                     shared["cand"] = _candidates(score, vis[:, None], c.cand_blocks, c.cand_block)
                 elif 0 <= c.cand_source < lay.idx:
-                    score.masked_fill_(~shared["cand"], float("-inf"))
+                    apply_candidates(score, shared["cand"], c.cand_block)
                 kk = min(c.idx_topk, nb)
                 top = score.topk(kk, dim=-1, sorted=False).indices.sort(dim=-1).values
                 shared["topk"] = torch.where(top < vis[:, None], top, -1).contiguous()

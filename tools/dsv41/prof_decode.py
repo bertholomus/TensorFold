@@ -67,10 +67,22 @@ def main():
     pos = a.prompt_len
     tok = last[0].argmax().view(1)
     times = []
+    runner = None
+    if os.environ.get("GRAPH") == "1":
+        from tensorfold.families.deepseek_v41.cuda.graph import GraphRunner
+        runner = GraphRunner(model, 4)
+        sc.host = hl[:]
+
+    def step(tok, pos):
+        if runner is not None:
+            lg, _ = runner.forward(sc, [int(tok)], pos, False)
+            return lg
+        return model.forward(sc, tok, pos)
+
     for _ in range(a.steps):
         torch.cuda.synchronize()
         t1 = time.perf_counter()
-        last = model.forward(sc, tok, pos)
+        last = step(tok, pos)
         tok = last[0].argmax().view(1)
         torch.cuda.synchronize()
         times.append(time.perf_counter() - t1)
@@ -89,7 +101,7 @@ def main():
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         for _ in range(a.profile_steps):
-            last = model.forward(sc, tok, pos)
+            last = step(tok, pos)
             tok = last[0].argmax().view(1)
             pos += 1
         torch.cuda.synchronize()

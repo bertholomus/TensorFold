@@ -60,19 +60,21 @@ class Drafter:
             K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, pos % self.ring_size, c.eps, KV_QUANT, c.rope_dim)
         dc.absorbed = start + n
 
-    def _attention(self, lay, x, sc, ring, q0: int):
+    def _attention(self, lay, x, sc, ring, q0, pos=None, wpos=None):
         c = self.m.cfg
         n = x.shape[0]
         rd, hd = c.rope_dim, c.head_dim
         cos, sin = self._cs(lay, sc)
-        pos = torch.arange(q0, q0 + n, device=x.device)
+        if pos is None:
+            pos = torch.arange(q0, q0 + n, device=x.device)
         qr = K.rmsnorm(mm(lay.wq_a, x), lay.q_norm, c.eps)
         q = mm(lay.wq_b, qr).view(n, self.m.Hl, hd)
         K.rope_heads(q, cos, sin, pos, rd)
         kvb = K.kv_norm_rope(mm(lay.wkv, x), lay.kv_norm, cos, sin, pos, ring, self.m._neg(n), c.eps, KV_QUANT, rd)
         if self._block_idx is None or self._block_idx.shape[0] != n:
             self._block_idx = torch.arange(n, device=x.device).repeat(n, 1).contiguous()
-        wpos = torch.full((n,), q0 - 1, dtype=torch.int64, device=x.device)
+        if wpos is None:
+            wpos = torch.full((n,), q0 - 1, dtype=torch.int64, device=x.device)
         # every row sees the 128 newest absorbed positions and every block row (no mask inside the block)
         o = K.sparse_attn(q, lay.sink, ring, self.m._zero, True, kvb, self._block_idx, wpos, hd ** -0.5, c.window)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
@@ -119,6 +121,78 @@ class Drafter:
         conf_in = torch.cat([xc.float(), torch.stack(embs).float()], -1)
         conf = conf_in @ self.dw.conf.float().t()
         return out[1:], conf[:, 0]
+
+
+class DraftGraph:
+    """The drafter's pass and its Markov loop as one CUDA graph: token and position from device buffers, the drafts
+    (and confidences) left on the device; one read per round."""
+
+    def __init__(self, drafter: Drafter, sc, dc: DraftCache):
+        self.d, self.sc, self.dc = drafter, sc, dc
+        n = drafter.size
+        self.token = torch.zeros((1,), dtype=torch.long, device="cuda")
+        self.q0 = torch.zeros((1,), dtype=torch.long, device="cuda")
+        self.graph = None
+        self.out = None
+        self.conf = None
+
+    def _body(self):
+        d, m, c = self.d, self.d.m, self.d.m.cfg
+        n = d.size
+        dev = "cuda"
+        ids = torch.full((n,), d.noise, dtype=torch.long, device=dev)
+        ids[0:1] = self.token
+        pos = self.q0 + torch.arange(n, device=dev)
+        wpos = (self.q0 - 1).expand(n).contiguous()
+        h = m.w.embed[ids].to(BF16)[:, None, :].expand(-1, c.hc, -1).contiguous()
+        pre = torch.zeros((n, c.hc), dtype=F32, device=dev)
+        pre[:, 0] = 1.0
+        x = torch.empty((n, c.dim), dtype=BF16, device=dev)
+        part = torch.empty((n * K.HC_BLOCKS * 32,), dtype=F32, device=dev)
+        pre_a = torch.empty((n, c.hc), dtype=F32, device=dev)
+        pre_f = torch.empty((n, c.hc), dtype=F32, device=dev)
+        post = torch.empty((n, c.hc), dtype=F32, device=dev)
+        comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
+        for lay, ring in zip(d.dw.blocks, self.dc.rings):
+            fn, scale, base = lay.hc_attn
+            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
+            K.hc_post(m.comm.gather(d._attention(lay, x, self.sc, ring, None, pos=pos, wpos=wpos)), h, post, comb, h)
+            fn, scale, base = lay.hc_ffn
+            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
+            K.hc_post(m.comm.gather(m.moe(lay, x, topk=d.topk)), h, post, comb, h)
+            pre, pre_f = pre_f, pre
+        xc = K.collapse(h, pre)
+        local = mm(m.w.head, K.rmsnorm(xc, d.dw.norm, c.eps), F32)
+        logits = m.comm.gather(local).permute(1, 0, 2).reshape(n, -1)
+        out = torch.empty((n + 1,), dtype=torch.long, device=dev)
+        out[0:1] = self.token
+        head = d.dw.markov_head                                           # [V, rank] fp16
+        embs = []
+        for i in range(n):
+            e = d.dw.markov_embed[out[i:i + 1]][0]
+            embs.append(e)
+            out[i + 1:i + 2] = (logits[i] + (head @ e.to(torch.float16)).float()).argmax().view(1)
+        conf_in = torch.cat([xc.float(), torch.stack(embs).float()], -1)
+        self.out = out[1:]
+        self.conf = (conf_in @ d.dw.conf.float().t())[:, 0]
+
+    def capture(self, pool=None):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            self._body()
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=pool):
+            self._body()
+        torch.cuda.synchronize()
+
+    def run(self, token: int, q0: int):
+        self.token.fill_(token)
+        self.q0.fill_(q0)
+        self.graph.replay()
+        return self.out.tolist(), self.conf
 
 
 @dataclass

@@ -51,6 +51,19 @@ class _T:
             TIMES[self.name] = TIMES.get(self.name, 0.0) + time.perf_counter() - self.t
 
 
+def store_rows(cache, rows: torch.Tensor, x: torch.Tensor, block: int, e4m3: bool) -> None:
+    """Rows of a compressed cache: packed FP4 (a (codes, scales) pair) or bf16 (fp4-rounded unless TF_DS_KV=bf16)."""
+
+    from ..ops import fp4_pack
+
+    if isinstance(cache, tuple):
+        codes, scales = fp4_pack(x, block, e4m3)
+        cache[0][rows] = codes
+        cache[1][rows] = scales
+    else:
+        cache[rows] = fp4_qd(x, block, e4m3_scale=e4m3) if KV_QUANT else x
+
+
 class Comm:
     """All-gather of fp32 partials then a rank-order sum (identity on one rank). Decode-sized fp32 payloads go over
     our RDMA-write gather (tensorfold.cuda.rdma) when every rank opens it, the rest over NCCL."""
@@ -254,6 +267,8 @@ class Model:
         self.Hl = c.n_heads // w.world
         self.scratch: dict = {}
         self._zero = torch.zeros((1,), dtype=torch.int64, device="cuda")
+        if not KERNELS and KV_QUANT:
+            raise ValueError("TF_DS_KERNELS=0 (the torch path) reads bf16 caches only: also set TF_DS_KV=bf16")
         for lay in w.layers:
             if lay.idx_proj is not None:
                 lay.idx_proj_h = lay.idx_proj.to(torch.float16).contiguous()
@@ -268,9 +283,18 @@ class Model:
             if i >= len(self.w.layers):
                 continue
             r = c.compress_ratios[i]
-            sc.comp[i] = torch.zeros((cap // r + 1, c.head_dim), dtype=BF16, device="cuda")
+            rows = cap // r + 2                          # + a scratch row (graph-captured windows' incomplete groups)
+            if KV_QUANT:                                 # packed FP4 (DeepSeek's cache formats), 288 + 68 B a row
+                sc.comp[i] = (torch.zeros((rows, c.head_dim // 2), dtype=torch.uint8, device="cuda"),
+                              torch.zeros((rows, c.head_dim // 16), dtype=torch.uint8, device="cuda"))
+            else:
+                sc.comp[i] = torch.zeros((rows, c.head_dim), dtype=BF16, device="cuda")
             if i in c.index_sources:
-                sc.index_k[i] = torch.zeros((cap // r + 1, c.idx_dim), dtype=BF16, device="cuda")
+                if KV_QUANT:
+                    sc.index_k[i] = (torch.zeros((rows, c.idx_dim // 2), dtype=torch.uint8, device="cuda"),
+                                     torch.full((rows, c.idx_dim // 32), 127, dtype=torch.uint8, device="cuda"))
+                else:
+                    sc.index_k[i] = torch.zeros((rows, c.idx_dim), dtype=BF16, device="cuda")
             if r > 1:
                 sc.comp_raw[i] = (torch.zeros((RAW, c.head_dim), dtype=F32, device="cuda"),
                                   torch.zeros((RAW, c.head_dim), dtype=F32, device="cuda"))
@@ -428,7 +452,7 @@ class Model:
                     if lay.idx == c.cand_source:
                         shared["cand"] = _candidates(score, vis, c.cand_blocks, c.cand_block)
                     elif 0 <= c.cand_source < lay.idx:
-                        score.masked_fill_(~shared["cand"], float("-inf"))
+                        apply_candidates(score, shared["cand"], c.cand_block)
                     kk = min(c.idx_topk, n_comp_end)
                     top = score.topk(kk, dim=-1, sorted=False).indices.sort(dim=-1).values
                     cidx = torch.where(top < vis, top, -1)
@@ -457,15 +481,11 @@ class Model:
         if lat is not None and lay.idx_wk is not None:
             k = rms_norm(mm(lay.idx_wk, lat), lay.idx_k_norm, c.eps)
             rope_(k[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
-            if KV_QUANT:
-                k = fp4_qd(k, 32, e4m3_scale=False)
-            sc.index_k[lay.idx][groups] = k
+            store_rows(sc.index_k[lay.idx], groups, k, 32, False)
         if lat is not None:
             lat = lat.clone()
             rope_(lat[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
-            if KV_QUANT:
-                lat = fp4_qd(lat, 16, e4m3_scale=True)
-            sc.comp[lay.idx][groups] = lat
+            store_rows(sc.comp[lay.idx], groups, lat, 16, True)
 
     def attention_k(self, lay, x: torch.Tensor, sc: SeqCache, start: int, shared: dict, pos: torch.Tensor,
                     floor: int = 0, kv_done: bool = False):
@@ -525,7 +545,7 @@ class Model:
                         if lay.idx == c.cand_source:
                             cand_parts.append(_candidates(score, vis[r0:r1, None], c.cand_blocks, c.cand_block))
                         elif 0 <= c.cand_source < lay.idx:
-                            score.masked_fill_(~shared["cand"][r0:r1], float("-inf"))
+                            apply_candidates(score, shared["cand"][r0:r1], c.cand_block)
                         top = score.topk(kk, dim=-1, sorted=False).indices.sort(dim=-1).values
                         cidx[r0:r1] = torch.where(top < vis[r0:r1, None], top, -1)
                         del score
@@ -732,11 +752,21 @@ class Model:
 
 
 def _candidates(score: torch.Tensor, vis: torch.Tensor, nblocks: int, bsize: int) -> torch.Tensor:
+    """The candidate pool as a block mask [rows, ceil(width / bsize)] (the newest, partly filled block pinned in)."""
+
     width = score.shape[-1]
     s = F.pad(score, (0, -width % bsize), value=float("-inf")).unflatten(-1, (-1, bsize)).amax(-1)
     nb = s.shape[-1]
     last = (vis - 1) // bsize
     s = s.masked_fill(torch.arange(nb, device=score.device)[None] == last, float("inf"))
     top = s.topk(min(nblocks, nb), dim=-1)
-    keep = torch.zeros_like(s, dtype=torch.bool).scatter_(-1, top.indices, top.values > float("-inf"))
-    return keep.repeat_interleave(bsize, dim=-1)[..., :width]
+    return torch.zeros_like(s, dtype=torch.bool).scatter_(-1, top.indices, top.values > float("-inf"))
+
+
+def apply_candidates(score: torch.Tensor, blocks: torch.Tensor, bsize: int) -> torch.Tensor:
+    """-inf on every position outside the pool's blocks (score [rows, width], blocks [rows, >= ceil(width / bsize)])."""
+
+    width = score.shape[-1]
+    nb = -(-width // bsize)
+    keep = blocks[:, :nb].repeat_interleave(bsize, dim=-1)[:, :width]
+    return score.masked_fill_(~keep, float("-inf"))

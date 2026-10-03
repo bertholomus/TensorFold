@@ -129,4 +129,22 @@ res["rowmm"] = rel(K.rowmm(x, W), x.float() @ W.float().t())
 res["rowmm_row_invariant"] = bool(torch.equal(K.rowmm(x[3:4], W), K.rowmm(x, W)[3:4]))
 res["rmsnorm"] = {"rel": rel(K.rmsnorm(x, nw, 1e-20), rms_norm(x, nw, 1e-20)),
                   "bits_equal": bool(torch.equal(K.rmsnorm(x, nw, 1e-20), rms_norm(x, nw, 1e-20)))}
+# packed FP4 caches: pack/unpack == quant-dequant; kernels on packed rows == on the dequantized bf16 rows
+from tensorfold.families.deepseek_v41.ops import fp4_pack, fp4_qd, fp4_unpack
+xc = torch.randn(3000, 512, device=dev).to(BF) * 3
+pc = fp4_pack(xc, 16, True)
+res["fp4_pack_comp"] = bool(torch.equal(fp4_unpack(*pc, 16, True).float(), fp4_qd(xc, 16, True).float()))
+xi = torch.randn(1500, 128, device=dev).to(BF) * 2
+pi = fp4_pack(xi, 32, False)
+res["fp4_pack_index"] = bool(torch.equal(fp4_unpack(*pi, 32, False).float(), fp4_qd(xi, 32, False).float()))
+cq = fp4_unpack(*pc, 16, True)
+o_b = K.sparse_attn(q, sink, ring, torch.zeros(1, dtype=torch.int64, device=dev), True, cq, idx, pos, 512 ** -0.5, 128)
+o_p = K.sparse_attn(q, sink, ring, torch.zeros(1, dtype=torch.int64, device=dev), True, pc, idx, pos, 512 ** -0.5, 128)
+res["sparse_attn_packed_equal"] = [bool(torch.equal(o_b, o_p)), rel(o_p, o_b)]
+ki = fp4_unpack(*pi, 32, False)
+s_b = K.index_score(iq, ki, wts, vis, 1500)
+s_p = K.index_score(iq, pi, wts, vis, 1500)
+res["index_score_packed_equal"] = [bool(torch.equal(s_b, s_p)), rel(s_p, s_b)]
+# direct check of the kernel-side dequant: a 1-row comp, idx pointing at it, compare against bf16 rows
+
 print(json.dumps(res, indent=1))

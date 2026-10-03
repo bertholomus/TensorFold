@@ -23,6 +23,7 @@ GRAPHS = os.environ.get("TF_DS_GRAPHS", "1") != "0"
 # decoder SWA bounded replay (CED's prefill, DeepSeek's deployment mode): the decoder runs only over the last 128
 # prompt tokens; off by default (exact prefill) until its agreement and needle recall are measured
 REPLAY = os.environ.get("TF_DS_REPLAY", "0") == "1"
+CHUNK_LOG = os.environ.get("TF_DS_CHUNK_LOG", "0") == "1"
 
 
 class DsEngine:
@@ -132,18 +133,28 @@ class DsEngine:
         sc.length = 0
         sc.host.clear()
         use_drafts = bool(draft) and self.drafter is not None
-        dc = self.drafter.new_cache() if use_drafts else None
+        dc = None
+        if use_drafts:
+            if getattr(self, "dc", None) is None:
+                self.dc = self.drafter.new_cache()
+            dc = self.dc
+            dc.absorbed = 0
         t0 = time.perf_counter()
         last = None
-        replay = max(0, len(prompt) - self.w.cfg.window) if REPLAY else None
+        replay = max(0, len(prompt) - self.w.cfg.window) if getattr(self, "replay_mode", REPLAY) else None
         for s in range(0, len(prompt), PREFILL_CHUNK):
             ids = torch.tensor(prompt[s:s + PREFILL_CHUNK], dtype=torch.long, device="cuda")
             taps: list | None = [] if use_drafts else None
+            tc = time.perf_counter()
             out = m.forward(sc, ids, s, taps=taps, host_ids=prompt[s:s + PREFILL_CHUNK], replay=replay)
+            if CHUNK_LOG and self.rank == 0:
+                torch.cuda.synchronize()
+                print(f"[tensorfold] chunk at {s}: {time.perf_counter() - tc:.2f}s", flush=True)
             if out is not None:
                 last = out
             if use_drafts and taps:
                 self.drafter.absorb(dc, sc, torch.cat(taps, -1), m.taps_start)
+        self.last_prefill_logits = last
         first = self._sample(last, [len(prompt)], sampling)[0]
         stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0}
         t1 = time.perf_counter()
@@ -189,7 +200,18 @@ class DsEngine:
         while len(out) < max_tokens and tok not in eos:
             P = sc.length
             ta = time.perf_counter()
-            drafts, _conf = d.draft(dc, sc, tok, P)
+            if self.runner is not None:
+                dg = getattr(self, "_dg", None)
+                if dg is None or dg.sc is not sc or dg.dc is not dc:
+                    from .dspark import DraftGraph
+
+                    dg = self._dg = DraftGraph(d, sc, dc)
+                    dg.token.fill_(tok)
+                    dg.q0.fill_(P)
+                    dg.capture(self.runner.pool)
+                drafts, _conf = dg.run(tok, P)
+            else:
+                drafts, _conf = d.draft(dc, sc, tok, P)
             tb = time.perf_counter()
             t_draft += tb - ta
             kk = min(self.drafts, max_tokens - len(out), len(drafts))

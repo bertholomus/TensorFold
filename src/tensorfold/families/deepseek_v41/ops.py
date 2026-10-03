@@ -261,3 +261,50 @@ class EngramHasher:
             rolling = torch.bitwise_xor(rolling, prod[..., i])
             out.append(rolling[..., None] % self.primes[None, :, i - 1])
         return torch.cat(out, -1) + self.offsets[None]
+
+
+def _e2m1_code(v: torch.Tensor) -> torch.Tensor:
+    """E2M1 code (sign bit 3, magnitude index 0..7 of 0, .5, 1, 1.5, 2, 3, 4, 6), round to nearest, ties to even."""
+
+    a = v.abs()
+    grid = _e2m1_on(v.device)
+    mids = (grid[1:] + grid[:-1]) / 2
+    idx = torch.bucketize(a, mids)
+    tie = (idx < len(mids)) & (a == mids[idx.clamp(max=len(mids) - 1)])
+    idx = torch.where(tie & (idx % 2 == 1), idx + 1, idx)
+    return (idx | torch.where((v < 0) & (idx > 0), 8, 0)).to(torch.uint8)
+
+
+def fp4_pack(x: torch.Tensor, block: int, e4m3_scale: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    """x [rows, D] -> (codes uint8 [rows, D / 2]: byte j holds element j (low nibble) and j + D / 2 (high nibble);
+    scales uint8 [rows, D / block]: E4M3 bits, or the E8M0 exponent byte). Dequantized, the same values as fp4_qd."""
+
+    rows, d = x.shape
+    v = x.to(F32).reshape(-1, block)
+    amax = v.abs().amax(-1, keepdim=True)
+    if e4m3_scale:
+        s8 = (amax.clamp_min(6 * 2.0 ** -9) / 6.0).to(torch.float8_e4m3fn)
+        s = s8.to(F32)
+        sb = s8.view(torch.uint8)
+    else:
+        s = _pow2_ceil(amax.clamp_min(6 * 2.0 ** -126) / 6.0)
+        e = ((s.view(torch.int32) >> 23) & 0xFF)                       # biased exponent = the E8M0 byte
+        sb = e.to(torch.uint8)
+    code = _e2m1_code((v / s).clamp(-6, 6)).reshape(rows, d)
+    packed = code[:, :d // 2] | (code[:, d // 2:] << 4)
+    return packed.contiguous(), sb.reshape(rows, d // block).contiguous()
+
+
+def fp4_unpack(codes: torch.Tensor, scales: torch.Tensor, block: int, e4m3_scale: bool) -> torch.Tensor:
+    """The inverse of fp4_pack, to bf16 (exact: an E2M1 value times its scale fits bf16)."""
+
+    rows, h = codes.shape
+    d = 2 * h
+    code = torch.cat([codes & 15, codes >> 4], 1).long()
+    mag = _e2m1_on(codes.device)[code & 7]
+    val = torch.where((code & 8) != 0, -mag, mag)
+    if e4m3_scale:
+        s = scales.view(torch.float8_e4m3fn).to(F32)
+    else:
+        s = torch.ldexp(torch.ones(scales.shape, device=codes.device), scales.to(torch.int32) - 127)
+    return (val.view(rows, d // block, block) * s[..., None]).view(rows, d).to(BF16)

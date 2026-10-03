@@ -173,6 +173,16 @@ def _pow2_ceil(v):
     return tl.exp2(e.to(tl.float32))
 
 
+@triton.jit
+def _e2m1(code):
+    """E2M1 nibble (sign bit 3) -> fp32 by building the float's bits: magnitudes 0, .5, 1, 1.5, 2, 3, 4, 6."""
+
+    m = code & 7
+    bits = tl.where(m >= 2, (((m >> 1) + 126) << 23) | ((m & 1) << 22), tl.where(m == 1, 0x3F000000, 0))
+    bits = bits | ((code & 8) << 28)
+    return bits.to(tl.float32, bitcast=True)
+
+
 # -- the window KV: RMSNorm, RoPE on the last 64 (adjacent pairs), FP8 quant-dequant per 32, into the ring ------
 @triton.jit
 def _kv_norm_rope(Y, W, COS, SIN, POS, OUT, RING, SLOT_OF, ring_size, eps, QUANT: tl.constexpr,
@@ -253,104 +263,194 @@ def rope_heads(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch
 
 
 # -- sparse attention with a sink: window (ring or a linear source) + selected compressed entries ------------------
+# Rows are handled as two 256-wide halves (q, keys, accumulators), which is also how the FP4 cache packs a row. The
+# keys (window then picks, in blocks of BN) are split over SPLITS programs a head group; a second kernel merges the
+# partial softmax states in split order, so a row's bits never depend on how many rows share the call.
 @triton.jit
-def _sparse_attn(Q, SINK, WSRC, WLO, COMP, IDX, POS, OUT, scale, ring_size, n_idx,
-                 H: tl.constexpr, HD: tl.constexpr, HB: tl.constexpr, WIN: tl.constexpr, BN: tl.constexpr,
-                 RING: tl.constexpr, HAS_COMP: tl.constexpr):
+def _attn_step(q_lo, q_hi, k_lo, k_hi, ok, m_i, l_i, acc_lo, acc_hi, scale):
+    s = (tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))) * scale
+    s = tl.where(ok[None, :], s, float("-inf"))
+    m_new = tl.maximum(m_i, tl.max(s, axis=1))
+    alpha = tl.exp(m_i - m_new)
+    pr = tl.exp(s - m_new[:, None])
+    l_i = l_i * alpha + tl.sum(pr, axis=1)
+    p16 = pr.to(tl.bfloat16)
+    acc_lo = acc_lo * alpha[:, None] + tl.dot(p16, k_lo)
+    acc_hi = acc_hi * alpha[:, None] + tl.dot(p16, k_hi)
+    return m_new, l_i, acc_lo, acc_hi
+
+
+@triton.jit
+def _comp_keys(COMP, CSC, row, ok, hc, HD: tl.constexpr, BN: tl.constexpr, PACKED: tl.constexpr):
+    HALF: tl.constexpr = HD // 2
+    if PACKED:
+        cb = tl.load(COMP + row[:, None] * HALF + hc[None, :], mask=ok[:, None], other=0).to(tl.int32)
+        g = tl.arange(0, HALF // 16)
+        sl = tl.load(CSC + row[:, None] * (HD // 16) + g[None, :], mask=ok[:, None], other=0)
+        sh = tl.load(CSC + row[:, None] * (HD // 16) + HALF // 16 + g[None, :], mask=ok[:, None], other=0)
+        sl = sl.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        sh = sh.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+        lo = tl.reshape(tl.reshape(_e2m1(cb & 15), (BN, HALF // 16, 16)) * sl[:, :, None], (BN, HALF))
+        hi = tl.reshape(tl.reshape(_e2m1(cb >> 4), (BN, HALF // 16, 16)) * sh[:, :, None], (BN, HALF))
+        return lo.to(tl.bfloat16), hi.to(tl.bfloat16)
+    else:
+        kb = COMP + row[:, None] * HD
+        return (tl.load(kb + hc[None, :], mask=ok[:, None], other=0.0),
+                tl.load(kb + HALF + hc[None, :], mask=ok[:, None], other=0.0))
+
+
+@triton.jit
+def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, scale, ring_size, n_idx,
+                      H: tl.constexpr, HD: tl.constexpr, HB: tl.constexpr, WIN: tl.constexpr, BN: tl.constexpr,
+                      RING: tl.constexpr, HAS_COMP: tl.constexpr, PACKED: tl.constexpr, SPLITS: tl.constexpr,
+                      NBLK: tl.constexpr):
     r = tl.program_id(0)
     hb = tl.program_id(1)
+    sp = tl.program_id(2)
+    HALF: tl.constexpr = HD // 2
     h = hb * HB + tl.arange(0, HB)
-    dcol = tl.arange(0, HD)
-    q = tl.load(Q + r * (H * HD) + h[:, None] * HD + dcol[None, :])
+    hc = tl.arange(0, HALF)
+    qb = Q + r * (H * HD) + h[:, None] * HD
+    q_lo = tl.load(qb + hc[None, :])
+    q_hi = tl.load(qb + HALF + hc[None, :])
     p = tl.load(POS + r)
     wlo = tl.load(WLO)
     m_i = tl.full((HB,), -1e30, dtype=tl.float32)
     l_i = tl.zeros((HB,), dtype=tl.float32)
-    acc = tl.zeros((HB, HD), dtype=tl.float32)
+    acc_lo = tl.zeros((HB, HALF), dtype=tl.float32)
+    acc_hi = tl.zeros((HB, HALF), dtype=tl.float32)
     n = tl.arange(0, BN)
-    # window: positions p - WIN + 1 .. p
-    for t in range(0, WIN, BN):
-        wp = p - (WIN - 1) + t + n
-        ok = wp >= 0
-        if RING:
-            slot = wp % ring_size
+    WB: tl.constexpr = WIN // BN
+    # key blocks 0..WB-1 are the window, WB.. the picks; this program takes blocks sp, sp + SPLITS, ...
+    for b in range(sp, NBLK, SPLITS):
+        if b < WB:
+            wp = p - (WIN - 1) + b * BN + n
+            ok = wp >= 0
+            if RING:
+                slot = wp % ring_size
+            else:
+                slot = wp - wlo
+                ok = ok & (slot >= 0)
+            slot = tl.where(ok, slot, 0)
+            kb = WSRC + slot[:, None] * HD
+            k_lo = tl.load(kb + hc[None, :], mask=ok[:, None], other=0.0)
+            k_hi = tl.load(kb + HALF + hc[None, :], mask=ok[:, None], other=0.0)
         else:
-            slot = wp - wlo
-            ok = ok & (slot >= 0)
-        slot = tl.where(ok, slot, 0)
-        k = tl.load(WSRC + slot[:, None] * HD + dcol[None, :], mask=ok[:, None], other=0.0)
-        s = tl.dot(q, tl.trans(k)) * scale
-        s = tl.where(ok[None, :], s, float("-inf"))
-        m_new = tl.maximum(m_i, tl.max(s, axis=1))
-        alpha = tl.exp(m_i - m_new)
-        pr = tl.exp(s - m_new[:, None])
-        l_i = l_i * alpha + tl.sum(pr, axis=1)
-        acc = acc * alpha[:, None] + tl.dot(pr.to(tl.bfloat16), k)
-        m_i = m_new
-    if HAS_COMP:
-        for t in range(0, n_idx, BN):
+            t = (b - WB) * BN
             ii = tl.load(IDX + r * n_idx + t + n, mask=(t + n) < n_idx, other=-1)
             ok = ii >= 0
-            k = tl.load(COMP + tl.where(ok, ii, 0)[:, None] * HD + dcol[None, :], mask=ok[:, None], other=0.0)
-            s = tl.dot(q, tl.trans(k)) * scale
-            s = tl.where(ok[None, :], s, float("-inf"))
-            m_new = tl.maximum(m_i, tl.max(s, axis=1))
-            alpha = tl.exp(m_i - m_new)
-            pr = tl.exp(s - m_new[:, None])
-            l_i = l_i * alpha + tl.sum(pr, axis=1)
-            acc = acc * alpha[:, None] + tl.dot(pr.to(tl.bfloat16), k)
-            m_i = m_new
-    sink = tl.load(SINK + h)
-    l_i = l_i + tl.exp(sink - m_i)
-    o = acc / l_i[:, None]
-    tl.store(OUT + r * (H * HD) + h[:, None] * HD + dcol[None, :], o.to(tl.bfloat16))
+            k_lo, k_hi = _comp_keys(COMP, CSC, tl.where(ok, ii, 0), ok, hc, HD, BN, PACKED)
+        m_i, l_i, acc_lo, acc_hi = _attn_step(q_lo, q_hi, k_lo, k_hi, ok, m_i, l_i, acc_lo, acc_hi, scale)
+    base = (r * (H // HB) + hb) * SPLITS + sp
+    tl.store(PM + base * HB + tl.arange(0, HB), m_i)
+    tl.store(PL + base * HB + tl.arange(0, HB), l_i)
+    ob = PO + base * HB * HD + tl.arange(0, HB)[:, None] * HD
+    tl.store(ob + hc[None, :], acc_lo)
+    tl.store(ob + HALF + hc[None, :], acc_hi)
+
+
+@triton.jit
+def _sparse_attn_merge(PM, PL, PO, SINK, OUT, H: tl.constexpr, HD: tl.constexpr, HB: tl.constexpr,
+                       SPLITS: tl.constexpr):
+    r = tl.program_id(0)
+    hb = tl.program_id(1)
+    hh = tl.arange(0, HB)
+    d = tl.arange(0, HD)
+    base0 = (r * (H // HB) + hb) * SPLITS
+    m = tl.full((HB,), -1e30, dtype=tl.float32)
+    for sp in range(SPLITS):
+        m = tl.maximum(m, tl.load(PM + (base0 + sp) * HB + hh))
+    l = tl.zeros((HB,), dtype=tl.float32)
+    acc = tl.zeros((HB, HD), dtype=tl.float32)
+    for sp in range(SPLITS):
+        ms = tl.load(PM + (base0 + sp) * HB + hh)
+        a = tl.exp(ms - m)
+        l += tl.load(PL + (base0 + sp) * HB + hh) * a
+        acc += tl.load(PO + (base0 + sp) * HB * HD + hh[:, None] * HD + d[None, :]) * a[:, None]
+    h = hb * HB + hh
+    l += tl.exp(tl.load(SINK + h) - m)
+    tl.store(OUT + r * (H * HD) + h[:, None] * HD + d[None, :], (acc / l[:, None]).to(tl.bfloat16))
+
+
+ATTN_SPLITS = 8
 
 
 def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: torch.Tensor, ring: bool,
-                comp: torch.Tensor | None, idx: torch.Tensor | None, pos: torch.Tensor, scale: float, window: int,
+                comp, idx: torch.Tensor | None, pos: torch.Tensor, scale: float, window: int,
                 out: torch.Tensor | None = None) -> torch.Tensor:
     """q [R, H, HD] bf16 -> o [R, H, HD]; window keys from ``wsrc`` (a ring: slot = position % size; else linear from
-    position wlo[0]); compressed keys comp[idx[r, j]] (idx -1 = none)."""
+    position wlo[0]); compressed keys comp[idx[r, j]] (idx -1 = none). ``comp`` is a bf16 [N, HD] tensor or a packed
+    FP4 pair (codes uint8 [N, HD/2], E4M3 scales uint8 [N, HD/16])."""
 
     rows, h, hd = q.shape
     if out is None:
         out = torch.empty_like(q)
-    hb = 16
+    hb, bn = 16, 32
     has = comp is not None and idx is not None and idx.shape[1] > 0
+    packed = has and isinstance(comp, tuple)
+    codes, scales = (comp if packed else (comp, None)) if has else (wsrc, None)
     n_idx = idx.shape[1] if has else 0
-    _sparse_attn[(rows, h // hb)](q, sink, wsrc, wlo, comp if has else wsrc, idx if has else pos, pos, out, scale,
-                                  wsrc.shape[0], n_idx, H=h, HD=hd, HB=hb, WIN=window, BN=32, RING=ring,
-                                  HAS_COMP=has, num_warps=8, num_stages=1)
+    nblk = window // bn + (triton.cdiv(n_idx, bn) if has else 0)
+    sp = ATTN_SPLITS
+    groups = h // hb
+    pm = torch.empty((rows * groups * sp * hb,), dtype=torch.float32, device=q.device)
+    pl = torch.empty_like(pm)
+    po = torch.empty((rows * groups * sp * hb * hd,), dtype=torch.float32, device=q.device)
+    _sparse_attn_part[(rows, groups, sp)](q, wsrc, wlo, codes, scales if packed else wsrc, idx if has else pos, pos,
+                                          pm, pl, po, scale, wsrc.shape[0], n_idx, H=h, HD=hd, HB=hb, WIN=window,
+                                          BN=bn, RING=ring, HAS_COMP=has, PACKED=packed, SPLITS=sp, NBLK=nblk,
+                                          num_warps=4, num_stages=1)
+    _sparse_attn_merge[(rows, groups)](pm, pl, po, sink, out, H=h, HD=hd, HB=hb, SPLITS=sp, num_warps=8)
     return out
 
 
 # -- indexer scores: sum_h relu(q_h . k_t) w_h over t < n, masked past each row's visible count -------------------
 @triton.jit
-def _index_score(Q, K, Wt, VIS, OUT, n, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr):
+def _index_score(Q, K, KS, Wt, VIS, OUT, n, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr,
+                 PACKED: tl.constexpr):
     r = tl.program_id(0)
     b = tl.program_id(1)
+    HALF: tl.constexpr = ID // 2
     hh = tl.arange(0, IH)
-    dd = tl.arange(0, ID)
+    hc = tl.arange(0, HALF)
     t = b * BN + tl.arange(0, BN)
-    q = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + dd[None, :])
-    k = tl.load(K + t[:, None] * ID + dd[None, :], mask=(t < n)[:, None], other=0.0)
-    s = tl.dot(q, tl.trans(k))                                   # [IH, BN] fp32
+    ok = t < n
+    q_lo = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + hc[None, :])
+    q_hi = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + HALF + hc[None, :])
+    if PACKED:
+        # FP4 rows: byte j = element j and j + ID/2; a power-of-two (E8M0) scale per 32 elements
+        cb = tl.load(K + t[:, None] * HALF + hc[None, :], mask=ok[:, None], other=0).to(tl.int32)
+        g = tl.arange(0, HALF // 32)
+        el = tl.load(KS + t[:, None] * (ID // 32) + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
+        eh = tl.load(KS + t[:, None] * (ID // 32) + HALF // 32 + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
+        sl = (el << 23).to(tl.float32, bitcast=True)                    # E8M0 byte -> 2^(byte - 127)
+        sh = (eh << 23).to(tl.float32, bitcast=True)
+        k_lo = tl.reshape(tl.reshape(_e2m1(cb & 15), (BN, HALF // 32, 32)) * sl[:, :, None], (BN, HALF)).to(tl.bfloat16)
+        k_hi = tl.reshape(tl.reshape(_e2m1(cb >> 4), (BN, HALF // 32, 32)) * sh[:, :, None], (BN, HALF)).to(tl.bfloat16)
+    else:
+        k_lo = tl.load(K + t[:, None] * ID + hc[None, :], mask=ok[:, None], other=0.0)
+        k_hi = tl.load(K + t[:, None] * ID + HALF + hc[None, :], mask=ok[:, None], other=0.0)
+    s = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))      # [IH, BN] fp32
     w = tl.load(Wt + r * IH + hh).to(tl.float32)
     sc = tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
     vis = tl.load(VIS + r)
     sc = tl.where(t < vis, sc, float("-inf"))
-    tl.store(OUT + r * n + t, sc, mask=t < n)
+    tl.store(OUT + r * n + t, sc, mask=ok)
 
 
-def index_score(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, vis: torch.Tensor, n: int,
+def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
                 out: torch.Tensor | None = None) -> torch.Tensor:
-    """q [R, IH, ID] bf16, k [>= n, ID] bf16, w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r])."""
+    """q [R, IH, ID] bf16, k bf16 [>= n, ID] or a packed FP4 pair (codes [N, ID/2], E8M0 [N, ID/32]),
+    w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r])."""
 
     rows, ih, idim = q.shape
     if out is None:
         out = torch.empty((rows, n), dtype=torch.float32, device=q.device)
+    packed = isinstance(k, tuple)
+    codes, scales = k if packed else (k, k)
     bn = 64
-    _index_score[(rows, triton.cdiv(n, bn))](q, k, w, vis, out, n, IH=ih, ID=idim, BN=bn, num_warps=4)
+    _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, IH=ih, ID=idim, BN=bn, PACKED=packed,
+                                             num_warps=4)
     return out
 
 
