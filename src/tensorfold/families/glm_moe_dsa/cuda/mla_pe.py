@@ -354,15 +354,17 @@ def _attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, 
 
 def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor,
                      tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor, scale: float,
-                     qscratch: torch.Tensor | None = None) -> None:
+                     qscratch: torch.Tensor | None = None, fused: bool | None = None) -> None:
     """Rows with counts > 0 over their selected tokens (ascending, -1 padded) into out; other rows untouched (``cache``
-    and ``qscratch`` as in attention(); the scratch only on prompt chunks' kernels)."""
+    and ``qscratch`` as in attention(); the scratch only on prompt chunks' kernels). ``fused``: the prompt chunks'
+    kernel whatever the row count (default: from FUSED_ROWS rows)."""
 
     R, H, LW = qa.shape
     PW = qp.shape[2]
     W = tokens.shape[1]
-    rows, scales, h32, kv8, qb, qsc = _scratch_planes(cache, qscratch if R >= FUSED_ROWS else None)
-    if R >= FUSED_ROWS:
+    fused = R >= FUSED_ROWS if fused is None else fused
+    rows, scales, h32, kv8, qb, qsc = _scratch_planes(cache, qscratch if fused else None)
+    if fused:
         # a prompt chunk: a program a row and head block, partials merged in registers (the decode windows' bits at
         # PROMPT_KT = KT)
         _sparse_rows_pe[(R, triton.cdiv(H, HB))](qa, qp, rows, scales, h32, pcache, tokens, counts, out, W=W, H=H,
@@ -444,19 +446,27 @@ def _expand_rows(OL, WV, OUT, R, H: tl.constexpr, DV: tl.constexpr, LW: tl.const
         tl.store(OUT + (r * H + h) * DV + n, acc.to(tl.bfloat16))
 
 
-def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
-    """latent.absorb_q (q [R, H, qk_dim] -> out [R, H, latent]); a prompt chunk's rows split over programs."""
+def absorb_q(q: torch.Tensor, a, out: torch.Tensor, exact: bool = False, blocks: bool = False) -> torch.Tensor:
+    """latent.absorb_q (q [R, H, qk_dim] -> out [R, H, latent]); a prompt chunk's rows split over programs. ``exact``:
+    latent's bits at any row count (a concurrent forward's rows: the row-block programs past PROMPT_RB, whatever
+    ABSORB says). ``blocks`` (the chunk-invariant prompt path): the batched matmul in fixed row blocks at any R."""
 
     from tensorfold.families.glm5_next.cuda import latent
 
+    from . import invariant
+
     R, H, D = q.shape
+    if blocks and not isinstance(a, latent.AbsorbQ4):
+        invariant.blocked(lambda x, y: torch.bmm(x.transpose(0, 1), a.wk[:, :D], out=y.transpose(0, 1)), R, [q], [out])
+        return out
     if R <= PROMPT_RB or isinstance(a, latent.AbsorbQ4):
         return latent.absorb_q(q, a, out)
-    if ABSORB == "bmm":
+    mode = "triton" if exact else ABSORB
+    if mode == "bmm":
         # written through out's head-major view: cuBLAS takes the strides, no transposing copy
         torch.bmm(q.transpose(0, 1), a.wk[:, :D], out=out.transpose(0, 1))
         return out
-    if ABSORB == "cuda" and _exact_shapes(a) and q.is_contiguous() and out.is_contiguous():
+    if mode == "cuda" and _exact_shapes(a) and q.is_contiguous() and out.is_contiguous():
         _rows_ext().absorb(q, a.wk, out, PROMPT_RB)
         return out
     BN = 32                                              # latent.absorb_q's: the same tile, the same sum
@@ -465,18 +475,26 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
-    """latent.expand_v (o_lat [R, H, latent] -> out [R, H, v_dim]); a prompt chunk's rows split over programs."""
+def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, exact: bool = False, blocks: bool = False) -> torch.Tensor:
+    """latent.expand_v (o_lat [R, H, latent] -> out [R, H, v_dim]); a prompt chunk's rows split over programs
+    (``exact`` and ``blocks`` as in absorb_q)."""
 
     from tensorfold.families.glm5_next.cuda import latent
 
+    from . import invariant
+
     R, H, _ = o_lat.shape
+    if blocks and not isinstance(a, latent.AbsorbQ4):
+        invariant.blocked(lambda x, y: torch.bmm(x.transpose(0, 1), a.wv.transpose(1, 2), out=y.transpose(0, 1)), R,
+                          [o_lat], [out])
+        return out
     if R <= PROMPT_RB or isinstance(a, latent.AbsorbQ4):
         return latent.expand_v(o_lat, a, out)
-    if ABSORB == "bmm":
+    mode = "triton" if exact else ABSORB
+    if mode == "bmm":
         torch.bmm(o_lat.transpose(0, 1), a.wv.transpose(1, 2), out=out.transpose(0, 1))
         return out
-    if ABSORB == "cuda" and _exact_shapes(a) and o_lat.is_contiguous() and out.is_contiguous():
+    if mode == "cuda" and _exact_shapes(a) and o_lat.is_contiguous() and out.is_contiguous():
         _rows_ext().expand(o_lat, a.wv, out, PROMPT_RB)
         return out
     BN = 16                                              # latent.expand_v's

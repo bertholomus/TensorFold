@@ -91,12 +91,19 @@ class GlmEngine:
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         prefill_rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
+        from .decode import DEPTH_COST
+        from .multi import DRAFT_CUT, EXTENTS, FILL_ROWS, KEEP, QUICK_ROWS
+
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
-                prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G, streams]
+                prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G, streams,
+                FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
+                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6)]
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
             raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
-                               " TF_GLM_EMBED_SPLIT, TF_GLM_KV, TF_GLM_DRAFT_VOCAB, TF_GLM_DCP, --parallel):"
+                               " TF_GLM_EMBED_SPLIT, TF_GLM_KV, TF_GLM_DRAFT_VOCAB, TF_GLM_DCP, --parallel, "
+                               "TF_GLM_FILL_ROWS, TF_GLM_QUICK_ROWS, TF_GLM_DEPTH_COST, TF_GLM_KEEP_SLOTS, "
+                               "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
         if rank == 0 and kv8.parse(kv8.MODE) != ("bf16", "bf16"):
             lat, idx = kv8.parse(kv8.MODE)
@@ -136,8 +143,11 @@ class GlmEngine:
                 if world > 1:
                     self.multi.link = Link(_store(self.comm), rank=0, world=world, host=master)
                 self.scheduler = Scheduler(self.multi, max_streams=streams)
+                from .multi import EXTENTS
+
+                pool = (f"extents of one {capacity}-row pool" if EXTENTS else f"a {capacity}-row cache slot each")
                 print(f"[tensorfold] up to {streams} requests decode together, each with a {self.limit}-token window "
-                      f"(a {capacity}-row cache slot each); {depth} MTP drafts a round", flush=True)
+                      f"({pool}); {depth} MTP drafts a round", flush=True)
         else:
             self.e = Decoder(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
                              graph_rows=GRAPH_ROWS, long_context=long_context)
@@ -192,8 +202,11 @@ class GlmEngine:
         extra += max(0, prompt_rows - PREFILL_ROWS) * PROMPT_ROW_BYTES      # chunks wider than geometry's 2,048 rows
         qs_row = 2 * int(text["kv_lora_rank"])
         if streams > 1:
-            own = own * streams
+            from .multi import EXTENTS, FILL_ROW_BYTES, FILL_ROWS
+
+            own = own if EXTENTS else own * streams    # extents: one window's pool for every stream
             extra += 1 << 30                           # the rounds' buffers (every stream's rows), graphs' pool
+            extra += FILL_ROWS * FILL_ROW_BYTES        # short prompts' batched fills
 
         def bytes_at(slots: int) -> int:
             return (int(flash.bytes_at(slots) + (own - flash_slot) * slots) + 3 * SELECT_BYTES + extra
@@ -288,15 +301,17 @@ class GlmEngine:
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
                   on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool) -> dict[str, Any]:
-        from .decode import DepthPolicy, mtp_decode, prefill, serial_decode
+        from .decode import DEPTH_COST, AcceptPolicy, DepthPolicy, mtp_decode, prefill, serial_decode
 
         t0 = time.perf_counter()
         first = prefill(self.e, prompt, sampling)
-        stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0}
+        stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0, "cached": getattr(self.e, "cached", 0)}
         on_tokens([first])
         if max_tokens <= 1 or (stop_eos and first in self.eos):
             return stats
-        policy = DepthPolicy(code[1], fixed=True) if code[0] else None
+        policy = None
+        if code[0]:
+            policy = AcceptPolicy(code[1]) if DEPTH_COST > 0 else DepthPolicy(code[1], fixed=True)
         res = (serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
                if policy is None or self.w.mtp is None or not draft
                else mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,

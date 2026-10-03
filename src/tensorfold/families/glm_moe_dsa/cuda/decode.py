@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Sequence
 
 import torch
@@ -14,6 +15,69 @@ from tensorfold.families.glm5_next.cuda.decode import (  # noqa: F401
 from .forward import Buffers, State, check_room, stage, commit  # noqa: F401
 from .select import sparse_bucket  # noqa: F401
 
+# draft depth by acceptance (TF_GLM_DEPTH_COST: what a draft position adds to a round, relative to a one-row round;
+# empty or 0: the lane's fixed depth). Drafts only propose: the depth changes speed, never a reply.
+DEPTH_COST = float(os.environ.get("TF_GLM_DEPTH_COST") or 0)
+DEPTH_PROBE = 8                           # every this many rounds one position deeper, so deeper estimates stay current
+
+
+class AcceptPolicy:
+    """DepthPolicy's interface: each draft position's acceptance (given the ones before it) as a running mean of the
+    rounds that reached it, and the depth (at least 1, at most ``most``) whose expected tokens a round per cost
+    (1 + cost x depth) is highest, one deeper every DEPTH_PROBE rounds. Only the rounds' drafted / accepted counts
+    decide it (the same on every rank), never a clock."""
+
+    fixed = False
+    confidence = 0.0
+
+    def __init__(self, most: int, cost: float = DEPTH_COST, prior: float = 0.8, rate: float = 0.125) -> None:
+        self.most, self.cost, self.rate = int(most), float(cost), float(rate)
+        self.a = [float(prior)] * self.most
+        self.rounds = 0
+
+    def update(self, drafted: int, accepted: int) -> None:
+        """A round that drafted ``drafted`` and kept the first ``accepted`` of them."""
+
+        for j in range(min(drafted, accepted + 1)):
+            self.a[j] += self.rate * ((1.0 if j < accepted else 0.0) - self.a[j])
+
+    def best(self, cost: float | None = None) -> int:
+        k = self.cost if cost is None else float(cost)
+        depth, value, chain, gain = 1, 0.0, 1.0, 1.0
+        for d in range(1, self.most + 1):
+            chain *= self.a[d - 1]
+            gain += chain
+            v = gain / (1.0 + k * d)
+            if v > value:
+                depth, value = d, v
+        self.rounds += 1
+        if self.rounds % DEPTH_PROBE == 0:
+            depth = min(self.most, depth + 1)
+        return max(1, min(self.most, depth)) if self.most else 0
+
+    def next(self, drafted: int, accepted: int) -> int:
+        if drafted:
+            self.update(drafted, accepted)
+        return self.best()
+
+
+def shared_cost(cost: float, streams: int) -> float:
+    """A draft row's cost relative to a stream's share of a concurrent round (``cost``: relative to a one-row round of
+    one stream). A round of n streams costs B + r x rows (r: mostly the routed experts' weight bytes its rows add); with
+    cost = r / (B + r), a stream's share of the n-stream round of one row each is (B + n r) / n, so its draft row costs
+    n r / (B + n r) = n cost / (1 + (n - 1) cost) of it: drafts pay off less as streams join."""
+
+    n = max(1, int(streams))
+    return n * cost / (1.0 + (n - 1) * cost)
+
+
+def resume_cut(kept: Sequence[int] | None, prompt: Sequence[int], step: int, short: int = 0) -> int:
+    """Where a prompt resumes from a kept prompt's rows (TF_GLM_KEEP_SLOTS; multi.resume_at's rule); 0: none."""
+
+    from .multi import KEEP, resume_at
+
+    return resume_at(kept, prompt, step, short) if KEEP else 0
+
 
 @torch.no_grad()
 def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
@@ -21,29 +85,40 @@ def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
 
     MTP: the prompt's rows are absorbed into the MTP head's cache chunk by chunk, as Flash does, when the
     checkpoint has the head (``--no-drafts`` serves still absorb nothing: the MTP cache stays unused).
+    A prompt that extends the last one resumes after the chunks they share (``resume_cut``; e.cached).
     """
 
-    from . import forward as fwd
+    from . import forward as fwd, invariant
+    from .multi import tiny_rows
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
     w, st, b = e.w, e.st, e.pbuf
+    short = tiny_rows(w) if invariant.INVARIANT else 0   # a whole prompt this short: the decode kernels (as batched)
+    cut = resume_cut(getattr(e, "kept", None), prompt, e.prefill_rows, short)
+    e.kept = None                                    # (set again once this prompt is whole)
     e.reset()
+    if cut:
+        st.set_pos(cut)
+        st.set_mtp_len(cut)
+    e.cached = cut
     last = None
     use_mtp = w.mtp is not None and not getattr(e, "serial_only", False)
-    for start in range(0, len(prompt), e.prefill_rows):
-        chunk = list(prompt[start:start + e.prefill_rows])
-        R = fwd.stage(w, st, b, chunk)
-        last = fwd.compute(w, st, b, R, nch=fwd.chunks_for(st, R), host_pos=st.pos).clone()
-        e.last_hidden = b.fnormed[R - 1:R].clone()
-        if use_mtp:
-            nxt = list(prompt[start + 1:start + R + 1])
-            if nxt:
-                from .mtp import mtp_forward
+    with invariant.suspended(cut == 0 and len(prompt) <= short):
+        for start in range(cut, len(prompt), e.prefill_rows):
+            chunk = list(prompt[start:start + e.prefill_rows])
+            R = fwd.stage(w, st, b, chunk)
+            last = fwd.compute(w, st, b, R, nch=fwd.chunks_for(st, R), host_pos=st.pos).clone()
+            e.last_hidden = b.fnormed[R - 1:R].clone()
+            if use_mtp:
+                nxt = list(prompt[start + 1:start + R + 1])
+                if nxt:
+                    from .mtp import mtp_forward
 
-                mtp_forward(w, st, b, nxt, b.fnormed[:len(nxt)])
-                st.set_mtp_len(st.mtp_len + len(nxt))
-        fwd.commit(w, st, b, R, R)
+                    mtp_forward(w, st, b, nxt, b.fnormed[:len(nxt)])
+                    st.set_mtp_len(st.mtp_len + len(nxt))
+            fwd.commit(w, st, b, R, R)
+    e.kept = list(prompt)
     if e.constraint is not None:
         e.window = e.constraint.window([0], [-1])
     first = e.sample(last, [len(prompt)], sampling)[0]

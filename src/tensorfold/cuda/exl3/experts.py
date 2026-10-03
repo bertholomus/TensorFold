@@ -204,14 +204,15 @@ class Scratch:
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
            group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None,
-           kernel: str | None = None) -> torch.Tensor:
+           kernel: str | None = None, exact_rows: int | None = None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts`` (plus
     ``add`` [R, D] fp32 added last, in the same launch, when given).
 
     Decode windows make no host sync. Prompt chunks (``group`` and R >= EXACT_ROWS) read the busiest expert's row count
     once; with ``prompt`` (default TF_EXL3_PROMPT_TILES) they group in parallel and decode each weight tile once for
     several member rows (``kernel``, default PROMPT_KERNEL), every row's arithmetic the one-tile launch's (the same
-    bits) for "mma" and "rows"; "mma2" / "mma3" sum in their own order.
+    bits) for "mma" and "rows"; "mma2" / "mma3" sum in their own order. ``exact_rows``: the row count from which the
+    prompt grouping runs (default EXACT_ROWS; 1: every window, a chunk-invariant prompt path).
     """
 
     ext = _ext()
@@ -221,7 +222,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     if R > s.rows:
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
-    chunk = group and R >= EXACT_ROWS
+    chunk = group and R >= (EXACT_ROWS if exact_rows is None else exact_rows)
     fast = chunk and (PROMPT if prompt is None else prompt) and all(
         n % (16 * t[0]) == 0 for n, t in ((I, PROMPT_TILES["gateup"]), (D, PROMPT_TILES["down"])))
     if fast:

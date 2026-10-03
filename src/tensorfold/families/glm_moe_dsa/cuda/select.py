@@ -342,7 +342,7 @@ RADIX_ROWS = 16             # blocks of this many rows or more select with _radi
 
 def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys, pos: int | None, R: int,
                   topk: int, pos_dev: torch.Tensor, *, tokens: torch.Tensor, counts: torch.Tensor,
-                  bucket: int | None = None) -> None:
+                  bucket: int | None = None, span: bool | None = None) -> None:
     """Each row's attended tokens [R, width] ascending (-1 padded) and their count past the dense limit.
 
     ``keys`` is the layer group's bf16 indexer key plane, its FP8 plane (kv8.Kv8) or its quantized one (kvq.KvQ).
@@ -368,16 +368,18 @@ def select_tokens(qi: torch.Tensor, wts: torch.Tensor, keys, pos: int | None, R:
     per_row = 4 * np_max if R >= RADIX_ROWS else 12 * np_max      # the radix path keeps only the fp32 scores
     rows = max(1, min(R, SELECT_BYTES // per_row))
     if rows >= R:
-        _select(qi, wts, keys, R, topk, pos_dev, tokens, counts, np_max)
+        _select(qi, wts, keys, R, topk, pos_dev, tokens, counts, np_max, span)
         return
     for r0 in range(0, R, rows):
         r1 = min(R, r0 + rows)
-        _select(qi[r0:r1], wts[r0:r1], keys, r1 - r0, topk, pos_dev + r0, tokens[r0:r1], counts[r0:r1], np_max)
+        _select(qi[r0:r1], wts[r0:r1], keys, r1 - r0, topk, pos_dev + r0, tokens[r0:r1], counts[r0:r1], np_max,
+                span)
 
 
 def _select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, pos_dev: torch.Tensor,
-            tokens: torch.Tensor, counts: torch.Tensor, np_max: int) -> None:
-    """select_tokens for rows at pos_dev .. pos_dev + R - 1 over np_max scored tokens."""
+            tokens: torch.Tensor, counts: torch.Tensor, np_max: int, span: bool | None = None) -> None:
+    """select_tokens for rows at pos_dev .. pos_dev + R - 1 over np_max scored tokens (``span``: span scores and the
+    radix top-k whatever R, the chunk-invariant prompt path)."""
 
     from .kv8 import Kv8
     from .kvq import KvQ
@@ -391,7 +393,8 @@ def _select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, pos_de
     ik, isc = (keys.codes, keys.scales) if kv8 or qb else (keys, keys)
     hq = keys.h if qb else isc
     HP = max(16, triton.next_power_of_2(H))
-    if SCORES_SPAN and R >= RADIX_ROWS:
+    wide = R >= RADIX_ROWS if span is None else span
+    if SCORES_SPAN and wide:
         _scores_span[(triton.cdiv(R, SPAN_RB), triton.cdiv(np_max, SPAN_TS))](
             qi, wts, wts.stride(0), ik, isc, hq, scores, pos_dev, R, np_max, D ** -0.5, wscale, H=H, HP=HP, D=D, BT=64,
             RB=SPAN_RB, TS=SPAN_TS, KV8=kv8, QB=qb, num_warps=4)
@@ -401,7 +404,7 @@ def _select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, pos_de
                                                                RB=rb, KV8=kv8, QB=qb, num_warps=4)
     width = tokens.shape[1]
     k = min(topk, np_max)
-    if R >= RADIX_ROWS and tokens.stride(1) == 1:
+    if wide and tokens.stride(1) == 1:
         tokens.zero_()
         _radix_topk[(R,)](scores, scores.stride(0), tokens, tokens.stride(0), np_max, K=k, BLOCK=1024, num_warps=4)
     elif tokens.stride(1) == 1:

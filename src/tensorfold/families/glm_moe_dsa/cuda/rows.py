@@ -23,6 +23,8 @@ from .kv8 import Kv8
 from .kvq import KvQ, _put_plane, rotate as _q_rotate, tile as _q_tile
 from .mla_pe import _keys
 
+RADIX_TOKENS = 16384     # scored tokens up to which a round of 16+ rows selects with _radix_topk (see select_tokens)
+
 
 class Tables:
     """A round's per-row tables on the device, with pinned host mirrors: ``pos`` int32 [rows] (each row's position in
@@ -377,7 +379,10 @@ def select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, t: Tabl
                                                               RB=rb, RBLK=rblk, KV8=kv8, QB=qb, num_warps=4)
     width = tokens.shape[1]
     k = min(topk, np_max)
-    if R >= sel.RADIX_ROWS and tokens.stride(1) == 1:
+    # a program a row (_radix_topk) for 16 rows or more over short buckets; past RADIX_TOKENS scored tokens each row's
+    # scores split over programs, whatever the round's rows: the same tokens in the same order, and faster there (16
+    # rows: 0.12 vs 0.22 ms at 32k, 0.19 vs 0.88 at 128k; tools/bench_rows_topk.py)
+    if R >= sel.RADIX_ROWS and np_max <= RADIX_TOKENS and tokens.stride(1) == 1:
         tokens.zero_()
         sel._radix_topk[(R,)](scores, scores.stride(0), tokens, tokens.stride(0), np_max, K=k, BLOCK=1024,
                               num_warps=4)

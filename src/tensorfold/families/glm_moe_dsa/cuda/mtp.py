@@ -82,13 +82,21 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = 
     k = n - lo
     glue.rmsnorm(b.mx[lo:n], m.norm, c.eps, b.fnormed[:k], b.fxs[:k])
     head = w.head if w.draft_head is None else w.draft_head         # TF_GLM_DRAFT_VOCAB: the draft ids only
+    from . import invariant
+    from .x3 import X3
+
+    if invariant.INVARIANT and b.prefill and isinstance(head, X3):  # the decode linear, as without it
+        return head(b.fnormed[:k], b.logits[:k, :head.n], b.x3, prefill=False)
     return mm(b, b.fnormed[:k], head, b.fxs[:k], b.logits[:k, :head.n])
 
 
-def mtp_compute_rows(w: Weights, st: State, b: Buffers, n: int, heads: torch.Tensor) -> torch.Tensor:
+def mtp_compute_rows(w: Weights, st: State, b: Buffers, n: int, heads: torch.Tensor | None,
+                     zero: torch.Tensor | None = None) -> torch.Tensor | None:
     """mtp_compute over a concurrent round's MTP rows: row r at the MTP position and slot b.rows_t holds for it (rows.
     Tables, filled before) over the pool ``st``, the head over the rows ``heads`` (int64, each drafting stream's last
-    row; b.fnormed[:k] keeps their shared_head.norm rows for the next chained step): logits [k, head columns]."""
+    row; b.fnormed[:k] keeps their shared_head.norm rows for the next chained step): logits [k, head columns]. A
+    batched fill's prompt rows: ``heads`` None (no head, b.fnormed untouched), ``zero`` the rows at MTP position 0
+    (their embedding zeroed, as mtp_compute's first row)."""
 
     from . import rows as rows_mod
 
@@ -96,6 +104,8 @@ def mtp_compute_rows(w: Weights, st: State, b: Buffers, n: int, heads: torch.Ten
     m = w.mtp
     D = c.hidden
     embed(w, b, b.ids[:n], b.me[:n])
+    if zero is not None:
+        b.me[:n].index_fill_(0, zero, 0)
     glue.rmsnorm(b.me[:n], m.enorm, c.eps, b.mcat[:n, :D])
     glue.rmsnorm(b.hin[:n], m.hnorm, c.eps, b.mcat[:n, D:])
     mm(b, b.mcat[:n], m.eh, _group_sums(b, b.mcat[:n]), b.mx[:n])
@@ -108,6 +118,8 @@ def mtp_compute_rows(w: Weights, st: State, b: Buffers, n: int, heads: torch.Ten
     glue.rmsnorm(b.mx[:n], layer.post_norm, c.eps, b.normed[:n], b.xs[:n])
     g = moe_block(layer, w, b, n)
     residual(b.mx[:n], b.mx[:n], g)
+    if heads is None:
+        return None
     k = heads.shape[0]
     torch.index_select(b.mx[:n], 0, heads, out=b.mhead[:k])
     glue.rmsnorm(b.mhead[:k], m.norm, c.eps, b.fnormed[:k], b.fxs[:k])

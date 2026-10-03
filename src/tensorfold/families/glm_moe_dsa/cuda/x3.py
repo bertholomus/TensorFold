@@ -22,6 +22,10 @@ ROWS = 128               # most rows one call of the EXL3 linear takes
 # prompt chunks' EXL3 GEMMs take tiles by shape (exl3.prefill.tiles; 1.4 % of a 32.5k prefill on TP4) unless
 # TF_GLM_PROMPT_TILES=0 (the fixed 128-row tiles)
 PROMPT_TILES = __import__("os").environ.get("TF_GLM_PROMPT_TILES", "1") != "0"
+# prompt chunks' EXL3 GEMMs on the weight dequantized into the model's basis once a chunk (exl3.prefill's deq: "bf16" a
+# cuBLAS GEMM, "fp16" the Triton one, "auto" each call's faster; no input rotation, no epilogue H128) or "0" (rotated
+# rows, TF_GLM_PROMPT_DEQ)
+PROMPT_DEQ = __import__("os").environ.get("TF_GLM_PROMPT_DEQ") or "0"
 
 
 class X3Scratch:
@@ -98,14 +102,17 @@ class X3:
             raise ValueError(f"X3: x {tuple(x.shape)} / out {tuple(out.shape)} do not match K={lin.k}, N={self.n_pad}")
         if self.n_pad > keep:
             out[:, keep:].fill_(float("-inf"))
-        if prefill and sc.prefill is not None and R > ROWS:
+        from . import invariant
+
+        if prefill and sc.prefill is not None and (R > ROWS or invariant.INVARIANT):
             from tensorfold.cuda.exl3.prefill import matmul
 
+            blocks = invariant.blocked if invariant.INVARIANT else None
             if stored == keep:
-                matmul(lin, x, out[:, :keep], sc.prefill, PROMPT_TILES)     # the prompt GEMM takes any row stride
+                matmul(lin, x, out[:, :keep], sc.prefill, PROMPT_TILES, PROMPT_DEQ, blocks)     # any row stride
             else:
                 y = sc.staging(out.dtype, R, stored)
-                matmul(lin, x, y, sc.prefill, PROMPT_TILES)
+                matmul(lin, x, y, sc.prefill, PROMPT_TILES, PROMPT_DEQ, blocks)
                 out[:, :keep].copy_(y[:, :keep])
             return out
         sk = lin.split[0]

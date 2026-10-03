@@ -15,6 +15,7 @@ from tensorfold.families.glm5_next.cuda import latent as latent_mod, prof, qmm a
 from tensorfold.cuda.geometry import share
 
 from . import dcp as dcp_mod, glue, kv8, kvq, mla_pe, rope as rope_mod, rows as rows_mod, select as select_mod
+from . import invariant
 from .kv8 import Kv8
 from .kvq import KvQ
 from .weights import LayerW, Weights
@@ -362,6 +363,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
     HL = a.heads
     s = b.lat_s
     G = w.meta.get("dcp", 1)                 # dcp: the cache's positions interleaved over G ranks
+    inv = invariant.INVARIANT and b.prefill and G == 1   # the chunk-invariant prompt path (invariant.py)
     t = getattr(b, "rows_t", None)           # a concurrent round (rows.Tables): every row its own stream's position
     if t is not None and (G > 1 or reuse):
         raise ValueError("a concurrent round runs neither with decode context parallelism nor MTP index reuse")
@@ -415,7 +417,8 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
     sparse_rows = long_ctx and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
     with prof.timed("dsa: absorb"):
-        qa = mla_pe.absorb_q(b.q[:R], a.absorb, s.qa[:R])              # rope columns of wk are zero: q_nope . W_UK
+        # rope columns of wk are zero: q_nope . W_UK (a concurrent forward: the decode kernels' bits at any row count)
+        qa = mla_pe.absorb_q(b.q[:R], a.absorb, s.qa[:R], exact=t is not None, blocks=inv)
         qp = mla_pe.gather_pe(b.q[:R], c.qk_nope, b.qp[:R])
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
@@ -434,7 +437,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
             with prof.timed("dsa: sparse attention"):
                 rows_mod.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], t, ol, scale)
         with prof.timed("dsa: expand"):
-            o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+            o = mla_pe.expand_v(ol, a.absorb, b.vn[:R], exact=True).view(R, HL * c.v_dim)
         return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
     if G > 1:
         # dcp: rows below the dense limit read every key a rank holds, later rows its share of the global selection
@@ -451,7 +454,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
     qs = None
     qscr = getattr(b, "qscr", None)
     if (mla_pe.QSCRATCH and qscr is not None and isinstance(lc, KvQ) and host_pos is not None
-            and R >= mla_pe.FUSED_ROWS and (host_pos + R) * lc.width <= qscr.numel()):
+            and (R >= mla_pe.FUSED_ROWS or inv) and (host_pos + R) * lc.width <= qscr.numel()):
         with prof.timed("dsa: q unpack"):
             # the slots these rows can see (theirs included, written above), once for the layer's attention
             buf = qscr.view(torch.bfloat16) if mla_pe.QSCRATCH_BF16 else qscr
@@ -472,12 +475,14 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
             with prof.timed("dsa: select tokens"):
                 index_inputs(w, b, a.index, R)
                 select_mod.select_tokens(b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev,
-                                         tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np)
+                                         tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np,
+                                         span=True if inv else None)
         # a "shared" layer attends the tokens its group's full layer selected for these rows (still in b.tokens)
         with prof.timed("dsa: sparse attention"):
-            mla_pe.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], ol, scale, qscratch=qs)
+            mla_pe.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], ol, scale, qscratch=qs,
+                                    fused=True if inv else None)
     with prof.timed("dsa: expand"):
-        o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+        o = mla_pe.expand_v(ol, a.absorb, b.vn[:R], blocks=inv).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
 
 
@@ -488,7 +493,10 @@ def index_inputs(w: Weights, b: Buffers, ix, R: int) -> None:
     mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
     rope_mod.apply_index(b.qi[:R], b.cos[:R], b.sin[:R], c, c.index_heads)
     # per-token head weights: weights_proj applied to the layer input (the scorer folds the scales)
-    if getattr(b, "micro", False):
+    if invariant.INVARIANT and b.prefill:
+        # the chunk-invariant prompt path: cuBLAS in fixed row blocks (a row's bits from its block's shape alone)
+        invariant.blocked(lambda x, y: torch.mm(x, ix.weights.t(), out=y), R, [b.normed[:R]], [b.iw[:R]])
+    elif getattr(b, "micro", False):
         # cuBLAS picks its kernel by the row count and a row's bits move with it: a micro-batch multiplies
         # the whole chunk's rows (the other's are recomputed when it gets here) and keeps its own
         f = b.full
@@ -546,10 +554,13 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         glue.router(b.normed[:R], m.router, b.mlog[:R])
         glue.select(b.mlog[:R], m.bias, b.pick[:R], b.wts[:R], c.top_k, c.experts, c.routed_scale, c.norm_topk)
     with prof.timed("moe: routed"):
-        # GLM-5.3 has no swiglu_limit; the bf16 activation roundings are the GLM family's
+        # GLM-5.3 has no swiglu_limit; the bf16 activation roundings are the GLM family's. A concurrent forward of 64
+        # rows or more (a batched fill) groups as a prompt chunk does, on "mma": the decode windows' bits
+        rows_t = getattr(b, "rows_t", None)
         x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], m.experts.ex, b.moe, b.part[:R], R,
                          limit=math.inf, act_mode=x3experts.ACT_BF16, add=b.sy[:R] if inline else None,
-                         kernel=PROMPT_EXPERTS)
+                         kernel=PROMPT_EXPERTS if rows_t is None else "mma",
+                         exact_rows=1 if invariant.INVARIANT and b.prefill and rows_t is None else None)
     if b.side is not None:
         join(b)
     elif not inline:
@@ -689,13 +700,16 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
         return None
     glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
     if b.prefill:                        # the head reads the last row only (fnormed keeps every row for the MTP)
+        if invariant.INVARIANT and isinstance(w.head, X3):      # (the decode linear, as without it)
+            return w.head(b.fnormed[R - 1:R], b.logits[:1], b.x3, prefill=False)
         return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
     return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
 
 
-def compute_rows(w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
+def compute_rows(w: Weights, st: State, b: Buffers, R: int, heads: torch.Tensor | None = None) -> torch.Tensor:
     """A concurrent round's forward (capturable): the rows of every live stream's window, each at the position and
-    cache slot b.rows_t holds for it (rows.Tables, filled before), over the pool ``st``; logits [R, V/world]."""
+    cache slot b.rows_t holds for it (rows.Tables, filled before), over the pool ``st``; logits [R, V/world], or with
+    ``heads`` (int64 rows: a batched fill's last row a stream) [len(heads), V/world] (the head is row-invariant)."""
 
     c = w.cfg
     t = b.rows_t
@@ -704,6 +718,11 @@ def compute_rows(w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
     for layer in w.layers:
         layer_forward(layer, w, st, b, R)
     glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
+    if heads is not None:
+        k = heads.shape[0]
+        torch.index_select(b.fnormed[:R], 0, heads, out=b.hidden[:k])
+        torch.index_select(b.fxs[:R], 0, heads, out=b.xs[:k])
+        return mm(b, b.hidden[:k], w.head, b.xs[:k], b.logits[:k])
     return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
 
 
