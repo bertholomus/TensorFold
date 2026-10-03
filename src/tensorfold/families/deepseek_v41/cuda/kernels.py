@@ -13,7 +13,7 @@ import torch
 import triton
 import triton.language as tl
 
-HC_BLOCKS = 16          # fixed K split of the mHC mixing dots (a function of the shape only)
+HC_BLOCKS = 40          # fixed K split of the mHC mixing dots (a function of the shape only)
 
 
 # -- mHC: mixes of the stream (for the next sublayer) + collapse with the carried pre-mix + RMSNorm ---------------
@@ -104,7 +104,7 @@ def hc_pre(h: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.T
     rows = h.shape[0]
     d = h.shape[-1]
     wide = 4 * d
-    _hc_partial[(rows, HC_BLOCKS)](h, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=4)
+    _hc_partial[(rows, HC_BLOCKS)](h, fn, part, WIDE=wide, NB=HC_BLOCKS, SUB=128, num_warps=2)
     _hc_finish[(rows,)](h, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, D=d,
                         NB=HC_BLOCKS, ITERS=iters, BLOCK=1024, num_warps=8)
 
@@ -412,8 +412,8 @@ def rowmm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> 
     n = w.shape[0]
     if out is None:
         out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
-    bn = 32
-    _rowmm[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, K=k, N=n, BN=bn, BK=128, num_warps=4)
+    bn = 8
+    _rowmm[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, K=k, N=n, BN=bn, BK=256, num_warps=4)
     return out
 
 

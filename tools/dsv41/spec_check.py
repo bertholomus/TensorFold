@@ -60,6 +60,7 @@ def main():
                "draft_tps": round(res["draft"][1]["tokens_per_second"], 2),
                "accept_per_round": round(res["draft"][1]["accepted"] / max(res["draft"][1]["rounds"], 1), 3),
                "tokens_per_round": round(len(d_tok) / max(res["draft"][1]["rounds"], 1), 3),
+               "round_ms": {k: round(res["draft"][1].get(k, 0), 2) for k in ("draft_ms", "verify_ms", "absorb_ms")},
                "matches_kit_greedy_prefix": next((i for i, (x, y) in enumerate(zip(s_tok, r["gen_ids"])) if x != y),
                                                  min(len(s_tok), len(r["gen_ids"])))}
         rows.append(row)

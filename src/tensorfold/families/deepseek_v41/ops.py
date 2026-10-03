@@ -80,11 +80,21 @@ def fp8_qd(x: torch.Tensor, block: int = 32) -> torch.Tensor:
 _E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])
 
 
+_E2M1_DEV: dict = {}
+
+
+def _e2m1_on(device) -> torch.Tensor:
+    t = _E2M1_DEV.get(str(device))
+    if t is None:
+        t = _E2M1_DEV[str(device)] = _E2M1.to(device)
+    return t
+
+
 def _to_e2m1(v: torch.Tensor) -> torch.Tensor:
     """Round to the nearest E2M1 value, ties to the even code (0, 1, 2, 4), v already clamped to [-6, 6]."""
 
     a = v.abs()
-    grid = _E2M1.to(v.device)
+    grid = _e2m1_on(v.device)
     mids = (grid[1:] + grid[:-1]) / 2
     idx = torch.bucketize(a, mids)                       # the lower neighbour on a tie
     tie = (idx < len(mids)) & (a == mids[idx.clamp(max=len(mids) - 1)])

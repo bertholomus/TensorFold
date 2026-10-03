@@ -28,6 +28,27 @@ RAW = 64                            # per-position compressor inputs kept (a ver
 RING_EXTRA = 16                     # window ring slots beyond the 128-token window (verify windows never clobber)
 KV_QUANT = os.environ.get("TF_DS_KV", "native") != "bf16"
 KERNELS = os.environ.get("TF_DS_KERNELS", "1") != "0"      # 0: the plain-torch phase-1 path (A/B and debugging)
+TIMING = os.environ.get("TF_DS_TIMING", "0") == "1"        # per-section wall times (synchronizing; profiling only)
+TIMES: dict = {}
+
+
+class _T:
+    """with _T("name"): ... adds the section's synchronized wall time to TIMES (no-op unless TF_DS_TIMING=1)."""
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __enter__(self):
+        if TIMING:
+            import time
+            torch.cuda.synchronize()
+            self.t = time.perf_counter()
+
+    def __exit__(self, *a):
+        if TIMING:
+            import time
+            torch.cuda.synchronize()
+            TIMES[self.name] = TIMES.get(self.name, 0.0) + time.perf_counter() - self.t
 
 
 class Comm:
@@ -117,43 +138,112 @@ class SeqCache:
     comp: dict = field(default_factory=dict)          # kv-source layer -> [cap // ratio, head_dim] bf16 (fp4-rounded)
     index_k: dict = field(default_factory=dict)       # kv-source layer -> [cap // ratio, idx_dim] bf16 (fp4-rounded)
     comp_raw: dict = field(default_factory=dict)      # ratio>1 kv-source layer -> (kv, score) [RAW, D] f32 by position
-    tokens: torch.Tensor | None = None                # [cap] int64 token ids (Engram lookback)
+    tokens: torch.Tensor | None = None                # [cap] int64 token ids
+    host: list = field(default_factory=list)          # the same ids on the host (Engram hashes)
     ring_size: int = 0
 
 
+def _engram_io():
+    from pathlib import Path
+
+    from tensorfold.cuda.build import load
+
+    if not hasattr(_engram_io, "ext"):
+        here = Path(__file__).parent
+        from torch.utils import cpp_extension
+
+        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v1", sources=[str(here / "engram_io.cpp")],
+                                            extra_cflags=["-O3"], verbose=False)
+    return _engram_io.ext
+
+
 class Engram:
-    """Hash rows of the original FP8 tables, read by offset from local NVMe; this rank's hash columns only."""
+    """Hash rows of the original FP8 tables, read by offset from local NVMe; this rank's hash columns only.
+
+    Hashes are computed on the host from the token ids (numpy, DeepSeek's rule), rows are read with parallel preads
+    into a pinned buffer and copied to the GPU without a device sync.
+    """
 
     def __init__(self, engram_dir: str, cfg: Cfg, token_map: list[int], rank: int, world: int):
         import json
         import struct
+        from concurrent.futures import ThreadPoolExecutor
         from pathlib import Path
+
+        from ..ops import engram_multipliers, engram_primes
 
         self.cfg = cfg
         self.hasher = EngramHasher(cfg, token_map)
         n_cols = (cfg.engram_ngram - 1) * cfg.engram_heads
         self.cols = (rank * n_cols // world, (rank + 1) * n_cols // world)
-        self.maps = {}
+        primes = engram_primes(cfg)
+        flat = [[p for per in layer for p in per] for layer in primes]
+        self.np_primes = np.array(flat, dtype=np.int64)                         # [L, cols]
+        self.np_offsets = np.array([np.cumsum([0, *f[:-1]]) for f in flat], dtype=np.int64)
+        self.np_mult = engram_multipliers(cfg).numpy().astype(np.int64)           # [L, ngram]
+        self.np_map = np.asarray(token_map, dtype=np.int64)
+        self.pad = int(token_map[cfg.engram_pad])
+        self.files: dict = {}
         for path in sorted(Path(engram_dir).glob("*.safetensors")):
             with open(path, "rb") as f:
                 size = struct.unpack("<Q", f.read(8))[0]
                 header = json.loads(f.read(size))
+            fd = os.open(str(path), os.O_RDONLY)
             for name, e in header.items():
                 if name.endswith("engram.embed.weight") or name.endswith("engram.embed.scale"):
                     lo, hi = e["data_offsets"]
-                    mm_ = np.memmap(path, dtype=np.uint8, mode="r", offset=8 + size + lo, shape=(hi - lo,))
-                    self.maps[name] = mm_.reshape(e["shape"])
+                    self.files[name] = (fd, 8 + size + lo, int(np.prod(e["shape"][1:])))
+        self.io = _engram_io()
+        self.threads = int(os.environ.get("TF_DS_ENGRAM_THREADS") or 48)
+        self.pinned: dict = {}
 
-    def rows(self, layer: int, idx: torch.Tensor) -> torch.Tensor:
-        """idx [n, cols] (this rank's columns) -> bf16 [n, cols * head_dim]."""
+    def hashes(self, tokens: list[int], start: int, n: int) -> np.ndarray:
+        """Row ids [n, L, cols] for positions start .. start + n - 1 of ``tokens`` (the whole sequence so far)."""
 
-        flat = idx.reshape(-1).cpu().numpy()
-        wv = np.asarray(self.maps[f"layers.{layer}.engram.embed.weight"][flat])
-        sv = np.asarray(self.maps[f"layers.{layer}.engram.embed.scale"][flat])
-        v = torch.from_numpy(wv).view(torch.float8_e4m3fn).cuda().to(F32)
-        e = torch.from_numpy(sv).cuda().to(torch.int32) - 127
+        c = self.cfg
+        lb = c.engram_ngram - 1
+        lo = max(0, start - lb)
+        comp = self.np_map[np.asarray(tokens[lo:start + n], dtype=np.int64)]
+        pos = np.arange(start, start + n)
+        toks = []
+        for shift in range(c.engram_ngram):
+            src = comp[np.clip(pos - shift - lo, 0, None)]
+            toks.append(np.where(pos < shift, self.pad, src))
+        toks = np.stack(toks, -1)                                              # [n, ngram]
+        prod = toks[:, None, :] * self.np_mult[None]                           # [n, L, ngram]
+        rolling, out = prod[..., 0], []
+        H = c.engram_heads
+        for i in range(1, c.engram_ngram):
+            rolling = np.bitwise_xor(rolling, prod[..., i])
+            out.append(rolling[..., None] % self.np_primes[None, :, (i - 1) * H:i * H])
+        return np.concatenate(out, -1) + self.np_offsets[None]
+
+    def rows(self, layer: int, idx: np.ndarray) -> torch.Tensor:
+        """idx [n, cols] (this rank's columns, host) -> bf16 [n, cols * head_dim] on the GPU, no device sync."""
+
+        fw, bw, rw = self.files[f"layers.{layer}.engram.embed.weight"]
+        fs, bs, rs = self.files[f"layers.{layer}.engram.embed.scale"]
+        flat = np.ascontiguousarray(idx.reshape(-1), dtype=np.int64)
+        m = flat.shape[0]
+        key = (layer, m)
+        buf = self.pinned.get(key)
+        if buf is None:
+            if len(self.pinned) > 64:
+                self.pinned.clear()
+            buf = (torch.empty((m, rw), dtype=torch.uint8, pin_memory=True),
+                   torch.empty((m, rs), dtype=torch.uint8, pin_memory=True), torch.cuda.Event())
+            self.pinned[key] = buf
+        buf[2].synchronize()               # the previous copy out of this staging buffer has finished
+        it = torch.from_numpy(flat)
+        self.io.gather_rows(fw, bw, rw, it, buf[0], self.threads)
+        self.io.gather_rows(fs, bs, rs, it, buf[1], self.threads)
+        gw = buf[0].cuda(non_blocking=True)
+        gs = buf[1].cuda(non_blocking=True)
+        buf[2].record()
+        v = gw.view(torch.float8_e4m3fn).to(F32)
+        e = gs.to(torch.int32) - 127
         sc = torch.ldexp(torch.ones_like(e, dtype=F32), e)
-        v = (v.view(-1, v.shape[-1] // 32, 32) * sc[..., None]).view(v.shape)
+        v = (v.view(m, rw // 32, 32) * sc[..., None]).view(m, rw)
         return v.to(BF16).reshape(idx.shape[0], -1)
 
 
@@ -231,7 +321,8 @@ class Model:
     def engram_apply(self, lay, h: torch.Tensor, hashes: torch.Tensor) -> torch.Tensor:
         c = self.cfg
         lo, hi = self.engram.cols
-        e = self.engram.rows(lay.idx, hashes[:, lo:hi])
+        with _T("engram_rows"):
+            e = self.engram.rows(lay.idx, hashes[:, lo:hi])
         kv = self.comm.sum(mm(lay.engram_wkv, e, F32)).to(BF16)
         if KERNELS:
             return K.engram_gate(h, kv.contiguous(), lay.engram_qk, c.eps)
@@ -356,8 +447,30 @@ class Model:
         u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
         return mm(lay.wo_b, u, F32)                                      # this rank's partial
 
-    def attention_k(self, lay, x: torch.Tensor, sc: SeqCache, start: int, shared: dict, pos: torch.Tensor):
-        """The same math as ``attention`` with the row-independent Triton kernels."""
+    def kv_source_update(self, lay, x: torch.Tensor, sc: SeqCache, start: int, shared: dict) -> None:
+        """A kv-source layer's compressed latents (and index keys) for rows at start.., into the caches."""
+
+        c = self.cfg
+        rd, ratio = c.rope_dim, lay.ratio
+        lat, groups = self._compress(lay, x, sc, start)
+        shared["kv_layer"] = lay.idx
+        if lat is not None and lay.idx_wk is not None:
+            k = rms_norm(mm(lay.idx_wk, lat), lay.idx_k_norm, c.eps)
+            rope_(k[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
+            if KV_QUANT:
+                k = fp4_qd(k, 32, e4m3_scale=False)
+            sc.index_k[lay.idx][groups] = k
+        if lat is not None:
+            lat = lat.clone()
+            rope_(lat[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
+            if KV_QUANT:
+                lat = fp4_qd(lat, 16, e4m3_scale=True)
+            sc.comp[lay.idx][groups] = lat
+
+    def attention_k(self, lay, x: torch.Tensor, sc: SeqCache, start: int, shared: dict, pos: torch.Tensor,
+                    floor: int = 0, kv_done: bool = False):
+        """The same math as ``attention`` with the row-independent Triton kernels. ``floor``: no window key before
+        this position (bounded replay); ``kv_done``: the kv-source update already ran for these rows."""
 
         c = self.cfg
         n = x.shape[0]
@@ -375,7 +488,7 @@ class Model:
             kv = K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, pos % R, c.eps, KV_QUANT, rd)
             wsrc, wlo = ring, self._zero
         else:
-            lo = max(0, start - (c.window - 1))
+            lo = max(floor, start - (c.window - 1))
             wsrc = torch.empty((start - lo + n, hd), dtype=BF16, device=x.device)
             if start > lo:
                 wsrc[:start - lo] = ring[torch.arange(lo, start, device=x.device) % R]
@@ -385,21 +498,8 @@ class Model:
             wlo = torch.tensor([lo], dtype=torch.int64, device=x.device)
         comp, cidx = None, None
         if ratio:
-            if lay.comp_wkv is not None:
-                lat, groups = self._compress(lay, x, sc, start)
-                shared["kv_layer"] = lay.idx
-                if lat is not None and lay.idx_wk is not None:
-                    k = rms_norm(mm(lay.idx_wk, lat), lay.idx_k_norm, c.eps)
-                    rope_(k[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
-                    if KV_QUANT:
-                        k = fp4_qd(k, 32, e4m3_scale=False)
-                    sc.index_k[lay.idx][groups] = k
-                if lat is not None:
-                    lat = lat.clone()
-                    rope_(lat[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
-                    if KV_QUANT:
-                        lat = fp4_qd(lat, 16, e4m3_scale=True)
-                    sc.comp[lay.idx][groups] = lat
+            if lay.comp_wkv is not None and not kv_done:
+                self.kv_source_update(lay, x, sc, start, shared)
             src = shared["kv_layer"]
             n_comp_end = (start + n) // ratio
             vis = (pos + 1) // ratio
@@ -411,15 +511,26 @@ class Model:
                     K.rope_heads(iq, cos, sin, pos, rd)
                     if KV_QUANT:
                         iq = fp4_qd(iq, 32, e4m3_scale=False)
-                    wts = (K.rowmm(x, lay.idx_proj_h).to(BF16) * (c.idx_dim ** -0.5 * c.idx_heads ** -0.5))
-                    score = K.index_score(iq, sc.index_k[src], wts, vis, n_comp_end)
-                    if lay.idx == c.cand_source:
-                        shared["cand"] = _candidates(score, vis[:, None], c.cand_blocks, c.cand_block)
-                    elif 0 <= c.cand_source < lay.idx:
-                        score.masked_fill_(~shared["cand"], float("-inf"))
+                    wl = K.rowmm(x, lay.idx_proj_h) if n <= 16 else x.float() @ lay.idx_proj.t()
+                    wts = (wl.to(BF16) * (c.idx_dim ** -0.5 * c.idx_heads ** -0.5))
                     kk = min(c.idx_topk, n_comp_end)
-                    top = score.topk(kk, dim=-1, sorted=False).indices.sort(dim=-1).values
-                    cidx = torch.where(top < vis[:, None], top, -1).contiguous()
+                    cidx = torch.empty((n, kk), dtype=torch.int64, device=x.device)
+                    # rows in blocks so the [rows, n_comp] score matrix stays bounded at long contexts
+                    rb = max(16, min(n, (1 << 28) // (4 * max(n_comp_end, 1))))
+                    cand_parts = []
+                    for r0 in range(0, n, rb):
+                        r1 = min(n, r0 + rb)
+                        score = K.index_score(iq[r0:r1].contiguous(), sc.index_k[src], wts[r0:r1].contiguous(),
+                                              vis[r0:r1].contiguous(), n_comp_end)
+                        if lay.idx == c.cand_source:
+                            cand_parts.append(_candidates(score, vis[r0:r1, None], c.cand_blocks, c.cand_block))
+                        elif 0 <= c.cand_source < lay.idx:
+                            score.masked_fill_(~shared["cand"][r0:r1], float("-inf"))
+                        top = score.topk(kk, dim=-1, sorted=False).indices.sort(dim=-1).values
+                        cidx[r0:r1] = torch.where(top < vis[r0:r1, None], top, -1)
+                        del score
+                    if lay.idx == c.cand_source:
+                        shared["cand"] = torch.cat(cand_parts, 0)
                 shared["topk"] = cidx
             cidx = shared["topk"]
             comp = sc.comp[src]
@@ -447,7 +558,8 @@ class Model:
         slots = topk + 1
         shared_id = lay.experts.count - 1
         if KERNELS:
-            logits = K.rowmm(x, lay.gate_w)
+            # decode / verify windows: the row-invariant matmul; prompt chunks: one cuBLAS GEMM
+            logits = K.rowmm(x, lay.gate_w) if n <= 16 else (x.float() @ lay.gate_w.float().t())
             pick = torch.empty((n, slots), dtype=torch.int32, device=x.device)
             wts = torch.empty((n, slots), dtype=F32, device=x.device)
             K.route(logits, lay.gate_b, topk, c.route_scale, shared_id, pick, wts)
@@ -460,11 +572,12 @@ class Model:
             wts = wts * c.route_scale
             pick = torch.cat([ind, torch.full((n, 1), shared_id, dtype=ind.dtype, device=x.device)], 1).to(torch.int32)
             wts = torch.cat([wts, torch.ones((n, 1), dtype=F32, device=x.device)], 1).contiguous()
-        skey = ("moe", slots, lay.experts.count)
+        prompt = n >= 64
+        skey = ("moe", slots, lay.experts.count, prompt)
         s = self.scratch.get(skey)
         if s is None or s.rows < n:
             self.scratch.pop(skey, None)
-            s = exl3_experts.Scratch(lay.experts, rows=max(n, 8), slots=slots)
+            s = exl3_experts.Scratch(lay.experts, rows=max(n, 8), slots=slots, prompt=prompt)
             self.scratch[skey] = s
         if EXACT_MM:
             return self._moe_exact(lay, x, pick, wts)
@@ -499,7 +612,7 @@ class Model:
     # -- one block of rows ----------------------------------------------------------------------------------------
     @torch.inference_mode()
     def forward(self, sc: SeqCache, ids: torch.Tensor, start: int, all_logits: bool = False,
-                taps: list | None = None) -> torch.Tensor:
+                taps: list | None = None, host_ids: list[int] | None = None, replay: int | None = None):
         """Rows ids [n] at positions start.. of one sequence -> fp32 logits [n or 1, V] (both ranks the same)."""
 
         c, w = self.cfg, self.w
@@ -511,12 +624,14 @@ class Model:
         pre[:, 0] = 1.0
         hashes = None
         if self.engram is not None:
-            lb = c.engram_ngram - 1
-            lo = max(0, start - lb)
-            hashes = self.engram.hasher(sc.tokens[lo:start + n])[start - lo:]       # [n, L, cols]
+            if host_ids is None:
+                host_ids = ids.tolist()
+            del sc.host[start:]
+            sc.host.extend(int(t) for t in host_ids)
+            hashes = self.engram.hashes(sc.host, start, n)                          # [n, L, cols] host
         shared: dict = {}
         if KERNELS:
-            return self._forward_k(sc, ids, start, all_logits, taps, h, pre, hashes, shared)
+            return self._forward_k(sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay)
         for lay in w.layers:
             if hashes is not None and lay.engram_wkv is not None:
                 h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)])
@@ -541,7 +656,10 @@ class Model:
         g = self.comm.gather(local)                                       # [world, n, V / world]
         return g.permute(1, 0, 2).reshape(local.shape[0], -1)
 
-    def _forward_k(self, sc, ids, start, all_logits, taps, h, pre, hashes, shared):
+    def _forward_k(self, sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay=None):
+        """``replay`` (decoder SWA bounded replay, CED's prefill): the decoder layers run only for rows at positions
+        >= replay, their window truncated there; the first decoder layer's kv source still covers every row."""
+
         c, w = self.cfg, self.w
         n = ids.shape[0]
         dev = ids.device
@@ -552,27 +670,65 @@ class Model:
         pre_f = torch.empty((n, c.hc), dtype=F32, device=dev)
         post = torch.empty((n, c.hc), dtype=F32, device=dev)
         comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
+        floor, kv_done = 0, False
+        self.taps_start = start
         for lay in w.layers:
+            if replay is not None and lay.idx == c.n_layers // 2:
+                fn, scale, base = lay.hc_attn
+                K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb,
+                         part)
+                self.kv_source_update(lay, x, sc, start, shared)
+                first = max(start, replay) - start
+                if first >= n:
+                    sc.length = start + n
+                    return None                                  # an encoder-only chunk
+                if first:
+                    h, pre = h[first:].contiguous(), pre[first:].contiguous()
+                    start, n = start + first, n - first
+                    pos = pos[first:]
+                    x = torch.empty((n, c.dim), dtype=BF16, device=dev)
+                    part = torch.empty((n * K.HC_BLOCKS * 32,), dtype=F32, device=dev)
+                    pre_a = torch.empty((n, c.hc), dtype=F32, device=dev)
+                    pre_f = torch.empty((n, c.hc), dtype=F32, device=dev)
+                    post = torch.empty((n, c.hc), dtype=F32, device=dev)
+                    comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
+                    self.taps_start = start
+                floor, kv_done = replay, True
             if hashes is not None and lay.engram_wkv is not None:
-                h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)])
+                with _T("engram"):
+                    h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)])
             if taps is not None and lay.idx in c.dspark_taps:
                 taps.append(h.to(F32).mean(1).to(BF16))
             fn, scale, base = lay.hc_attn
-            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
-            g = self.comm.gather(self.attention_k(lay, x, sc, start, shared, pos))
-            K.hc_post(g, h, post, comb, h)
-            fn, scale, base = lay.hc_ffn
-            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
-            g = self.comm.gather(self.moe(lay, x))
-            K.hc_post(g, h, post, comb, h)
+            with _T("hc"):
+                K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb,
+                         part)
+            with _T("attn_r%d" % (2 if lay.comp_wkv is not None else 1 if lay.idx_wq_b is not None else 0)):
+                pa = self.attention_k(lay, x, sc, start, shared, pos, floor=floor,
+                                      kv_done=kv_done and lay.idx == c.n_layers // 2)
+            with _T("gather"):
+                g = self.comm.gather(pa)
+            with _T("hc"):
+                K.hc_post(g, h, post, comb, h)
+                fn, scale, base = lay.hc_ffn
+                K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb,
+                         part)
+            with _T("moe"):
+                pm = self.moe(lay, x)
+            with _T("gather"):
+                g = self.comm.gather(pm)
+            with _T("hc"):
+                K.hc_post(g, h, post, comb, h)
             pre, pre_f = pre_f, pre
         sc.length = start + n
         if not all_logits:
             h, pre = h[-1:], pre[-1:]
-        xc = K.collapse_norm(h.contiguous(), pre.contiguous(), w.norm, c.eps)
-        local = mm(w.head, xc, F32)
-        g = self.comm.gather(local)
-        return g.permute(1, 0, 2).reshape(local.shape[0], -1)
+        with _T("head"):
+            xc = K.collapse_norm(h.contiguous(), pre.contiguous(), w.norm, c.eps)
+            local = mm(w.head, xc, F32)
+            g = self.comm.gather(local)
+            out = g.permute(1, 0, 2).reshape(local.shape[0], -1)
+        return out
 
 
 def _candidates(score: torch.Tensor, vis: torch.Tensor, nblocks: int, bsize: int) -> torch.Tensor:

@@ -69,7 +69,7 @@ def main() -> None:
         lg = []
         for s in range(0, len(ids), a.chunk):
             x = torch.tensor(ids[s:s + a.chunk], dtype=torch.long, device="cuda")
-            lg.append(model.forward(sc, x, s, all_logits=True))
+            lg.append(model.forward(sc, x, s, all_logits=True, host_ids=ids[s:s + a.chunk]))
         lg = torch.cat(lg, 0)
         torch.cuda.synchronize()
         dt = time.time() - t1
@@ -110,7 +110,7 @@ def main() -> None:
             sc2 = model.new_cache(len(ids) + 64)
             for s in range(0, P, a.chunk):
                 x = torch.tensor(ids[s:min(s + a.chunk, P)], dtype=torch.long, device="cuda")
-                last = model.forward(sc2, x, s)
+                last = model.forward(sc2, x, s, host_ids=ids[s:min(s + a.chunk, P)])
             d_ag = d_bits = 0
             steps = min(a.decode, len(ids) - P)
             t2 = time.time()
@@ -118,7 +118,7 @@ def main() -> None:
                 d_ag += int(int(last[0].argmax()) == top1[P - 1 + k])
                 d_bits += int(torch.equal(last[0], lg[P - 1 + k]))
                 x = torch.tensor([ids[P + k]], dtype=torch.long, device="cuda")
-                last = model.forward(sc2, x, P + k)
+                last = model.forward(sc2, x, P + k, host_ids=[ids[P + k]])
             torch.cuda.synchronize()
             row.update(decode_steps=steps, decode_vs_prefill_top1=d_ag / max(steps, 1),
                        decode_tok_s=steps / (time.time() - t2))

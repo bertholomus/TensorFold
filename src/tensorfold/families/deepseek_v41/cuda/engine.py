@@ -19,6 +19,10 @@ from typing import Any, Callable
 import torch
 
 PREFILL_CHUNK = int(os.environ.get("TF_DS_PREFILL_CHUNK") or 512)
+GRAPHS = os.environ.get("TF_DS_GRAPHS", "1") != "0"
+# decoder SWA bounded replay (CED's prefill, DeepSeek's deployment mode): the decoder runs only over the last 128
+# prompt tokens; off by default (exact prefill) until its agreement and needle recall are measured
+REPLAY = os.environ.get("TF_DS_REPLAY", "0") == "1"
 
 
 class DsEngine:
@@ -56,6 +60,9 @@ class DsEngine:
             print("[tensorfold] WARNING: no Engram tables (TF_DS_ENGRAM): output will be degraded", flush=True)
         self.model = Model(self.w, Comm(nccl, world, rdma_bytes=8 << 20), eng)
         self.drafter = Drafter(self.model) if drafts > 0 and self.w.dspark is not None else None
+        from .graph import GraphRunner
+
+        self.runner = GraphRunner(self.model, drafts + 1) if GRAPHS else None
         self.drafts = drafts
         self.limit = int(context or 65536)
         self.max_rows = drafts + 1
@@ -118,23 +125,31 @@ class DsEngine:
         eos = self.eos if stop_eos else ()
         if len(prompt) + max_tokens > self.limit:
             max_tokens = max(1, self.limit - len(prompt))
-        sc = m.new_cache(len(prompt) + max_tokens + self.max_rows + 8)
+        need = len(prompt) + max_tokens + self.max_rows + 8
+        if getattr(self, "sc", None) is None or self.sc.cap < need:
+            self.sc = m.new_cache(max(need, self.limit + self.max_rows + 8))
+        sc = self.sc
+        sc.length = 0
+        sc.host.clear()
         use_drafts = bool(draft) and self.drafter is not None
         dc = self.drafter.new_cache() if use_drafts else None
         t0 = time.perf_counter()
         last = None
+        replay = max(0, len(prompt) - self.w.cfg.window) if REPLAY else None
         for s in range(0, len(prompt), PREFILL_CHUNK):
             ids = torch.tensor(prompt[s:s + PREFILL_CHUNK], dtype=torch.long, device="cuda")
             taps: list | None = [] if use_drafts else None
-            last = m.forward(sc, ids, s, taps=taps)
-            if use_drafts:
-                self.drafter.absorb(dc, sc, torch.cat(taps, -1), s)
+            out = m.forward(sc, ids, s, taps=taps, host_ids=prompt[s:s + PREFILL_CHUNK], replay=replay)
+            if out is not None:
+                last = out
+            if use_drafts and taps:
+                self.drafter.absorb(dc, sc, torch.cat(taps, -1), m.taps_start)
         first = self._sample(last, [len(prompt)], sampling)[0]
         stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0}
         t1 = time.perf_counter()
         if use_drafts:
             out, st = self._spec(sc, dc, first, max_tokens, sampling, eos, on_tokens)
-            stats.update(rounds=st[0], drafted=st[1], accepted=st[2])
+            stats.update(rounds=st[0], drafted=st[1], accepted=st[2], **self.last_spec_times)
         else:
             out = self._serial(sc, first, max_tokens, sampling, eos, on_tokens)
         dt = time.perf_counter() - t1
@@ -153,7 +168,10 @@ class DsEngine:
         tok = first
         while len(out) < max_tokens and tok not in eos:
             p = sc.length
-            lg = self.model.forward(sc, torch.tensor([tok], dtype=torch.long, device="cuda"), p)
+            if self.runner is not None:
+                lg, _ = self.runner.forward(sc, [tok], p, False)
+            else:
+                lg = self.model.forward(sc, torch.tensor([tok], dtype=torch.long, device="cuda"), p, host_ids=[tok])
             tok = self._sample(lg, [p + 1], sampling)[0]
             out.append(tok)
             on_tokens([tok])
@@ -167,14 +185,25 @@ class DsEngine:
         on_tokens([first])
         tok = first
         rounds = drafted = accepted = 0
+        t_draft = t_verify = t_absorb = 0.0
         while len(out) < max_tokens and tok not in eos:
             P = sc.length
+            ta = time.perf_counter()
             drafts, _conf = d.draft(dc, sc, tok, P)
+            tb = time.perf_counter()
+            t_draft += tb - ta
             kk = min(self.drafts, max_tokens - len(out), len(drafts))
             window = [tok] + drafts[:kk]
-            taps: list = []
-            lg = m.forward(sc, torch.tensor(window, dtype=torch.long, device="cuda"), P, all_logits=True, taps=taps)
+            if self.runner is not None:
+                lg, tapt = self.runner.forward(sc, window, P, True)
+                taps = [tapt]
+            else:
+                taps = []
+                lg = m.forward(sc, torch.tensor(window, dtype=torch.long, device="cuda"), P, all_logits=True,
+                               taps=taps, host_ids=window)
             target = self._sample(lg, [P + 1 + i for i in range(kk + 1)], sampling)
+            tc = time.perf_counter()
+            t_verify += tc - tb
             a = 0
             while a < kk and drafts[a] == target[a]:
                 a += 1
@@ -184,6 +213,7 @@ class DsEngine:
             accepted += a
             sc.length = P + a + 1
             d.absorb(dc, sc, torch.cat(taps, -1)[:a + 1], P)
+            t_absorb += time.perf_counter() - tc
             for i, t in enumerate(new):
                 if t in eos:
                     new = new[:i + 1]
@@ -192,6 +222,8 @@ class DsEngine:
             out += new
             on_tokens(new)
             tok = out[-1]
+        self.last_spec_times = {"draft_ms": 1000 * t_draft / max(rounds, 1), "verify_ms": 1000 * t_verify / max(rounds, 1),
+                                "absorb_ms": 1000 * t_absorb / max(rounds, 1)}
         return out, (rounds, drafted, accepted)
 
 
