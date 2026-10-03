@@ -20,19 +20,32 @@ from tensorfold.cuda.exl3 import experts as exl3_experts
 from tensorfold.cuda.exl3 import prefill as exl3_prefill
 
 from ..config import Cfg
+from . import kernels as K
 from ..ops import (BF16, F32, EngramHasher, fp4_qd, fp8_qd, freqs_cis, hc_split_sinkhorn, rms_norm, rope_,
                    sparse_attn)
 
+RAW = 64                            # per-position compressor inputs kept (a verify window rolls back by length alone)
 RING_EXTRA = 16                     # window ring slots beyond the 128-token window (verify windows never clobber)
 KV_QUANT = os.environ.get("TF_DS_KV", "native") != "bf16"
+KERNELS = os.environ.get("TF_DS_KERNELS", "1") != "0"      # 0: the plain-torch phase-1 path (A/B and debugging)
 
 
 class Comm:
-    """All-gather of fp32 partials then a rank-order sum (identity on one rank)."""
+    """All-gather of fp32 partials then a rank-order sum (identity on one rank). Decode-sized fp32 payloads go over
+    our RDMA-write gather (tensorfold.cuda.rdma) when every rank opens it, the rest over NCCL."""
 
-    def __init__(self, nccl, world: int):
+    def __init__(self, nccl, world: int, rdma_bytes: int = 0):
         self.nccl, self.world = nccl, world
         self._buf: dict = {}
+        if world > 1 and rdma_bytes and os.environ.get("TF_DS_RDMA", "1") != "0":
+            from tensorfold.cuda.rdma import Hybrid, RdmaGather
+
+            try:
+                self.nccl = Hybrid(nccl, RdmaGather(nccl.store, nccl.rank, world, max_bytes=rdma_bytes))
+                if nccl.rank == 0:
+                    print("[tensorfold] decode gathers over RDMA writes", flush=True)
+            except Exception as exc:          # noqa: BLE001  (every rank sees the same refusal)
+                print(f"[tensorfold] gathers stay on NCCL: {exc}", flush=True)
 
     def gather(self, x: torch.Tensor) -> torch.Tensor:
         """[world, *x.shape] of every rank's x."""
@@ -54,10 +67,37 @@ class Comm:
         return acc
 
 
+EXACT_MM = os.environ.get("TF_DS_EXACT_MM", "0") == "1"     # test mode: fp32 dequantized weights, fp32 matmuls
+
+
+def _had(device) -> torch.Tensor:
+    h = getattr(_had, "h", None)
+    if h is None:
+        i = torch.arange(128)
+        b = i[:, None] & i[None, :]
+        par = torch.zeros_like(b)
+        for k in range(7):
+            par ^= (b >> k) & 1
+        h = _had.h = ((1 - 2 * par).float() / math.sqrt(128)).to(device)
+    return h
+
+
+def dequant_fp32(words_or_trellis, suh, svh, k: int, n: int, layer=None) -> torch.Tensor:
+    """W [K, N] fp32 = diag(suh) H W_q H diag(svh) (the reference's dequantization)."""
+
+    wq = layer.unpack().float() if layer is not None else words_or_trellis
+    h = _had(wq.device)
+    w = torch.einsum("bin,ij->bjn", wq.view(k // 128, 128, n), h).reshape(k, n) * suh.float()[:, None]
+    return torch.einsum("kci,ij->kcj", w.view(k, n // 128, 128), h).reshape(k, n) * svh.float()[None, :]
+
+
 def mm(layer, x: torch.Tensor, out_dtype=BF16, ws: exl3_prefill.Workspace | None = None) -> torch.Tensor:
     """x [M, K] @ W: the row-invariant EXL3 linear up to 128 rows, the prompt GEMM beyond."""
 
     m = x.shape[0]
+    if EXACT_MM:
+        w = dequant_fp32(None, layer.suh, layer.svh, layer.k, layer.n, layer=layer)
+        return (x.float() @ w).to(out_dtype)
     if m <= 128:
         return layer(x.contiguous(), out_dtype=out_dtype)
     out = torch.empty((m, layer.n), dtype=out_dtype, device=x.device)
@@ -76,7 +116,7 @@ class SeqCache:
     ring: list = field(default_factory=list)          # per layer [RING, head_dim] bf16 (fp8-rounded values)
     comp: dict = field(default_factory=dict)          # kv-source layer -> [cap // ratio, head_dim] bf16 (fp4-rounded)
     index_k: dict = field(default_factory=dict)       # kv-source layer -> [cap // ratio, idx_dim] bf16 (fp4-rounded)
-    comp_state: dict = field(default_factory=dict)    # ratio>1 kv-source layer -> (kv [ratio, D] f32, score, count)
+    comp_raw: dict = field(default_factory=dict)      # ratio>1 kv-source layer -> (kv, score) [RAW, D] f32 by position
     tokens: torch.Tensor | None = None                # [cap] int64 token ids (Engram lookback)
     ring_size: int = 0
 
@@ -123,6 +163,10 @@ class Model:
         c = self.cfg
         self.Hl = c.n_heads // w.world
         self.scratch: dict = {}
+        self._zero = torch.zeros((1,), dtype=torch.int64, device="cuda")
+        for lay in w.layers:
+            if lay.idx_proj is not None:
+                lay.idx_proj_h = lay.idx_proj.to(torch.float16).contiguous()
 
     # -- caches ---------------------------------------------------------------------------------------------------
     def new_cache(self, cap: int) -> SeqCache:
@@ -138,8 +182,8 @@ class Model:
             if i in c.index_sources:
                 sc.index_k[i] = torch.zeros((cap // r + 1, c.idx_dim), dtype=BF16, device="cuda")
             if r > 1:
-                sc.comp_state[i] = [torch.zeros((r, c.head_dim), dtype=F32, device="cuda"),
-                                    torch.zeros((r, c.head_dim), dtype=F32, device="cuda"), 0]
+                sc.comp_raw[i] = (torch.zeros((RAW, c.head_dim), dtype=F32, device="cuda"),
+                                  torch.zeros((RAW, c.head_dim), dtype=F32, device="cuda"))
         sc.tokens = torch.zeros((cap,), dtype=torch.int64, device="cuda")
         return sc
 
@@ -148,6 +192,17 @@ class Model:
         if c.compress_ratios[layer]:
             return freqs_cis(c.rope_dim, n, c.orig_len, c.compress_theta, c.rope_factor, c.beta_fast, c.beta_slow)
         return freqs_cis(c.rope_dim, n, 0, c.rope_theta, c.rope_factor, c.beta_fast, c.beta_slow)
+
+    def _cs(self, layer: int, sc: SeqCache):
+        """(cos, sin) fp32 [cap, rope_dim / 2] for this layer's rope kind."""
+
+        f = self._f(layer, sc)
+        key = (self.cfg.compress_ratios[layer] > 0, f.shape[0])
+        t = self.scratch.get(("cs", key))
+        if t is None:
+            t = (f.real.contiguous().float(), f.imag.contiguous().float())
+            self.scratch[("cs", key)] = t
+        return t
 
     def _f(self, layer: int, sc: SeqCache) -> torch.Tensor:
         # one table per (rope kind, capacity), rounded up so it is built once
@@ -197,17 +252,18 @@ class Model:
             return lat, torch.arange(start, start + x.shape[0], device=x.device)
         kv = mm(lay.comp_wkv, x, F32)
         score = mm(lay.comp_wgate, x, F32)
-        st = sc.comp_state[lay.idx]
-        pend = st[2]
-        assert pend == start % r, (pend, start, r)
-        kv = torch.cat([st[0][:pend], kv], 0)
-        score = torch.cat([st[1][:pend], score], 0)
+        rk, rs = sc.comp_raw[lay.idx]
+        pend = start % r
+        if pend:                                   # the group's earlier rows come from the positional store
+            prev = torch.arange(start - pend, start, device=x.device) % RAW
+            kv = torch.cat([rk[prev], kv], 0)
+            score = torch.cat([rs[prev], score], 0)
+        keep = min(x.shape[0], RAW)
+        pw = torch.arange(start + x.shape[0] - keep, start + x.shape[0], device=x.device) % RAW
+        rk[pw] = kv[-keep:]
+        rs[pw] = score[-keep:]
         first = start - pend
         full = kv.shape[0] // r
-        rem = kv.shape[0] - full * r
-        st[0][:rem] = kv[full * r:]
-        st[1][:rem] = score[full * r:]
-        st[2] = rem
         if full == 0:
             return None, None
         kvg = kv[:full * r].unflatten(0, (full, r))
@@ -298,28 +354,145 @@ class Model:
         u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
         return mm(lay.wo_b, u, F32)                                      # this rank's partial
 
-    # -- MoE -------------------------------------------------------------------------------------------------------
-    def moe(self, lay, x: torch.Tensor) -> torch.Tensor:
+    def attention_k(self, lay, x: torch.Tensor, sc: SeqCache, start: int, shared: dict, pos: torch.Tensor):
+        """The same math as ``attention`` with the row-independent Triton kernels."""
+
         c = self.cfg
         n = x.shape[0]
-        scores = F.softplus(x.to(F32) @ lay.gate_w.t()).sqrt()
-        ind = (scores + lay.gate_b).topk(c.topk, dim=-1).indices
-        wts = scores.gather(1, ind)
-        if c.topk > 1:
-            wts = wts / (wts.sum(-1, keepdim=True) + 1e-20)
-        wts = wts * c.route_scale
+        rd, hd = c.rope_dim, c.head_dim
+        ratio = lay.ratio
+        cos, sin = self._cs(lay.idx, sc)
+        qr = K.rmsnorm(mm(lay.wq_a, x), lay.q_norm, c.eps)
+        q = mm(lay.wq_b, qr).view(n, self.Hl, hd)
+        K.rope_heads(q, cos, sin, pos, rd)
+        y = mm(lay.wkv, x)
+        ring = sc.ring[lay.idx]
+        R = sc.ring_size
+        ring_mode = n <= RING_EXTRA
+        if ring_mode:
+            kv = K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, pos % R, c.eps, KV_QUANT, rd)
+            wsrc, wlo = ring, self._zero
+        else:
+            lo = max(0, start - (c.window - 1))
+            wsrc = torch.empty((start - lo + n, hd), dtype=BF16, device=x.device)
+            if start > lo:
+                wsrc[:start - lo] = ring[torch.arange(lo, start, device=x.device) % R]
+            K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, self._neg(n), c.eps, KV_QUANT, rd,
+                           out=wsrc[start - lo:])
+            kv = wsrc[start - lo:]
+            wlo = torch.tensor([lo], dtype=torch.int64, device=x.device)
+        comp, cidx = None, None
+        if ratio:
+            if lay.comp_wkv is not None:
+                lat, groups = self._compress(lay, x, sc, start)
+                shared["kv_layer"] = lay.idx
+                if lat is not None and lay.idx_wk is not None:
+                    k = rms_norm(mm(lay.idx_wk, lat), lay.idx_k_norm, c.eps)
+                    rope_(k[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
+                    if KV_QUANT:
+                        k = fp4_qd(k, 32, e4m3_scale=False)
+                    sc.index_k[lay.idx][groups] = k
+                if lat is not None:
+                    lat = lat.clone()
+                    rope_(lat[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
+                    if KV_QUANT:
+                        lat = fp4_qd(lat, 16, e4m3_scale=True)
+                    sc.comp[lay.idx][groups] = lat
+            src = shared["kv_layer"]
+            n_comp_end = (start + n) // ratio
+            vis = (pos + 1) // ratio
+            if lay.idx_wq_b is not None:
+                if n_comp_end == 0:
+                    cidx = torch.full((n, 0), -1, dtype=torch.int64, device=x.device)
+                else:
+                    iq = mm(lay.idx_wq_b, qr).view(n, c.idx_heads, c.idx_dim)
+                    K.rope_heads(iq, cos, sin, pos, rd)
+                    if KV_QUANT:
+                        iq = fp4_qd(iq, 32, e4m3_scale=False)
+                    wts = (K.rowmm(x, lay.idx_proj_h).to(BF16) * (c.idx_dim ** -0.5 * c.idx_heads ** -0.5))
+                    score = K.index_score(iq, sc.index_k[src], wts, vis, n_comp_end)
+                    if lay.idx == c.cand_source:
+                        shared["cand"] = _candidates(score, vis[:, None], c.cand_blocks, c.cand_block)
+                    elif 0 <= c.cand_source < lay.idx:
+                        score.masked_fill_(~shared["cand"], float("-inf"))
+                    kk = min(c.idx_topk, n_comp_end)
+                    top = score.topk(kk, dim=-1, sorted=False).indices.sort(dim=-1).values
+                    cidx = torch.where(top < vis[:, None], top, -1).contiguous()
+                shared["topk"] = cidx
+            cidx = shared["topk"]
+            comp = sc.comp[src]
+        o = K.sparse_attn(q, lay.sink, wsrc, wlo, ring_mode, comp, cidx, pos, hd ** -0.5, c.window)
+        K.rope_heads(o, cos, sin, pos, rd, inverse=True)
+        if not ring_mode:
+            keep = min(n, R)
+            ring[pos[-keep:] % R] = kv[-keep:]
+        og = o.view(n, len(lay.wo_a), -1)
+        u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
+        return mm(lay.wo_b, u, F32)
+
+    def _neg(self, n: int) -> torch.Tensor:
+        t = self.scratch.get(("neg", n))
+        if t is None:
+            t = torch.full((n,), -1, dtype=torch.int64, device="cuda")
+            self.scratch[("neg", n)] = t
+        return t
+
+    # -- MoE -------------------------------------------------------------------------------------------------------
+    def moe(self, lay, x: torch.Tensor, topk: int | None = None) -> torch.Tensor:
+        c = self.cfg
+        n = x.shape[0]
+        topk = topk or c.topk
+        slots = topk + 1
         shared_id = lay.experts.count - 1
-        pick = torch.cat([ind, torch.full((n, 1), shared_id, dtype=ind.dtype, device=x.device)], 1).to(torch.int32)
-        wts = torch.cat([wts, torch.ones((n, 1), dtype=F32, device=x.device)], 1).contiguous()
-        slots = c.topk + 1
-        s = self.scratch.get("moe")
+        if KERNELS:
+            logits = K.rowmm(x, lay.gate_w)
+            pick = torch.empty((n, slots), dtype=torch.int32, device=x.device)
+            wts = torch.empty((n, slots), dtype=F32, device=x.device)
+            K.route(logits, lay.gate_b, topk, c.route_scale, shared_id, pick, wts)
+        else:
+            scores = F.softplus(x.to(F32) @ lay.gate_w.float().t()).sqrt()
+            ind = (scores + lay.gate_b).topk(topk, dim=-1).indices
+            wts = scores.gather(1, ind)
+            if topk > 1:
+                wts = wts / (wts.sum(-1, keepdim=True) + 1e-20)
+            wts = wts * c.route_scale
+            pick = torch.cat([ind, torch.full((n, 1), shared_id, dtype=ind.dtype, device=x.device)], 1).to(torch.int32)
+            wts = torch.cat([wts, torch.ones((n, 1), dtype=F32, device=x.device)], 1).contiguous()
+        skey = ("moe", slots, lay.experts.count)
+        s = self.scratch.get(skey)
         if s is None or s.rows < n:
-            self.scratch.pop("moe", None)
+            self.scratch.pop(skey, None)
             s = exl3_experts.Scratch(lay.experts, rows=max(n, 8), slots=slots)
-            self.scratch["moe"] = s
+            self.scratch[skey] = s
+        if EXACT_MM:
+            return self._moe_exact(lay, x, pick, wts)
         out = exl3_experts.routed(x.contiguous(), pick.contiguous(), wts, lay.experts, s, None, n,
                                   limit=c.swiglu_limit, act_mode=exl3_experts.ACT_F32)
         return out                                                        # fp32 partial [n, d]
+
+    def _moe_exact(self, lay, x, pick, wts):
+        """Test mode: each picked expert dequantized to fp32 (the reference's arithmetic, split by rank)."""
+
+        c, ex = self.cfg, lay.experts
+        D, I = ex.dims, ex.width
+        y = torch.zeros((x.shape[0], D), dtype=F32, device=x.device)
+
+        def mat(ptrs, k2s, suh, svh, e, k, n):
+            words = getattr(ex, "_trellis_views", None)
+            t = ex.keep[{"g": 0, "u": 1, "d": 2}[ptrs] * ex.count + e]
+            wq = exl3_experts.dequant(t, ex.cb).float()
+            return dequant_fp32(wq, suh[e], svh[e], k, n)
+
+        for e in torch.unique(pick).tolist():
+            rows, slot = torch.where(pick == e)
+            xs = x[rows]
+            g = (xs.float() @ mat("g", None, ex.suh_g, ex.svh_g, e, D, I)).to(BF16).float()
+            u = (xs.float() @ mat("u", None, ex.suh_u, ex.svh_u, e, D, I)).to(BF16).float()
+            u = u.clamp(-c.swiglu_limit, c.swiglu_limit)
+            g = g.clamp(max=c.swiglu_limit)
+            hh = F.silu(g) * u * wts[rows, slot, None]
+            y[rows] += (hh.to(BF16).float() @ mat("d", None, ex.suh_d, ex.svh_d, e, I, D)).to(BF16).float()
+        return y
 
     # -- one block of rows ----------------------------------------------------------------------------------------
     @torch.inference_mode()
@@ -340,6 +513,8 @@ class Model:
             lo = max(0, start - lb)
             hashes = self.engram.hasher(sc.tokens[lo:start + n])[start - lo:]       # [n, L, cols]
         shared: dict = {}
+        if KERNELS:
+            return self._forward_k(sc, ids, start, all_logits, taps, h, pre, hashes, shared)
         for lay in w.layers:
             if hashes is not None and lay.engram_wkv is not None:
                 h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)])
@@ -362,6 +537,39 @@ class Model:
         x = rms_norm(self.hc_pre(h, pre), w.norm, c.eps)
         local = mm(w.head, x, F32)                                        # [n, V / world]
         g = self.comm.gather(local)                                       # [world, n, V / world]
+        return g.permute(1, 0, 2).reshape(local.shape[0], -1)
+
+    def _forward_k(self, sc, ids, start, all_logits, taps, h, pre, hashes, shared):
+        c, w = self.cfg, self.w
+        n = ids.shape[0]
+        dev = ids.device
+        pos = torch.arange(start, start + n, device=dev)
+        x = torch.empty((n, c.dim), dtype=BF16, device=dev)
+        part = torch.empty((n * K.HC_BLOCKS * 32,), dtype=F32, device=dev)
+        pre_a = torch.empty((n, c.hc), dtype=F32, device=dev)
+        pre_f = torch.empty((n, c.hc), dtype=F32, device=dev)
+        post = torch.empty((n, c.hc), dtype=F32, device=dev)
+        comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
+        for lay in w.layers:
+            if hashes is not None and lay.engram_wkv is not None:
+                h = self.engram_apply(lay, h, hashes[:, c.engram_layers.index(lay.idx)])
+            if taps is not None and lay.idx in c.dspark_taps:
+                taps.append(h.to(F32).mean(1).to(BF16))
+            fn, scale, base = lay.hc_attn
+            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
+            g = self.comm.gather(self.attention_k(lay, x, sc, start, shared, pos))
+            K.hc_post(g, h, post, comb, h)
+            fn, scale, base = lay.hc_ffn
+            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
+            g = self.comm.gather(self.moe(lay, x))
+            K.hc_post(g, h, post, comb, h)
+            pre, pre_f = pre_f, pre
+        sc.length = start + n
+        if not all_logits:
+            h, pre = h[-1:], pre[-1:]
+        xc = rms_norm(self.hc_pre(h, pre), w.norm, c.eps)
+        local = mm(w.head, xc, F32)
+        g = self.comm.gather(local)
         return g.permute(1, 0, 2).reshape(local.shape[0], -1)
 
 

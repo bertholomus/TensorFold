@@ -26,6 +26,7 @@ def main() -> None:
     p.add_argument("--oracle", required=True)
     p.add_argument("--ref-top")
     p.add_argument("--out")
+    p.add_argument("--save-top")
     p.add_argument("--chunk", type=int, default=512)
     p.add_argument("--decode", type=int, default=0)
     p.add_argument("--limit", type=int, default=0)
@@ -42,7 +43,7 @@ def main() -> None:
         from tensorfold.cuda.comm import NCCL
 
         nccl = NCCL(a.rank, a.world, a.master, a.port)
-    comm = Comm(nccl, a.world)
+    comm = Comm(nccl, a.world, rdma_bytes=8 << 20)
     t0 = time.time()
     w = load(a.model, a.rank, a.world, n_layers=a.layers or None)
     print(f"[check] rank {a.rank} loaded in {time.time() - t0:.0f} s, {torch.cuda.memory_allocated() / 2**30:.1f} GiB",
@@ -73,6 +74,12 @@ def main() -> None:
         torch.cuda.synchronize()
         dt = time.time() - t1
         top1 = lg.argmax(-1).tolist()
+        if a.save_top and a.rank == 0:
+            lp = torch.log_softmax(lg.float(), -1)
+            tv = lp.topk(20, dim=-1)
+            with open(a.save_top, "a") as fh:
+                fh.write(json.dumps({"index": rec["index"], "ids": ids, "top": [
+                    {str(int(t)): float(v) for t, v in zip(tv.indices[j], tv.values[j])} for j in range(len(ids))]}) + "\n")
         if a.ref_inline and a.rank == 0:
             import sys
             sys.path.insert(0, a.ref_inline)
