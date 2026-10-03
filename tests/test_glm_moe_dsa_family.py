@@ -523,21 +523,26 @@ def test_loader_holds_its_vocabulary_span_of_the_embedding(tmp_path, monkeypatch
 
 @pytest.mark.skipif(not REAL_CONFIG.is_file(), reason="the banked GLM-5.3 checkpoint is not on this host")
 def test_admission_counts_each_cache_format_a_slot():
-    """The startup estimate grows by exactly the bytes State allocates a slot, in every TF_GLM_KV format."""
+    """The startup estimate grows by exactly the bytes State allocates a slot, in every TF_GLM_KV format, and by a
+    quarter of them with the positions interleaved over four ranks (TF_GLM_DCP=4)."""
 
     from tensorfold.families.glm_moe_dsa.cuda import kv8
     from tensorfold.families.glm_moe_dsa.cuda.engine import GlmEngine
 
     text = json.loads(REAL_CONFIG.read_text())
 
-    def per_slot(kv: str) -> float:
-        g = GlmEngine._geometry(text, 4, kv)
+    def per_slot(kv: str, dcp: int = 1) -> float:
+        g = GlmEngine._geometry(text, 4, kv, dcp)
         return (g.bytes_at(1 << 22) - g.bytes_at(1 << 21)) / (1 << 21)
 
     for kv, want in (("bf16", 96640), ("idx8", 93912), ("fp8", 53780), ("q8", 55992), ("q6b", 48608),
                      ("q4/q8", 79 * (4 * 64 + 32 + 128) + 22 * 136)):
         assert kv8.slot_bytes(79, 512, 64, 22, 128, kv) == want
         assert per_slot(kv) == pytest.approx(want, abs=1e-6)
+        assert per_slot(kv, 4) == pytest.approx(want / 4, abs=1e-6)
+    # the dcp mode also holds its exchange buffers: a fixed amount, not a slot cost
+    g1, g4 = GlmEngine._geometry(text, 4, "bf16", 1), GlmEngine._geometry(text, 4, "bf16", 4)
+    assert g4.bytes_at(0) > g1.bytes_at(0)
 
 
 def test_cache_modes_parse_and_refuse():

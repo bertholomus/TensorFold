@@ -29,7 +29,7 @@ def reuse_rows(st: State, b: Buffers) -> None:
     if src:
         b.tokens[0].copy_(b.tokens[src])
         b.counts[0].copy_(b.counts[src])
-    if MTP_REUSE == "1":
+    if MTP_REUSE == "1" and getattr(st, "dcp", 1) == 1:      # (dcp: the reused list alone, no own token)
         W = b.tokens.shape[1]
         full = b.counts[0:1] >= W - 1
         b.tokens[0, W - 1:W].copy_(torch.where(full, st.mtp_pos_dev, b.tokens[0, W - 1:W]))

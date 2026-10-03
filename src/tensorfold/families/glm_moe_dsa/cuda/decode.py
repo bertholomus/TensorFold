@@ -227,7 +227,8 @@ class Engine:
             g = self.graphs.main.get((R, 0))
         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
             # every row past the dense limit: the sparse graph for this bucket (same kernels as eager)
-            g, kind = self.graphs.sparse.get((R, 0, sparse_bucket(self.st.pos, R))), "sparse"
+            g, kind = self.graphs.sparse.get((R, 0, sparse_bucket(self.st.pos, R, self.w.meta.get("dcp", 1)))), \
+                "sparse"
         if g is not None:
             self.replays[kind] += 1
             g.replay()
@@ -313,7 +314,7 @@ class Graphs:
                 # bucket, the eager path's kernels and shapes (Engine.forward looks up sparse_bucket(pos, R))
                 from .select import sparse_buckets
 
-                for bucket in sparse_buckets(st.capacity, w.cfg.dense_limit):
+                for bucket in sparse_buckets(st.capacity, w.cfg.dense_limit, w.meta.get("dcp", 1)):
                     for R in main_rows:
                         for _ in range(2):
                             fwd.compute(w, st, e.buf, R, sparse_np=bucket)

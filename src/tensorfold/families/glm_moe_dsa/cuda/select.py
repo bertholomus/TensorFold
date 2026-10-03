@@ -250,20 +250,23 @@ def _split_topk(scores: torch.Tensor, tokens: torch.Tensor, k: int, np_max: int)
                             SEG=SPLIT_SEG, BLOCK=1024, num_warps=4)
 
 
-def sparse_bucket(pos: int, R: int) -> int:
-    """Tokens scored for rows pos .. pos + R - 1: the visible ones rounded up to a power of two (at least 2048)."""
+def sparse_bucket(pos: int, R: int, G: int = 1) -> int:
+    """Tokens scored for rows pos .. pos + R - 1: the visible ones rounded up to a power of two (at least 2048); with
+    the cache interleaved over G ranks (dcp), the slots one rank holds of them (at least 512)."""
 
+    if G > 1:
+        return max(512, 1 << (-(-(pos + R) // G) - 1).bit_length())
     visible = pos + R
     return max(2048, 1 << (visible - 1).bit_length())
 
 
-def sparse_buckets(capacity: int, dense_limit: int) -> list[int]:
+def sparse_buckets(capacity: int, dense_limit: int, G: int = 1) -> list[int]:
     """Every value ``sparse_bucket`` gives a window starting at or past the dense limit within ``capacity`` slots."""
 
-    out, bucket = [], sparse_bucket(dense_limit, 1)
+    out, bucket = [], sparse_bucket(dense_limit, 1, G)
     while True:
         out.append(bucket)
-        if bucket >= capacity:
+        if bucket >= -(-capacity // G):
             return out
         bucket *= 2
 

@@ -95,12 +95,18 @@ def _put_plane(q, QW, base, PB: tl.constexpr, SH: tl.constexpr, W: tl.constexpr,
 
 
 @triton.jit
-def _write(X, x_stride, QW, QS, H, POS, LW: tl.constexpr, QB: tl.constexpr):
+def _write(X, x_stride, QW, QS, H, POS, LW: tl.constexpr, QB: tl.constexpr, DG: tl.constexpr = 1,
+           RANK: tl.constexpr = 0):
     """Program r: row r of X (bf16) into slot POS + r: each group rotated by H32 / sqrt(32), its absmax as an fp16
-    scale, its codes on the midpoint grid in bit planes."""
+    scale, its codes on the midpoint grid in bit planes. DG > 1 (dcp): rank (POS + r) % DG stores it at
+    (POS + r) // DG."""
 
     r = tl.program_id(0)
     P = tl.load(POS).to(tl.int64)
+    if DG > 1:
+        if (P + r) % DG != RANK:
+            return
+        P = (P + r) // DG - r
     G: tl.constexpr = LW // 32
     x = tl.load(X + r * x_stride + tl.arange(0, LW)).to(tl.float32)
     h = tl.load(H + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :])
@@ -125,14 +131,15 @@ def _write(X, x_stride, QW, QS, H, POS, LW: tl.constexpr, QB: tl.constexpr):
     tl.store(QS + (P + r) * G + tl.arange(0, G), s16)
 
 
-def write(rows: torch.Tensor, plane: KvQ, pos: torch.Tensor) -> None:
-    """rows [R, width] bf16 (unit column stride) into ``plane`` slots pos .. pos + R - 1 (pos read on the device)."""
+def write(rows: torch.Tensor, plane: KvQ, pos: torch.Tensor, G: int = 1, rank: int = 0) -> None:
+    """rows [R, width] bf16 (unit column stride) into ``plane`` slots pos .. pos + R - 1 (pos read on the device;
+    G > 1: the positions this rank holds, at their dcp slots)."""
 
     R, W = rows.shape
     if W != plane.width or rows.stride(1) != 1:
         raise ValueError(f"kvq.write: rows of {W} (unit stride) into a plane of {plane.width}")
-    _write[(R,)](rows, rows.stride(0), plane.codes, plane.scales, plane.h, pos, LW=W, QB=plane.bits,
-                 num_warps=4)
+    _write[(R,)](rows, rows.stride(0), plane.codes, plane.scales, plane.h, pos, LW=W, QB=plane.bits, DG=G,
+                 RANK=rank, num_warps=4)
 
 
 # -- reading (inside the attention kernels) --------------------------------------------------------------------------

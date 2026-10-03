@@ -14,7 +14,7 @@ from tensorfold.families.glm5_next.cuda import latent as latent_mod, prof, qmm a
 
 from tensorfold.cuda.geometry import share
 
-from . import glue, kv8, kvq, mla_pe, rope as rope_mod, select as select_mod
+from . import dcp as dcp_mod, glue, kv8, kvq, mla_pe, rope as rope_mod, select as select_mod
 from .kv8 import Kv8
 from .kvq import KvQ
 from .weights import LayerW, Weights
@@ -210,6 +210,9 @@ class Buffers(FlashBuffers):
         if SIDE and not prefill and dev.type == "cuda":
             self.side = torch.cuda.Stream(device=dev)
             self.x3s = X3Scratch(w.meta.get("x3", []), dev, prefill=False)
+        # dcp (TF_GLM_DCP): every head's absorbed query and the partials exchanged between the ranks
+        self.dcp = (dcp_mod.Scratch(rows, share(c.heads, w.world, w.rank), c.kv_lora, c.qk_rope, w.world, dev)
+                    if w.meta.get("dcp", 1) > 1 else None)
         first = next((l.moe.experts for l in w.layers if l.moe is not None), None)
         if first is not None and first.ex is not None:
             from tensorfold.cuda.exl3 import experts as x3experts
@@ -229,13 +232,16 @@ class State(FlashState):
         self.kv = kv8.check_mode(kv or kv8.MODE)
         lat8, idx8, bits = kv8.latent_fp8(self.kv), kv8.index_fp8(self.kv), kv8.latent_bits(self.kv)
         ibits = kv8.index_bits(self.kv)
+        # dcp: positions interleaved over the ranks, each plane holds this rank's share (capacity stays the window)
+        self.dcp = w.meta.get("dcp", 1)
+        rows_held = dcp_mod.local_slots(capacity, self.dcp) if self.dcp > 1 else capacity
 
         def latent_plane():
             if bits:
-                return KvQ(capacity, c.kv_lora, bits, dev)
+                return KvQ(rows_held, c.kv_lora, bits, dev)
             if lat8:
-                return Kv8(capacity, c.kv_lora, dev)
-            return torch.zeros((capacity, c.kv_lora), dtype=torch.bfloat16, device=dev)
+                return Kv8(rows_held, c.kv_lora, dev)
+            return torch.zeros((rows_held, c.kv_lora), dtype=torch.bfloat16, device=dev)
 
         self.capacity = capacity
         self.pos = 0
@@ -246,13 +252,13 @@ class State(FlashState):
         self.latent = latent_mod.ENABLED
         self.kc = [latent_plane() for _ in dsa_layers]
         # the shared rope key per token (q_pe . k_pe is the second score term; Flash has qk_rope 0 and no such cache)
-        self.pc = [torch.zeros((capacity, c.qk_rope), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
+        self.pc = [torch.zeros((rows_held, c.qk_rope), dtype=torch.bfloat16, device=dev) for _ in dsa_layers]
         self.vc = [None for _ in dsa_layers]
         self.mtp_len = 0
         self.mtp_drafted = 0
         if w.mtp is not None:
             self.mtp_kc = latent_plane()
-            self.mtp_pc = torch.zeros((capacity, c.qk_rope), dtype=torch.bfloat16, device=dev)
+            self.mtp_pc = torch.zeros((rows_held, c.qk_rope), dtype=torch.bfloat16, device=dev)
             self.mtp_vc = None
         # one indexer key plane per full-indexer group (and the MTP layer, last): a "shared" layer
         # reads the nearest preceding full layer's keys, so a group shares one plane
@@ -265,8 +271,8 @@ class State(FlashState):
                     slot += 1
                 self.index_slot[i] = slot
             n_idx = slot + 1 + (1 if w.mtp is not None else 0)
-            self.index = [KvQ(capacity, c.index_dim, ibits, dev) if ibits else Kv8(capacity, c.index_dim, dev)
-                          if idx8 else torch.zeros((capacity, c.index_dim), dtype=torch.bfloat16, device=dev)
+            self.index = [KvQ(rows_held, c.index_dim, ibits, dev) if ibits else Kv8(rows_held, c.index_dim, dev)
+                          if idx8 else torch.zeros((rows_held, c.index_dim), dtype=torch.bfloat16, device=dev)
                           for _ in range(n_idx)]
 
     def reset(self) -> None:
@@ -304,14 +310,16 @@ class State(FlashState):
         return other
 
 
-def write_rows(rows: torch.Tensor, cache, pos_dev: torch.Tensor) -> None:
+def write_rows(rows: torch.Tensor, cache, pos_dev: torch.Tensor, G: int = 1, rank: int = 0) -> None:
     """Window rows into a cache plane at slots pos_dev .. (bf16 rows, an FP8 plane's codes and scales, or a quantized
-    plane's)."""
+    plane's); G > 1 (dcp): only the positions this rank holds, at their local slots."""
 
     if isinstance(cache, Kv8):
-        kv8.write(rows, cache, pos_dev)
+        kv8.write(rows, cache, pos_dev, G, rank)
     elif isinstance(cache, KvQ):
-        kvq.write(rows, cache, pos_dev)
+        kvq.write(rows, cache, pos_dev, G, rank)
+    elif G > 1:
+        dcp_mod.write_bf16(rows, cache, pos_dev, G, rank)
     else:
         latent_mod.latent_write(rows, cache, pos_dev)
 
@@ -332,6 +340,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
     a = layer.dsa
     HL = a.heads
     s = b.lat_s
+    G = w.meta.get("dcp", 1)                 # dcp: the cache's positions interleaved over G ranks
 
     def keys(sc: X3Scratch | None) -> None:
         """This window's latent, rope key and (full layers) indexer key, into their caches at the window's slots."""
@@ -343,18 +352,18 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         with prof.timed("dsa: rope"):
             rope_mod.apply_key(b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
         with prof.timed("dsa: latent write"):
-            write_rows(b.lat[:R, :c.kv_lora], lc, pos_dev)
-            write_rows(b.lat[:R, c.kv_lora:], pc, pos_dev)                  # the rope key: its own [cap, qk_rope] cache
+            write_rows(b.lat[:R, :c.kv_lora], lc, pos_dev, G, w.rank)
+            write_rows(b.lat[:R, c.kv_lora:], pc, pos_dev, G, w.rank)        # the rope key: its own [cap, qk_rope] cache
         if index is not None and not reuse:
             with prof.timed("dsa: indexer update"):
                 ix = a.index
                 mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
                 glue.layernorm(b.ik[:R], ix.ln_w, ix.ln_b, c.eps, b.ik[:R])
                 rope_mod.apply_index(b.ik[:R], b.cos[:R], b.sin[:R], c, 1)
-                if host_pos is not None and isinstance(index, torch.Tensor):
+                if host_pos is not None and isinstance(index, torch.Tensor) and G == 1:
                     index[host_pos:host_pos + R].copy_(b.ik[:R])
                 else:
-                    write_rows(b.ik[:R], index, pos_dev)
+                    write_rows(b.ik[:R], index, pos_dev, G, w.rank)
 
     if b.side is not None:                   # the keys on the side stream while the queries project
         with fork(b):
@@ -380,28 +389,25 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         qp = mla_pe.gather_pe(b.q[:R], c.qk_nope, b.qp[:R])
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
+    if G > 1:
+        # dcp: rows below the dense limit read every key a rank holds, later rows its share of the global selection
+        if sparse_rows and a.index is not None and not reuse:
+            with prof.timed("dsa: select tokens"):
+                index_inputs(w, b, a.index, R)
+                dcp_mod.select(w, b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev, tokens=b.tokens[:R],
+                               counts=b.counts[:R], bucket=sparse_np)
+        with prof.timed("dsa: attention (dcp)"):
+            dcp_mod.attention(w, qa, qp, lc, pc, b.tokens[:R], b.counts[:R], pos_dev, ol, scale, b.dcp, c.index_topk)
+        with prof.timed("dsa: expand"):
+            o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+        return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
     if not all_sparse:
         with prof.timed("dsa: dense attention"):
             mla_pe.attention(qa, qp, lc, pc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
     if sparse_rows:
         if a.index is not None and not reuse:
             with prof.timed("dsa: select tokens"):
-                ix = a.index
-                mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
-                rope_mod.apply_index(b.qi[:R], b.cos[:R], b.sin[:R], c, c.index_heads)
-                # per-token head weights: weights_proj applied to the layer input (the scorer folds the scales)
-                if getattr(b, "micro", False):
-                    # cuBLAS picks its kernel by the row count and a row's bits move with it: a micro-batch multiplies
-                    # the whole chunk's rows (the other's are recomputed when it gets here) and keeps its own
-                    f = b.full
-                    torch.mm(f.normed[:b.chunk], ix.weights.t(), out=f.iw[:b.chunk])
-                elif b.prefill:
-                    torch.mm(b.normed[:R], ix.weights.t(), out=b.iw[:R])
-                else:
-                    # decode windows: the row-invariant BF16 matmul, so a verify window's row gets the 1-row step's
-                    # weights (cuBLAS by row count gave them different bits, near-tie selections moved, and past the
-                    # dense limit MTP drafts' output parted from serial decoding: tools/check_window_rows.py)
-                    flash_qmm.matmul(b.normed[:R], ix.w16, None, out=b.iw[:R], part=b.sk)
+                index_inputs(w, b, a.index, R)
                 select_mod.select_tokens(b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev,
                                          tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np)
         # a "shared" layer attends the tokens its group's full layer selected for these rows (still in b.tokens)
@@ -410,6 +416,27 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
     with prof.timed("dsa: expand"):
         o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
+
+
+def index_inputs(w: Weights, b: Buffers, ix, R: int) -> None:
+    """A full indexer layer's queries (b.qi) and per-token head weights (b.iw) for the window's rows."""
+
+    c = w.cfg
+    mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+    rope_mod.apply_index(b.qi[:R], b.cos[:R], b.sin[:R], c, c.index_heads)
+    # per-token head weights: weights_proj applied to the layer input (the scorer folds the scales)
+    if getattr(b, "micro", False):
+        # cuBLAS picks its kernel by the row count and a row's bits move with it: a micro-batch multiplies
+        # the whole chunk's rows (the other's are recomputed when it gets here) and keeps its own
+        f = b.full
+        torch.mm(f.normed[:b.chunk], ix.weights.t(), out=f.iw[:b.chunk])
+    elif b.prefill:
+        torch.mm(b.normed[:R], ix.weights.t(), out=b.iw[:R])
+    else:
+        # decode windows: the row-invariant BF16 matmul, so a verify window's row gets the 1-row step's
+        # weights (cuBLAS by row count gave them different bits, near-tie selections moved, and past the
+        # dense limit MTP drafts' output parted from serial decoding: tools/check_window_rows.py)
+        flash_qmm.matmul(b.normed[:R], ix.w16, None, out=b.iw[:R], part=b.sk)
 
 
 def qmm_sums(b: Buffers, o: torch.Tensor, R: int):
@@ -574,7 +601,9 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
     c = w.cfg
     embed(w, b, b.ids[:R], b.x[:R])
     rope_mod.table(b.cos[:R], b.sin[:R], st.pos_dev, R, c.rope_theta, c.qk_rope)   # device position: graph-safe
-    if b.prefill and R >= OVERLAP_ROWS and w.comm is not None and w.world > 2 and b.comm_stream is not None:
+    # (dcp exchanges every head's queries and partials inside attention on this stream: one batch, no comm stream)
+    if (b.prefill and R >= OVERLAP_ROWS and w.comm is not None and w.world > 2 and b.comm_stream is not None
+            and w.meta.get("dcp", 1) == 1):
         prompt_layers(w, st, b, R, nch, host_pos, sparse_np)
     else:
         for layer in w.layers:

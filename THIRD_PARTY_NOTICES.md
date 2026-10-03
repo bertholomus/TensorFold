@@ -87,6 +87,13 @@ attention's value sum back instead of rotating keys. TensorFold quantizes from b
 rows in CUDA), rotates in fp32 and stores the bit planes in its own word order; the kernels are written for
 TensorFold and checked against a float64 reference of that arithmetic. GLM-5.3's FP8 cache (`kv8.py`) is TensorFold's.
 
+GLM-5.3's decode context parallelism (`TF_GLM_DCP=4`: `families/glm_moe_dsa/cuda/dcp.py` and the interleaved cache
+writers) follows the design of TensorFold PR #159 by drowzeys (commit dc43ca6, "glm_moe_dsa: 1M-token context (decode
+context parallelism 4)"; its `fused._attention_dcp`, `_merge_lse`, `_dcp_combine`, `dcp_gather` and selection):
+positions interleaved over the ranks (p % 4), each rank's top-2048 merged into the same tie-free global choice on every
+rank, all-gathered absorbed queries, every rank attending all heads over its own keys, and log-sum-exp partials merged
+in rank order. It is restated for this fork's kernels and cache formats.
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from

@@ -128,11 +128,17 @@ class Kv8:
 
 
 @triton.jit
-def _write(X, x_stride, C, S, POS, W: tl.constexpr, SHIFT: tl.constexpr):
-    """Program r: row r of X (bf16) into slot POS + r: e4m3 codes of x / 2^e and the scale 2^e, e from amax's bits."""
+def _write(X, x_stride, C, S, POS, W: tl.constexpr, SHIFT: tl.constexpr, G: tl.constexpr = 1,
+           RANK: tl.constexpr = 0):
+    """Program r: row r of X (bf16) into slot POS + r: e4m3 codes of x / 2^e and the scale 2^e, e from amax's bits.
+    G > 1 (dcp): position POS + r is stored at slot (POS + r) // G by rank (POS + r) % G only."""
 
     r = tl.program_id(0)
     P = tl.load(POS).to(tl.int64)
+    if G > 1:
+        if (P + r) % G != RANK:
+            return
+        P = (P + r) // G - r
     k = tl.arange(0, W)
     x = tl.load(X + r * x_stride + k).to(tl.float32)
     amax = tl.max(tl.abs(x), 0)
@@ -148,13 +154,14 @@ def _write(X, x_stride, C, S, POS, W: tl.constexpr, SHIFT: tl.constexpr):
     tl.store(S + P + r, scale)
 
 
-def write(rows: torch.Tensor, plane: Kv8, pos: torch.Tensor) -> None:
-    """rows [R, width] bf16 (rows may be strided) into ``plane`` slots pos .. pos + R - 1 (pos read on the device)."""
+def write(rows: torch.Tensor, plane: Kv8, pos: torch.Tensor, G: int = 1, rank: int = 0) -> None:
+    """rows [R, width] bf16 (rows may be strided) into ``plane`` slots pos .. pos + R - 1 (pos read on the device;
+    G > 1: the positions this rank holds, at their dcp slots)."""
 
     R, W = rows.shape
     if W != plane.codes.shape[1] or rows.stride(1) != 1:
         raise ValueError(f"kv8.write: rows of {W} (unit stride) into a plane of {plane.codes.shape[1]}")
-    _write[(R,)](rows, rows.stride(0), plane.codes, plane.scales, pos, W=W, SHIFT=SHIFT, num_warps=4)
+    _write[(R,)](rows, rows.stride(0), plane.codes, plane.scales, pos, W=W, SHIFT=SHIFT, G=G, RANK=rank, num_warps=4)
 
 
 def quantize_reference(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
