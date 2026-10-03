@@ -22,10 +22,11 @@ ROWS = 128               # most rows one call of the EXL3 linear takes
 # prompt chunks' EXL3 GEMMs take tiles by shape (exl3.prefill.tiles; 1.4 % of a 32.5k prefill on TP4) unless
 # TF_GLM_PROMPT_TILES=0 (the fixed 128-row tiles)
 PROMPT_TILES = __import__("os").environ.get("TF_GLM_PROMPT_TILES", "1") != "0"
-# prompt chunks' EXL3 GEMMs on the weight dequantized into the model's basis once a chunk (exl3.prefill's deq: "bf16" a
-# cuBLAS GEMM, "fp16" the Triton one, "auto" each call's faster; no input rotation, no epilogue H128) or "0" (rotated
-# rows, TF_GLM_PROMPT_DEQ)
-PROMPT_DEQ = __import__("os").environ.get("TF_GLM_PROMPT_DEQ") or "0"
+# prompt chunks' EXL3 GEMMs on the weight dequantized into the model's basis once a chunk (exl3.prefill's deq: "auto",
+# the default, cuBLAS bf16 for bf16 outputs and the Triton fp16 GEMM for fp32 partials; "bf16" / "fp16" one of them; no
+# input rotation, no epilogue H128: TP4 prefill at 35.7k 36.9 -> 35.1 s, KL against BF16 0.1124 -> 0.1113) or "0" (the
+# rotated rows, the prompt bits before; TF_GLM_PROMPT_DEQ)
+PROMPT_DEQ = __import__("os").environ.get("TF_GLM_PROMPT_DEQ") or "auto"
 
 
 class X3Scratch:

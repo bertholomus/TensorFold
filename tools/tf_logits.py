@@ -69,7 +69,7 @@ def main() -> None:
         a_dir.mkdir(parents=True, exist_ok=True)
     what = f"writing {a_dir}" if a_dir else "scoring"
     say(f"== {n_rows} rows x {length} tokens, vocab {vocab}; settings TF_GLM_KV={os.environ.get('TF_GLM_KV', '')} "
-        f"TF_GLM_PROMPT_DEQ={os.environ.get('TF_GLM_PROMPT_DEQ', '0')}; {what}")
+        f"TF_GLM_PROMPT_DEQ={x3mod.PROMPT_DEQ}; {what}")
 
     def score(label: str) -> None:
         """The panel's rows through the prompt path as it is set now, scored (or written) row by row."""
