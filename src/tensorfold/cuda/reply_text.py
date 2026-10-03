@@ -16,6 +16,42 @@ _TOOL_CALL_BLOCK_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.IGNOR
 _TOOL_FUNCTION_BLOCK_RE = re.compile(r"^\s*<function=([^>\s]+)>\s*(.*?)\s*</function>\s*$", re.IGNORECASE | re.DOTALL)
 _TOOL_PARAMETER_BLOCK_RE = re.compile(r"<parameter=([^>\s]+)>\n?(.*?)\n?</parameter>", re.IGNORECASE | re.DOTALL)
 
+# DeepSeek-V4.x DSML tool calls (the format DeepSeek's own encoding.py writes and its chat template asks for):
+#   <｜DSML｜ calls>\n<｜DSML｜ invoke name="f">\n<｜DSML｜ parameter name="k" string="true">v</｜DSML｜ parameter>\n
+#   </｜DSML｜ invoke>\n</｜DSML｜ calls>   (string="false": the value is JSON)
+_DSML = "\uff5cDSML\uff5c"
+_DSML_OPEN, _DSML_CLOSE = f"<{_DSML} calls>", f"</{_DSML} calls>"
+_DSML_BLOCK_RE = re.compile(re.escape(_DSML_OPEN) + r"\s*(.*?)\s*" + re.escape(_DSML_CLOSE), re.DOTALL)
+_DSML_INVOKE_RE = re.compile(rf'<{_DSML} invoke name="([^"]+)">\s*(.*?)\s*</{_DSML} invoke>', re.DOTALL)
+_DSML_PARAM_RE = re.compile(rf'<{_DSML} parameter name="([^"]+)"(?: string="(true|false)")?>(.*?)</{_DSML} parameter>',
+                            re.DOTALL)
+
+
+def dsml_to_tool_calls(text: str) -> str:
+    """Rewrite each complete DSML calls block as ``<tool_call>{json}</tool_call>`` blocks (one per invoke)."""
+
+    if _DSML_OPEN not in text:
+        return text
+
+    def block(m: re.Match) -> str:
+        out = []
+        for inv in _DSML_INVOKE_RE.finditer(m.group(1)):
+            args: dict[str, Any] = {}
+            for p in _DSML_PARAM_RE.finditer(inv.group(2)):
+                key, is_str, value = p.group(1), p.group(2), p.group(3)
+                if is_str == "false":
+                    try:
+                        args[key] = json.loads(value)
+                        continue
+                    except json.JSONDecodeError:
+                        pass
+                args[key] = value
+            out.append(_CALL_OPEN + json.dumps({"name": inv.group(1), "arguments": args}, ensure_ascii=False)
+                       + _CALL_CLOSE)
+        return "".join(out)
+
+    return _DSML_BLOCK_RE.sub(block, text)
+
 
 
 def _partial_tag(text: str, tag: str) -> int:
@@ -77,6 +113,16 @@ class StopStrings:
 
 
 def hide_tool_calls(text: str, *, finished: bool) -> str:
+    if _DSML_OPEN in text or (not finished and _partial_tag(text, _DSML_OPEN)):
+        cut = text.find(_DSML_OPEN)                    # DeepSeek DSML: everything from the calls block on is a call
+        if cut < 0:
+            return text[: len(text) - _partial_tag(text, _DSML_OPEN)]
+        rest = text[cut:]
+        end = rest.find(_DSML_CLOSE)
+        head = text[:cut]
+        if end < 0:
+            return head
+        return head + hide_tool_calls(rest[end + len(_DSML_CLOSE):], finished=finished)
     out: list[str] = []
     pos = 0
     while True:
@@ -102,6 +148,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
 
     if not tools:
         return text, None
+    text = dsml_to_tool_calls(text)
     known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []

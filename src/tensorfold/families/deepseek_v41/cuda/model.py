@@ -554,17 +554,6 @@ class Model:
                 shared["topk"] = cidx
             cidx = shared["topk"]
             comp = sc.comp[src]
-            if isinstance(comp, tuple) and n > 16:
-                # a prompt chunk: dequantize the visible compressed rows once for this kv source's layers (the same
-                # bf16 values the packed kernel builds per row, so the same bits), instead of once a row
-                key = (src, n_comp_end, start)
-                if shared.get("comp16_key") != key:
-                    from ..ops import fp4_unpack
-
-                    m_ = max(n_comp_end, 1)
-                    shared["comp16"] = fp4_unpack(comp[0][:m_], comp[1][:m_], 16, True)
-                    shared["comp16_key"] = key
-                comp = shared["comp16"]
         o = K.sparse_attn(q, lay.sink, wsrc, wlo, ring_mode, comp, cidx, pos, hd ** -0.5, c.window)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
         if not ring_mode:

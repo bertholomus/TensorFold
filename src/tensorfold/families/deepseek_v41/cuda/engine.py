@@ -153,9 +153,11 @@ class DsEngine:
             taps: list | None = [] if use_drafts else None
             tc = time.perf_counter()
             out = m.forward(sc, ids, s, taps=taps, host_ids=prompt[s:s + PREFILL_CHUNK], replay=replay)
-            if CHUNK_LOG and self.rank == 0:
+            if CHUNK_LOG:
                 torch.cuda.synchronize()
-                print(f"[tensorfold] chunk at {s}: {time.perf_counter() - tc:.2f}s", flush=True)
+                print(f"[tensorfold] rank {self.rank} chunk at {s}: {time.perf_counter() - tc:.2f}s, allocated "
+                      f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB, peak {torch.cuda.max_memory_allocated() / 2**30:.2f}, "
+                      f"reserved {torch.cuda.memory_reserved() / 2**30:.2f}", flush=True)
             if out is not None:
                 last = out
             if use_drafts and taps:

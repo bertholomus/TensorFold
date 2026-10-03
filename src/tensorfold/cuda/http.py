@@ -41,9 +41,43 @@ def _log_error(exc: BaseException) -> None:
 POLLED = ("/metrics", "/v1/metrics", "/health", "/v1/health")
 
 
+def _api_key() -> str | None:
+    """TF_API_KEY, or the key in TF_API_KEY_FILE (a bare key or KEY=value lines): every route but /health needs it."""
+
+    import os
+
+    key = os.environ.get("TF_API_KEY") or ""
+    path = os.environ.get("TF_API_KEY_FILE") or ""
+    if not key and path:
+        for line in open(path).read().splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                key = line.split("=", 1)[1].strip().strip("'\"") if "=" in line else line
+                break
+    return key or None
+
+
 def make_handler(app: App):
+    key = _api_key()
+
     class Handler(Rearming):              # USR1's stack dump armed again after each request
         protocol_version = "HTTP/1.1"
+
+        def _authorized(self) -> bool:
+            """A bearer key (OpenAI) or x-api-key (Anthropic) when the server was started with one."""
+
+            if key is None or self.path.split("?", 1)[0].rstrip("/") in ("/health", "/v1/health"):
+                return True
+            import hmac
+
+            got = self.headers.get("Authorization") or ""
+            got = got[7:].strip() if got.lower().startswith("bearer ") else (self.headers.get("x-api-key") or "")
+            if got and hmac.compare_digest(got.encode(), key.encode()):
+                return True
+            if self.command == "POST":
+                self._discard_body()
+            self._json(401, {"error": {"message": "invalid or missing API key", "type": "authentication_error"}})
+            return False
 
         def log_message(self, fmt, *args):    # one line a request, as the Mac server prints
             print(f"[tensorfold] {self.address_string()} {fmt % args}", flush=True)
@@ -85,6 +119,8 @@ def make_handler(app: App):
             self.close_connection = True
 
         def do_GET(self):
+            if not self._authorized():
+                return
             route = self.path.split("?", 1)[0].rstrip("/")
             if route in ("/metrics", "/v1/metrics"):
                 return metrics.send(self, app)
@@ -99,9 +135,13 @@ def make_handler(app: App):
                 self._json(404, {"error": "not found"})
 
         def do_DELETE(self):
+            if not self._authorized():
+                return
             responses.delete(self, app, responses.route(self.path))
 
         def do_POST(self):
+            if not self._authorized():
+                return
             path = self.path.split("?", 1)[0].rstrip("/")
             if path.endswith("/decisions"):
                 return self._post_decisions()
