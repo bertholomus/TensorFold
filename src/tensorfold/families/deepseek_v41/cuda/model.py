@@ -238,20 +238,21 @@ class Engram:
         fs, bs, rs = self.files[f"layers.{layer}.engram.embed.scale"]
         flat = np.ascontiguousarray(idx.reshape(-1), dtype=np.int64)
         m = flat.shape[0]
-        key = (layer, m)
-        buf = self.pinned.get(key)
-        if buf is None:
-            if len(self.pinned) > 64:
-                self.pinned.clear()
-            buf = (torch.empty((m, rw), dtype=torch.uint8, pin_memory=True),
-                   torch.empty((m, rs), dtype=torch.uint8, pin_memory=True), torch.cuda.Event())
-            self.pinned[key] = buf
-        buf[2].synchronize()               # the previous copy out of this staging buffer has finished
+        # one pinned staging pair a layer, grown (never shrunk); the copy out of it finishes before it is refilled
+        buf = self.pinned.get(layer)
+        if buf is not None:
+            buf[2].synchronize()
+        if buf is None or buf[0].shape[0] < m:
+            cap = max(m, 64)
+            buf = (torch.empty((cap, rw), dtype=torch.uint8, pin_memory=True),
+                   torch.empty((cap, rs), dtype=torch.uint8, pin_memory=True), torch.cuda.Event())
+            self.pinned[layer] = buf
+        bw_v, bs_v = buf[0][:m], buf[1][:m]
         it = torch.from_numpy(flat)
-        self.io.gather_rows(fw, bw, rw, it, buf[0], self.threads)
-        self.io.gather_rows(fs, bs, rs, it, buf[1], self.threads)
-        gw = buf[0].cuda(non_blocking=True)
-        gs = buf[1].cuda(non_blocking=True)
+        self.io.gather_rows(fw, bw, rw, it, bw_v, self.threads)
+        self.io.gather_rows(fs, bs, rs, it, bs_v, self.threads)
+        gw = bw_v.cuda(non_blocking=True)
+        gs = bs_v.cuda(non_blocking=True)
         buf[2].record()
         v = gw.view(torch.float8_e4m3fn).to(F32)
         e = gs.to(torch.int32) - 127
@@ -596,8 +597,12 @@ class Model:
         skey = ("moe", slots, lay.experts.count, prompt)
         s = self.scratch.get(skey)
         if s is None or s.rows < n:
+            # decode / verify windows (< 64 rows) take one scratch of 64 rows made once and never replaced: CUDA graphs
+            # captured with it keep writing into its memory, so freeing it for a bigger one would corrupt whatever
+            # reused that memory (an illegal access on the next replay). Prompt chunks (eager only) may grow theirs.
+            assert prompt or s is None, "decode scratch must not be replaced"
             self.scratch.pop(skey, None)
-            s = exl3_experts.Scratch(lay.experts, rows=max(n, 8), slots=slots, prompt=prompt)
+            s = exl3_experts.Scratch(lay.experts, rows=max(n, 64) if not prompt else n, slots=slots, prompt=prompt)
             self.scratch[skey] = s
         if EXACT_MM:
             return self._moe_exact(lay, x, pick, wts)
