@@ -14,7 +14,7 @@ from tensorfold.families.glm5_next.cuda import latent as latent_mod, prof, qmm a
 
 from tensorfold.cuda.geometry import share
 
-from . import dcp as dcp_mod, glue, kv8, kvq, mla_pe, rope as rope_mod, select as select_mod
+from . import dcp as dcp_mod, glue, kv8, kvq, mla_pe, rope as rope_mod, rows as rows_mod, select as select_mod
 from .kv8 import Kv8
 from .kvq import KvQ
 from .weights import LayerW, Weights
@@ -362,6 +362,9 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
     HL = a.heads
     s = b.lat_s
     G = w.meta.get("dcp", 1)                 # dcp: the cache's positions interleaved over G ranks
+    t = getattr(b, "rows_t", None)           # a concurrent round (rows.Tables): every row its own stream's position
+    if t is not None and (G > 1 or reuse):
+        raise ValueError("a concurrent round runs neither with decode context parallelism nor MTP index reuse")
 
     def keys(sc: X3Scratch | None) -> None:
         """This window's latent, rope key and (full layers) indexer key, into their caches at the window's slots."""
@@ -373,15 +376,21 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         with prof.timed("dsa: rope"):
             rope_mod.apply_key(b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
         with prof.timed("dsa: latent write"):
-            write_rows(b.lat[:R, :c.kv_lora], lc, pos_dev, G, w.rank)
-            write_rows(b.lat[:R, c.kv_lora:], pc, pos_dev, G, w.rank)        # the rope key: its own [cap, qk_rope] cache
+            if t is not None:                # a concurrent round: each row at its own stream's slot
+                rows_mod.write(b.lat[:R, :c.kv_lora], lc, t)
+                rows_mod.write(b.lat[:R, c.kv_lora:], pc, t)
+            else:
+                write_rows(b.lat[:R, :c.kv_lora], lc, pos_dev, G, w.rank)
+                write_rows(b.lat[:R, c.kv_lora:], pc, pos_dev, G, w.rank)    # the rope key: its own [cap, qk_rope] cache
         if index is not None and not reuse:
             with prof.timed("dsa: indexer update"):
                 ix = a.index
                 mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
                 glue.layernorm(b.ik[:R], ix.ln_w, ix.ln_b, c.eps, b.ik[:R])
                 rope_mod.apply_index(b.ik[:R], b.cos[:R], b.sin[:R], c, 1)
-                if host_pos is not None and isinstance(index, torch.Tensor) and G == 1:
+                if t is not None:
+                    rows_mod.write(b.ik[:R], index, t)
+                elif host_pos is not None and isinstance(index, torch.Tensor) and G == 1:
                     index[host_pos:host_pos + R].copy_(b.ik[:R])
                 else:
                     write_rows(b.ik[:R], index, pos_dev, G, w.rank)
@@ -410,6 +419,23 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         qp = mla_pe.gather_pe(b.q[:R], c.qk_nope, b.qp[:R])
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
+    if t is not None:
+        # a concurrent round: rows below the dense limit attend densely, rows past it their selection (each row's
+        # keys are its own stream's; the kernels and their order are the single-stream ones)
+        if t.dense:
+            with prof.timed("dsa: dense attention"):
+                rows_mod.dense_attention(qa, qp, lc, pc, t, s, scale=scale, dense_limit=c.dense_limit, out=ol)
+        if t.sparse and long_ctx:
+            if a.index is not None:
+                with prof.timed("dsa: select tokens"):
+                    index_inputs(w, b, a.index, R)
+                    rows_mod.select(b.qi[:R], b.iw[:R], index, R, c.index_topk, t, tokens=b.tokens[:R],
+                                    counts=b.counts[:R], max_rows=b.stream_rows)
+            with prof.timed("dsa: sparse attention"):
+                rows_mod.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], t, ol, scale)
+        with prof.timed("dsa: expand"):
+            o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
+        return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
     if G > 1:
         # dcp: rows below the dense limit read every key a rank holds, later rows its share of the global selection
         if sparse_rows and a.index is not None and not reuse:
@@ -664,6 +690,20 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
     glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
     if b.prefill:                        # the head reads the last row only (fnormed keeps every row for the MTP)
         return mm(b, b.fnormed[R - 1:R], w.head, b.fxs[R - 1:R], b.logits[:1])
+    return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
+
+
+def compute_rows(w: Weights, st: State, b: Buffers, R: int) -> torch.Tensor:
+    """A concurrent round's forward (capturable): the rows of every live stream's window, each at the position and
+    cache slot b.rows_t holds for it (rows.Tables, filled before), over the pool ``st``; logits [R, V/world]."""
+
+    c = w.cfg
+    t = b.rows_t
+    embed(w, b, b.ids[:R], b.x[:R])
+    rows_mod.rope(b.cos[:R], b.sin[:R], t, R, c.rope_theta, c.qk_rope)
+    for layer in w.layers:
+        layer_forward(layer, w, st, b, R)
+    glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])
     return mm(b, b.fnormed[:R], w.head, b.fxs[:R], b.logits[:R])
 
 

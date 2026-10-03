@@ -23,7 +23,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_rdma_gather_v2", sources=[str(here / "rdma_gather.cu")],
+    return load(name="tensorfold_rdma_gather_v3", sources=[str(here / "rdma_gather.cu")],
                 extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
 
 
@@ -93,6 +93,11 @@ class RdmaGather:
 
     def failure(self) -> str:
         return self.ext.failure(self.h)
+
+    def abort(self, why: str) -> None:
+        """A peer is gone: every gather on this rank (captured ones too) stops waiting and returns at once."""
+
+        self.ext.abort(self.h, why)
 
 
 class Hybrid:

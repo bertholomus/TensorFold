@@ -7,6 +7,11 @@
 // in a flag; the collecting kernel waits for every peer's flag and copies the slots out in rank order. The bytes are
 // NCCL's all-gather's; no host node or NCCL proxy is on the path, so a CUDA graph captures the kernel pair as it would
 // any other.
+//
+// A peer that dies must not leave the others spinning: both waits also read an abort word in the same pinned memory
+// (every 1024 spins, so a live gather's latency is unchanged). The proxy sets it when an RDMA completion fails (a write
+// to a dead peer runs out of retries), and so does ``abort`` (a watchdog that lost a peer); after it every gather on this
+// rank, captured ones included, returns at once with garbage and ``failure`` names why.
 
 #include <torch/extension.h>
 #include <pybind11/stl.h>
@@ -76,6 +81,7 @@ struct Gather {
     uint64_t* doorbell = nullptr;         // the last sequence staged
     uint64_t* sizes = nullptr;            // [slots]: bytes staged in a slot
     uint64_t* sent = nullptr;             // [slots]: the last sequence whose writes from a slot completed
+    uint64_t* abort_word = nullptr;       // nonzero: every wait gives up (a peer is gone)
     uint64_t* seq = nullptr;              // device: gathers so far
     uint64_t* probe = nullptr;            // device: summed ns (stage, doorbell -> flags, copy-out), count, doorbell time
     bool probing = false;
@@ -110,14 +116,15 @@ T* dev(T* host_ptr) {
 __global__ void __launch_bounds__(STAGE_THREADS) stage_kernel(const float4* __restrict__ src, int n4, char* send_ring,
                                                                uint64_t* sizes, uint64_t* doorbell, const uint64_t* sent,
                                                                uint64_t* seq, int slots, uint64_t max_bytes,
-                                                               uint64_t* probe) {
+                                                               uint64_t* probe, const uint64_t* abort_word) {
     __shared__ uint64_t s_seq;
     const uint64_t t0 = now_ns();
     if (threadIdx.x == 0) {
         const uint64_t q = *seq + 1;
         const int slot = (int)(q % slots);
         if (q > (uint64_t)slots)
-            while (load_sys(sent + slot) + slots < q) {}
+            for (uint32_t i = 1; load_sys(sent + slot) + slots < q; ++i)
+                if ((i & 1023) == 0 && load_sys(abort_word)) break;
         s_seq = q;
     }
     __syncthreads();
@@ -144,11 +151,13 @@ __global__ void __launch_bounds__(COLLECT_THREADS) collect_kernel(const float4* 
                                                                    float4* __restrict__ dst, int n4,
                                                                    const char* recv_ring, const uint64_t* flags,
                                                                    const uint64_t* seq, int rank, int world, int slots,
-                                                                   uint64_t max_bytes, uint64_t* probe) {
+                                                                   uint64_t max_bytes, uint64_t* probe,
+                                                                   const uint64_t* abort_word) {
     const uint64_t q = *seq;
     const int slot = (int)(q % slots);
     if (threadIdx.x < world && threadIdx.x != rank)
-        while (load_sys(flags + (size_t)slot * world + threadIdx.x) < q) {}
+        for (uint32_t i = 1; load_sys(flags + (size_t)slot * world + threadIdx.x) < q; ++i)
+            if ((i & 1023) == 0 && load_sys(abort_word)) break;
     __syncthreads();
     const uint64_t t2 = now_ns();
     for (int p = 0; p < world; ++p) {
@@ -173,6 +182,7 @@ __global__ void __launch_bounds__(COLLECT_THREADS) collect_kernel(const float4* 
 
 void fail(Gather& g, const std::string& what) {
     if (!g.failed.exchange(1)) snprintf(g.why, sizeof(g.why), "%s", what.c_str());
+    __atomic_store_n(g.abort_word, (uint64_t)1, __ATOMIC_RELEASE);      // the GPU's waits give up
 }
 
 bool post_recvs(ibv_qp* qp, int count) {
@@ -347,7 +357,7 @@ int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, co
     g->gid_index = (int)gid_index;
     g->cpu = (int)cpu;
     const size_t send_b = (size_t)slots * max_bytes, recv_b = (size_t)slots * world * max_bytes;
-    const size_t meta_b = ((size_t)slots * world + 1 + 2 * (size_t)slots) * 8;
+    const size_t meta_b = ((size_t)slots * world + 1 + 2 * (size_t)slots + 1) * 8;
     g->host_bytes = send_b + recv_b + ((meta_b + 4095) / 4096) * 4096;
     C10_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g->host), g->host_bytes,
                                  cudaHostAllocMapped | cudaHostAllocPortable));
@@ -358,6 +368,7 @@ int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, co
     g->doorbell = g->flags + (size_t)slots * world;
     g->sizes = g->doorbell + 1;
     g->sent = g->sizes + slots;
+    g->abort_word = g->sent + slots;
     C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->seq), 8));
     C10_CUDA_CHECK(cudaMemset(g->seq, 0, 8));
     C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->probe), 8 * 8));
@@ -449,6 +460,12 @@ std::string failure(int64_t h) {
     return g.failed.load() ? std::string(g.why) : std::string();
 }
 
+// A watchdog lost a peer: every wait on this rank gives up (the gathers return garbage; ``failure`` says why).
+void abort_all(int64_t h, const std::string& why) {
+    Gather& g = get(h);
+    fail(g, why);
+}
+
 void configure(int64_t h, bool probing) { get(h).probing = probing; }
 
 // (stage, doorbell -> every flag, copy-out) mean ns over the probed gathers, and their count
@@ -479,12 +496,12 @@ void gather(int64_t h, const at::Tensor& send, at::Tensor recv) {
     auto stream = at::cuda::getCurrentCUDAStream();
     stage_kernel<<<1, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(send.data_ptr()), n4,
                                                   dev(g.send_ring), dev(g.sizes), dev(g.doorbell), dev(g.sent), g.seq,
-                                                  g.slots, g.max_bytes, probe);
+                                                  g.slots, g.max_bytes, probe, dev(g.abort_word));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     const int blocks = std::max(1, std::min(16, (n4 * g.world + COLLECT_THREADS * 4 - 1) / (COLLECT_THREADS * 4)));
     collect_kernel<<<blocks, COLLECT_THREADS, 0, stream>>>(
         reinterpret_cast<const float4*>(send.data_ptr()), reinterpret_cast<float4*>(recv.data_ptr()), n4,
-        dev(g.recv_ring), dev(g.flags), g.seq, g.rank, g.world, g.slots, g.max_bytes, probe);
+        dev(g.recv_ring), dev(g.flags), g.seq, g.rank, g.world, g.slots, g.max_bytes, probe, dev(g.abort_word));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -497,6 +514,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("start", &start);
     m.def("stop", &stop);
     m.def("failure", &failure);
+    m.def("abort", &abort_all);
     m.def("configure", &configure);
     m.def("probes", &probes);
     m.def("gather", &gather);

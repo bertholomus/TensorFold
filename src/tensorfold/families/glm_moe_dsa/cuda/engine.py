@@ -26,8 +26,10 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None,
-                 serial_only: bool = False, comm=None, prefill_rows: int | None = None) -> None:
-        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between machines (tests)."""
+                 serial_only: bool = False, comm=None, prefill_rows: int | None = None, parallel: int = 1) -> None:
+        """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between machines (tests).
+        ``parallel`` > 1: up to that many requests decoded together (multi.MultiDecoder), each with the window
+        ``context`` asks for, every stream's cache a slot of one pool."""
 
         import torch
 
@@ -61,7 +63,7 @@ class GlmEngine:
             from tensorfold.families.glm_moe_dsa.cuda.weights import Config
 
             cfg0 = Config.read(model_dir)
-            most = MAX_ROWS * cfg0.hidden * 4
+            most = MAX_ROWS * max(1, int(parallel)) * cfg0.hidden * 4      # a concurrent round's rows: every stream's
             if dcp_mod.DCP > 1:                       # dcp: a decode window's partials for every rank's heads
                 most = max(most, world * MAX_ROWS * (cfg0.heads // world) * (cfg0.kv_lora // 2 + 1) * 4)
             comm = _rdma(comm, rank, world, most)
@@ -78,8 +80,11 @@ class GlmEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         # each rank holds its vocabulary span of the embedding (weights.embed_span), not the whole table
         rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
+        streams = max(1, int(parallel))
+        if streams > 1 and G > 1:
+            raise ValueError("--parallel and TF_GLM_DCP (decode context parallelism) do not run together yet")
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
-                                   lambda text: self._geometry(text, world, dcp=G, rows=rows),
+                                   lambda text: self._geometry(text, world, dcp=G, rows=rows, streams=streams),
                                    embed_transform(split_weights(rule, world), cfg.vocab, world, rank),
                                    rank=rank, world=world, gather=self._gather_ints)
         self.limit = self.capacity_plan["context_window"]
@@ -87,11 +92,11 @@ class GlmEngine:
         long_context = self.limit > cfg.dense_limit
         prefill_rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
-                prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G]
+                prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G, streams]
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
             raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
-                               " TF_GLM_EMBED_SPLIT, TF_GLM_KV, TF_GLM_DRAFT_VOCAB, TF_GLM_DCP):"
+                               " TF_GLM_EMBED_SPLIT, TF_GLM_KV, TF_GLM_DRAFT_VOCAB, TF_GLM_DCP, --parallel):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
         if rank == 0 and kv8.parse(kv8.MODE) != ("bf16", "bf16"):
             lat, idx = kv8.parse(kv8.MODE)
@@ -111,8 +116,31 @@ class GlmEngine:
             print("[tensorfold] this checkpoint has no MTP layer: every round decodes one token", flush=True)
             self.policy = "0"
         self.w = w
-        self.e = Decoder(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
-                         graph_rows=GRAPH_ROWS, long_context=long_context)
+        self.master = master
+        self.concurrent = streams > 1
+        self.multi = self.scheduler = None
+        if self.concurrent:
+            from tensorfold.cuda.scheduler import Scheduler
+
+            from .multi import Link, MultiDecoder
+
+            depth = 0 if self.policy == "0" else min(int(self.policy) if str(self.policy).isdigit() else 3, MAX_ROWS - 1)
+            self.e = None
+            self.multi = MultiDecoder(w, slots=streams, slot_cap=capacity, depth=depth, prefill_rows=prefill_rows)
+            self.multi.warm()
+            if world > 1:
+                from .multi import Watchdog
+
+                self.multi.watch = Watchdog(self.comm, _store(self.comm), rank=rank, world=world, host=master)
+            if rank == 0:
+                if world > 1:
+                    self.multi.link = Link(_store(self.comm), rank=0, world=world, host=master)
+                self.scheduler = Scheduler(self.multi, max_streams=streams)
+                print(f"[tensorfold] up to {streams} requests decode together, each with a {self.limit}-token window "
+                      f"(a {capacity}-row cache slot each); {depth} MTP drafts a round", flush=True)
+        else:
+            self.e = Decoder(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
+                             graph_rows=GRAPH_ROWS, long_context=long_context)
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
@@ -120,7 +148,8 @@ class GlmEngine:
         self.live: list[int] = []
 
     @staticmethod
-    def _geometry(text: dict, world: int, kv: str | None = None, dcp: int = 1, rows: int | None = None):
+    def _geometry(text: dict, world: int, kv: str | None = None, dcp: int = 1, rows: int | None = None,
+                  streams: int = 1):
         """The Flash MLA geometry minus the KDA and hyper-connection terms, with the MTP head counted, and this family's
         own cache a slot: Flash counts a 512-wide latent and three indexer planes a layer, this family keeps the latent
         plus a 64-wide rope key a layer (and the MTP head's) and one indexer key plane a full-indexer layer (96,640 B a
@@ -128,7 +157,8 @@ class GlmEngine:
         35,768), and its token selection holds at most select.SELECT_BYTES at once. With ``dcp`` ranks interleaving the
         positions a rank holds 1/dcp of every slot, plus the prompt chunks' exchange buffers (dcp.Scratch). A quantized
         latent without dcp adds the prompt chunks' latent scratch (forward.qscratch_slots, 1 KiB a slot), and prompt
-        chunks wider than geometry's 2,048 rows PROMPT_ROW_BYTES a row."""
+        chunks wider than geometry's 2,048 rows PROMPT_ROW_BYTES a row. With ``streams`` > 1 (--parallel) every slot
+        of the window is held once a stream, plus the rounds' wider buffers."""
 
         from tensorfold.cuda.geometry import PREFILL_ROWS, Geometry, mla_geometry
 
@@ -161,6 +191,9 @@ class GlmEngine:
             extra += 2 * r * dcp * 2048 * 8            # a prompt block's gathered selection candidates
         extra += max(0, prompt_rows - PREFILL_ROWS) * PROMPT_ROW_BYTES      # chunks wider than geometry's 2,048 rows
         qs_row = 2 * int(text["kv_lora_rank"])
+        if streams > 1:
+            own = own * streams
+            extra += 1 << 30                           # the rounds' buffers (every stream's rows), graphs' pool
 
         def bytes_at(slots: int) -> int:
             return (int(flash.bytes_at(slots) + (own - flash_slot) * slots) + 3 * SELECT_BYTES + extra
@@ -196,6 +229,13 @@ class GlmEngine:
 
         from tensorfold.engine.grammar import pack
 
+        if self.scheduler is not None:
+            if constraint is not None:
+                raise ValueError("structured output is not served with --parallel on GLM-5.3 yet: send text without "
+                                 "response_format, or start without --parallel")
+            stop_eos = bool(getattr(self.request, "stop_eos", True))
+            return self.scheduler.submit(list(prompt), max_tokens, sampling, draft and self.policy != "0", on_tokens,
+                                         stop_eos=stop_eos)
         spec = getattr(self.request, "policy", None) or self.policy
         stop_eos = bool(getattr(self.request, "stop_eos", True))
         code = [1 if spec not in ("", "0") else 0, min(int(spec) if str(spec).isdigit() else 3, MAX_ROWS - 1), 0, 0]
@@ -214,6 +254,12 @@ class GlmEngine:
         """Follower rank: mirror every request rank 0 serves, forever."""
 
         from tensorfold.engine.exact_sampling import Sampling
+
+        if self.multi is not None:
+            from .multi import Link
+
+            self.multi.follow(Link(_store(self.comm), rank=self.rank, world=self.world, host=self.master))
+            return
         while True:
             (max_tokens, stop_eos, draft, _cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi,
              shaped, kind, most, _a, _b) = self._share(None)
@@ -261,6 +307,16 @@ class GlmEngine:
             print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
                   f" drafted {res.drafted} accepted {res.accepted}", flush=True)
         return stats
+
+
+def _store(comm):
+    """The rendezvous store under the communicator (the RDMA hybrid wraps NCCL's)."""
+
+    for c in (comm, getattr(comm, "comm", None), getattr(comm, "nccl", None)):
+        store = getattr(c, "store", None)
+        if store is not None:
+            return store
+    raise RuntimeError("--parallel on several ranks needs the communicator's rendezvous store")
 
 
 def _rdma(comm, rank: int, world: int, max_bytes: int):

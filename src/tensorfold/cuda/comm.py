@@ -135,6 +135,25 @@ class NCCL:
             print(f"[tensorfold] rank {self.rank} finished {label}; waiting for rank {missing} ({waited:.0f} s)",
                   flush=True)
 
+    def abort(self) -> None:
+        """A peer is gone: ncclCommAbort, so NCCL work in flight on this rank returns (callable from any thread; the
+        communicator is unusable after it)."""
+
+        comm, self.comm = self.comm, None
+        if comm is not None and comm.value:
+            self.lib.ncclCommAbort.argtypes = [ctypes.c_void_p]
+            self.lib.ncclCommAbort(comm)
+
+    def async_error(self) -> int:
+        """NCCL's asynchronous error code for this communicator (0: none; a network failure shows here)."""
+
+        if self.comm is None:
+            return -1
+        code = ctypes.c_int(0)
+        self.lib.ncclCommGetAsyncError.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
+        self.lib.ncclCommGetAsyncError(self.comm, ctypes.byref(code))
+        return int(code.value)
+
     def barrier(self) -> None:
         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")

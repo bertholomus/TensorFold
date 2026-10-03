@@ -72,6 +72,14 @@ class KvQ:
         other.codes, other.scales = self.codes.clone(), self.scales.clone()
         return other
 
+    def rows(self, lo: int, hi: int) -> "KvQ":
+        """A plane over rows [lo, hi) of this one (views: a concurrent stream's slot of the pool)."""
+
+        other = KvQ.__new__(KvQ)
+        other.bits, other.width, other.h = self.bits, self.width, self.h
+        other.codes, other.scales = self.codes[lo:hi], self.scales[lo:hi]
+        return other
+
     def dequant(self, n: int | None = None) -> torch.Tensor:
         """Rows [0, n) back in the latent's own domain (fp32), for checks and tools."""
 

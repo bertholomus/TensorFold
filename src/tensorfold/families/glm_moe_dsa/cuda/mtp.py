@@ -85,6 +85,36 @@ def mtp_compute(w: Weights, st: State, b: Buffers, n: int, *, last_only: bool = 
     return mm(b, b.fnormed[:k], head, b.fxs[:k], b.logits[:k, :head.n])
 
 
+def mtp_compute_rows(w: Weights, st: State, b: Buffers, n: int, heads: torch.Tensor) -> torch.Tensor:
+    """mtp_compute over a concurrent round's MTP rows: row r at the MTP position and slot b.rows_t holds for it (rows.
+    Tables, filled before) over the pool ``st``, the head over the rows ``heads`` (int64, each drafting stream's last
+    row; b.fnormed[:k] keeps their shared_head.norm rows for the next chained step): logits [k, head columns]."""
+
+    from . import rows as rows_mod
+
+    c = w.cfg
+    m = w.mtp
+    D = c.hidden
+    embed(w, b, b.ids[:n], b.me[:n])
+    glue.rmsnorm(b.me[:n], m.enorm, c.eps, b.mcat[:n, :D])
+    glue.rmsnorm(b.hin[:n], m.hnorm, c.eps, b.mcat[:n, D:])
+    mm(b, b.mcat[:n], m.eh, _group_sums(b, b.mcat[:n]), b.mx[:n])
+    rows_mod.rope(b.cos[:n], b.sin[:n], b.rows_t, n, c.rope_theta, c.qk_rope)
+    layer = m.layer
+    glue.rmsnorm(b.mx[:n], layer.in_norm, c.eps, b.normed[:n], b.xs[:n])
+    g = dsa_block(layer, w, st.mtp_kc, st.mtp_pos_dev, b, n, None,
+                  st.index[-1] if getattr(st, "index", None) is not None else None, None, None, pc=st.mtp_pc)
+    residual(b.mx[:n], b.mx[:n], g)
+    glue.rmsnorm(b.mx[:n], layer.post_norm, c.eps, b.normed[:n], b.xs[:n])
+    g = moe_block(layer, w, b, n)
+    residual(b.mx[:n], b.mx[:n], g)
+    k = heads.shape[0]
+    torch.index_select(b.mx[:n], 0, heads, out=b.mhead[:k])
+    glue.rmsnorm(b.mhead[:k], m.norm, c.eps, b.fnormed[:k], b.fxs[:k])
+    head = w.head if w.draft_head is None else w.draft_head
+    return mm(b, b.fnormed[:k], head, b.fxs[:k], b.logits[:k, :head.n])
+
+
 def _group_sums(b: Buffers, x: torch.Tensor):
     from tensorfold.families.glm5_next.cuda import qmm
 

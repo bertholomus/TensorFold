@@ -113,6 +113,13 @@ class Kv8:
         other.codes, other.scales = self.codes.clone(), self.scales.clone()
         return other
 
+    def rows(self, lo: int, hi: int) -> "Kv8":
+        """A plane over rows [lo, hi) of this one (views: a concurrent stream's slot of the pool)."""
+
+        other = Kv8.__new__(Kv8)
+        other.codes, other.scales = self.codes[lo:hi], self.scales[lo:hi]
+        return other
+
     def dequant(self, n: int | None = None) -> torch.Tensor:
         """Rows [0, n) as bf16 (exact: an e4m3 code times a power of two), for checks and tools."""
 
