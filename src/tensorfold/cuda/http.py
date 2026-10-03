@@ -125,8 +125,11 @@ def make_handler(app: App):
             if route in ("/metrics", "/v1/metrics"):
                 return metrics.send(self, app)
             if self.path.rstrip("/") in ("/v1/models", "/models"):
-                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold"}
-                                                            for model_id in app.model_ids]})
+                # vLLM's max_model_len: the prompt-plus-reply tokens a request may use (clients size their context by it)
+                limit = getattr(app, "effective_context_window", None) or getattr(app, "native_context_window", None)
+                extra = {"max_model_len": int(limit)} if limit else {}
+                self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold",
+                                                             **extra} for model_id in app.model_ids]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
                 self._json(200, health.of(app).snapshot(app))
             elif responses.route(self.path):

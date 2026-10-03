@@ -358,6 +358,7 @@ class MultiDecoder:
         self.conf_depth = [[0, 0] for _ in range(8)]     # CONF_LOG: (drafts reached, kept) by depth
         self.conf_bins = [[0, 0] for _ in range(10)]     # CONF_LOG: (drafts, kept) by sigmoid(confidence) tenths
         self.conf_rounds = 0
+        self.k_hist: dict[int, list[int]] = {}           # CONF_LOG: drafts verified a stream a round, by streams live
         self.kept: dict[int, Kept] = {}                  # kept prompts by id
         self.next_kept, self.ticks = 0, 0
         self.keep_stats: dict[str, int] = {}             # admissions that continued a kept prompt, by placement
@@ -417,6 +418,14 @@ class MultiDecoder:
     def _step(self, busy: bool) -> None:
         if self.watch is not None:
             self.watch.busy = time.monotonic() if busy else None
+
+    def _broken(self, exc: BaseException) -> None:
+        """A step that raised past its digest check (out of memory under the allocator ceiling, a bug) may have left
+        another rank inside a collective: the lane breaks on every rank (the watchdog restarts it) instead of the next
+        step's collectives pairing with the wrong ones. OutOfStep and NoRoom happen on every rank at the same point."""
+
+        if self.watch is not None and not isinstance(exc, (OutOfStep, NoRoom)):
+            self.watch.abort(f"a step failed on rank {self.e.rank} ({type(exc).__name__}: {str(exc)[:160]})")
 
     def _alive(self) -> None:
         if self.watch is not None and self.watch.broken is not None:
@@ -711,6 +720,9 @@ class MultiDecoder:
                                       snap=snap)
             s.filled, s.prefill_s, s.cached = cut, 0.0, cut
             self.filling.append(s)
+        except Exception as exc:
+            self._broken(exc)
+            raise
         finally:
             self._step(False)
 
@@ -745,6 +757,9 @@ class MultiDecoder:
             self.streams[s.sid] = s
             s.take([first], self._ends(s))
             return [s] if s.done else []
+        except Exception as exc:
+            self._broken(exc)
+            raise
         finally:
             self._step(False)
 
@@ -825,6 +840,8 @@ class MultiDecoder:
                     kk = want[s.sid]
                     if DEPTH_POLICY == "conf":
                         kk = self._choose_k(cf, kk, len(live))
+                    if CONF_LOG:
+                        self.k_hist.setdefault(len(live), [0] * 8)[kk] += 1
                     proposed[s.sid] = r[:kk]
                     confs[s.sid] = cf
             mark()
@@ -881,8 +898,9 @@ class MultiDecoder:
                 if self.conf_rounds % 200 == 0 and e.rank == 0:
                     dep = [f"{j + 1}:{kept}/{n}" for j, (n, kept) in enumerate(self.conf_depth) if n]
                     bins = [f"{b / 10:.1f}:{kept}/{n}" for b, (n, kept) in enumerate(self.conf_bins) if n]
-                    print(f"[tensorfold] drafts kept by depth {' '.join(dep)}; by confidence {' '.join(bins)}",
-                          flush=True)
+                    ks = [f"{n}:{','.join(str(x) for x in h[:self.depth_most + 1])}" for n, h in sorted(self.k_hist.items())]
+                    print(f"[tensorfold] drafts kept by depth {' '.join(dep)}; by confidence {' '.join(bins)}; "
+                          f"k chosen by streams {' '.join(ks)}", flush=True)
             if absorbs:                                  # every drafting stream's kept rows into its rings, one pass
                 ta = time.perf_counter()
                 e.drafter.absorb_many(self.dpool, self.m.pool_view(self.pool, 0, 0, self.extents.total) if
@@ -913,6 +931,9 @@ class MultiDecoder:
                           f"absorb {1000 * st[6] / r:.1f}", flush=True)
             self.round_end = time.perf_counter()
             return done
+        except Exception as exc:
+            self._broken(exc)
+            raise
         finally:
             self._step(False)
 

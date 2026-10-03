@@ -31,11 +31,13 @@ Modified upstream files:
   src/tensorfold/cuda/exl3/experts_cb1.cu      as above
   src/tensorfold/cuda/exl3/experts_cb2.cu      as above
   src/tensorfold/cuda/exl3/prefill.py          optional tile choice by shape (TF_EXL3_PREFILL_TILES)
-  src/tensorfold/cuda/http.py                  optional API key (TF_API_KEY / TF_API_KEY_FILE), all routes but /health
+  src/tensorfold/cuda/http.py                  optional API key (TF_API_KEY / TF_API_KEY_FILE), all routes but /health;
+                                               max_model_len in /v1/models
   src/tensorfold/cuda/server.py                a family's own image prompts continue through its vision object
   src/tensorfold/cuda/comm.py                  NCCL abort and asynchronous-error hooks (a concurrent lane's watchdog)
   src/tensorfold/serve_options.py              --vision for families with their own image path (CUDA_VISION)
   src/tensorfold/cuda/reply_text.py            DSML tool-call parsing for DeepSeek-V4.1
+  src/tensorfold/server/request_options.py     reasoning_effort "off" heard as "none"
   .gitignore                                   ignores macOS ._* files
 
 The "git log" of this branch and tools/dsv41/ATTRIBUTION.md describe the changes and their sources.

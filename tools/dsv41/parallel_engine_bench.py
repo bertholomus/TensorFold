@@ -28,6 +28,8 @@ def main():
     p.add_argument("--reps", type=int, default=2)
     p.add_argument("--parallel", type=int, default=4)
     p.add_argument("--drafts", type=int, default=3)
+    p.add_argument("--acceptance", action="store_true",
+                   help="per row: drafts kept by depth, by confidence and the depths chosen (needs TF_DS_CONF_LOG=1)")
     p.add_argument("--out")
     a = p.parse_args()
     from pathlib import Path
@@ -78,6 +80,14 @@ def main():
                    "decode_aggregate_tps": round(agg, 2),
                    "steady_state_tps": round(steady, 2), "rounds_all_live": len(rounds),
                    "wall_s": round(time.perf_counter() - t0, 2), "tokens": count}
+            if a.acceptance:
+                mu = eng.multi
+                row["kept_by_depth"] = [list(x) for x in mu.conf_depth if x[0]]
+                row["kept_by_confidence_tenth"] = [list(x) for x in mu.conf_bins]
+                row["k_chosen"] = {str(n): h[:mu.depth_most + 1] for n, h in sorted(mu.k_hist.items())}
+                mu.conf_depth = [[0, 0] for _ in range(8)]
+                mu.conf_bins = [[0, 0] for _ in range(10)]
+                mu.k_hist = {}
             res.append(row)
             print(json.dumps(row), flush=True)
     summary = {}

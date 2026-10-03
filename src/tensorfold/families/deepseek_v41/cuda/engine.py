@@ -151,9 +151,32 @@ class DsEngine:
                 self.scheduler = Scheduler(self.multi, max_streams=int(parallel))
                 print(f"[tensorfold] --parallel {int(parallel)}: {int(parallel)} streams share one window of "
                       f"{self.multi.extents.total} tokens (an extent each)", flush=True)
+        self._memory_ceiling()
         if rank == 0:
             print(f"[tensorfold] DeepSeek-V4.1 engine ready: {world} rank(s), context {self.limit}, "
                   f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}", flush=True)
+
+    def _memory_ceiling(self) -> None:
+        """After the warm-up, torch may grow only while the host keeps TF_DS_MEM_FLOOR_GIB (default 2; 0: no ceiling)
+        available: a step that would need more fails with CUDA's out-of-memory error (that request fails, the lane's
+        watchdog restarts it if a rank broke) instead of the kernel's OOM killer, which on a unified-memory GB10 took
+        the user's systemd manager, and its restart started every enabled user unit."""
+
+        floor = float(os.environ.get("TF_DS_MEM_FLOOR_GIB") or 2.0)
+        if floor <= 0:
+            return
+        try:
+            info = dict(line.split(":", 1) for line in open("/proc/meminfo"))
+            available = int(info["MemAvailable"].split()[0]) * 1024
+        except (OSError, KeyError, ValueError):
+            return
+        torch.cuda.synchronize()
+        total = torch.cuda.mem_get_info()[1]
+        reserved = torch.cuda.memory_reserved()
+        ceiling = reserved + max(0, available - int(floor * 2**30))
+        torch.cuda.set_per_process_memory_fraction(min(1.0, ceiling / total))
+        print(f"[tensorfold] rank {self.rank}: allocator ceiling {ceiling / 2**30:.1f} GiB (holds "
+              f"{reserved / 2**30:.1f}, host available {available / 2**30:.1f}, floor {floor:.1f})", flush=True)
 
     def warm(self) -> None:
         """Same steps on every rank, in the same order (prefills and graph captures issue real collectives)."""

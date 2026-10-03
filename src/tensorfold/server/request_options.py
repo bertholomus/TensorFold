@@ -107,6 +107,8 @@ def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset()) 
     effort = body.get("reasoning_effort")
     if effort is None and isinstance(kwargs, dict):
         effort = kwargs.get("reasoning_effort")           # where vLLM's clients put it
+    if effort == "off":                                   # what some clients send for none
+        effort = "none"
     if effort is not None:
         if not isinstance(effort, str) or effort not in EFFORTS:
             raise RequestError("reasoning_effort must be none, minimal, low, medium, high, xhigh or max")
