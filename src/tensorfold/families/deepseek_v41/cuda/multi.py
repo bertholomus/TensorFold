@@ -32,8 +32,9 @@ import torch
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
 
-# drafts a stream verifies a round by how many streams decode ("3,3,3,3": three each at 1-4 streams, 16 rows at 4)
-DEPTH_BY = [int(x) for x in (os.environ.get("TF_DS_PARALLEL_DEPTH") or "3,3,3,3").split(",") if x.strip()]
+# the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the drafter's block of five
+# alone or beside one other, three at three or four streams: 16 rows at four), capped by the engine's --mtp-drafts
+DEPTH_BY = [int(x) for x in (os.environ.get("TF_DS_PARALLEL_DEPTH") or "5,5,3,3").split(",") if x.strip()]
 # while prompts fill, decoding keeps this share of the time (a prompt chunk runs once the rounds since the last one
 # took share / (1 - share) of its time); a prompt whose rest fits in QUICK_ROWS tokens fills before the next round
 DECODE_SHARE = float(os.environ.get("TF_DS_DECODE_SHARE") or 0.5)
@@ -41,6 +42,16 @@ QUICK_ROWS = int(os.environ.get("TF_DS_QUICK_ROWS") or 1024)
 # TF_DS_ROUND_STATS=1: each round's stages synchronized and timed (drafts, Engram rows + forward, sampling, absorb),
 # their averages printed every 100 rounds by streams decoding (profiling only: the syncs cost a little)
 ROUND_STATS = os.environ.get("TF_DS_ROUND_STATS", "0") == "1"
+# TF_DS_DEPTH_POLICY=conf (default; "fixed": the table depth): each stream verifies the k (<= its table depth, up to the drafter's block) with the most
+# expected tokens a millisecond: expected tokens from the confidence head's prefix survivals, the round's cost from a
+# fixed table of forward ms by rows (TF_DS_ROUND_MS, a pure function of state every rank holds: no live timers)
+DEPTH_POLICY = os.environ.get("TF_DS_DEPTH_POLICY", "conf")
+ROUND_MS = [float(x) for x in (os.environ.get("TF_DS_ROUND_MS") or
+                               "32.4,40.9,45.4,51.8,56.2,60.8,64.4,68.0,71.8,75.6,79.6,83.5,86.3,89.0,91.8,94.6").split(",")]
+DRAFT_MS = float(os.environ.get("TF_DS_DRAFT_MS") or 5.3)
+# TF_DS_CONF_LOG=1: per draft depth, drafts verified and kept, and kept by confidence (sigmoid tenths), printed every
+# 200 rounds (the DSpark acceptance report)
+CONF_LOG = os.environ.get("TF_DS_CONF_LOG", "0") == "1"
 STEP_TIMEOUT = float(os.environ.get("TF_DS_STEP_TIMEOUT") or 900.0)
 
 
@@ -294,6 +305,9 @@ class MultiDecoder:
         self.rounds = 0
         self.round_log: list[tuple[int, int, float, int]] = []
         self.stage = {}                                 # ROUND_STATS: streams -> [rounds, rows, tokens, seconds a stage]
+        self.conf_depth = [[0, 0] for _ in range(8)]     # CONF_LOG: (drafts reached, kept) by depth
+        self.conf_bins = [[0, 0] for _ in range(10)]     # CONF_LOG: (drafts, kept) by sigmoid(confidence) tenths
+        self.conf_rounds = 0
 
     def warm(self, buckets=(1024, 2048, 4096, 8192)) -> None:
         """Before serving, on every rank in the same order: round graphs for 1 .. 16 rows at the small context
@@ -470,6 +484,24 @@ class MultiDecoder:
         finally:
             self._step(False)
 
+    def _choose_k(self, conf: list[float], kmax: int, live: int) -> int:
+        """The k in 0 .. kmax with the most expected tokens a millisecond: 1 + the prefix survivals' sum over the
+        round's table cost (this stream's rows beside the other streams' at their table depth)."""
+
+        import math
+
+        others = (live - 1) * (self._depth(live) + 1)
+        best, best_v, surv, exp_tokens = 0, -1.0, 1.0, 1.0
+        for kk in range(0, kmax + 1):
+            if kk > 0:
+                surv *= 1.0 / (1.0 + math.exp(-float(conf[kk - 1])))
+                exp_tokens += surv
+            rows = min(len(ROUND_MS), others + kk + 1)
+            v = exp_tokens * live / (ROUND_MS[rows - 1] + DRAFT_MS)
+            if v > best_v:
+                best, best_v = kk, v
+        return best
+
     def _depth(self, live: int) -> int:
         k = DEPTH_BY[min(live, len(DEPTH_BY)) - 1] if DEPTH_BY else self.depth_most
         return max(0, min(k, self.depth_most, self.max_rows // max(live, 1) - 1))
@@ -520,11 +552,17 @@ class MultiDecoder:
 
             want = {s.sid: (min(k, s.count - len(s.out)) if s.draft else 0) for s in live}
             drafting = [s for s in live if want[s.sid] > 0]
-            proposed = {}
+            proposed, confs = {}, {}
             if drafting:
                 rows = self._drafts([s.pending for s in drafting], [s.st.sc.length for s in drafting],
                                     [s.st.index for s in drafting])
-                proposed = {s.sid: r[:want[s.sid]] for s, r in zip(drafting, rows)}
+                conf_rows = self.drafters[len(drafting)].last_conf
+                for s, r, cf in zip(drafting, rows, conf_rows):
+                    kk = want[s.sid]
+                    if DEPTH_POLICY == "conf":
+                        kk = self._choose_k(cf, kk, len(live))
+                    proposed[s.sid] = r[:kk]
+                    confs[s.sid] = cf
             mark()
             for s in live:
                 sc = s.st.sc
@@ -546,6 +584,17 @@ class MultiDecoder:
                 a = 0
                 while a < len(drafts) and drafts[a] == target[a]:
                     a += 1
+                if CONF_LOG and drafts:
+                    import math
+
+                    cf = confs.get(s.sid, [])
+                    for j in range(min(len(drafts), a + 1)):          # drafts reached: the first miss included
+                        self.conf_depth[j][0] += 1
+                        self.conf_depth[j][1] += int(j < a)
+                        if j < len(cf):
+                            b = min(9, int(10 / (1 + math.exp(-cf[j]))))
+                            self.conf_bins[b][0] += 1
+                            self.conf_bins[b][1] += int(j < a)
                 new = drafts[:a] + [target[a]]
                 s.st.sc.length = P + a + 1
                 if s.draft and taps is not None:
@@ -563,6 +612,13 @@ class MultiDecoder:
                 r0 += n
                 if s.done:
                     done.append(s)
+            if CONF_LOG:
+                self.conf_rounds += 1
+                if self.conf_rounds % 200 == 0 and e.rank == 0:
+                    dep = [f"{j + 1}:{kept}/{n}" for j, (n, kept) in enumerate(self.conf_depth) if n]
+                    bins = [f"{b / 10:.1f}:{kept}/{n}" for b, (n, kept) in enumerate(self.conf_bins) if n]
+                    print(f"[tensorfold] drafts kept by depth {' '.join(dep)}; by confidence {' '.join(bins)}",
+                          flush=True)
             if absorbs:                                  # every drafting stream's kept rows into its rings, one pass
                 ta = time.perf_counter()
                 e.drafter.absorb_many(self.dpool, self.m.pool_view(self.pool, 0, 0, self.extents.total) if

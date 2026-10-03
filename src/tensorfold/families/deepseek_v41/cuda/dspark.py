@@ -328,7 +328,9 @@ class BatchDraftGraph:
         else:
             self.graph.replay()
         n = self.d.size
-        return [[int(x) for x in row[:n]] for row in self.packed.tolist()]
+        rows = self.packed.tolist()
+        self.last_conf = [row[n:] for row in rows]       # the confidence head's logits, a list a stream
+        return [[int(x) for x in row[:n]] for row in rows]
 
 
 @dataclass

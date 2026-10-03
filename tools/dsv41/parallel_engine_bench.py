@@ -27,21 +27,27 @@ def main():
     p.add_argument("--tokens", type=int, default=384)
     p.add_argument("--reps", type=int, default=2)
     p.add_argument("--parallel", type=int, default=4)
+    p.add_argument("--drafts", type=int, default=3)
     p.add_argument("--out")
     a = p.parse_args()
     from pathlib import Path
 
     from tensorfold.families.deepseek_v41.cuda.engine import DsEngine
 
-    eng = DsEngine(Path(a.model), rank=a.rank, world=a.world, master=a.master, port=a.port, drafts=3,
+    eng = DsEngine(Path(a.model), rank=a.rank, world=a.world, master=a.master, port=a.port, drafts=a.drafts,
                    context=262144, parallel=a.parallel)
     if a.rank != 0:
         eng.follow()
         return
     prompts = [v for k, v in json.load(open(a.prompts)).items() if k.startswith(a.set + "/")]
     res = []
+    names = [k for k in json.load(open(a.prompts)) if k.startswith(a.set + "/")]
+    plan = []
     for n in [int(x) for x in a.streams.split(",")]:
-        for rep in range(a.reps):
+        for off in (range(len(prompts)) if n == 1 else [0]):         # one stream: each prompt in turn
+            plan += [(n, off, rep) for rep in range(a.reps)]
+    for n, off, rep in plan:
+        if True:
             first, last, count = [None] * n, [None] * n, [0] * n
             log0 = len(eng.multi.round_log)
 
@@ -56,7 +62,7 @@ def main():
                     count[i] += len(new)
                     return False
 
-                eng.generate(prompts[i % len(prompts)], a.tokens, None, emit, draft=True)
+                eng.generate(prompts[(off + i) % len(prompts)], a.tokens, None, emit, draft=True)
 
             th = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
             t0 = time.perf_counter()
@@ -68,16 +74,17 @@ def main():
             agg = (sum(count) - n) / span
             rounds = [r for r in eng.multi.round_log[log0:] if r[0] == n]
             steady = sum(r[3] for r in rounds) / max(sum(r[2] for r in rounds), 1e-9)
-            row = {"streams": n, "rep": rep, "decode_aggregate_tps": round(agg, 2),
+            row = {"streams": n, "prompt": names[off] if n == 1 else "mix", "rep": rep,
+                   "decode_aggregate_tps": round(agg, 2),
                    "steady_state_tps": round(steady, 2), "rounds_all_live": len(rounds),
                    "wall_s": round(time.perf_counter() - t0, 2), "tokens": count}
             res.append(row)
             print(json.dumps(row), flush=True)
     summary = {}
-    for n in sorted({r["streams"] for r in res}):
-        rr = [r for r in res if r["streams"] == n]
-        summary[n] = {"decode_aggregate_median": statistics.median(r["decode_aggregate_tps"] for r in rr),
-                      "steady_state_median": statistics.median(r["steady_state_tps"] for r in rr)}
+    for key in sorted({(r["streams"], r["prompt"]) for r in res}):
+        rr = [r for r in res if (r["streams"], r["prompt"]) == key]
+        summary[f"{key[0]} {key[1]}"] = {"decode_aggregate_median": statistics.median(r["decode_aggregate_tps"] for r in rr),
+                                         "steady_state_median": statistics.median(r["steady_state_tps"] for r in rr)}
     print(json.dumps({"summary": summary}), flush=True)
     if a.out:
         json.dump({"rows": res, "summary": summary}, open(a.out, "w"), indent=1)
