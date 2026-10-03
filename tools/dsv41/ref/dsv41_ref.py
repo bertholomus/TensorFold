@@ -691,7 +691,7 @@ class Reference:
 
     # -- whole model -------------------------------------------------------------------------------------------
     @torch.inference_mode()
-    def forward(self, seqs_ids: list[list[int]], dump_layers: bool = False, log=print) -> dict:
+    def forward(self, seqs_ids: list[list[int]], dump_layers: bool = False, log=print, n_layers: int | None = None) -> dict:
         """Independent sequences (each from position 0) -> fp32 logits [n_i, vocab] each (and per-layer streams)."""
 
         c = self.cfg
@@ -712,7 +712,7 @@ class Reference:
             hashes = torch.cat([self.hasher(ids[b]) for b in bounds], 0)      # [n, L, cols]
         shared = [dict() for _ in bounds]
         taps, dumps = [], []
-        for layer in range(c.n_layers):
+        for layer in range(c.n_layers if n_layers is None else n_layers):
             if self.engram is not None and layer in c.engram_layers:
                 h = self.engram_apply(layer, h, hashes[:, c.engram_layers.index(layer)])
             if layer in c.dspark_taps:
