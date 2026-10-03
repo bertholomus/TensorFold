@@ -300,10 +300,10 @@ def _comp_keys(COMP, CSC, row, ok, hc, HD: tl.constexpr, BN: tl.constexpr, PACKE
 
 
 @triton.jit
-def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, SINK, OUT, scale, ring_size, n_idx,
+def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, SINK, OUT, scale, ring_size, n_idx, RBASE, CBASE,
                       H: tl.constexpr, HD: tl.constexpr, HB: tl.constexpr, WIN: tl.constexpr, BN: tl.constexpr,
                       RING: tl.constexpr, HAS_COMP: tl.constexpr, PACKED: tl.constexpr, SPLITS: tl.constexpr,
-                      NBLK: tl.constexpr, FINAL: tl.constexpr):
+                      NBLK: tl.constexpr, FINAL: tl.constexpr, HAS_BASE: tl.constexpr):
     r = tl.program_id(0)
     hb = tl.program_id(1)
     sp = tl.program_id(2)
@@ -332,6 +332,8 @@ def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, SINK, OUT, 
                 slot = wp - wlo
                 ok = ok & (slot >= 0)
             slot = tl.where(ok, slot, 0)
+            if HAS_BASE:                   # a concurrent round: the row's stream's ring starts at pool row RBASE[r]
+                slot = slot + tl.load(RBASE + r)
             kb = WSRC + slot[:, None] * HD
             k_lo = tl.load(kb + hc[None, :], mask=ok[:, None], other=0.0)
             k_hi = tl.load(kb + HALF + hc[None, :], mask=ok[:, None], other=0.0)
@@ -339,7 +341,10 @@ def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, SINK, OUT, 
             t = (b - WB) * BN
             ii = tl.load(IDX + r * n_idx + t + n, mask=(t + n) < n_idx, other=-1)
             ok = ii >= 0
-            k_lo, k_hi = _comp_keys(COMP, CSC, tl.where(ok, ii, 0), ok, hc, HD, BN, PACKED)
+            row = tl.where(ok, ii, 0)
+            if HAS_BASE:                   # ... and its compressed rows at pool row CBASE[r]
+                row = row + tl.load(CBASE + r)
+            k_lo, k_hi = _comp_keys(COMP, CSC, row, ok, hc, HD, BN, PACKED)
         m_i, l_i, acc_lo, acc_hi = _attn_step(q_lo, q_hi, k_lo, k_hi, ok, m_i, l_i, acc_lo, acc_hi, scale)
     if FINAL:                         # one split (prompt chunks): the sink and the division here, no merge pass
         l_i = l_i + tl.exp(tl.load(SINK + h) - m_i)
@@ -383,7 +388,8 @@ ATTN_SPLITS = 8
 
 def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: torch.Tensor, ring: bool,
                 comp, idx: torch.Tensor | None, pos: torch.Tensor, scale: float, window: int,
-                out: torch.Tensor | None = None) -> torch.Tensor:
+                out: torch.Tensor | None = None, wbase: torch.Tensor | None = None,
+                cbase: torch.Tensor | None = None, ring_rows: int | None = None) -> torch.Tensor:
     """q [R, H, HD] bf16 -> o [R, H, HD]; window keys from ``wsrc`` (a ring: slot = position % size; else linear from
     position wlo[0]); compressed keys comp[idx[r, j]] (idx -1 = none). ``comp`` is a bf16 [N, HD] tensor or a packed
     FP4 pair (codes uint8 [N, HD/2], E4M3 scales uint8 [N, HD/16])."""
@@ -410,17 +416,22 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
             n_idx = idx.shape[1]
         picks = triton.next_power_of_2(picks)
     nblk = window // bn + picks
-    ring_size = wsrc.shape[0] if ring else 16          # only ring windows read it (a fixed value: one variant)
+    # only ring windows read it (a fixed value otherwise: one variant); a pool of rings: one stream's ring rows
+    ring_size = (ring_rows or wsrc.shape[0]) if ring else 16
     if final:
         pm = pl = po = out
     else:
         pm = torch.empty((rows * groups * sp * hb,), dtype=torch.float32, device=q.device)
         pl = torch.empty_like(pm)
         po = torch.empty((rows * groups * sp * hb * hd,), dtype=torch.float32, device=q.device)
+    based = wbase is not None
+    if based:
+        assert ring, "per-row bases address rings (concurrent rounds and batched drafts)"
     _sparse_attn_part[(rows, groups, sp)](q, wsrc, wlo, codes, scales if packed else wsrc, idx if has else pos, pos,
-                                          pm, pl, po, sink, out, scale, ring_size, n_idx, H=h, HD=hd, HB=hb,
-                                          WIN=window, BN=bn, RING=ring, HAS_COMP=has, PACKED=packed, SPLITS=sp,
-                                          NBLK=nblk, FINAL=final, num_warps=4, num_stages=1)
+                                          pm, pl, po, sink, out, scale, ring_size, n_idx,
+                                          wbase if based else pos, (cbase if cbase is not None else wbase) if based else pos,
+                                          H=h, HD=hd, HB=hb, WIN=window, BN=bn, RING=ring, HAS_COMP=has, PACKED=packed,
+                                          SPLITS=sp, NBLK=nblk, FINAL=final, HAS_BASE=based, num_warps=4, num_stages=1)
     if not final:
         _sparse_attn_merge[(rows, groups)](pm, pl, po, sink, out, H=h, HD=hd, HB=hb, SPLITS=sp, num_warps=8)
     return out
@@ -428,8 +439,8 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
 
 # -- indexer scores: sum_h relu(q_h . k_t) w_h over t < n, masked past each row's visible count -------------------
 @triton.jit
-def _index_score(Q, K, KS, Wt, VIS, OUT, n, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr,
-                 PACKED: tl.constexpr):
+def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr,
+                 PACKED: tl.constexpr, HAS_BASE: tl.constexpr):
     r = tl.program_id(0)
     b = tl.program_id(1)
     HALF: tl.constexpr = ID // 2
@@ -437,21 +448,25 @@ def _index_score(Q, K, KS, Wt, VIS, OUT, n, IH: tl.constexpr, ID: tl.constexpr, 
     hc = tl.arange(0, HALF)
     t = b * BN + tl.arange(0, BN)
     ok = t < n
+    if HAS_BASE:                       # a concurrent round: the row's stream's keys start at pool row KB[r]
+        kt = tl.load(KB + r) + t
+    else:
+        kt = t
     q_lo = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + hc[None, :])
     q_hi = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + HALF + hc[None, :])
     if PACKED:
         # FP4 rows: byte j = element j and j + ID/2; a power-of-two (E8M0) scale per 32 elements
-        cb = tl.load(K + t[:, None] * HALF + hc[None, :], mask=ok[:, None], other=0).to(tl.int32)
+        cb = tl.load(K + kt[:, None] * HALF + hc[None, :], mask=ok[:, None], other=0).to(tl.int32)
         g = tl.arange(0, HALF // 32)
-        el = tl.load(KS + t[:, None] * (ID // 32) + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
-        eh = tl.load(KS + t[:, None] * (ID // 32) + HALF // 32 + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
+        el = tl.load(KS + kt[:, None] * (ID // 32) + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
+        eh = tl.load(KS + kt[:, None] * (ID // 32) + HALF // 32 + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
         sl = (el << 23).to(tl.float32, bitcast=True)                    # E8M0 byte -> 2^(byte - 127)
         sh = (eh << 23).to(tl.float32, bitcast=True)
         k_lo = tl.reshape(tl.reshape(_e2m1(cb & 15), (BN, HALF // 32, 32)) * sl[:, :, None], (BN, HALF)).to(tl.bfloat16)
         k_hi = tl.reshape(tl.reshape(_e2m1(cb >> 4), (BN, HALF // 32, 32)) * sh[:, :, None], (BN, HALF)).to(tl.bfloat16)
     else:
-        k_lo = tl.load(K + t[:, None] * ID + hc[None, :], mask=ok[:, None], other=0.0)
-        k_hi = tl.load(K + t[:, None] * ID + HALF + hc[None, :], mask=ok[:, None], other=0.0)
+        k_lo = tl.load(K + kt[:, None] * ID + hc[None, :], mask=ok[:, None], other=0.0)
+        k_hi = tl.load(K + kt[:, None] * ID + HALF + hc[None, :], mask=ok[:, None], other=0.0)
     s = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))      # [IH, BN] fp32
     w = tl.load(Wt + r * IH + hh).to(tl.float32)
     sc = tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
@@ -499,7 +514,7 @@ def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, IH: tl.constexpr, ID: tl.
 
 
 def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
-                out: torch.Tensor | None = None) -> torch.Tensor:
+                out: torch.Tensor | None = None, base: torch.Tensor | None = None) -> torch.Tensor:
     """q [R, IH, ID] bf16, k bf16 [>= n, ID] or a packed FP4 pair (codes [N, ID/2], E8M0 [N, ID/32]),
     w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r]). Decode / verify windows (R <= 16) take one row a program
     (row-invariant); prompt chunks share each key tile among 8 rows."""
@@ -511,9 +526,11 @@ def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
     codes, scales = k if packed else (k, k)
     bn = 64
     if rows <= 16:
-        _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, IH=ih, ID=idim, BN=bn,
-                                                 PACKED=packed, num_warps=4)
+        _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, vis if base is None else base,
+                                                 IH=ih, ID=idim, BN=bn, PACKED=packed, HAS_BASE=base is not None,
+                                                 num_warps=4)
     else:
+        assert base is None, "concurrent rounds are decode windows (16 rows at most)"
         rbs = 8
         _index_score_rows[(triton.cdiv(rows, rbs), triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, rows,
                                                                           IH=ih, ID=idim, BN=bn, RB=rbs,
@@ -672,3 +689,16 @@ def engram_gate(h: torch.Tensor, kv: torch.Tensor, qk: torch.Tensor, eps: float)
     out = torch.empty_like(h)
     _engram_gate[(rows, 4)](h, kv, qk, out, eps, D=d, BLOCK=1024, num_warps=4)
     return out
+
+
+def topk_indices(score: torch.Tensor, k: int) -> torch.Tensor:
+    """Each row's k highest scores' indices, ascending; ties go to the lower index. A total order (the score's bits
+    above, the inverted index below, one int64 key), so the set is the same whatever the row's width, the rows beside
+    it or torch's algorithm: a stream's selection in a concurrent round is its solo selection."""
+
+    bits = (score + 0.0).view(torch.int32)                       # + 0.0: -0 becomes +0
+    ordered = torch.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(torch.int64)
+    keys = (ordered << 32) | (0xFFFFFFFF - torch.arange(score.shape[-1], device=score.device, dtype=torch.int64))
+    top = keys.topk(k, dim=-1, sorted=False).values
+    return (0xFFFFFFFF - (top & 0xFFFFFFFF)).sort(dim=-1).values
+

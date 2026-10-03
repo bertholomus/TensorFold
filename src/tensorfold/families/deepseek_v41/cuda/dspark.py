@@ -199,6 +199,119 @@ class DraftGraph:
         return [int(x) for x in v[:n]], v[n:]
 
 
+class DraftPool:
+    """``slots`` drafter caches in one ring plane a stage (slot s: rows [s * ring, (s + 1) * ring)); ``views[s]`` is
+    slot s's DraftCache over its rows (absorb and the single-stream graph use it unchanged)."""
+
+    def __init__(self, drafter: Drafter, slots: int):
+        c = drafter.m.cfg
+        self.ring_size = drafter.ring_size
+        self.rings = [torch.zeros((slots * self.ring_size, c.head_dim), dtype=BF16, device="cuda")
+                      for _ in drafter.dw.blocks]
+        self.views = [DraftCache([r[s * self.ring_size:(s + 1) * self.ring_size] for r in self.rings], self.ring_size)
+                      for s in range(slots)]
+
+
+class BatchDraftGraph:
+    """Drafts for N streams in one pass of the drafter (5 N rows: each stream's [token, noise x 4] at its own
+    positions, attending its own ring through per-row bases and its own five block rows) and one batched Markov loop.
+    Drafts only propose: they may differ in the last bits from a stream's solo drafts, never a reply."""
+
+    def __init__(self, drafter: Drafter, sc, dpool: DraftPool, streams: int):
+        self.d, self.sc, self.dp, self.N = drafter, sc, dpool, streams
+        dev = "cuda"
+        n = drafter.size
+        self.tokens = torch.zeros((streams,), dtype=torch.long, device=dev)
+        self.q0 = torch.zeros((streams,), dtype=torch.long, device=dev)
+        self.slots = torch.zeros((streams,), dtype=torch.long, device=dev)
+        self.bidx = (torch.arange(streams, device=dev)[:, None, None] * n +
+                     torch.arange(n, device=dev)[None, None, :]).expand(streams, n, n).reshape(streams * n, n).contiguous()
+        self.zero = torch.zeros((streams * n,), dtype=torch.long, device=dev)
+        self.graph = None
+
+    def _attention(self, lay, x, ring, pos, wpos, rbase):
+        d, c = self.d, self.d.m.cfg
+        n = x.shape[0]
+        rd, hd = c.rope_dim, c.head_dim
+        cos, sin = d._cs(lay, self.sc)
+        qr = K.rmsnorm(mm(lay.wq_a, x), lay.q_norm, c.eps)
+        q = mm(lay.wq_b, qr).view(n, d.m.Hl, hd)
+        K.rope_heads(q, cos, sin, pos, rd)
+        kvb = K.kv_norm_rope(mm(lay.wkv, x), lay.kv_norm, cos, sin, pos, ring, d.m._neg(n), c.eps, KV_QUANT, rd)
+        o = K.sparse_attn(q, lay.sink, ring, d.m._zero, True, kvb, self.bidx, wpos, hd ** -0.5, c.window,
+                          wbase=rbase, cbase=self.zero, ring_rows=self.dp.ring_size)
+        K.rope_heads(o, cos, sin, pos, rd, inverse=True)
+        og = o.view(n, len(lay.wo_a), -1)
+        u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
+        return mm(lay.wo_b, u, F32)
+
+    def _body(self):
+        d, m, c = self.d, self.d.m, self.d.m.cfg
+        N, n = self.N, d.size
+        R = N * n
+        dev = "cuda"
+        ids = torch.full((N, n), d.noise, dtype=torch.long, device=dev)
+        ids[:, 0] = self.tokens
+        ids = ids.view(R)
+        pos = (self.q0[:, None] + torch.arange(n, device=dev)[None]).reshape(R)
+        wpos = (self.q0 - 1)[:, None].expand(N, n).reshape(R).contiguous()
+        rbase = (self.slots * self.dp.ring_size)[:, None].expand(N, n).reshape(R).contiguous()
+        h = m.w.embed[ids].to(BF16)[:, None, :].expand(-1, c.hc, -1).contiguous()
+        pre = torch.zeros((R, c.hc), dtype=F32, device=dev)
+        pre[:, 0] = 1.0
+        x = torch.empty((R, c.dim), dtype=BF16, device=dev)
+        part = torch.empty((R * K.HC_BLOCKS * 32,), dtype=F32, device=dev)
+        pre_a = torch.empty((R, c.hc), dtype=F32, device=dev)
+        pre_f = torch.empty((R, c.hc), dtype=F32, device=dev)
+        post = torch.empty((R, c.hc), dtype=F32, device=dev)
+        comb = torch.empty((R, c.hc, c.hc), dtype=F32, device=dev)
+        for lay, ring in zip(d.dw.blocks, self.dp.rings):
+            fn, scale, base = lay.hc_attn
+            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
+            K.hc_post(m.comm.gather(self._attention(lay, x, ring, pos, wpos, rbase)), h, post, comb, h)
+            fn, scale, base = lay.hc_ffn
+            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
+            K.hc_post(m.comm.gather(m.moe(lay, x, topk=d.topk)), h, post, comb, h)
+            pre, pre_f = pre_f, pre
+        xc = K.collapse(h, pre)
+        local = mm(m.w.head, K.rmsnorm(xc, d.dw.norm, c.eps), F32)
+        logits = m.comm.gather(local).permute(1, 0, 2).reshape(R, -1).view(N, n, -1)
+        out = torch.empty((N, n + 1), dtype=torch.long, device=dev)
+        out[:, 0] = self.tokens
+        head = d.dw.markov_head                                           # [V, rank] fp16
+        embs = []
+        for i in range(n):
+            e = d.dw.markov_embed[out[:, i]]                              # [N, rank]
+            embs.append(e)
+            out[:, i + 1] = (logits[:, i] + (e.to(torch.float16) @ head.t()).float()).argmax(-1)
+        conf_in = torch.cat([xc.float().view(N, n, -1), torch.stack(embs, 1).float()], -1)
+        conf = (conf_in @ d.dw.conf.float().t())[..., 0]                 # [N, n]
+        self.packed = torch.cat([out[:, 1:].to(F32), conf], 1)           # [N, 2 n]: one host read a round
+
+    def capture(self, pool=None):
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            self._body()
+        torch.cuda.current_stream().wait_stream(s)
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph, pool=pool):
+            self._body()
+        torch.cuda.synchronize()
+
+    def run(self, tokens: list[int], q0: list[int], slots: list[int]) -> list[list[int]]:
+        self.tokens.copy_(torch.tensor(tokens, dtype=torch.long))
+        self.q0.copy_(torch.tensor(q0, dtype=torch.long))
+        self.slots.copy_(torch.tensor(slots, dtype=torch.long))
+        if self.graph is None:
+            self._body()
+        else:
+            self.graph.replay()
+        n = self.d.size
+        return [[int(x) for x in row[:n]] for row in self.packed.tolist()]
+
+
 @dataclass
 class SpecStats:
     rounds: int = 0

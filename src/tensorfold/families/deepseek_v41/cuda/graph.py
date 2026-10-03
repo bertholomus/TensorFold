@@ -106,7 +106,7 @@ class StaticDecoder:
                 elif 0 <= c.cand_source < lay.idx:
                     apply_candidates(score, shared["cand"], c.cand_block)
                 kk = min(c.idx_topk, nb)
-                top = score.topk(kk, dim=-1, sorted=False).indices.sort(dim=-1).values
+                top = K.topk_indices(score, kk)
                 shared["topk"] = torch.where(top < vis[:, None], top, -1).contiguous()
             cidx = shared["topk"]
             comp = sc.comp[src]

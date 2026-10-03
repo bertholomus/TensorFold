@@ -156,6 +156,22 @@ class SeqCache:
     ring_size: int = 0
 
 
+@dataclass
+class PoolCache:
+    """``slots`` sequences' caches, a plane a layer (see ``Model.new_pool``); ``crows[ratio]``: a slot's compressed
+    rows at that compress ratio (its last row the scratch row of graph-captured windows)."""
+
+    slots: int
+    cap: int
+    ring_size: int
+    ring: list = field(default_factory=list)
+    comp: dict = field(default_factory=dict)
+    index_k: dict = field(default_factory=dict)
+    comp_raw: dict = field(default_factory=dict)
+    crows: dict = field(default_factory=dict)
+    views: list = field(default_factory=list)
+
+
 def _engram_io():
     from pathlib import Path
 
@@ -306,6 +322,45 @@ class Model:
                                   torch.zeros((RAW, c.head_dim), dtype=F32, device="cuda"))
         sc.tokens = torch.zeros((cap,), dtype=torch.int64, device="cuda")
         return sc
+
+    def new_pool(self, slots: int, cap: int) -> "PoolCache":
+        """Every slot's caches in one plane a layer: slot s owns rows [s * per, (s + 1) * per) of each plane (``per``
+        what ``new_cache(cap)`` gives one sequence). ``views[s]`` is slot s's SeqCache over those rows, so the
+        single-stream paths (prompt chunks, the solo decode graphs, the drafter) run on it unchanged; a concurrent
+        round addresses every stream's rows at once through per-row bases (rounds.py)."""
+
+        c = self.cfg
+        one = self.new_cache(cap)                      # the planes' shapes, one sequence's
+        pool = PoolCache(slots=slots, cap=cap, ring_size=one.ring_size)
+
+        def plane(t: torch.Tensor) -> torch.Tensor:
+            out = torch.empty((slots * t.shape[0], *t.shape[1:]), dtype=t.dtype, device=t.device)
+            out.view(slots, *t.shape).copy_(t.expand(slots, *t.shape))       # zeros (index scales 127), as fresh
+            return out
+
+        def planes(x):
+            return tuple(plane(t) for t in x) if isinstance(x, tuple) else plane(x)
+
+        pool.ring = [plane(t) for t in one.ring]
+        pool.comp = {i: planes(x) for i, x in one.comp.items()}
+        pool.index_k = {i: planes(x) for i, x in one.index_k.items()}
+        pool.comp_raw = {i: planes(x) for i, x in one.comp_raw.items()}
+        for i, x in one.comp.items():
+            pool.crows[c.compress_ratios[i]] = (x[0] if isinstance(x, tuple) else x).shape[0]
+        del one
+
+        def rows(x, s: int, per: int):
+            return tuple(t[s * per:(s + 1) * per] for t in x) if isinstance(x, tuple) else x[s * per:(s + 1) * per]
+
+        for s in range(slots):
+            v = SeqCache(cap=cap, ring_size=pool.ring_size)
+            v.ring = [t[s * pool.ring_size:(s + 1) * pool.ring_size] for t in pool.ring]
+            v.comp = {i: rows(x, s, pool.crows[c.compress_ratios[i]]) for i, x in pool.comp.items()}
+            v.index_k = {i: rows(x, s, pool.crows[c.compress_ratios[i]]) for i, x in pool.index_k.items()}
+            v.comp_raw = {i: rows(x, s, RAW) for i, x in pool.comp_raw.items()}
+            v.tokens = torch.zeros((cap,), dtype=torch.int64, device="cuda")
+            pool.views.append(v)
+        return pool
 
     def _freqs(self, layer: int, n: int) -> torch.Tensor:
         c = self.cfg
@@ -556,7 +611,7 @@ class Model:
                             cand_parts.append(_candidates(score, vis[r0:r1, None], c.cand_blocks, c.cand_block))
                         elif 0 <= c.cand_source < lay.idx:
                             apply_candidates(score, shared["cand"][r0:r1], c.cand_block)
-                        top = score.topk(kk, dim=-1, sorted=False).indices.sort(dim=-1).values
+                        top = K.topk_indices(score, kk)
                         cidx[r0:r1] = torch.where(top < vis[r0:r1, None], top, -1)
                         del score
                     if lay.idx == c.cand_source:
@@ -797,8 +852,8 @@ def _candidates(score: torch.Tensor, vis: torch.Tensor, nblocks: int, bsize: int
     nb = s.shape[-1]
     last = (vis - 1) // bsize
     s = s.masked_fill(torch.arange(nb, device=score.device)[None] == last, float("inf"))
-    top = s.topk(min(nblocks, nb), dim=-1)
-    return torch.zeros_like(s, dtype=torch.bool).scatter_(-1, top.indices, top.values > float("-inf"))
+    idx = K.topk_indices(s, min(nblocks, nb))
+    return torch.zeros_like(s, dtype=torch.bool).scatter_(-1, idx, s.gather(-1, idx) > float("-inf"))
 
 
 def apply_candidates(score: torch.Tensor, blocks: torch.Tensor, bsize: int) -> torch.Tensor:

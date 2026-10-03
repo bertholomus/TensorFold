@@ -39,7 +39,7 @@ WARM_LENGTHS = tuple(int(v) for v in (os.environ.get("TF_DS_WARM_LENGTHS") or
 class DsEngine:
     def __init__(self, model_dir: Path, *, rank: int, world: int, master: str, port: int, drafts: int = 3,
                  context: int | None = None, engram_dir: str | None = None, vision: bool = False,
-                 vision_urls: bool = False) -> None:
+                 vision_urls: bool = False, parallel: int = 1) -> None:
         from tensorfold.cuda.comm import NCCL
 
         from ..ops import compressed_token_map
@@ -48,7 +48,7 @@ class DsEngine:
         from .weights import load
 
         torch.cuda.set_device(0)
-        self.rank, self.world = rank, world
+        self.rank, self.world, self._master = rank, world, master
         # NCCL only moves prompt chunks' partials ([2048, 5120] fp32): the Simple protocol on 4 channels took 3.8 ms a
         # gather on the CX7 link against 7.1 with NCCL's choice (decode windows go over the RDMA gather)
         os.environ.setdefault("NCCL_PROTO", "Simple")
@@ -108,6 +108,15 @@ class DsEngine:
         self.eos = (int(json.loads((Path(model_dir) / "config.json").read_text()).get("eos_token_id", 1)),)
         self.request = threading.local()
         self.quiet = False
+        # --parallel N: up to N requests decoded together (multi.MultiDecoder), each in a slot of one cache pool
+        self.concurrent = int(parallel) > 1
+        self.multi = self.scheduler = None
+        if self.concurrent:
+            from .multi import MultiDecoder
+
+            self.multi = MultiDecoder(self, slots=int(parallel), cap=self.limit + self.max_rows + 8)
+            self.sc = self.multi.slots[0].sc            # the warm-up's prompts run on slot 0
+            self.dc = self.multi.slots[0].dc
         if nccl is not None:
             nccl.barrier()
             mine = torch.tensor([int(self.vcfg is not None)], dtype=torch.int64, device="cuda")
@@ -117,6 +126,21 @@ class DsEngine:
                 raise ValueError("--vision must be given to every rank (rank 0 and the workers run the same steps)")
         if WARM:
             self.warm()
+        if self.concurrent:
+            if WARM:
+                self.multi.warm()
+            if world > 1:
+                from .multi import Link, Watchdog
+
+                self.multi.watch = Watchdog(self.model.comm.nccl, nccl.store, rank=rank, world=world, host=master)
+                if rank == 0:
+                    self.multi.link = Link(nccl.store, rank=0, world=world, host=master)
+            if rank == 0:
+                from tensorfold.cuda.scheduler import Scheduler
+
+                self.scheduler = Scheduler(self.multi, max_streams=int(parallel))
+                print(f"[tensorfold] --parallel {int(parallel)}: one pool of {int(parallel)} slots of {self.multi.cap} "
+                      f"tokens", flush=True)
         if rank == 0:
             print(f"[tensorfold] DeepSeek-V4.1 engine ready: {world} rank(s), context {self.limit}, "
                   f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}", flush=True)
@@ -126,9 +150,10 @@ class DsEngine:
 
         t0 = time.perf_counter()
         m = self.model
-        self.sc = m.new_cache(self.limit + self.max_rows + 8)
-        if self.drafter is not None:
-            self.dc = self.drafter.new_cache()
+        if not self.concurrent:
+            self.sc = m.new_cache(self.limit + self.max_rows + 8)
+            if self.drafter is not None:
+                self.dc = self.drafter.new_cache()
         ids = [1000 + (i * 7919) % 60000 for i in range(max(WARM_LENGTHS))]
         self.quiet = True
         try:
@@ -142,7 +167,7 @@ class DsEngine:
             self.quiet = False
         t1 = time.perf_counter()
         info = {}
-        if self.runner is not None:
+        if self.runner is not None and not self.concurrent:
             info = self.runner.warm(self.sc, self.limit)
             if self.drafter is not None:
                 self._draft_graph(self.sc, self.dc, 0, 0)
@@ -188,6 +213,21 @@ class DsEngine:
         self.nccl.all_gather(send.view(-1), recv)
         return recv[:n * dim].view(n, dim)
 
+    def _make_draft_graph(self, sc, dc, tok: int, pos: int):
+        """A drafter graph bound to one cache pair (a concurrent slot's), captured in the shared graph pool."""
+
+        from .dspark import DraftGraph
+
+        dg = DraftGraph(self.drafter, sc, dc)
+        dg.token.fill_(tok)
+        dg.q0.fill_(pos)
+        if self.runner is None:
+            return dg
+        if self.runner.pool is None:
+            self.runner.pool = torch.cuda.graph_pool_handle()
+        dg.capture(self.runner.pool)
+        return dg
+
     def _draft_graph(self, sc, dc, tok: int, pos: int):
         dg = getattr(self, "_dg", None)
         if dg is None or dg.sc is not sc or dg.dc is not dc:
@@ -223,6 +263,11 @@ class DsEngine:
         if constraint is not None:
             raise ValueError("structured output is not served by the DeepSeek-V4.1 engine yet")
         stop_eos = bool(getattr(self.request, "stop_eos", True))
+        if self.scheduler is not None:
+            if vision is not None and getattr(vision, "spans", None) and self.tower is None:
+                raise ValueError("image input needs the server started with --vision")
+            return self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft), on_tokens,
+                                         stop_eos=stop_eos, vision=vision)
         positions, rows = [], None
         if vision is not None and getattr(vision, "spans", None):
             if self.tower is None:
@@ -246,6 +291,11 @@ class DsEngine:
     def follow(self) -> None:
         from tensorfold.engine.exact_sampling import Sampling
 
+        if self.multi is not None:
+            from .multi import Link
+
+            self.multi.follow(Link(self.nccl.store, rank=self.rank, world=self.world, host=self._master))
+            return
         while True:
             (max_tokens, stop_eos, draft, seed, t0, t1, top_k, p0, p1, m0, m1, n_img) = self._share(None)
             prompt = self._share(None)
@@ -264,27 +314,27 @@ class DsEngine:
 
         return sample_rows(logits, positions, sampling)
 
-    def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable,
-             draft: bool, image: tuple | None = None) -> dict[str, Any]:
-        """``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16)."""
+    def prefill(self, sc, dc, prompt: list[int], image: tuple | None = None) -> torch.Tensor:
+        """The prompt into ``sc`` (and the drafter's cache ``dc``, when given) in PREFILL_CHUNK chunks: the last row's
+        logits. ``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16)."""
+
+        steps = self.prefill_steps(sc, dc, prompt, image)
+        while True:
+            try:
+                next(steps)
+            except StopIteration as done:
+                return done.value
+
+    def prefill_steps(self, sc, dc, prompt: list[int], image: tuple | None = None):
+        """``prefill`` one chunk a step (a generator: each ``next`` runs one chunk; its return value is the last
+        row's logits), so a concurrent lane can decode between a long prompt's chunks."""
+
         m = self.model
-        eos = self.eos if stop_eos else ()
-        if len(prompt) + max_tokens > self.limit:
-            max_tokens = max(1, self.limit - len(prompt))
-        need = len(prompt) + max_tokens + self.max_rows + 8
-        if getattr(self, "sc", None) is None or self.sc.cap < need:
-            self.sc = m.new_cache(max(need, self.limit + self.max_rows + 8))
-        sc = self.sc
         sc.length = 0
         sc.host.clear()
-        use_drafts = bool(draft) and self.drafter is not None
-        dc = None
+        use_drafts = dc is not None
         if use_drafts:
-            if getattr(self, "dc", None) is None:
-                self.dc = self.drafter.new_cache()
-            dc = self.dc
             dc.absorbed = 0
-        t0 = time.perf_counter()
         last = None
         replay = max(0, len(prompt) - self.w.cfg.window) if getattr(self, "replay_mode", REPLAY) else None
         host = prompt
@@ -316,6 +366,29 @@ class DsEngine:
                 last = out
             if use_drafts and taps:
                 self.drafter.absorb(dc, sc, torch.cat(taps, -1), m.taps_start)
+            if e < len(prompt):
+                yield e
+        return last
+
+    def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable,
+             draft: bool, image: tuple | None = None) -> dict[str, Any]:
+        """``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16)."""
+        m = self.model
+        eos = self.eos if stop_eos else ()
+        if len(prompt) + max_tokens > self.limit:
+            max_tokens = max(1, self.limit - len(prompt))
+        need = len(prompt) + max_tokens + self.max_rows + 8
+        if getattr(self, "sc", None) is None or self.sc.cap < need:
+            self.sc = m.new_cache(max(need, self.limit + self.max_rows + 8))
+        sc = self.sc
+        use_drafts = bool(draft) and self.drafter is not None
+        dc = None
+        if use_drafts:
+            if getattr(self, "dc", None) is None:
+                self.dc = self.drafter.new_cache()
+            dc = self.dc
+        t0 = time.perf_counter()
+        last = self.prefill(sc, dc, prompt, image)
         self.last_prefill_logits = last
         torch.cuda.empty_cache()          # a long prompt's chunk buffers back to the node (unified memory)
         first = self._sample(last, [len(prompt)], sampling)[0]

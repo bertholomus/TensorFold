@@ -51,7 +51,8 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 2, rank: 
     drafts = 0 if no_drafts else (3 if mtp_drafts is None else int(mtp_drafts))
     return DsEngine(Path(model_dir), rank=int(rank), world=int(tp), master=master, port=int(master_port),
                     drafts=drafts, context=options.get("context"), engram_dir=os.environ.get("TF_DS_ENGRAM") or None,
-                    vision=bool(options.get("vision")), vision_urls=bool(options.get("vision_urls")))
+                    vision=bool(options.get("vision")), vision_urls=bool(options.get("vision_urls")),
+                    parallel=int(options.get("parallel") or 1))
 
 
 def __getattr__(name: str) -> Any:
