@@ -447,26 +447,28 @@ def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, IH: tl.constexpr, ID: tl.constex
     hh = tl.arange(0, IH)
     hc = tl.arange(0, HALF)
     t = b * BN + tl.arange(0, BN)
-    ok = t < n
+    ok = t < n                         # the scores written (every t < n: -inf past the row's visible keys)
     if HAS_BASE:                       # a concurrent round: the row's stream's keys start at pool row KB[r]
         kt = tl.load(KB + r) + t
+        ld = ok & (t < tl.load(VIS + r))   # keys read: none past its own visible ones (its extent may end the pool)
     else:
         kt = t
+        ld = ok
     q_lo = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + hc[None, :])
     q_hi = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + HALF + hc[None, :])
     if PACKED:
         # FP4 rows: byte j = element j and j + ID/2; a power-of-two (E8M0) scale per 32 elements
-        cb = tl.load(K + kt[:, None] * HALF + hc[None, :], mask=ok[:, None], other=0).to(tl.int32)
+        cb = tl.load(K + kt[:, None] * HALF + hc[None, :], mask=ld[:, None], other=0).to(tl.int32)
         g = tl.arange(0, HALF // 32)
-        el = tl.load(KS + kt[:, None] * (ID // 32) + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
-        eh = tl.load(KS + kt[:, None] * (ID // 32) + HALF // 32 + g[None, :], mask=ok[:, None], other=127).to(tl.int32)
+        el = tl.load(KS + kt[:, None] * (ID // 32) + g[None, :], mask=ld[:, None], other=127).to(tl.int32)
+        eh = tl.load(KS + kt[:, None] * (ID // 32) + HALF // 32 + g[None, :], mask=ld[:, None], other=127).to(tl.int32)
         sl = (el << 23).to(tl.float32, bitcast=True)                    # E8M0 byte -> 2^(byte - 127)
         sh = (eh << 23).to(tl.float32, bitcast=True)
         k_lo = tl.reshape(tl.reshape(_e2m1(cb & 15), (BN, HALF // 32, 32)) * sl[:, :, None], (BN, HALF)).to(tl.bfloat16)
         k_hi = tl.reshape(tl.reshape(_e2m1(cb >> 4), (BN, HALF // 32, 32)) * sh[:, :, None], (BN, HALF)).to(tl.bfloat16)
     else:
-        k_lo = tl.load(K + kt[:, None] * ID + hc[None, :], mask=ok[:, None], other=0.0)
-        k_hi = tl.load(K + kt[:, None] * ID + HALF + hc[None, :], mask=ok[:, None], other=0.0)
+        k_lo = tl.load(K + kt[:, None] * ID + hc[None, :], mask=ld[:, None], other=0.0)
+        k_hi = tl.load(K + kt[:, None] * ID + HALF + hc[None, :], mask=ld[:, None], other=0.0)
     s = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))      # [IH, BN] fp32
     w = tl.load(Wt + r * IH + hh).to(tl.float32)
     sc = tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)

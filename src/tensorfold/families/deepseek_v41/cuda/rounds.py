@@ -15,7 +15,7 @@ import torch
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
 from .graph import BUCKET_MIN, bucket_for
-from .model import KV_QUANT, RAW, Model, PoolCache, _candidates, apply_candidates, mm, store_rows
+from .model import KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, mm, store_rows
 
 MAX_ROWS = 16
 
@@ -33,6 +33,9 @@ class RoundDecoder:
         self.ids = torch.zeros((rows,), dtype=torch.long, device=dev)
         self.pos = torch.zeros((rows,), dtype=torch.long, device=dev)
         self.slot = torch.zeros((rows,), dtype=torch.long, device=dev)
+        self.base = torch.zeros((rows,), dtype=torch.long, device=dev)     # the row's stream's extent, positions
+        self.end = torch.ones((rows,), dtype=torch.long, device=dev)
+        self.table = SeqCache(cap=pool.cap)                                # RoPE tables for any pool position
         self.e_in = {}
         if model.engram is not None:
             lo, hi = model.engram.cols
@@ -58,10 +61,9 @@ class RoundDecoder:
         K.kv_norm_rope(mm(lay.wkv, x), lay.kv_norm, cos, sin, pos, ring, wbase + pos % RS, c.eps, KV_QUANT, rd)
         comp, cidx, cbase = None, None, None
         if ratio:
-            crows = pool.crows[ratio]
-            cbase = slot * crows
+            cbase = self.base // ratio
             if lay.comp_wkv is not None:
-                scratch = crows - 1
+                scratch = self.end // ratio - 1 - cbase        # the last row of the stream's extent
                 if ratio == 1:
                     lat = K.rmsnorm(mm(lay.comp_wkv, x), lay.comp_norm, c.eps)
                     groups = pos
@@ -119,7 +121,7 @@ class RoundDecoder:
         m, c, w = self.m, self.m.cfg, self.m.w
         n = self.R
         dev = "cuda"
-        view = self.pool.views[0]                      # RoPE tables: every slot has the same capacity
+        view = self.table
         h = w.embed[self.ids].to(BF16)[:, None, :].expand(-1, c.hc, -1).contiguous()
         pre = torch.zeros((n, c.hc), dtype=F32, device=dev)
         pre[:, 0] = 1.0
@@ -163,10 +165,16 @@ class RoundDecoder:
             self._body()
         torch.cuda.synchronize()
 
-    def run(self, ids: list[int], pos: list[int], slots: list[int], e_rows: dict | None) -> torch.Tensor:
+    def set(self, ids: list[int], pos: list[int], slots: list[int], base: list[int], end: list[int]) -> None:
         self.ids.copy_(torch.tensor(ids, dtype=torch.long), non_blocking=False)
         self.pos.copy_(torch.tensor(pos, dtype=torch.long), non_blocking=False)
         self.slot.copy_(torch.tensor(slots, dtype=torch.long), non_blocking=False)
+        self.base.copy_(torch.tensor(base, dtype=torch.long), non_blocking=False)
+        self.end.copy_(torch.tensor(end, dtype=torch.long), non_blocking=False)
+
+    def run(self, ids: list[int], pos: list[int], slots: list[int], base: list[int], end: list[int],
+            e_rows: dict | None) -> torch.Tensor:
+        self.set(ids, pos, slots, base, end)
         if e_rows:
             for i, t in e_rows.items():
                 self.e_in[i].copy_(t)
@@ -189,19 +197,22 @@ class RoundRunner:
     def bucket(self, deepest: int) -> int:
         return bucket_for(deepest, self.pool.cap)
 
-    def forward(self, windows: list[tuple[int, int, list[int], list[int]]]) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """``windows``: each stream's (slot, first position, token ids, host ids so far): rows in that order. Returns
-        logits [R, V] and taps [R, 3 d] (the rows in window order)."""
+    def forward(self, windows: list[tuple]) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``windows``: each stream's (slot, extent base, extent size, first position, token ids, host ids so far):
+        rows in that order. Returns logits [R, V] and taps [R, 3 d] (the rows in window order)."""
 
         m = self.m
-        ids, pos, slots = [], [], []
+        ids, pos, slots, base, end = [], [], [], [], []
         hashes = []
-        for slot, p0, toks, host in windows:
+        for slot, b0, size, p0, toks, host in windows:
+            n = len(toks)
             ids += toks
-            pos += range(p0, p0 + len(toks))
-            slots += [slot] * len(toks)
+            pos += range(p0, p0 + n)
+            slots += [slot] * n
+            base += [b0] * n
+            end += [b0 + size] * n
             if m.engram is not None:
-                hashes.append(m.engram.hashes(host, p0, len(toks)))
+                hashes.append(m.engram.hashes(host, p0, n))
         R = len(ids)
         b = self.bucket(max(p + 1 for p in pos))
         e_rows = None
@@ -216,9 +227,7 @@ class RoundRunner:
         g = self.graphs.get(key) if self.graphs is not None else None
         if g is None:
             g = RoundDecoder(m, self.pool, R, b, True)
-            g.ids.copy_(torch.tensor(ids, dtype=torch.long))
-            g.pos.copy_(torch.tensor(pos, dtype=torch.long))
-            g.slot.copy_(torch.tensor(slots, dtype=torch.long))
+            g.set(ids, pos, slots, base, end)
             for i, t in (e_rows or {}).items():
                 g.e_in[i].copy_(t)
             if self.graphs is not None:
@@ -227,5 +236,5 @@ class RoundRunner:
                 g.capture(self.graph_pool)
                 self.graphs[key] = g
                 self.captures += 1
-        out = g.run(ids, pos, slots, e_rows)
+        out = g.run(ids, pos, slots, base, end, e_rows)
         return out, g.taps

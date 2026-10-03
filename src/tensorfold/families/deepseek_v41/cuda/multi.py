@@ -44,6 +44,40 @@ ROUND_STATS = os.environ.get("TF_DS_ROUND_STATS", "0") == "1"
 STEP_TIMEOUT = float(os.environ.get("TF_DS_STEP_TIMEOUT") or 900.0)
 
 
+ALIGN = 2048                     # extents start and end on multiples of this many positions
+
+
+class Extents:
+    """First-fit extents of a pool of ``total`` positions in ALIGN steps; a freed extent merges with its neighbours."""
+
+    def __init__(self, total: int, align: int = ALIGN) -> None:
+        self.align = int(align)
+        self.total = int(total) // self.align * self.align
+        self.gaps: list[tuple[int, int]] = [(0, self.total)] if self.total else []
+
+    def size(self, rows: int) -> int:
+        return -(-int(rows) // self.align) * self.align
+
+    def take(self, rows: int) -> int | None:
+        """The first gap that holds ``rows`` (aligned up): its start, else None."""
+
+        n = self.size(rows)
+        for i, (a, b) in enumerate(self.gaps):
+            if b - a >= n:
+                self.gaps[i:i + 1] = [(a + n, b)] if b - a > n else []
+                return a
+        return None
+
+    def give(self, start: int, rows: int) -> None:
+        merged: list[tuple[int, int]] = []
+        for a, b in sorted(self.gaps + [(start, start + self.size(rows))]):
+            if merged and merged[-1][1] == a:
+                merged[-1] = (merged[-1][0], b)
+            else:
+                merged.append((a, b))
+        self.gaps = merged
+
+
 class OutOfStep(RuntimeError):
     """The ranks planned a different step: it fails on every rank before its collectives."""
 
@@ -217,11 +251,11 @@ def _unpack(values):
 
 
 class Slot:
-    """A stream's cache slot: its index, its SeqCache (pool views) and its drafter cache (and graph)."""
+    """A stream's slot: its index (its window ring, compressor inputs and drafter rings) and, while a stream holds it,
+    that stream's SeqCache over its extent of the pool."""
 
-    def __init__(self, index: int, sc, dc) -> None:
-        self.index, self.sc, self.dc = index, sc, dc
-        self.dg = None
+    def __init__(self, index: int, dc) -> None:
+        self.index, self.sc, self.dc = index, None, dc
 
 
 class MultiDecoder:
@@ -240,8 +274,8 @@ class MultiDecoder:
             from .dspark import DraftPool
 
             self.dpool = DraftPool(d, slots)             # every slot's drafter rings in one plane a stage
-        self.slots = [Slot(i, self.pool.views[i], self.dpool.views[i] if d is not None else None)
-                      for i in range(slots)]
+        self.slots = [Slot(i, self.dpool.views[i] if d is not None else None) for i in range(slots)]
+        self.extents = Extents(self.cap)              # every stream takes an extent of the one window
         self.drafters: dict[int, object] = {}            # batched drafter graphs by drafting streams
         self.free = list(range(slots))
         self.max_rows = MAX_ROWS
@@ -274,7 +308,7 @@ class MultiDecoder:
             for R in range(self.max_rows, 0, -1):
                 if (R, self.runner.bucket(b)) in (self.runner.graphs or {}):
                     continue
-                self.runner.forward([(0, b - R, host[b - R:b], host)])
+                self.runner.forward([(0, 0, self.extents.total, b - R, host[b - R:b], host)])
                 n += 1
         if self.e.drafter is not None:
             for k in range(1, len(self.slots) + 1):
@@ -292,7 +326,7 @@ class MultiDecoder:
         N = len(tokens)
         g = self.drafters.get(N)
         if g is None:
-            g = BatchDraftGraph(self.e.drafter, self.pool.views[0], self.dpool, N)
+            g = BatchDraftGraph(self.e.drafter, self.m.pool_view(self.pool, 0, 0, self.extents.total), self.dpool, N)
             g.tokens.copy_(torch.tensor(tokens, dtype=torch.long))
             g.q0.copy_(torch.tensor(q0, dtype=torch.long))
             g.slots.copy_(torch.tensor(slots, dtype=torch.long))
@@ -336,7 +370,7 @@ class MultiDecoder:
             raise OutOfStep(f"the ranks planned different {what}s; its requests fail, serving goes on")
 
     def _shape(self) -> list:
-        return [self.next_id, list(self.free),
+        return [self.next_id, list(self.free), list(self.extents.gaps),
                 [[s.sid, s.st.index, s.st.sc.length, len(s.out), bool(s.done)] for s in self.streams.values()],
                 [[s.sid, s.st.index, s.filled] for s in self.filling]]
 
@@ -349,28 +383,43 @@ class MultiDecoder:
 
         if s.constraint is not None or s.probabilities is not None:
             raise ValueError("structured output and logprobs are not served with --parallel on DeepSeek-V4.1")
-        room = self.cap - len(s.prompt) - self.max_rows - 8
+        room = self.extents.total - len(s.prompt) - self.max_rows - 8 - 4
         if room < 1:
-            raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.cap}-token context")
+            raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.extents.total}-token "
+                             "context")
         s.count = max(1, min(s.count, room))
         if not self.free:
             raise NoRoom("every stream slot is busy")
+        if not any(b - a >= self.extents.size(self._need(s)) for a, b in self.extents.gaps):
+            raise NoRoom("the window's free extents are too small for this request now")
         positions = s.vision.positions() if s.vision is not None and getattr(s.vision, "spans", None) else []
         index = self.free[0]
         self._send(["admit", list(s.prompt), s.count, _pack(s.sampling), bool(s.draft), bool(s.stop_eos), index,
                     positions])
         self._admit(s, index, positions)
 
+    def _need(self, s: Stream) -> int:
+        """A stream's positions: its prompt, its reply, a round's rows and its extent's scratch row (a group long)."""
+
+        return len(s.prompt) + s.count + self.max_rows + 8 + 4
+
     def _admit(self, s: Stream, index: int, positions: list[int]) -> None:
-        """Its slot, its image rows (shared from rank 0) and its prompt's chunk steps; ``_fill`` runs them."""
+        """Its slot, its extent, its image rows (shared from rank 0) and its prompt's chunk steps; ``_fill`` runs
+        them."""
 
         e = self.e
         self._step(True)
         try:
             self._agree("admission", [self._shape(), list(s.prompt), s.count, _pack(s.sampling), bool(s.draft),
                                       bool(s.stop_eos), index, positions])
+            need = self._need(s)
+            base = self.extents.take(need)
+            if base is None:                             # (every rank at the same point: the same extents)
+                raise NoRoom("the window's free extents are too small for this request now")
             slot = self.slots[index]
             self.free.remove(index)
+            s.base, s.size = base, self.extents.size(need)
+            slot.sc = self.m.pool_view(self.pool, index, base, s.size)
             s.sid, s.st = self.next_id, slot
             self.next_id += 1
             image = None
@@ -480,13 +529,13 @@ class MultiDecoder:
                 window = [s.pending] + drafts
                 del sc.host[P:]
                 sc.host.extend(int(t) for t in window)
-                windows.append((s.st.index, P, window, sc.host))
+                windows.append((s.st.index, s.base, s.size, P, window, sc.host))
                 kept.append((s, P, drafts))
             logits, taps = self.runner.forward(windows)
             mark()
             done, r0, tokens = [], 0, 0
             t_absorb = 0.0
-            for (s, P, drafts), (_, _, window, _) in zip(kept, windows):
+            for (s, P, drafts), (_, _, _, _, window, _) in zip(kept, windows):
                 n = len(window)
                 target = e._sample(logits[r0:r0 + n], [P + 1 + i for i in range(n)], s.sampling)
                 a = 0
@@ -546,12 +595,17 @@ class MultiDecoder:
         self._send(["finish", sids])
         self._finish(sids)
 
+    def _release(self, s: Stream) -> None:
+        self.free.append(s.st.index)
+        self.free.sort()
+        self.extents.give(s.base, s.size)
+        s.st.sc = None
+
     def _finish(self, sids: list[int]) -> None:
         for sid in sids:
             s = self.streams.pop(sid, None)
             if s is not None:
-                self.free.append(s.st.index)
-                self.free.sort()
+                self._release(s)
 
     def drop(self) -> list[Stream]:
         """Every live stream fails (a step raised); their slots are free again."""
@@ -566,8 +620,7 @@ class MultiDecoder:
 
     def _drop(self) -> None:
         for s in list(self.streams.values()) + self.filling:
-            self.free.append(s.st.index)
-        self.free.sort()
+            self._release(s)
         self.streams.clear()
         self.filling.clear()
 

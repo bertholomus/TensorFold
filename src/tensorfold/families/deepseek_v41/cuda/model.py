@@ -158,18 +158,16 @@ class SeqCache:
 
 @dataclass
 class PoolCache:
-    """``slots`` sequences' caches, a plane a layer (see ``Model.new_pool``); ``crows[ratio]``: a slot's compressed
-    rows at that compress ratio (its last row the scratch row of graph-captured windows)."""
+    """A window of ``cap`` positions shared by up to ``slots`` streams (see ``Model.new_pool``)."""
 
     slots: int
     cap: int
     ring_size: int
-    ring: list = field(default_factory=list)
-    comp: dict = field(default_factory=dict)
+    ring: list = field(default_factory=list)          # per layer [slots * ring_size, head_dim]
+    comp: dict = field(default_factory=dict)          # one sequence's planes, by position
     index_k: dict = field(default_factory=dict)
-    comp_raw: dict = field(default_factory=dict)
-    crows: dict = field(default_factory=dict)
-    views: list = field(default_factory=list)
+    comp_raw: dict = field(default_factory=dict)      # per kv source [slots * RAW, head_dim] pairs
+    tokens: torch.Tensor | None = None
 
 
 def _engram_io():
@@ -324,43 +322,44 @@ class Model:
         return sc
 
     def new_pool(self, slots: int, cap: int) -> "PoolCache":
-        """Every slot's caches in one plane a layer: slot s owns rows [s * per, (s + 1) * per) of each plane (``per``
-        what ``new_cache(cap)`` gives one sequence). ``views[s]`` is slot s's SeqCache over those rows, so the
-        single-stream paths (prompt chunks, the solo decode graphs, the drafter) run on it unchanged; a concurrent
-        round addresses every stream's rows at once through per-row bases (rounds.py)."""
+        """One window of ``cap`` positions that up to ``slots`` streams share by extents: the compressed and indexer
+        planes are one sequence's (``new_cache(cap)``), a stream owning the rows of its extent [base, base + size) of
+        positions (its last row its scratch row); each slot has its own window ring and compressor inputs.
+        ``view(slot, base, size)`` is that stream's SeqCache over its rows, so the single-stream paths (prompt chunks,
+        the drafter) run on it unchanged; a concurrent round addresses every stream's rows through per-row bases
+        (rounds.py)."""
 
-        c = self.cfg
-        one = self.new_cache(cap)                      # the planes' shapes, one sequence's
+        one = self.new_cache(cap)
         pool = PoolCache(slots=slots, cap=cap, ring_size=one.ring_size)
 
         def plane(t: torch.Tensor) -> torch.Tensor:
             out = torch.empty((slots * t.shape[0], *t.shape[1:]), dtype=t.dtype, device=t.device)
-            out.view(slots, *t.shape).copy_(t.expand(slots, *t.shape))       # zeros (index scales 127), as fresh
+            out.view(slots, *t.shape).copy_(t.expand(slots, *t.shape))
             return out
 
-        def planes(x):
-            return tuple(plane(t) for t in x) if isinstance(x, tuple) else plane(x)
-
         pool.ring = [plane(t) for t in one.ring]
-        pool.comp = {i: planes(x) for i, x in one.comp.items()}
-        pool.index_k = {i: planes(x) for i, x in one.index_k.items()}
-        pool.comp_raw = {i: planes(x) for i, x in one.comp_raw.items()}
-        for i, x in one.comp.items():
-            pool.crows[c.compress_ratios[i]] = (x[0] if isinstance(x, tuple) else x).shape[0]
-        del one
-
-        def rows(x, s: int, per: int):
-            return tuple(t[s * per:(s + 1) * per] for t in x) if isinstance(x, tuple) else x[s * per:(s + 1) * per]
-
-        for s in range(slots):
-            v = SeqCache(cap=cap, ring_size=pool.ring_size)
-            v.ring = [t[s * pool.ring_size:(s + 1) * pool.ring_size] for t in pool.ring]
-            v.comp = {i: rows(x, s, pool.crows[c.compress_ratios[i]]) for i, x in pool.comp.items()}
-            v.index_k = {i: rows(x, s, pool.crows[c.compress_ratios[i]]) for i, x in pool.index_k.items()}
-            v.comp_raw = {i: rows(x, s, RAW) for i, x in pool.comp_raw.items()}
-            v.tokens = torch.zeros((cap,), dtype=torch.int64, device="cuda")
-            pool.views.append(v)
+        pool.comp_raw = {i: tuple(plane(t) for t in x) for i, x in one.comp_raw.items()}
+        pool.comp, pool.index_k, pool.tokens = one.comp, one.index_k, one.tokens
         return pool
+
+    def pool_view(self, pool: "PoolCache", slot: int, base: int, size: int) -> SeqCache:
+        """Slot ``slot``'s stream over positions [base, base + size) of the pool (both multiples of every compress
+        ratio): its compressed rows [base / r, (base + size) / r), the last one its scratch row."""
+
+        c = self.cfg
+
+        def rows(x, lo: int, hi: int):
+            return tuple(t[lo:hi] for t in x) if isinstance(x, tuple) else x[lo:hi]
+
+        v = SeqCache(cap=size, ring_size=pool.ring_size)
+        v.ring = [t[slot * pool.ring_size:(slot + 1) * pool.ring_size] for t in pool.ring]
+        v.comp = {i: rows(x, base // c.compress_ratios[i], (base + size) // c.compress_ratios[i])
+                  for i, x in pool.comp.items()}
+        v.index_k = {i: rows(x, base // c.compress_ratios[i], (base + size) // c.compress_ratios[i])
+                     for i, x in pool.index_k.items()}
+        v.comp_raw = {i: rows(x, slot * RAW, (slot + 1) * RAW) for i, x in pool.comp_raw.items()}
+        v.tokens = pool.tokens[base:base + size]
+        return v
 
     def _freqs(self, layer: int, n: int) -> torch.Tensor:
         c = self.cfg
@@ -380,8 +379,10 @@ class Model:
         return t
 
     def _f(self, layer: int, sc: SeqCache) -> torch.Tensor:
-        # one table per (rope kind, capacity), rounded up so it is built once
-        cap = 1 << max(12, (sc.cap - 1).bit_length())
+        # one table per rope kind, for the engine's whole window (``rope_cap``) whatever the cache: a table built at
+        # another length can differ in a row's last bits (the CPU's vectorized sin/cos), and a stream's prompt and its
+        # rounds must read the same rows
+        cap = 1 << max(12, (max(sc.cap, getattr(self, "rope_cap", 0)) - 1).bit_length())
         return self._freqs(layer, cap)
 
     # -- mHC -------------------------------------------------------------------------------------------------------

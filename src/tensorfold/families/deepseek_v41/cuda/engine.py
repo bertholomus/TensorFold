@@ -105,6 +105,7 @@ class DsEngine:
         self.drafts = drafts
         self.limit = int(context or 65536)
         self.max_rows = drafts + 1
+        self.model.rope_cap = self.limit + self.max_rows + 8      # every cache reads the same RoPE table
         self.eos = (int(json.loads((Path(model_dir) / "config.json").read_text()).get("eos_token_id", 1)),)
         self.request = threading.local()
         self.quiet = False
@@ -115,15 +116,18 @@ class DsEngine:
             from .multi import MultiDecoder
 
             self.multi = MultiDecoder(self, slots=int(parallel), cap=self.limit + self.max_rows + 8)
-            self.sc = self.multi.slots[0].sc            # the warm-up's prompts run on slot 0
-            self.dc = self.multi.slots[0].dc
+            mu = self.multi                              # the warm-up's prompts run on slot 0 over the whole window
+            self.sc = self.model.pool_view(mu.pool, 0, 0, mu.extents.total)
+            self.dc = mu.slots[0].dc
         if nccl is not None:
             nccl.barrier()
-            mine = torch.tensor([int(self.vcfg is not None)], dtype=torch.int64, device="cuda")
-            every = torch.empty((world,), dtype=torch.int64, device="cuda")
+            mine = torch.tensor([int(self.vcfg is not None), int(parallel)], dtype=torch.int64, device="cuda")
+            every = torch.empty((world * 2,), dtype=torch.int64, device="cuda")
             nccl.all_gather(mine, every)
-            if len(set(every.tolist())) > 1:
-                raise ValueError("--vision must be given to every rank (rank 0 and the workers run the same steps)")
+            flags = every.view(world, 2).tolist()
+            if any(f != flags[0] for f in flags):
+                raise ValueError("--vision and --parallel must be the same on every rank (rank 0 and the workers run "
+                                 f"the same steps): {flags}")
         if WARM:
             self.warm()
         if self.concurrent:
@@ -139,8 +143,8 @@ class DsEngine:
                 from tensorfold.cuda.scheduler import Scheduler
 
                 self.scheduler = Scheduler(self.multi, max_streams=int(parallel))
-                print(f"[tensorfold] --parallel {int(parallel)}: one pool of {int(parallel)} slots of {self.multi.cap} "
-                      f"tokens", flush=True)
+                print(f"[tensorfold] --parallel {int(parallel)}: {int(parallel)} streams share one window of "
+                      f"{self.multi.extents.total} tokens (an extent each)", flush=True)
         if rank == 0:
             print(f"[tensorfold] DeepSeek-V4.1 engine ready: {world} rank(s), context {self.limit}, "
                   f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}", flush=True)
