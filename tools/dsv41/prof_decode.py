@@ -1,4 +1,9 @@
-"""Decode-step profile of the engine on TP ranks: wall time a token and the top CUDA / CPU ops (rank 0 prints)."""
+"""Decode-step profile of the engine on TP ranks: wall time a token and the top CUDA / CPU ops (rank 0 prints).
+
+  python3 prof_decode.py --rank R --master <HEAD_IP> --model M [--engram E] [--dspark] [--out F]
+
+--master is rank 0's address on the link between the machines (default 127.0.0.1, which only suits --world 1).
+"""
 
 import argparse
 import os

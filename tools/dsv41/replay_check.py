@@ -2,6 +2,11 @@
 
 For each length: the first next-token distribution after the prompt (top-1, logprob gap) and a 64-token greedy
 continuation in both modes (common prefix length).
+
+  python3 replay_check.py --rank R --master <HEAD_IP> --model M [--engram E] --text T [--lengths 2048,8192,32768] \
+      [--out F]
+
+--master is rank 0's address on the link between the machines (default 127.0.0.1, which only suits --world 1).
 """
 
 import argparse

@@ -1,6 +1,9 @@
 """Drafted == serial on the engine (TP ranks, same command on each): greedy serial vs DSpark replies, speeds.
 
-  python3 spec_check.py --rank R --model M --oracle O --tokens 128 --drafts 3 [--limit N] [--out F]
+  python3 spec_check.py --rank R --master <HEAD_IP> --model M [--engram E] --oracle O --tokens 128 --drafts 3 \
+      [--limit N] [--out F]
+
+--master is rank 0's address on the link between the machines (default 127.0.0.1, which only suits --world 1).
 """
 
 import argparse

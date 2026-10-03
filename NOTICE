@@ -6,3 +6,33 @@ TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.
 Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
 MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
+
+----------------------------------------------------------------------------------------------------------------------
+Changes in this fork (Apache License 2.0, section 4(b))
+
+This is a fork of TensorFold 0.6.3 (upstream commit 9356df5) by the DeepSeek-V4.1 TensorFold recipe authors,
+Copyright 2026. It adds the deepseek_v41 model family for DeepSeek-V4.1-Flash, tensor-parallel over two NVIDIA GB10
+nodes. TensorFold's text above, LICENSE, LICENSES/ and the upstream sections of THIRD_PARTY_NOTICES.md are unchanged.
+
+Added:
+  src/tensorfold/families/deepseek_v41/   the model family (engine, kernels, server integration)
+  src/tensorfold/cuda/rdma.py, src/tensorfold/cuda/rdma_gather.cu   RDMA-write all-gather for TP decode
+  tools/dsv41/                             tests, checks, benchmark clients, the reference model, DESIGN.md,
+                                           REPORT.md and ATTRIBUTION.md
+  A "DeepSeek-V4.1-Flash on CUDA (TP2)" section in THIRD_PARTY_NOTICES.md, and a fork note at the top of README.md.
+
+Modified upstream files:
+  pyproject.toml                               package data for the deepseek_v41 CUDA sources
+  src/tensorfold/cuda/exl3/experts_grouped.cuh grouped EXL3 expert kernels extended (multi-row prompt-chunk kernels)
+  src/tensorfold/cuda/exl3/experts.cu          as above
+  src/tensorfold/cuda/exl3/experts.cpp         bindings for the added kernels
+  src/tensorfold/cuda/exl3/experts.py          Python entry points for the added kernels
+  src/tensorfold/cuda/exl3/experts_cb0.cu      template instantiations of the added kernels
+  src/tensorfold/cuda/exl3/experts_cb1.cu      as above
+  src/tensorfold/cuda/exl3/experts_cb2.cu      as above
+  src/tensorfold/cuda/exl3/prefill.py          optional tile choice by shape (TF_EXL3_PREFILL_TILES)
+  src/tensorfold/cuda/http.py                  optional API key (TF_API_KEY / TF_API_KEY_FILE), all routes but /health
+  src/tensorfold/cuda/reply_text.py            DSML tool-call parsing for DeepSeek-V4.1
+  .gitignore                                   ignores macOS ._* files
+
+The "git log" of this branch and tools/dsv41/ATTRIBUTION.md describe the changes and their sources.

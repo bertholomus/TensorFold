@@ -76,6 +76,27 @@ checked bit for bit against ExLlamaV3's dequantization.
 
 Flash Next's optional int8 and int4 KV caches (`families/qwen4_exp/cuda/kvcache.py`) follow the cache quantization scheme of [ExLlamaV3](https://github.com/turboderp-org/exllamav3) `-cq 8` and `-cq 4` (MIT License, Copyright (c) 2025 Turboderp, text below): groups of 32, one fp16 absmax scale per group, the group rotated by a 32-point Hadamard, midpoint-grid codes, `compand_a == 0`. 8-bit stores each code as a signed int8 (`q - 128`). 4-bit stores two unsigned codes per byte, low nibble first (the same bits as ExLlamaV3's little-endian packing, a uint8 tensor rather than their uint32 words). Their dequantizer folds another `1/sqrt(32)` into the scale and applies the unnormalized butterfly on the way out; this cache applies the normalized H32 to the query and to the merged output instead, and leaves the stored codes rotated. Scales match their quantizer bit for bit. Reconstructed values agree within fp16/bf16 rounding (under 0.01 on random groups), not bit for bit. The quantizer and the attention dequant are written for TensorFold and checked against an independent reference of that arithmetic.
 
+## DeepSeek-V4.1-Flash on CUDA (TP2)
+
+This section was added by the fork that adds the `deepseek_v41` family; see `NOTICE`. The family
+(`src/tensorfold/families/deepseek_v41/`), its reference model (`tools/dsv41/ref/`) and the RDMA gather
+(`src/tensorfold/cuda/rdma.py`, `rdma_gather.cu`) are written for TensorFold. What they follow:
+
+- The model math (compressed-KV attention and the lightning indexer, the compressor, mHC with Sinkhorn, Engram
+  hashing, the MoE gate, the DSpark forward, the FP8/FP4 quantization rules) is re-implemented from DeepSeek's
+  inference code for DeepSeek-V4.1-Flash (`inference/model.py`, `engram.py`, `kernel.py` in
+  [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash)) and its tech report,
+  MIT License, Copyright (c) 2023 DeepSeek, without including that source.
+- The DSML tool-call parsing in `src/tensorfold/cuda/reply_text.py` follows the format that DeepSeek's encoding and
+  chat template for the model write (MIT License, Copyright (c) 2023 DeepSeek), without including that source.
+- Upstream [vLLM](https://github.com/vllm-project/vllm)'s `deepseek_v41` model code (Apache-2.0, Copyright
+  contributors to the vLLM project) was read only as a cross-check of that math. No code is taken from it.
+- The grouped EXL3 expert kernel additions (`src/tensorfold/cuda/exl3/experts_grouped.cuh`, `experts.cu`) follow
+  [ExLlamaV3](https://github.com/turboderp-org/exllamav3)'s EXL3 format, MIT License, Copyright (c) 2025 Turboderp
+  (text below), as the rest of the shared EXL3 module does.
+- The baseline used in `tools/dsv41/REPORT.md` (a vLLM kit under AGPL-3.0) was only run as a black box over HTTP. None
+  of its code was read or included. `tools/dsv41/ATTRIBUTION.md` lists every source in full.
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from
