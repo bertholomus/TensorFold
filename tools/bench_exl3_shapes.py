@@ -2,11 +2,13 @@
 experts (gate/up, down) at their tile settings, against a plain read of the same bytes. Random trellis words (the
 decode is data-independent); a variant with the same arithmetic order is bit-compared to the shipped setting.
 
-usage (one GPU, in the tf container): python3 tools/bench_exl3_shapes.py
+usage (one GPU, in the tf container): python3 tools/bench_exl3_shapes.py [ROWS=1,4] [PARTS=linear,experts]
+  (a concurrent round's verify window is 4 rows a stream: 16 at four streams)
 """
 
 from __future__ import annotations
 
+import sys
 import time
 
 import torch
@@ -44,6 +46,8 @@ def linear(k: int, n: int, bits: int) -> Exl3Linear:
 def main() -> None:
     torch.manual_seed(0)
     dev = "cuda"
+    rows = [int(v) for v in (sys.argv[1] if len(sys.argv) > 1 else "1,4").split(",")]
+    parts = (sys.argv[2] if len(sys.argv) > 2 else "linear,experts").split(",")
     print(f"L2 {torch.cuda.get_device_properties(0).L2_cache_size / 2**20:.0f} MiB", flush=True)
     copy_src = torch.empty((256 * 1024 * 1024,), dtype=torch.int32, device=dev)       # 1 GiB
     copy_dst = torch.empty_like(copy_src)
@@ -54,8 +58,8 @@ def main() -> None:
     shapes = [("q_a", 6144, 2048, 5), ("kv_a", 6144, 640, 5), ("q_b", 2048, 4096, 5), ("o_proj", 4096, 6144, 5),
               ("wq_b", 2048, 4096, 5), ("shared gate/up", 6144, 512, 5), ("shared down", 512, 6144, 5),
               ("dense gate/up", 6144, 3072, 4), ("dense down", 3072, 6144, 4), ("lm_head", 6144, 38784, 6)]
-    for R in (1, 4):
-        print(f"== EXL3 linear, {R} row(s)", flush=True)
+    for R in (rows if "linear" in parts else ()):
+        print(f"-- EXL3 linear, {R} row(s)", flush=True)
         for name, k, n, bits in shapes:
             one = linear(k, n, bits)
             copies = max(1, min(64, int(512e6 // one.nbytes())))      # distinct weights: L2 never holds the next
@@ -71,7 +75,9 @@ def main() -> None:
                   f"{mb / t * 1e3:4.0f} GB/s", flush=True)
             del lins
 
-    print("== routed experts (8 of 256, 3 bits, D 6144, I 512 a rank)", flush=True)
+    if "experts" not in parts:
+        return
+    print("-- routed experts (8 of 256, 3 bits, D 6144, I 512 a rank)", flush=True)
     E, D, I = 256, 6144, 512
     mats = {}
     for p, (k, n) in (("gate", (D, I)), ("up", (D, I)), ("down", (I, D))):
@@ -80,7 +86,7 @@ def main() -> None:
                    for _ in range(E)]
     ex = x3experts.prepare(mats["gate"], mats["up"], mats["down"], "mul1", device=dev)
     per_expert = 3 * D * I * 3 / 8
-    for R in (1, 4):
+    for R in rows:
         slots = 9
         x = torch.randn((R, D), device=dev).to(torch.bfloat16)
         g = torch.Generator(device="cpu").manual_seed(R)

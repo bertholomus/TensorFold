@@ -100,6 +100,10 @@ def kernel_table(prof, top: int = 28) -> None:
         say(f"    {t / 1e3:7.3f} ms {100 * t / max(total, 1e-9):5.1f}% x{counts[name]:4d}  {name}")
 
 
+def topk_of(w) -> int:
+    return int(w.cfg.index_topk)
+
+
 def main() -> None:
     from tensorfold.families.glm_moe_dsa.cuda import decode as dec
     from tensorfold.families.glm_moe_dsa.cuda import forward as fwd
@@ -298,7 +302,11 @@ def main() -> None:
         # gemm0 / gemm1: the EXL3 prompt GEMM's fixed tiles vs tiles by shape (TF_EXL3_PREFILL_TILES); skt16 / skt32:
         # prompt sparse attention's key tile (TF_GLM_PROMPT_KT); span0 / span1: prompt chunks' indexer scores a program
         # a 64-token tile vs a program a span with its rows' queries held (TF_GLM_SCORES_SPAN); fuse0 / fuse1: prompt
-        # chunks' residual add and next RMSNorm as two launches vs one (TF_GLM_FUSE_NORM, same bits).
+        # chunks' residual add and next RMSNorm as two launches vs one (TF_GLM_FUSE_NORM, same bits); deq0 / deqbf16 /
+        # deqfp16 / deqauto: the EXL3 prompt GEMM on rotated rows vs the weight dequantized into the model's basis
+        # (bf16, cuBLAS; fp16, Triton; auto: cuBLAS for bf16 outputs, Triton for fp32 partials) (TF_GLM_PROMPT_DEQ:
+        # other bits); nw2 / nw4: mma3's gate/up columns a program, 256 or 512 (TF_EXL3_MMA3_NW, same bits); inv0 /
+        # inv1: the chunk-invariant prompt path off / on (TF_GLM_PROMPT_INVARIANT).
         variants = (os.environ.get("TF_PROFILE_AB")
                     or "experts0+gather+overlap0+absorb0+sparse0+select0+shared0,"
                        "experts2+rowred+overlap1+absorb2+sparse1+select1+shared1").split(",")
@@ -320,12 +328,13 @@ def main() -> None:
             return (x3experts.PROMPT, fwd.PROMPT_EXPERTS, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
                     mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE, mla_pe.QSCRATCH,
                     mla_pe.QSCRATCH_BF16, mla_pe.PROMPT_KT, x3mod.PROMPT_TILES, select_mod.SCORES_SPAN,
-                    fwd.FUSE_NORM)
+                    fwd.FUSE_NORM, x3mod.PROMPT_DEQ, x3experts.MMA3_NW, fwd.invariant.INVARIANT)
 
         def restore(v):
             (x3experts.PROMPT, fwd.PROMPT_EXPERTS, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
              mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE, mla_pe.QSCRATCH, mla_pe.QSCRATCH_BF16,
-             mla_pe.PROMPT_KT, x3mod.PROMPT_TILES, select_mod.SCORES_SPAN, fwd.FUSE_NORM) = v
+             mla_pe.PROMPT_KT, x3mod.PROMPT_TILES, select_mod.SCORES_SPAN, fwd.FUSE_NORM, x3mod.PROMPT_DEQ,
+             x3experts.MMA3_NW, fwd.invariant.INVARIANT) = v
 
         shipped = settings()
         runs = []
@@ -352,6 +361,12 @@ def main() -> None:
                         mla_pe.PROMPT_KT = int(s[3:])
                     elif s in ("gemm0", "gemm1"):
                         x3mod.PROMPT_TILES = s == "gemm1"
+                    elif s in ("deq0", "deqbf16", "deqfp16", "deqauto"):
+                        x3mod.PROMPT_DEQ = s[3:]
+                    elif s in ("nw2", "nw4"):
+                        x3experts.MMA3_NW = int(s[2:])
+                    elif s in ("inv0", "inv1"):
+                        fwd.invariant.INVARIANT = s == "inv1"
                     elif s in ("qscr0", "qscr1", "qscr2"):
                         mla_pe.QSCRATCH, mla_pe.QSCRATCH_BF16 = s != "qscr0", s == "qscr2"
                     elif s in ("sparse0", "sparse1"):
@@ -422,6 +437,62 @@ def main() -> None:
             + " ".join(f"{x:.1f}" for x in chunk_times))
         if prof.ENABLED:
             prof.report(len(p))
+
+    if "union" in SECTIONS:
+        # how much consecutive rows' selections overlap (a sparse kernel over a block's union reads each gathered key
+        # once for the block): over a TF_PROFILE_PREFILL-token prefill, the selections of TF_PROFILE_UNION_LAYERS (full
+        # indexer layers) in every chunk, the union of blocks of 2 / 4 / 8 / 16 rows against 2,048 a row
+        n = int(os.environ.get("TF_PROFILE_PREFILL", "32000"))
+        layers = {int(x) for x in (os.environ.get("TF_PROFILE_UNION_LAYERS") or "2,20,40,60").split(",")}
+        filler = " ".join(f"Item {i}: the quick brown fox jumps over the lazy dog." for i in range(int(n / 13.6)))
+        text = os.environ.get("TF_PROFILE_UNION_TEXT")
+        if text:                                          # a real document instead of the filler
+            body = Path(text).read_text(errors="ignore")[:n * 4]
+        else:
+            body = filler
+        p = app._prepare({"messages": [{"role": "user", "content": body + "\n\nSummarize."}], "max_tokens": 8,
+                          "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, True).prompt[:n]
+        from tensorfold.families.glm_moe_dsa.cuda import select as select_mod
+
+        seen: dict = {}
+        calls = [0]
+        current = [None]                                  # the layer whose dsa_block is running (MTP: None)
+        real, real_block = select_mod.select_tokens, fwd.dsa_block
+
+        def block(layer, *a, **k):
+            current[0] = layer.index
+            try:
+                return real_block(layer, *a, **k)
+            finally:
+                current[0] = None
+
+        def spy(qi, wts, keys, pos, R, topk, pos_dev, *, tokens, counts, **kw):
+            real(qi, wts, keys, pos, R, topk, pos_dev, tokens=tokens, counts=counts, **kw)
+            calls[0] += 1
+            if current[0] in layers and pos is not None:
+                seen.setdefault(current[0], []).append((pos, tokens[:R].clone(), counts[:R].clone()))
+
+        select_mod.select_tokens, fwd.dsa_block = spy, block
+        try:
+            dec.prefill(e, p, None)
+            torch.cuda.synchronize()
+        finally:
+            select_mod.select_tokens, fwd.dsa_block = real, real_block
+        say(f"== selection overlap over a {len(p)}-token prompt ({calls[0]} selections, layers {sorted(seen)})")
+        for layer, parts in sorted(seen.items()):
+            for pos, tok, cnt in parts:
+                keep = cnt >= topk_of(w)
+                tok = tok[keep][:, :topk_of(w)].long()
+                if tok.shape[0] < 16:
+                    continue
+                line = f"   layer {layer} rows {pos}..{pos + len(cnt) - 1} ({tok.shape[0]} full rows):"
+                for B in (2, 4, 8, 16):
+                    m = tok.shape[0] // B * B
+                    blk = tok[:m].view(m // B, B * tok.shape[1])
+                    srt = blk.sort(dim=1).values
+                    distinct = 1 + (srt[:, 1:] != srt[:, :-1]).sum(1)
+                    line += f" B{B} union {float(distinct.float().mean()) / tok.shape[1]:.2f}x"
+                say(line)
 
     if "prefill_kernels" in SECTIONS:
         # kernel time by name over one prefill (torch profiler, CUDA activity only), then the same prefill untimed

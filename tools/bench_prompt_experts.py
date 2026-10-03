@@ -78,8 +78,9 @@ def main() -> None:
     x = (torch.randn((max(rows), D), device="cuda") * 0.5).to(torch.bfloat16)
     tb = int(ex.trellis_bytes.sum())
     print(f"layer: {E} experts, {tb / 2**20:.0f} MiB of trellis on this rank", flush=True)
-    # a setting is "nt:pf:g" for both projections or "gate/up+down" (grouped_rows), or "mma" (grouped_mma)
-    tiles = [(t,) if t in ("mma", "mma2") else
+    # a setting is "nt:pf:g" for both projections or "gate/up+down" (grouped_rows), or "mma" / "mma2" / "mma3"
+    # (grouped_mma*; mma3's program shape from TF_EXL3_MMA3_NW)
+    tiles = [(t,) if t in ("mma", "mma2", "mma3") else
              [tuple(int(v) for v in p.split(":")) for p in (t.split("+") * 2)[:2]]
              for t in (sys.argv[3] if len(sys.argv) > 3 else "8:1:2,mma").split(",")]
     for R in rows:
@@ -91,7 +92,7 @@ def main() -> None:
             line = f"R={R} skew {skew}: busiest expert {int(cnt.max())} rows (mean {R * TOPK / E:.0f})"
             for name, fast, tile in [("per-tile", False, None)] + [(f"decode-once {t}", True, t) for t in tiles]:
                 out = torch.empty((R, D), dtype=torch.float32, device="cuda")
-                if tile is not None and tile[0] in ("mma", "mma2"):
+                if tile is not None and tile[0] in ("mma", "mma2", "mma3"):
                     x3experts.PROMPT_KERNEL = tile[0]
                 elif tile is not None:
                     x3experts.PROMPT_KERNEL = "rows"

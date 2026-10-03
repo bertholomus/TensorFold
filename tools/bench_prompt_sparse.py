@@ -3,7 +3,10 @@ key, 2,048 selected tokens a row): ms a call over a bf16 latent, over a quantize
 over the quantized one through the fp16 scratch (mla_pe.unpack_q, timed with it), with the compiled kernels'
 registers, spills and shared memory.
 
-usage (one GPU, tf container): python3 tools/bench_prompt_sparse.py [ROWS=2048] [CONTEXT=38000] [BITS=5]
+usage (one GPU, tf container): python3 tools/bench_prompt_sparse.py [ROWS=2048] [CONTEXT=38000] [BITS=5] [KEEP]
+  KEEP (e.g. 0.72): each row keeps that share of the previous row's picks (prompt rows' measured overlap) instead of
+  independent picks (neighbouring rows then share their gathers through L2), and the program-a-row kernel is timed
+  over the same bf16 latent rows.
 """
 
 from __future__ import annotations
@@ -49,7 +52,18 @@ def main() -> None:
     plane = kvq.KvQ(n, LW, bits, "cuda")
     kvq.write(lat, plane, torch.zeros((1,), dtype=torch.int32, device="cuda"))
     pos = n - R
-    tokens = torch.stack([torch.randperm(pos + r, generator=g)[:TOPK].sort().values for r in range(R)])
+    keep = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
+    if keep > 0:                                   # each row keeps `keep` of the previous row's picks
+        rows_sel, cur = [], torch.randperm(pos, generator=g)[:TOPK]
+        for r in range(R):
+            stay = cur[torch.randperm(TOPK, generator=g)[:int(keep * TOPK)]]
+            fresh = torch.randperm(pos + r, generator=g)[:2 * TOPK]
+            fresh = fresh[~torch.isin(fresh, stay)][:TOPK - len(stay)]
+            cur = torch.cat([stay, fresh])
+            rows_sel.append(cur.sort().values)
+        tokens = torch.stack(rows_sel)
+    else:
+        tokens = torch.stack([torch.randperm(pos + r, generator=g)[:TOPK].sort().values for r in range(R)])
     tokens = torch.cat([tokens, torch.full((R, 1), -1)], 1).to(torch.int32).cuda()
     counts = torch.full((R,), TOPK, dtype=torch.int32, device="cuda")
     qa = (torch.randn((R, H, LW), generator=g) * 0.05).to(torch.bfloat16).cuda()
@@ -78,6 +92,9 @@ def main() -> None:
     print(f"q{bits} via the bf16 latent-domain scratch (unpack included): {timed(scratch_bf16):.2f} ms; unpack alone "
           f"{timed(lambda: mla_pe.unpack_q(plane, n, sbf)):.2f} ms", flush=True)
     print(f"_sparse_rows_pe variants: {kernels(mla_pe._sparse_rows_pe)}", flush=True)
+    if keep > 0:
+        rows_ms = timed(lambda: mla_pe.sparse_attention(qa, qp, lat, pc, tokens, counts, out, s))
+        print(f"bf16 latent, a program a row: {rows_ms:.2f} ms", flush=True)
 
 
 if __name__ == "__main__":
