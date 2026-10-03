@@ -19,6 +19,9 @@ import torch
 from tensorfold.cuda.geometry import share, share_lo
 
 ROWS = 128               # most rows one call of the EXL3 linear takes
+# prompt chunks' EXL3 GEMMs take tiles by shape (exl3.prefill.tiles; 1.4 % of a 32.5k prefill on TP4) unless
+# TF_GLM_PROMPT_TILES=0 (the fixed 128-row tiles)
+PROMPT_TILES = __import__("os").environ.get("TF_GLM_PROMPT_TILES", "1") != "0"
 
 
 class X3Scratch:
@@ -99,10 +102,10 @@ class X3:
             from tensorfold.cuda.exl3.prefill import matmul
 
             if stored == keep:
-                matmul(lin, x, out[:, :keep], sc.prefill)       # the prompt GEMM takes any row stride
+                matmul(lin, x, out[:, :keep], sc.prefill, PROMPT_TILES)     # the prompt GEMM takes any row stride
             else:
                 y = sc.staging(out.dtype, R, stored)
-                matmul(lin, x, y, sc.prefill)
+                matmul(lin, x, y, sc.prefill, PROMPT_TILES)
                 out[:, :keep].copy_(y[:, :keep])
             return out
         sk = lin.split[0]

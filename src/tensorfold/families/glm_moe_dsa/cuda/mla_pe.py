@@ -24,6 +24,19 @@ from .kvq import KvQ, rotate as _q_rotate, tile as _q_tile
 # decode windows keep a program a chunk (more programs a row) and _merge (TF_GLM_SPARSE_FUSED=0: every window does)
 FUSED_ROWS = 64 if os.environ.get("TF_GLM_SPARSE_FUSED", "1") != "0" else 1 << 30
 FUSED_LAUNCH = (4, 3)             # _sparse_rows_pe's warps and load stages
+# _sparse_rows_pe's keys a tile on prompt chunks: 16 (GB10, 2,048 rows x 2,048 tokens over a 38k bf16 latent: 5.6 ms
+# against 7.9 at the decode windows' 32; other bits: the online softmax rescales every 16 keys) or KT (32: the decode
+# windows' bits) (TF_GLM_PROMPT_KT)
+PROMPT_KT = int(os.environ.get("TF_GLM_PROMPT_KT") or 16)
+# prompt chunks over a quantized latent (kvq.KvQ): the slots a chunk can see are dequantized once a layer into a
+# scratch and the attention kernels load those rows instead of dequantizing every (row, key) pair. TF_GLM_QSCRATCH=2
+# (default): bf16 rotated back to the latent's own domain, read by the bf16 kernels (no rotations, fewer registers;
+# other bits than reading the plane); 1: fp16, exactly the rotated-domain tile values the readers build in registers
+# (the same arithmetic, so the same bits); 0: off. TF_GLM_QSCRATCH_TOKENS: the scratch's slots (prompts past it
+# dequantize as before).
+QSCRATCH = os.environ.get("TF_GLM_QSCRATCH", "2") != "0"
+QSCRATCH_BF16 = os.environ.get("TF_GLM_QSCRATCH", "2") == "2"
+QSCRATCH_TOKENS = int(os.environ.get("TF_GLM_QSCRATCH_TOKENS") or 262144)
 
 
 @triton.jit
@@ -61,10 +74,10 @@ def _tile_peq(qr, qp, kv, kp, m, l, o, valid, SCALE: tl.constexpr):
 
 @triton.jit
 def _keys(q, qr, qp, LC, LS, PC, rows, ok, k, kq, m, l, o, LW: tl.constexpr, PW: tl.constexpr, SCALE: tl.constexpr,
-          KTT: tl.constexpr, KV8: tl.constexpr, QB: tl.constexpr):
+          KTT: tl.constexpr, KV8: tl.constexpr, QB: tl.constexpr, QSC: tl.constexpr = False):
     """One tile of key rows ``rows`` [KTT] (int64) folded into (m, l, o): bf16 latent rows; FP8 rows dequantized to
     bf16 in registers (exact: an e4m3 code times a power of two) through the same _tile_pe; or quantized rows (QB
-    bits) through _tile_peq against the rotated query qr."""
+    bits) through _tile_peq against the rotated query qr (QSC: LC is unpack_q's fp16 scratch of those tiles)."""
 
     kp = tl.load(PC + rows[:, None] * PW + kq[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
     if KV8:
@@ -73,7 +86,10 @@ def _keys(q, qr, qp, LC, LS, PC, rows, ok, k, kq, m, l, o, LW: tl.constexpr, PW:
         kv = (kc.to(tl.float8e4nv, bitcast=True).to(tl.float32) * ks[:, None]).to(tl.bfloat16)
         m, l, o = _tile_pe(q, qp, kv, kp, m, l, o, ok, SCALE)
     elif QB > 0:
-        kv = _q_tile(LC, LS, rows, ok, LW, QB, KTT)
+        if QSC:
+            kv = _q_scratch(LC, rows, ok, k, LW)
+        else:
+            kv = _q_tile(LC, LS, rows, ok, LW, QB, KTT)
         m, l, o = _tile_peq(qr, qp, kv, kp, m, l, o, ok, SCALE)
     else:
         kv = tl.load(LC + rows[:, None] * LW + k[None, :], mask=ok[:, None], other=0).to(tl.bfloat16)
@@ -82,9 +98,46 @@ def _keys(q, qr, qp, LC, LS, PC, rows, ok, k, kq, m, l, o, LW: tl.constexpr, PW:
 
 
 @triton.jit
+def _q_scratch(SC, rows, ok, k, LW: tl.constexpr):
+    """Token rows of unpack_q's scratch as kvq.tile returns them: fp16, -0.0 where not ok (kvq.tile's masked rows are
+    (0 - MH) * 0)."""
+
+    v = tl.load(SC + rows[:, None] * LW + k[None, :], mask=ok[:, None], other=0.0)
+    return tl.where(ok[:, None], v, -0.0).to(tl.float16)
+
+
+@triton.jit
+def _q_unpack(QW, QS, HQ, OUT, N, LW: tl.constexpr, QB: tl.constexpr, KTT: tl.constexpr, BF: tl.constexpr):
+    """Program t: slots [t KTT, (t + 1) KTT) below N of a quantized plane as kvq.tile's fp16 rotated-domain values, or
+    (BF) rotated back by H32 and stored as bf16 latent rows: the tile's fp16 values times the +-1 H32 are exact
+    products, summed in fp32 on the tensor cores, then times 1 / sqrt(32)."""
+
+    rows = (tl.program_id(0) * KTT + tl.arange(0, KTT)).to(tl.int64)
+    ok = rows < N
+    kv = _q_tile(QW, QS, rows, ok, LW, QB, KTT)
+    if BF:
+        h = tl.load(HQ + tl.arange(0, 32)[:, None] * 32 + tl.arange(0, 32)[None, :]).to(tl.float16)
+        y = tl.dot(tl.reshape(kv, (KTT * (LW // 32), 32)), h, out_dtype=tl.float32) * 0.17677669529663688110
+        kv = tl.reshape(y, (KTT, LW)).to(tl.bfloat16)
+    tl.store(OUT + rows[:, None] * LW + tl.arange(0, LW)[None, :], kv, mask=ok[:, None])
+
+
+def unpack_q(plane: KvQ, n: int, out: torch.Tensor) -> torch.Tensor:
+    """Slots [0, n) of ``plane`` into ``out`` [>= n, width]: fp16 as the attention kernels' tiles hold them (QSC), or
+    bf16 latent rows in their own domain (a bf16 ``out``: the bf16 kernels read them as a bf16 cache)."""
+
+    if (out.dtype not in (torch.float16, torch.bfloat16) or out.shape[1] != plane.width or out.shape[0] < n
+            or not out.is_contiguous()):
+        raise ValueError(f"unpack_q: {n} slots of {plane.width} into {tuple(out.shape)} {out.dtype}")
+    _q_unpack[(triton.cdiv(n, KT),)](plane.codes, plane.scales, plane.h, out, n, LW=plane.width, QB=plane.bits,
+                                     KTT=KT, BF=out.dtype == torch.bfloat16, num_warps=4)
+    return out
+
+
+@triton.jit
 def _dense_chunks_pe(QA, QP, LC, LS, HQ, PC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr,
                      PW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr,
-                     KV8: tl.constexpr, QB: tl.constexpr):
+                     KV8: tl.constexpr, QB: tl.constexpr, QSC: tl.constexpr = False):
     """Program (row, head block, chunk): causal attention of HB heads of row r over keys [c CH, (c + 1) CH).
 
     The latent rows are bf16 (LC), FP8 codes with a scale a row (KV8: LC, LS) or packed QB-bit codes with fp16 group
@@ -113,7 +166,8 @@ def _dense_chunks_pe(QA, QP, LC, LS, HQ, PC, POS, PO, PM, PL, R, H: tl.constexpr
         for t in range(tl.minimum(CH // KTT, (limit - start) // KTT + 1)):
             ki = start + t * KTT + tl.arange(0, KTT)
             ok = ki <= limit
-            m, l, o = _keys(q, qr, qp, LC, LS, PC, ki.to(tl.int64), ok, k, kq, m, l, o, LW, PW, SCALE, KTT, KV8, QB)
+            m, l, o = _keys(q, qr, qp, LC, LS, PC, ki.to(tl.int64), ok, k, kq, m, l, o, LW, PW, SCALE, KTT, KV8, QB,
+                            QSC)
         if QB > 0:
             o = _q_rotate(o, HQ, HBT, LW)                       # the chunk's value sum back from the rotated domain
     base = (c * R + r) * H + hh
@@ -162,7 +216,7 @@ def _sparse_chunks_pe(QA, QP, LC, LS, HQ, PC, TOK, CNT, PO, PM, PL, R, W: tl.con
 @triton.jit
 def _sparse_rows_pe(QA, QP, LC, LS, HQ, PC, TOK, CNT, OUT, W: tl.constexpr, H: tl.constexpr, LW: tl.constexpr,
                     PW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr,
-                    KV8: tl.constexpr, QB: tl.constexpr):
+                    KV8: tl.constexpr, QB: tl.constexpr, QSC: tl.constexpr = False):
     """Program (row, head block): _sparse_chunks_pe's chunk partials one after another, each folded in as _merge folds
     it (the same arithmetic in the same order), so the partials never leave registers. Rows with CNT 0 are skipped,
     chunks past the row's count and key tiles past its last token change nothing there and are not run."""
@@ -191,7 +245,7 @@ def _sparse_rows_pe(QA, QP, LC, LS, HQ, PC, TOK, CNT, OUT, W: tl.constexpr, H: t
                 idx = c * CH + t * KTT + tl.arange(0, KTT)
                 ok = idx < n
                 tok = tl.load(TOK + r * W + idx, mask=ok, other=0).to(tl.int64)
-                m, l, o = _keys(q, qr, qp, LC, LS, PC, tok, ok, k, kq, m, l, o, LW, PW, SCALE, KTT, KV8, QB)
+                m, l, o = _keys(q, qr, qp, LC, LS, PC, tok, ok, k, kq, m, l, o, LW, PW, SCALE, KTT, KV8, QB, QSC)
             if QB > 0:
                 o = _q_rotate(o, HQ, HBT, LW)                   # as _sparse_chunks_pe stores it
             # _merge's step for chunk c
@@ -235,8 +289,21 @@ def _planes(cache):
     return cache, cache, cache, False, 0
 
 
+def _scratch_planes(cache, qscratch: torch.Tensor | None):
+    """_planes plus QSC: a quantized plane's rows as unpack_q's fp16 scratch ``qscratch`` when one is given (a bf16
+    scratch holds latent rows in their own domain: the plane reads as a bf16 cache)."""
+
+    rows, scales, h32, kv8, qb = _planes(cache)
+    if qb and qscratch is not None:
+        if qscratch.dtype == torch.bfloat16:
+            return qscratch, qscratch, qscratch, False, 0, False
+        return qscratch, scales, h32, kv8, qb, True
+    return rows, scales, h32, kv8, qb, False
+
+
 def attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, pos: torch.Tensor,
-              s: LatentScratch, *, scale: float, nch: int, out: torch.Tensor, hb: int | None = None) -> torch.Tensor:
+              s: LatentScratch, *, scale: float, nch: int, out: torch.Tensor, hb: int | None = None,
+              qscratch: torch.Tensor | None = None) -> torch.Tensor:
     """Dense causal attention of rows (qa [R, H, 512], qp [R, H, 64]) through pos + R - 1 in nch 512-key chunks.
 
     ``cache`` is the layer's bf16 latent rows, its FP8 plane (kv8.Kv8: codes and a scale a row) or its quantized
@@ -252,16 +319,18 @@ def attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, p
     hb = HB if hb is None else hb
     step = s.part_rows
     if R <= step:
-        return _attention(qa, qp, cache, pcache, pos, s, scale=scale, nch=nch, out=out, hb=hb)
+        return _attention(qa, qp, cache, pcache, pos, s, scale=scale, nch=nch, out=out, hb=hb, qscratch=qscratch)
     for r0 in range(0, R, step):
         r1 = min(R, r0 + step)
         at = pos if r0 == 0 else pos + r0
-        _attention(qa[r0:r1], qp[r0:r1], cache, pcache, at, s, scale=scale, nch=nch, out=out[r0:r1], hb=hb)
+        _attention(qa[r0:r1], qp[r0:r1], cache, pcache, at, s, scale=scale, nch=nch, out=out[r0:r1], hb=hb,
+                   qscratch=qscratch)
     return out
 
 
 def _attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, pos: torch.Tensor,
-               s: LatentScratch, *, scale: float, nch: int, out: torch.Tensor, hb: int) -> torch.Tensor:
+               s: LatentScratch, *, scale: float, nch: int, out: torch.Tensor, hb: int,
+               qscratch: torch.Tensor | None = None) -> torch.Tensor:
     R, H, LW = qa.shape
     PW = qp.shape[2]
     if nch > s.nch or R > s.part_rows or LW != s.lw:
@@ -272,28 +341,34 @@ def _attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, 
         raise ValueError(f"latent attention: {hb} heads a program, not {HB} or {HB_WIDE}")
     # 4 warps with 3 load stages keep the 8-warp single-stage launch's bits (tools/check_mla_cfg.py) and take 21 instead
     # of 35 us a decode row at 1-2k tokens on GB10
-    rows, scales, h32, kv8, qb = _planes(cache)
+    rows, scales, h32, kv8, qb, qsc = _scratch_planes(cache, qscratch)
+    # the scratch's fp16 tiles in three stages plus the H32 rotations pass GB10's 99 KiB of shared memory: two stages
+    # (the arithmetic does not depend on the stages)
     _dense_chunks_pe[(R, triton.cdiv(H, hb), nch)](qa, qp, rows, scales, h32, pcache, pos, s.po[:n * LW], s.pm[:n],
                                                    s.pl[:n], R, H=H, LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=hb,
-                                                   KTT=KT, KV8=kv8, QB=qb, num_warps=4, num_stages=3)
+                                                   KTT=KT, KV8=kv8, QB=qb, QSC=qsc, num_warps=4,
+                                                   num_stages=2 if qsc else 3)
     _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
     return out
 
 
 def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor,
-                     tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor, scale: float) -> None:
+                     tokens: torch.Tensor, counts: torch.Tensor, out: torch.Tensor, scale: float,
+                     qscratch: torch.Tensor | None = None) -> None:
     """Rows with counts > 0 over their selected tokens (ascending, -1 padded) into out; other rows untouched (``cache``
-    as in attention())."""
+    and ``qscratch`` as in attention(); the scratch only on prompt chunks' kernels)."""
 
     R, H, LW = qa.shape
     PW = qp.shape[2]
     W = tokens.shape[1]
-    rows, scales, h32, kv8, qb = _planes(cache)
+    rows, scales, h32, kv8, qb, qsc = _scratch_planes(cache, qscratch if R >= FUSED_ROWS else None)
     if R >= FUSED_ROWS:
-        # a prompt chunk: a program a row and head block, partials merged in registers (the same bits)
+        # a prompt chunk: a program a row and head block, partials merged in registers (the decode windows' bits at
+        # PROMPT_KT = KT)
         _sparse_rows_pe[(R, triton.cdiv(H, HB))](qa, qp, rows, scales, h32, pcache, tokens, counts, out, W=W, H=H,
-                                                 LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=HB, KTT=KT, KV8=kv8, QB=qb,
-                                                 num_warps=FUSED_LAUNCH[0], num_stages=FUSED_LAUNCH[1])
+                                                 LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=HB, KTT=PROMPT_KT, KV8=kv8,
+                                                 QB=qb, QSC=qsc, num_warps=FUSED_LAUNCH[0],
+                                                 num_stages=FUSED_LAUNCH[1])
         return
     nch = triton.cdiv(W, CHUNK)
     n = nch * R * H
@@ -315,8 +390,9 @@ def sparse_attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Te
 # are latent's (same shapes, BN and warps), so every row gets the same bits; a chunk gets R / RB times the programs.
 PROMPT_RB = 64
 # "cuda": latent_rows.cu, the Triton kernels' sums in their order without a barrier a row (bf16 weights, 256 -> 512 ->
-# 256 per head); "triton": _absorb_rows / _expand_rows (TF_GLM_ABSORB)
-ABSORB = os.environ.get("TF_GLM_ABSORB") or "cuda"
+# 256 per head); "triton": _absorb_rows / _expand_rows; "bmm": one batched tensor-core matmul a head (fp32 sums in
+# cuBLAS's order: a prompt chunk's rows no longer match the decode kernels' bits) (TF_GLM_ABSORB)
+ABSORB = os.environ.get("TF_GLM_ABSORB") or "bmm"
 
 
 @lru_cache(maxsize=1)
@@ -376,6 +452,10 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
     R, H, D = q.shape
     if R <= PROMPT_RB or isinstance(a, latent.AbsorbQ4):
         return latent.absorb_q(q, a, out)
+    if ABSORB == "bmm":
+        # written through out's head-major view: cuBLAS takes the strides, no transposing copy
+        torch.bmm(q.transpose(0, 1), a.wk[:, :D], out=out.transpose(0, 1))
+        return out
     if ABSORB == "cuda" and _exact_shapes(a) and q.is_contiguous() and out.is_contiguous():
         _rows_ext().absorb(q, a.wk, out, PROMPT_RB)
         return out
@@ -393,6 +473,9 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor) -> torch.Tensor:
     R, H, _ = o_lat.shape
     if R <= PROMPT_RB or isinstance(a, latent.AbsorbQ4):
         return latent.expand_v(o_lat, a, out)
+    if ABSORB == "bmm":
+        torch.bmm(o_lat.transpose(0, 1), a.wv.transpose(1, 2), out=out.transpose(0, 1))
+        return out
     if ABSORB == "cuda" and _exact_shapes(a) and o_lat.is_contiguous() and out.is_contiguous():
         _rows_ext().expand(o_lat, a.wv, out, PROMPT_RB)
         return out

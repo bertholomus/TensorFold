@@ -313,6 +313,31 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
         out[(size_t)r * D + n + j] = add ? __fadd_rn(acc[j], add[(size_t)r * D + n + j]) : acc[j];
 }
 
+// out[r][d] = the sum over slots in order of the routed slots' weighted bf16 outputs Y (grouped_down3), fp32, then add.
+__global__ void combine_y_kernel(const __nv_bfloat16* __restrict__ Y, const int* __restrict__ pick,
+                                 const float* __restrict__ add, float* __restrict__ out, int D, int slots, int E) {
+    const int r = blockIdx.x;
+    const int d = (blockIdx.y * blockDim.x + threadIdx.x) * 4;
+    if (d >= D) return;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k = 0; k < slots; ++k) {
+        const int e = pick[r * slots + k];
+        if (e < 0 || e >= E) continue;
+        const uint2 v = *reinterpret_cast<const uint2*>(Y + ((size_t)r * slots + k) * D + d);
+        const float2 a = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v.x));
+        const float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&v.y));
+        acc[0] += a.x; acc[1] += a.y; acc[2] += b.x; acc[3] += b.y;
+    }
+    float4 o;
+    if (add) {
+        const float4 s = *reinterpret_cast<const float4*>(add + (size_t)r * D + d);
+        o = make_float4(__fadd_rn(acc[0], s.x), __fadd_rn(acc[1], s.y), __fadd_rn(acc[2], s.z), __fadd_rn(acc[3], s.w));
+    } else {
+        o = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    }
+    *reinterpret_cast<float4*>(out + (size_t)r * D + d) = o;
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -327,6 +352,15 @@ extern template void grouped_rows_launch<2>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_mma_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_mma_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_mma_launch<2>(const GroupedArgs&, cudaStream_t);
+extern template void grouped_mma2_launch<0>(const GroupedArgs&, cudaStream_t);
+extern template void grouped_mma2_launch<1>(const GroupedArgs&, cudaStream_t);
+extern template void grouped_mma2_launch<2>(const GroupedArgs&, cudaStream_t);
+extern template void grouped_mma3_launch<0>(const GroupedArgs&, const Mma3Args&, cudaStream_t);
+extern template void grouped_mma3_launch<1>(const GroupedArgs&, const Mma3Args&, cudaStream_t);
+extern template void grouped_mma3_launch<2>(const GroupedArgs&, const Mma3Args&, cudaStream_t);
+extern template void grouped_down3_launch<0>(const GroupedArgs&, const half*, const float*, __nv_bfloat16*, cudaStream_t);
+extern template void grouped_down3_launch<1>(const GroupedArgs&, const half*, const float*, __nv_bfloat16*, cudaStream_t);
+extern template void grouped_down3_launch<2>(const GroupedArgs&, const half*, const float*, __nv_bfloat16*, cudaStream_t);
 extern template void dequant_launch<0>(const uint32_t*, half*, int, int, int, cudaStream_t);
 extern template void dequant_launch<1>(const uint32_t*, half*, int, int, int, cudaStream_t);
 extern template void dequant_launch<2>(const uint32_t*, half*, int, int, int, cudaStream_t);
@@ -420,6 +454,115 @@ void exl3x_grouped_mma_cuda(const at::Tensor& X0, const at::Tensor& X1, const at
     else if (cb == 1) tf_exl3x::grouped_mma_launch<1>(a, stream);
     else if (cb == 2) tf_exl3x::grouped_mma_launch<2>(a, stream);
     else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_grouped_mma2_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                             const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids,
+                             const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z, int64_t mats,
+                             int64_t K, int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi) {
+    TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
+    const size_t smem = tf_exl3x::m2_smem_bytes((int)hi);
+    int dev = 0, limit = 0;
+    C10_CUDA_CHECK(cudaGetDevice(&dev));
+    C10_CUDA_CHECK(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
+    TORCH_CHECK(smem + 512 <= (size_t)limit, "prompt mma2 needs ", smem, " bytes of shared memory at ", hi / 2.0,
+                " bits; this device allows ", limit);
+    tf_exl3x::GroupedArgs a;
+    a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
+    a.x1 = reinterpret_cast<const half*>(X1.data_ptr());
+    a.tp0 = TP0.data_ptr<int64_t>();
+    a.tp1 = TP1.data_ptr<int64_t>();
+    a.k2_0 = B0.data_ptr<int>();
+    a.k2_1 = B1.data_ptr<int>();
+    a.uids = uids.data_ptr<int>();
+    a.ucount = ucount.data_ptr<int>();
+    a.members = members.data_ptr<int>();
+    a.z = Z.data_ptr<float>();
+    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = 1; a.maxm = (int)members.size(1); a.slots = (int)slots;
+    a.nexp_max = (int)uids.size(0);
+    a.mats = (int)mats; a.nt = tf_exl3x::M2_TILES; a.warps = 8; a.pf = 0;
+    a.lo = (int)lo; a.hi = (int)hi;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (cb == 0) tf_exl3x::grouped_mma2_launch<0>(a, stream);
+    else if (cb == 1) tf_exl3x::grouped_mma2_launch<1>(a, stream);
+    else if (cb == 2) tf_exl3x::grouped_mma2_launch<2>(a, stream);
+    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_grouped_mma3_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh0, const at::Tensor& suh1,
+                             const at::Tensor& TP0, const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
+                             const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members,
+                             at::Tensor& Z, int64_t K, int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo,
+                             int64_t hi, int64_t nw) {
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16, "prompt mma3: bf16 rows");
+    TORCH_CHECK(x_stride % 4 == 0, "prompt mma3: a row stride of whole 8-byte words");
+    tf_exl3x::GroupedArgs a;
+    a.x0 = nullptr;
+    a.x1 = nullptr;
+    a.tp0 = TP0.data_ptr<int64_t>();
+    a.tp1 = TP1.data_ptr<int64_t>();
+    a.k2_0 = B0.data_ptr<int>();
+    a.k2_1 = B1.data_ptr<int>();
+    a.uids = uids.data_ptr<int>();
+    a.ucount = ucount.data_ptr<int>();
+    a.members = members.data_ptr<int>();
+    a.z = Z.data_ptr<float>();
+    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = 1; a.maxm = (int)members.size(1); a.slots = (int)slots;
+    a.nexp_max = (int)uids.size(0);
+    a.mats = 2; a.nt = tf_exl3x::M2_TILES; a.warps = 8; a.pf = 0;
+    a.lo = (int)lo; a.hi = (int)hi; a.g = (int)nw;
+    tf_exl3x::Mma3Args m;
+    m.x = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+    m.x_stride = (int)x_stride;
+    m.suh0 = reinterpret_cast<const half*>(suh0.data_ptr());
+    m.suh1 = reinterpret_cast<const half*>(suh1.data_ptr());
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (cb == 0) tf_exl3x::grouped_mma3_launch<0>(a, m, stream);
+    else if (cb == 1) tf_exl3x::grouped_mma3_launch<1>(a, m, stream);
+    else if (cb == 2) tf_exl3x::grouped_mma3_launch<2>(a, m, stream);
+    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_grouped_down3_cuda(const at::Tensor& Xd, const at::Tensor& TP, const at::Tensor& B, const at::Tensor& uids,
+                              const at::Tensor& ucount, const at::Tensor& members, const at::Tensor& svh,
+                              const at::Tensor& wts, at::Tensor& Y, int64_t K, int64_t N, int64_t P, int64_t slots,
+                              int64_t cb, int64_t lo, int64_t hi) {
+    TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
+    tf_exl3x::GroupedArgs a;
+    a.x0 = reinterpret_cast<const half*>(Xd.data_ptr());
+    a.x1 = a.x0;
+    a.tp0 = TP.data_ptr<int64_t>();
+    a.tp1 = a.tp0;
+    a.k2_0 = B.data_ptr<int>();
+    a.k2_1 = a.k2_0;
+    a.uids = uids.data_ptr<int>();
+    a.ucount = ucount.data_ptr<int>();
+    a.members = members.data_ptr<int>();
+    a.z = nullptr;
+    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = 1; a.maxm = (int)members.size(1); a.slots = (int)slots;
+    a.nexp_max = (int)uids.size(0);
+    a.mats = 1; a.nt = tf_exl3x::M2_TILES; a.warps = 8; a.pf = 0;
+    a.lo = (int)lo; a.hi = (int)hi;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto sv = reinterpret_cast<const half*>(svh.data_ptr());
+    auto y = reinterpret_cast<__nv_bfloat16*>(Y.data_ptr());
+    if (cb == 0) tf_exl3x::grouped_down3_launch<0>(a, sv, wts.data_ptr<float>(), y, stream);
+    else if (cb == 1) tf_exl3x::grouped_down3_launch<1>(a, sv, wts.data_ptr<float>(), y, stream);
+    else if (cb == 2) tf_exl3x::grouped_down3_launch<2>(a, sv, wts.data_ptr<float>(), y, stream);
+    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_combine_y_cuda(const at::Tensor& Y, const at::Tensor& pick, const at::Tensor& add, at::Tensor& out,
+                          int64_t rows, int64_t D, int64_t slots, int64_t E, int64_t has_add) {
+    TORCH_CHECK(D % 4 == 0, "combine_y: D a multiple of 4");
+    dim3 grid((unsigned)rows, (unsigned)((D / 4 + 255) / 256));
+    combine_y_kernel<<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const __nv_bfloat16*>(Y.data_ptr()), pick.data_ptr<int>(),
+        has_add ? add.data_ptr<float>() : nullptr, out.data_ptr<float>(), (int)D, (int)slots, (int)E);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

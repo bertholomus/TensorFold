@@ -64,6 +64,68 @@ def _scores(QI, W, w_stride, IK, IS, HQ, OUT, POS, R, NT, scale, wscale, H: tl.c
                 tl.store(OUT + r * NT + t, tl.full((BT,), float("-inf"), tl.float32), mask=t < NT)
 
 
+# prompt chunks' scores (TF_GLM_SCORES_SPAN, default on): a program per (SPAN_RB rows, SPAN_TS tokens) holds its rows'
+# queries ([rows x heads, D], loaded once) and walks its token span in 64-token key tiles: _scores reloads every row's
+# queries for every key tile, 16 rows x 8 KB a 64-token program (~10 GB a layer at 2,048 rows and 38k tokens, L2
+# bound). The same dot products; the head sum's order can differ, so other bits.
+SCORES_SPAN = os.environ.get("TF_GLM_SCORES_SPAN", "1") != "0"
+SPAN_RB, SPAN_TS = 4, 1024
+
+
+@triton.jit
+def _scores_span(QI, W, w_stride, IK, IS, HQ, OUT, POS, R, NT, scale, wscale, H: tl.constexpr, HP: tl.constexpr,
+                 D: tl.constexpr, BT: tl.constexpr, RB: tl.constexpr, TS: tl.constexpr, KV8: tl.constexpr,
+                 QB: tl.constexpr):
+    """Program (RB rows, TS tokens): s_t = sum_h w_h relu(scale * qi_h . k_t) up to each row's position (_scores'
+    terms), the rows' queries held for the whole span."""
+
+    rb = tl.program_id(0)
+    ts = tl.program_id(1)
+    P = tl.load(POS)
+    t0 = ts * TS
+    last = P + rb * RB + RB                              # past every row's last visible token
+    j = tl.arange(0, RB * HP)                            # query vector j: row j // HP, head j % HP
+    row = rb * RB + j // HP
+    head = j % HP
+    qok = (row < R) & (head < H)
+    d = tl.arange(0, D)
+    rr = rb * RB + tl.arange(0, RB)
+    if t0 < last:
+        q = tl.load(QI + (row * H + head)[:, None] * D + d[None, :], mask=qok[:, None], other=0.0).to(tl.bfloat16)
+        if QB > 0:
+            q = _q_rotate(q.to(tl.float32), HQ, RB * HP, D).to(tl.float16)
+        w = tl.load(W + row * w_stride + head, mask=qok, other=0.0).to(tl.float32) * wscale     # [RB * HP]
+        bound = P + rr + 1                                                                       # [RB]
+        for b in range(TS // BT):
+            t = t0 + b * BT + tl.arange(0, BT)
+            if t0 + b * BT < last:
+                tk = t < last
+                if KV8:
+                    k = tl.load(IK + t[:, None].to(tl.int64) * D + d[None, :], mask=tk[:, None],
+                                other=0).to(tl.float8e4nv, bitcast=True).to(tl.bfloat16)
+                    ks = tl.load(IS + t.to(tl.int64), mask=tk, other=0.0)
+                elif QB > 0:
+                    k = _q_tile(IK, IS, t.to(tl.int64), tk, D, QB, BT)
+                else:
+                    k = tl.load(IK + t[:, None].to(tl.int64) * D + d[None, :], mask=tk[:, None],
+                                other=0.0).to(tl.bfloat16)
+                dots = tl.dot(q, tl.trans(k))                                                    # [RB * HP, BT]
+                if KV8:
+                    dots = dots * ks[None, :]
+                v = w[:, None] * tl.maximum(dots * scale, 0.0)
+                sc = tl.sum(tl.reshape(v, (RB, HP, BT)), axis=1)                                 # [RB, BT]
+                sc = tl.where(t[None, :] < bound[:, None], sc, float("-inf"))
+                tl.store(OUT + rr[:, None] * NT + t[None, :], sc, mask=(rr < R)[:, None] & (t < NT)[None, :])
+            else:
+                tl.store(OUT + rr[:, None] * NT + t[None, :], tl.full((RB, BT), float("-inf"), tl.float32),
+                         mask=(rr < R)[:, None] & (t < NT)[None, :])
+    else:
+        for b in range(TS // BT):
+            t = t0 + b * BT + tl.arange(0, BT)
+            tl.store(OUT + rr[:, None] * NT + t[None, :], tl.full((RB, BT), float("-inf"), tl.float32),
+                     mask=(rr < R)[:, None] & (t < NT)[None, :])
+
+
 def _order_key(scores: torch.Tensor) -> torch.Tensor:
     """fp32 scores as int64 keys whose sort is score-ascending with ties to the lower token (Flash's trick)."""
 
@@ -328,10 +390,15 @@ def _select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, pos_de
     kv8, qb = isinstance(keys, Kv8), keys.bits if isinstance(keys, KvQ) else 0
     ik, isc = (keys.codes, keys.scales) if kv8 or qb else (keys, keys)
     hq = keys.h if qb else isc
-    _scores[(triton.cdiv(R, rb), triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), ik, isc, hq, scores, pos_dev, R,
-                                                           np_max, D ** -0.5, wscale, H=H,
-                                                           HP=max(16, triton.next_power_of_2(H)), D=D, BT=64, RB=rb,
-                                                           KV8=kv8, QB=qb, num_warps=4)
+    HP = max(16, triton.next_power_of_2(H))
+    if SCORES_SPAN and R >= RADIX_ROWS:
+        _scores_span[(triton.cdiv(R, SPAN_RB), triton.cdiv(np_max, SPAN_TS))](
+            qi, wts, wts.stride(0), ik, isc, hq, scores, pos_dev, R, np_max, D ** -0.5, wscale, H=H, HP=HP, D=D, BT=64,
+            RB=SPAN_RB, TS=SPAN_TS, KV8=kv8, QB=qb, num_warps=4)
+    else:
+        _scores[(triton.cdiv(R, rb), triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), ik, isc, hq, scores, pos_dev, R,
+                                                               np_max, D ** -0.5, wscale, H=H, HP=HP, D=D, BT=64,
+                                                               RB=rb, KV8=kv8, QB=qb, num_warps=4)
     width = tokens.shape[1]
     k = min(topk, np_max)
     if R >= RADIX_ROWS and tokens.stride(1) == 1:

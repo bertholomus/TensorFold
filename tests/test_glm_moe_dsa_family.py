@@ -543,6 +543,9 @@ def test_admission_counts_each_cache_format_a_slot():
     # the dcp mode also holds its exchange buffers: a fixed amount, not a slot cost
     g1, g4 = GlmEngine._geometry(text, 4, "bf16", 1), GlmEngine._geometry(text, 4, "bf16", 4)
     assert g4.bytes_at(0) > g1.bytes_at(0)
+    # a quantized latent without dcp also holds the prompt chunks' fp16 latent scratch: 1 KiB a slot up to its cap
+    g = GlmEngine._geometry(text, 4, "q5", 1)
+    assert (g.bytes_at(1 << 16) - g.bytes_at(1 << 15)) / (1 << 15) == pytest.approx(40824 + 1024, abs=1e-6)
 
 
 def test_cache_modes_parse_and_refuse():

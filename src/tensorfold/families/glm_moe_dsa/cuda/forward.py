@@ -35,6 +35,15 @@ SIDE = os.environ.get("TF_GLM_SIDE", "1") != "0"
 PROMPT_REDUCE = os.environ.get("TF_GLM_PROMPT_REDUCE") or "rows"
 
 
+# prompt chunks' routed experts (exl3.experts.routed's kernel): "mma3" (gate/up rotating its rows from the layer
+# input, down's epilogue and bf16 slot outputs inside; other bits than the decode windows') or "mma" (the decode
+# windows' bits) (TF_GLM_PROMPT_EXPERTS)
+PROMPT_EXPERTS = os.environ.get("TF_GLM_PROMPT_EXPERTS") or "mma3"
+
+# prompt chunks add each half-layer's reduced branch to x inside the next half's RMSNorm launch (residual_add's and
+# rmsnorm's arithmetic, one pass over x) (TF_GLM_FUSE_NORM=0: two launches)
+FUSE_NORM = os.environ.get("TF_GLM_FUSE_NORM", "1") != "0"
+
 # prompt chunks of this many rows or more run as two micro-batches, each one's collectives (rows mode) on a second
 # stream beside the other's compute (TF_GLM_PROMPT_OVERLAP=0: one batch); every row keeps its bits
 OVERLAP_ROWS = 256 if os.environ.get("TF_GLM_PROMPT_OVERLAP", "1") != "0" else 1 << 30
@@ -160,6 +169,14 @@ def out_proj(w, b, x: torch.Tensor, q, xs, R: int) -> torch.Tensor:
     return gather(w, b, R)
 
 
+def qscratch_slots(capacity: int, dcp: int = 1, kv: str | None = None) -> int:
+    """Slots of the prompt chunks' fp16 latent scratch (mla_pe.QSCRATCH): a quantized latent without dcp, else 0."""
+
+    if not mla_pe.QSCRATCH or dcp > 1 or not kv8.latent_bits(kv8.check_mode(kv or kv8.MODE)):
+        return 0
+    return min(capacity, mla_pe.QSCRATCH_TOKENS)
+
+
 class Buffers(FlashBuffers):
     """Flash's buffers plus GLM-5.3's rope cos/sin rows and plain-residual state (no stream copies)."""
 
@@ -213,6 +230,10 @@ class Buffers(FlashBuffers):
         # dcp (TF_GLM_DCP): every head's absorbed query and the partials exchanged between the ranks
         self.dcp = (dcp_mod.Scratch(rows, share(c.heads, w.world, w.rank), c.kv_lora, c.qk_rope, w.world, dev)
                     if w.meta.get("dcp", 1) > 1 else None)
+        # prompt chunks over a quantized latent: a layer's visible slots as fp16 tiles (mla_pe.unpack_q), flat so the
+        # micro-batch views leave it whole
+        self.qscr = (torch.empty((qscratch_slots(capacity, w.meta.get("dcp", 1)) * c.kv_lora,), dtype=torch.float16,
+                                 device=dev) if prefill and qscratch_slots(capacity, w.meta.get("dcp", 1)) else None)
         first = next((l.moe.experts for l in w.layers if l.moe is not None), None)
         if first is not None and first.ex is not None:
             from tensorfold.cuda.exl3 import experts as x3experts
@@ -401,9 +422,25 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         with prof.timed("dsa: expand"):
             o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
         return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
+    qs = None
+    qscr = getattr(b, "qscr", None)
+    if (mla_pe.QSCRATCH and qscr is not None and isinstance(lc, KvQ) and host_pos is not None
+            and R >= mla_pe.FUSED_ROWS and (host_pos + R) * lc.width <= qscr.numel()):
+        with prof.timed("dsa: q unpack"):
+            # the slots these rows can see (theirs included, written above), once for the layer's attention
+            buf = qscr.view(torch.bfloat16) if mla_pe.QSCRATCH_BF16 else qscr
+            qs = mla_pe.unpack_q(lc, host_pos + R, buf.view(-1, lc.width))
     if not all_sparse:
-        with prof.timed("dsa: dense attention"):
-            mla_pe.attention(qa, qp, lc, pc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol)
+        # rows past the dense limit take the sparse pass's output: a prompt chunk's dense pass runs only the rows
+        # below it (a 4,096- or 8,192-row first chunk otherwise attends every later row densely for nothing)
+        nd = R if host_pos is None or not sparse_rows else max(0, min(R, c.dense_limit - host_pos))
+        if nd:
+            dch = min(nch or s.nch, s.nch)
+            if host_pos is not None:                     # the chunks those rows can see, not the whole window's
+                dch = min(dch, -(-(host_pos + nd) // latent_mod.CHUNK))
+            with prof.timed("dsa: dense attention"):
+                mla_pe.attention(qa[:nd], qp[:nd], lc, pc, pos_dev, s, scale=scale, nch=dch, out=ol[:nd],
+                                 qscratch=qs)
     if sparse_rows:
         if a.index is not None and not reuse:
             with prof.timed("dsa: select tokens"):
@@ -412,7 +449,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
                                          tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np)
         # a "shared" layer attends the tokens its group's full layer selected for these rows (still in b.tokens)
         with prof.timed("dsa: sparse attention"):
-            mla_pe.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], ol, scale)
+            mla_pe.sparse_attention(qa, qp, lc, pc, b.tokens[:R], b.counts[:R], ol, scale, qscratch=qs)
     with prof.timed("dsa: expand"):
         o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
@@ -485,7 +522,8 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
     with prof.timed("moe: routed"):
         # GLM-5.3 has no swiglu_limit; the bf16 activation roundings are the GLM family's
         x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], m.experts.ex, b.moe, b.part[:R], R,
-                         limit=math.inf, act_mode=x3experts.ACT_BF16, add=b.sy[:R] if inline else None)
+                         limit=math.inf, act_mode=x3experts.ACT_BF16, add=b.sy[:R] if inline else None,
+                         kernel=PROMPT_EXPERTS)
     if b.side is not None:
         join(b)
     elif not inline:
@@ -496,15 +534,31 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         return gather(w, b, R)
 
 
+def norm_in(b, R: int, weight, eps: float, pre) -> None:
+    """b.normed / b.xs = rmsnorm(b.x) for a block, after adding ``pre`` (a prompt chunk's pending Rows branch) to b.x in
+    the same launch when given (residual() then rmsnorm: the same arithmetic)."""
+
+    if isinstance(pre, Rows) and FUSE_NORM:
+        if pre.done is not None:
+            torch.cuda.current_stream().wait_event(pre.done)
+        glue.residual_rmsnorm(b.x[:R], pre.bg, weight, eps, b.normed[:R], b.xs[:R])
+        return
+    if pre is not None:
+        residual(b.x[:R], b.x[:R], pre)
+    glue.rmsnorm(b.x[:R], weight, eps, b.normed[:R], b.xs[:R])
+
+
 def attn_part(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | None = None,
-              host_pos: int | None = None, sparse_np: int | None = None, pos_dev: torch.Tensor | None = None):
-    """A layer's attention half up to its gathered partials (residual() adds them); rows from pos_dev (default st's)."""
+              host_pos: int | None = None, sparse_np: int | None = None, pos_dev: torch.Tensor | None = None,
+              pre=None):
+    """A layer's attention half up to its gathered partials (residual() adds them); rows from pos_dev (default st's).
+    ``pre``: the previous half's pending branch, added to b.x first."""
 
     di = st.dsa_index[layer.index]
     c = w.cfg
     with prof.timed("dsa (total)"):
         # pre-attention RMSNorm (input_layernorm): the block reads b.normed / b.xs
-        glue.rmsnorm(b.x[:R], layer.in_norm, c.eps, b.normed[:R], b.xs[:R])
+        norm_in(b, R, layer.in_norm, c.eps, pre)
         # a "shared" indexer layer scores and selects nothing of its own: it reuses the owning full
         # layer's selection, which the same window computed one block earlier into the buffers
         idx = st.index[st.index_slot[layer.index]] if getattr(st, "index", None) is not None \
@@ -513,12 +567,12 @@ def attn_part(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int
                          sparse_np, pc=st.pc[di])
 
 
-def ffn_part(layer: LayerW, w: Weights, b: Buffers, R: int):
-    """A layer's MLP / MoE half up to its gathered partials."""
+def ffn_part(layer: LayerW, w: Weights, b: Buffers, R: int, pre=None):
+    """A layer's MLP / MoE half up to its gathered partials (``pre`` as in attn_part)."""
 
     with prof.timed("moe (total)" if layer.mlp is None else "mlp"):
         # post-attention RMSNorm before the MLP / MoE
-        glue.rmsnorm(b.x[:R], layer.post_norm, w.cfg.eps, b.normed[:R], b.xs[:R])
+        norm_in(b, R, layer.post_norm, w.cfg.eps, pre)
         return mlp_block(layer, w, b, R) if layer.mlp is not None else moe_block(layer, w, b, R)
 
 
@@ -541,12 +595,9 @@ def prompt_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, ho
     pend = [None, None]
     for layer in w.layers:
         for i, (v, r, pos, hp) in enumerate(mbs):
-            if pend[i] is not None:
-                residual(v.x[:r], v.x[:r], pend[i])
-            pend[i] = attn_part(layer, w, st, v, r, nch, hp, sparse_np, pos)
+            pend[i] = attn_part(layer, w, st, v, r, nch, hp, sparse_np, pos, pre=pend[i])
         for i, (v, r, pos, hp) in enumerate(mbs):
-            residual(v.x[:r], v.x[:r], pend[i])
-            pend[i] = ffn_part(layer, w, v, r)
+            pend[i] = ffn_part(layer, w, v, r, pre=pend[i])
     for i, (v, r, pos, hp) in enumerate(mbs):
         residual(v.x[:r], v.x[:r], pend[i])
 

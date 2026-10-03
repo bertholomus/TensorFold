@@ -114,8 +114,9 @@ def main() -> None:
         fwd.PROMPT_REDUCE = "gather"
         # alone, no rank holds the others' embedding rows: keep the whole table (real rows, real routing)
         os.environ["TF_GLM_EMBED_SPLIT"] = "0"
+    rows = int(os.environ.get("TF_PROFILE_ROWS") or 0) or None     # a prompt chunk's rows (default 2,048)
     eng = GlmEngine(MODEL, rank=RANK, master=MASTER, port=PORT, policy="3", context=CONTEXT, context_explicit=True,
-                    comm=Alone(RANK, int(os.environ.get("TF_TP_WORLD", "4"))) if alone else None)
+                    comm=Alone(RANK, int(os.environ.get("TF_TP_WORLD", "4"))) if alone else None, prefill_rows=rows)
     e, w = eng.e, eng.w
     st = e.st
     say(f"== loaded in {time.time() - t:.0f}s: limit {eng.limit}, slots {eng.capacity_plan['cache_slots']}, "
@@ -289,7 +290,15 @@ def main() -> None:
         # shared1 (the shared expert after the routed experts and added, vs first and added by their combine), profile
         # (TF_GLM_PROFILE block times, with syncs: slower); every run is compared to the first. Before each timed run
         # the same settings prefill a TF_PROFILE_WARM-token prompt (default 6000; 0: none), so first-use compiles land
-        # outside the timing.
+        # outside the timing. absorb3: absorb / expand as batched tensor-core matmuls; qscr0 / qscr1: a quantized latent's prompt
+        # attention dequantizing in registers vs reading the fp16 scratch (same bits), qscr2: the bf16 latent-domain
+        # scratch through the bf16 kernels (other bits); experts3: grouped_mma2
+        # (each warp's weight tiles decoded into mma fragments, one chain over K: other bits), experts4: grouped_mma3
+        # (gate/up rotating its rows from the layer input, down's epilogue inside, bf16 slot outputs: other bits);
+        # gemm0 / gemm1: the EXL3 prompt GEMM's fixed tiles vs tiles by shape (TF_EXL3_PREFILL_TILES); skt16 / skt32:
+        # prompt sparse attention's key tile (TF_GLM_PROMPT_KT); span0 / span1: prompt chunks' indexer scores a program
+        # a 64-token tile vs a program a span with its rows' queries held (TF_GLM_SCORES_SPAN); fuse0 / fuse1: prompt
+        # chunks' residual add and next RMSNorm as two launches vs one (TF_GLM_FUSE_NORM, same bits).
         variants = (os.environ.get("TF_PROFILE_AB")
                     or "experts0+gather+overlap0+absorb0+sparse0+select0+shared0,"
                        "experts2+rowred+overlap1+absorb2+sparse1+select1+shared1").split(",")
@@ -305,25 +314,46 @@ def main() -> None:
 
         from tensorfold.families.glm_moe_dsa.cuda import select as select_mod
 
-        shipped = (x3experts.PROMPT, x3experts.PROMPT_KERNEL, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
-                   mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE)
+        from tensorfold.families.glm_moe_dsa.cuda import x3 as x3mod
+
+        def settings():
+            return (x3experts.PROMPT, fwd.PROMPT_EXPERTS, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
+                    mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE, mla_pe.QSCRATCH,
+                    mla_pe.QSCRATCH_BF16, mla_pe.PROMPT_KT, x3mod.PROMPT_TILES, select_mod.SCORES_SPAN,
+                    fwd.FUSE_NORM)
+
+        def restore(v):
+            (x3experts.PROMPT, fwd.PROMPT_EXPERTS, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
+             mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE, mla_pe.QSCRATCH, mla_pe.QSCRATCH_BF16,
+             mla_pe.PROMPT_KT, x3mod.PROMPT_TILES, select_mod.SCORES_SPAN, fwd.FUSE_NORM) = v
+
+        shipped = settings()
         runs = []
         try:
             for v in variants:
-                (x3experts.PROMPT, x3experts.PROMPT_KERNEL, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
-                 mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE) = shipped
+                restore(shipped)
                 timed = False
                 for s in v.split("+"):
-                    if s in ("experts0", "experts1", "experts2"):
+                    if s in ("experts0", "experts1", "experts2", "experts3", "experts4"):
                         x3experts.PROMPT = s != "experts0"
-                        x3experts.PROMPT_KERNEL = "mma" if s == "experts2" else "rows"
+                        fwd.PROMPT_EXPERTS = {"experts2": "mma", "experts3": "mma2", "experts4": "mma3"}.get(s, "rows")
                     elif s in ("gather", "rowred"):
                         fwd.PROMPT_REDUCE = "rows" if s == "rowred" else s
                     elif s in ("overlap0", "overlap1"):
                         fwd.OVERLAP_ROWS = 256 if s == "overlap1" else 1 << 30
-                    elif s in ("absorb0", "absorb1", "absorb2"):
+                    elif s in ("absorb0", "absorb1", "absorb2", "absorb3"):
                         mla_pe.PROMPT_RB = 1 << 30 if s == "absorb0" else 64
-                        mla_pe.ABSORB = "cuda" if s == "absorb2" else "triton"
+                        mla_pe.ABSORB = {"absorb2": "cuda", "absorb3": "bmm"}.get(s, "triton")
+                    elif s in ("fuse0", "fuse1"):
+                        fwd.FUSE_NORM = s == "fuse1"
+                    elif s in ("span0", "span1"):
+                        select_mod.SCORES_SPAN = s == "span1"
+                    elif s in ("skt16", "skt32"):
+                        mla_pe.PROMPT_KT = int(s[3:])
+                    elif s in ("gemm0", "gemm1"):
+                        x3mod.PROMPT_TILES = s == "gemm1"
+                    elif s in ("qscr0", "qscr1", "qscr2"):
+                        mla_pe.QSCRATCH, mla_pe.QSCRATCH_BF16 = s != "qscr0", s == "qscr2"
                     elif s in ("sparse0", "sparse1"):
                         mla_pe.FUSED_ROWS = 64 if s == "sparse1" else 1 << 30
                     elif s in ("select0", "select1"):
@@ -354,8 +384,7 @@ def main() -> None:
                 if timed:
                     prof.report(n_)
         finally:
-            (x3experts.PROMPT, x3experts.PROMPT_KERNEL, fwd.PROMPT_REDUCE, fwd.OVERLAP_ROWS, mla_pe.PROMPT_RB,
-             mla_pe.ABSORB, mla_pe.FUSED_ROWS, select_mod.TRIM, fwd.SHARED_INLINE) = shipped
+            restore(shipped)
 
     if "prefill" in SECTIONS:
         from tensorfold.families.glm5_next.cuda import prof

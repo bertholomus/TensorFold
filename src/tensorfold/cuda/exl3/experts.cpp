@@ -13,6 +13,19 @@ void exl3x_grouped_mma_cuda(const at::Tensor&, const at::Tensor&, const at::Tens
                             const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                             const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t);
+void exl3x_grouped_mma2_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                             int64_t, int64_t);
+void exl3x_grouped_mma3_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
+                             int64_t, int64_t, int64_t, int64_t);
+void exl3x_grouped_down3_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                              const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
+                              int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+void exl3x_combine_y_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t,
+                          int64_t, int64_t, int64_t);
 void exl3x_dequant_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_group_count_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
@@ -97,6 +110,75 @@ void grouped_mma(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_mma_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, warps,
                            lo, hi, fold);
+}
+
+void grouped_mma2(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                  const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+                  const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P,
+                  int64_t slots, int64_t cb, int64_t lo, int64_t hi) {
+    check(X0, at::kHalf, "X0");
+    check(X1, at::kHalf, "X1");
+    check(TP0, at::kLong, "TP0");
+    check(TP1, at::kLong, "TP1");
+    check(B0, at::kInt, "B0");
+    check(B1, at::kInt, "B1");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(Z, at::kFloat, "Z");
+    TORCH_CHECK(Z.numel() >= mats * P * N, "Z too small");
+    TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
+    c10::cuda::CUDAGuard guard(X0.device());
+    exl3x_grouped_mma2_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, slots, cb, lo, hi);
+}
+
+void grouped_mma3(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh0, const at::Tensor& suh1,
+                  const at::Tensor& TP0, const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
+                  const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members, at::Tensor Z,
+                  int64_t K, int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi, int64_t nw) {
+    TORCH_CHECK(x.is_cuda() && x.scalar_type() == at::kBFloat16, "x: CUDA bf16");
+    check(suh0, at::kHalf, "suh0");
+    check(suh1, at::kHalf, "suh1");
+    check(TP0, at::kLong, "TP0");
+    check(TP1, at::kLong, "TP1");
+    check(B0, at::kInt, "B0");
+    check(B1, at::kInt, "B1");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(Z, at::kFloat, "Z");
+    TORCH_CHECK(Z.numel() >= 2 * P * N, "Z too small");
+    c10::cuda::CUDAGuard guard(x.device());
+    exl3x_grouped_mma3_cuda(x, x_stride, suh0, suh1, TP0, TP1, B0, B1, uids, ucount, members, Z, K, N, P, slots, cb,
+                            lo, hi, nw);
+}
+
+void grouped_down3(const at::Tensor& Xd, const at::Tensor& TP, const at::Tensor& B, const at::Tensor& uids,
+                   const at::Tensor& ucount, const at::Tensor& members, const at::Tensor& svh, const at::Tensor& wts,
+                   at::Tensor Y, int64_t K, int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi) {
+    check(Xd, at::kHalf, "Xd");
+    check(TP, at::kLong, "TP");
+    check(B, at::kInt, "B");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(svh, at::kHalf, "svh");
+    check(wts, at::kFloat, "wts");
+    TORCH_CHECK(Y.is_cuda() && Y.scalar_type() == at::kBFloat16 && Y.is_contiguous() && Y.numel() >= P * N,
+                "Y: CUDA bf16 [P, N]");
+    TORCH_CHECK(wts.numel() >= P, "wts: a weight a slot");
+    c10::cuda::CUDAGuard guard(Xd.device());
+    exl3x_grouped_down3_cuda(Xd, TP, B, uids, ucount, members, svh, wts, Y, K, N, P, slots, cb, lo, hi);
+}
+
+void combine_y(const at::Tensor& Y, const at::Tensor& pick, const at::Tensor& add, at::Tensor out, int64_t rows,
+               int64_t D, int64_t slots, int64_t E, int64_t has_add) {
+    TORCH_CHECK(Y.is_cuda() && Y.scalar_type() == at::kBFloat16, "Y: CUDA bf16");
+    check(pick, at::kInt, "pick");
+    check(out, at::kFloat, "out");
+    if (has_add) check(add, at::kFloat, "add");
+    c10::cuda::CUDAGuard guard(Y.device());
+    exl3x_combine_y_cuda(Y, pick, add, out, rows, D, slots, E, has_add);
 }
 
 void dequant(const at::Tensor& T, at::Tensor out, int64_t k2, int64_t cb) {
@@ -214,6 +296,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped", &grouped);
     m.def("grouped_rows", &grouped_rows);
     m.def("grouped_mma", &grouped_mma);
+    m.def("grouped_mma2", &grouped_mma2);
+    m.def("grouped_mma3", &grouped_mma3);
+    m.def("grouped_down3", &grouped_down3);
+    m.def("combine_y", &combine_y);
     m.def("dequant", &dequant);
     m.def("group", &group);
     m.def("group_count", &group_count);

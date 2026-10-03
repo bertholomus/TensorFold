@@ -34,6 +34,41 @@ def rank_sum(qr: torch.Tensor, br: torch.Tensor) -> torch.Tensor:
     return br
 
 
+# -- a prompt chunk's residual add and the next RMSNorm in one pass (residual_add's and rmsnorm's arithmetic) ----------
+@triton.jit
+def _residual_rmsnorm(X, G, W, XS, eps, D: tl.constexpr, BLOCK: tl.constexpr, OUT, o_stride):
+    """Row r: X = bf16(X + bf16(G)) (residual_add with one bf16 branch), OUT = rmsnorm(X) and its 64-group sums."""
+
+    r = tl.program_id(0)
+    d = tl.arange(0, BLOCK)
+    ok = d < D
+    x = tl.load(X + r * D + d, mask=ok, other=0.0).to(tl.float32)
+    g = tl.load(G + r * D + d, mask=ok, other=0.0).to(tl.bfloat16).to(tl.float32)
+    xn = (x + g).to(tl.bfloat16)
+    tl.store(X + r * D + d, xn, mask=ok)
+    xf = xn.to(tl.float32)
+    rinv = 1.0 / tl.sqrt(tl.sum(xf * xf, axis=0) / D + eps)
+    w = tl.load(W + d, mask=ok, other=0.0).to(tl.float32)
+    y = (w * (xf * rinv).to(tl.bfloat16).to(tl.float32)).to(tl.bfloat16)
+    tl.store(OUT + r * o_stride + d, y, mask=ok)
+    gs = tl.sum(tl.reshape(tl.where(ok, y.to(tl.float32), 0.0), (BLOCK // 64, 64)), axis=1)
+    gi = tl.arange(0, BLOCK // 64)
+    tl.store(XS + r * (D // 64) + gi, gs, mask=gi < D // 64)
+
+
+def residual_rmsnorm(x: torch.Tensor, branch: torch.Tensor, w: torch.Tensor, eps: float, out: torch.Tensor,
+                     xs: torch.Tensor) -> torch.Tensor:
+    """x += the bf16 branch (residual_add), then out / xs = rmsnorm(x) (Flash's rmsnorm with its sums), one launch."""
+
+    rows, d = x.shape
+    if not (x.is_contiguous() and branch.is_contiguous() and out.stride(-1) == 1):
+        raise ValueError("residual_rmsnorm: contiguous rows")
+    block = triton.next_power_of_2(d)
+    _residual_rmsnorm[(rows,)](x, branch, w, xs, eps, D=d, BLOCK=block, OUT=out, o_stride=out.stride(0),
+                               num_warps=4 if block <= 2048 else 8)
+    return out
+
+
 # -- the embedding split by vocabulary (weights.embed_span): a rank's own rows, then each token's from its holder ------
 @triton.jit
 def _embed_span(IDS, W, OUT, lo, n, D: tl.constexpr):

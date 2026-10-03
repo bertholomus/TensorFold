@@ -107,24 +107,28 @@ def test_sparse_attention_over_packed_rows(bits, R, pos):
     qa = (torch.randn((R, H, LW), generator=g) * 0.05).to(torch.bfloat16).cuda()
     qp = (torch.randn((R, H, PW), generator=g) * 0.05).to(torch.bfloat16).cuda()
     junk = torch.randn((R, H, LW), generator=g).to(torch.bfloat16).cuda()
-    fused = mla_pe.FUSED_ROWS
+    fused, kt = mla_pe.FUSED_ROWS, mla_pe.PROMPT_KT
     outs = []
     try:
-        for rows_cut in (1 << 30, 1):                      # chunk programs + _merge, then the prompt kernel
+        mla_pe.PROMPT_KT = mla_pe.KT                       # the decode windows' key tile: their bits
+        for rows_cut in (1 << 30, 1, 1):                   # chunk programs + _merge, the prompt kernel, at PROMPT_KT
             mla_pe.FUSED_ROWS = rows_cut
+            if len(outs) == 2:
+                mla_pe.PROMPT_KT = kt
             out = junk.clone()
             mla_pe.sparse_attention(qa, qp, plane, pc, tokens, counts, out, 256 ** -0.5)
             outs.append(out)
     finally:
-        mla_pe.FUSED_ROWS = fused
-    assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))        # prompt == decode
+        mla_pe.FUSED_ROWS, mla_pe.PROMPT_KT = fused, kt
+    assert torch.equal(outs[0].view(torch.int16), outs[1].view(torch.int16))        # prompt == decode at KT
     for r in range(0, R, max(1, R // 7)):
         if int(counts[r]) == 0:
             assert torch.equal(outs[0][r].view(torch.int16), junk[r].view(torch.int16))
             continue
         want = reference(qa[r], qp[r], rows, pc, tokens[r, :topk].long(), 256 ** -0.5)
-        err = (outs[0][r].double() - want).norm() / want.norm()
-        assert float(err) < 6e-3, (r, float(err))
+        for o in (outs[0], outs[2]):
+            err = (o[r].double() - want).norm() / want.norm()
+            assert float(err) < 6e-3, (r, float(err))
 
 
 def test_slot_bytes_of_the_quantized_formats():

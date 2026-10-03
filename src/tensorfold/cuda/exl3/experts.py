@@ -28,8 +28,17 @@ PROMPT = os.environ.get("TF_EXL3_PROMPT_TILES", "1") != "0"
 # prompt chunks' kernel: "mma" (64 member rows a program, each weight tile decoded once into shared memory for all of
 # them) or "rows" (grouped_rows: member tiles in registers, PROMPT_TILES); both keep every row's bits. The mma kernel
 # takes K in steps of MMA_KB k tiles, which must divide the window's chains (K / 16 / (splits x warps)); else rows.
+# "mma2": 64 member rows by 256 columns a program, each warp decoding its own weight tiles into mma fragments and
+# summing each output in one chain over K (deterministic, independent of the window, but not the decode windows' split
+# order: other bits); needs N and K multiples of 256 (GLM-5.3's shapes), else mma.
 PROMPT_KERNEL = os.environ.get("TF_EXL3_PROMPT_KERNEL") or "mma"
 MMA_KB = 4                        # experts_grouped.cuh's MMA_KB
+# "mma3": mma2 with gate/up's input rotation inside (rows made from the layer input in shared memory, no rot_in, no
+# rotated copies; bf16 input, up to 4 bits a gate/up weight: the same bits as mma2's setting 0), and with the combine
+# down's per-slot epilogue inside it: weighted slot outputs in bf16 (half of z's bytes), added by combine_y.
+# grouped_mma3's gate/up columns a program: 4 (512, a TP4 rank's whole width: the rows rotated once a mat; 5.3 against
+# 6.1 ms a 2,048-row layer at 2) or 2 (256)
+MMA3_NW = int(os.environ.get("TF_EXL3_MMA3_NW") or 4)
 
 
 @lru_cache(maxsize=1)
@@ -38,7 +47,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v3", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v12", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -168,8 +177,10 @@ class Scratch:
         self.cfg_gu = cfg_gu or default_config(D, I, True)
         self.cfg_d = cfg_d or default_config(I, D, False)
         P = rows * slots
-        self.xg = torch.zeros((P, D), dtype=torch.float16, device=device)
-        self.xu = torch.zeros((P, D), dtype=torch.float16, device=device)
+        # gate / up's rotated rows (rot_in): prompt buffers make them on first use (mma3 rotates inside its programs and
+        # never needs them: 1.8 GB at 8,192 rows)
+        self.xg = None if prompt else torch.zeros((P, D), dtype=torch.float16, device=device)
+        self.xu = None if prompt else torch.zeros((P, D), dtype=torch.float16, device=device)
         self.xd = torch.zeros((P, I), dtype=torch.float16, device=device)
         # gate and up write 2 * splits * P * I partials, down splits * P * D
         self.z = torch.zeros((max(2 * self.cfg_gu[2] * I, self.cfg_d[2] * D) * P,), dtype=torch.float32, device=device)
@@ -192,13 +203,15 @@ class Scratch:
 
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
-           group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None) -> torch.Tensor:
+           group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None,
+           kernel: str | None = None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts`` (plus
     ``add`` [R, D] fp32 added last, in the same launch, when given).
 
     Decode windows make no host sync. Prompt chunks (``group`` and R >= EXACT_ROWS) read the busiest expert's row count
     once; with ``prompt`` (default TF_EXL3_PROMPT_TILES) they group in parallel and decode each weight tile once for
-    several member rows (PROMPT_KERNEL), every row's arithmetic the one-tile launch's (the same bits).
+    several member rows (``kernel``, default PROMPT_KERNEL), every row's arithmetic the one-tile launch's (the same
+    bits) for "mma" and "rows"; "mma2" / "mma3" sum in their own order.
     """
 
     ext = _ext()
@@ -228,11 +241,27 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         ext.group(pick, ids, s.count, members, R, slots, E)
     if s.y is None and not (fast and wts is not None):        # prompt buffers: the one-tile path's per-slot outputs
         s.y = torch.zeros((s.rows * slots, D), dtype=torch.float32, device=x.device)
-    ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
+    kern = PROMPT_KERNEL if kernel is None else kernel
+    mma2 = (fast and kern in ("mma2", "mma3") and I % 256 == 0 and D % 256 == 0 and
+            max(ex.k2_gu[1], ex.k2_d[1]) <= 10)
+    mma3 = (mma2 and kern == "mma3" and x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.stride(0) % 4 == 0
+            and ex.k2_gu[1] <= 8)
+    if not mma3:                     # mma3 rotates gate/up's rows from x inside its programs
+        if s.xg is None:
+            s.xg = torch.zeros((s.rows * slots, D), dtype=torch.float16, device=x.device)
+            s.xu = torch.zeros((s.rows * slots, D), dtype=torch.float16, device=x.device)
+        ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
     nt, w, sk, pf = s.cfg_gu
-    mma = fast and PROMPT_KERNEL == "mma" and I % 64 == 0 and D % 64 == 0 and all(
+    mma = not mma2 and fast and kern in ("mma", "mma2", "mma3") and I % 64 == 0 and D % 64 == 0 and all(
         (k // 16) % (cfg[1] * cfg[2] * MMA_KB) == 0 for k, cfg in ((D, s.cfg_gu), (I, s.cfg_d)))
-    if mma:
+    if mma3:
+        ext.grouped_mma3(x, x.stride(0), ex.suh_g, ex.suh_u, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids,
+                         s.count, members, s.z, D, I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], MMA3_NW)
+    elif mma2:
+        # each output one fp32 chain over K: Z [2, P, I] holds whole sums (one split)
+        ext.grouped_mma2(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
+                         I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1])
+    elif mma:
         # every split's chains in one program, their sum from 0 as the epilogue would add them
         ext.grouped_mma(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                         P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], 1)
@@ -248,7 +277,21 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
                         float(limit), act_mode)
     nt, w, sk, pf = s.cfg_d
     dsk = sk                          # the down partials' splits as down_combine reads them
-    if mma:
+    if mma3 and wts is not None and ex.k2_d[1] <= 8:
+        # down with down_combine's per-slot arithmetic inside, times the routing weight, as bf16 Y [P, D] in the tail
+        # of the z buffer (gate/up's sums take its first 2 P I floats); the combine adds a row's routed slots
+        if out is None:
+            out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+        yb = s.z.view(torch.bfloat16)[4 * P * I:4 * P * I + P * D]
+        ext.grouped_down3(s.xd, ex.down_ptr, ex.down_k2, ids, s.count, members, ex.svh_d, wts, yb, I, D, P, slots,
+                          ex.cb, ex.k2_d[0], ex.k2_d[1])
+        ext.combine_y(yb, pick, s.no_y if add is None else add, out, R, D, slots, E, int(add is not None))
+        return out
+    if mma2:
+        ext.grouped_mma2(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
+                         I, D, P, slots, ex.cb, ex.k2_d[0], ex.k2_d[1])
+        dsk = 1
+    elif mma:
         # one split is written as is; several are folded in order from 0 (down_combine's order) into one
         ext.grouped_mma(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
                         I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1))

@@ -7,7 +7,7 @@ slot (id E), as glue.select lays them out.
 
 usage (one GPU, tf container): python3 tools/bench_prompt_experts.py [ROWS=2048,4096] [SKEW=0,0.6,1.2] [TILES=4:2:4,..]
 (TILES: decode-once settings to try: grouped_rows' n tiles:tiles in flight:member tiles a program, for gate/up and
-down alike or "gate/up+down", or mma for grouped_mma)
+down alike or "gate/up+down", mma for grouped_mma, mma2 for grouped_mma2: other bits, so its relative error is shown)
 """
 
 from __future__ import annotations
@@ -79,7 +79,7 @@ def main() -> None:
     tb = int(ex.trellis_bytes.sum())
     print(f"layer: {E} experts, {tb / 2**20:.0f} MiB of trellis on this rank", flush=True)
     # a setting is "nt:pf:g" for both projections or "gate/up+down" (grouped_rows), or "mma" (grouped_mma)
-    tiles = [("mma",) if t == "mma" else
+    tiles = [(t,) if t in ("mma", "mma2") else
              [tuple(int(v) for v in p.split(":")) for p in (t.split("+") * 2)[:2]]
              for t in (sys.argv[3] if len(sys.argv) > 3 else "8:1:2,mma").split(",")]
     for R in rows:
@@ -91,8 +91,8 @@ def main() -> None:
             line = f"R={R} skew {skew}: busiest expert {int(cnt.max())} rows (mean {R * TOPK / E:.0f})"
             for name, fast, tile in [("per-tile", False, None)] + [(f"decode-once {t}", True, t) for t in tiles]:
                 out = torch.empty((R, D), dtype=torch.float32, device="cuda")
-                if tile is not None and tile[0] == "mma":
-                    x3experts.PROMPT_KERNEL = "mma"
+                if tile is not None and tile[0] in ("mma", "mma2"):
+                    x3experts.PROMPT_KERNEL = tile[0]
                 elif tile is not None:
                     x3experts.PROMPT_KERNEL = "rows"
                     x3experts.PROMPT_TILES = {"gateup": tile[0], "down": tile[1]}
@@ -114,9 +114,11 @@ def main() -> None:
                     continue
                 ref = next(iter(outs.values()), None)
                 same = None if ref is None else torch.equal(out.view(torch.int32), ref.view(torch.int32))
+                err = None if ref is None else float((out.double() - ref.double()).norm() / ref.double().norm())
                 outs[name] = out.clone()
-                line += (f"\n   {name}: {ms:.2f} ms ({tb / ms / 1e6:.0f} GB/s of trellis), bit-equal {same}; "
-                         f"kernels ms: {kernels(call)}")
+                tf = 2 * R * TOPK * 3 * D * I / ms / 1e9
+                line += (f"\n   {name}: {ms:.2f} ms ({tb / ms / 1e6:.0f} GB/s of trellis, {tf:.1f} TFLOPS), bit-equal "
+                         f"{same}{'' if err is None else f' (rel. error {err:.2e})'}; kernels ms: {kernels(call)}")
             print(line, flush=True)
         del s
 

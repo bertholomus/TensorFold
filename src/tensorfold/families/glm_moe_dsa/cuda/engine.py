@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 MAX_ROWS = 8                          # the widest verify window (a pending token and up to 7 drafts)
+# a prompt chunk's rows (TF_GLM_PREFILL_ROWS): 8,192 runs each micro-batch's experts on 4,096 rows, twice the rows a
+# weight read of 2,048-row chunks (32.5k-token prefill on TP4: 32.0 s against 35.9 at 4,096 and ~40 at 2,048)
+PROMPT_ROWS = int(os.environ.get("TF_GLM_PREFILL_ROWS") or 8192)
+# the prompt buffers' bytes a row past geometry's 2,048 (measured on TP4: torch allocated 82.6 GiB at 8,192 rows
+# against 77.7 at 2,048, 64k context, before the rotated expert rows went lazy), counted by the startup estimate
+PROMPT_ROW_BYTES = 860_000
 GRAPH_ROWS = (1, 2, 3, 4, 5, 6)       # verify windows captured as CUDA graphs
 DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,048 tokens)
 DEFAULT_POLICY = "auto"
@@ -71,14 +77,15 @@ class GlmEngine:
         # GLM-5.3 has no k-pool: the dense limit is index_topk visible tokens
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         # each rank holds its vocabulary span of the embedding (weights.embed_span), not the whole table
+        rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
-                                   lambda text: self._geometry(text, world, dcp=G),
+                                   lambda text: self._geometry(text, world, dcp=G, rows=rows),
                                    embed_transform(split_weights(rule, world), cfg.vocab, world, rank),
                                    rank=rank, world=world, gather=self._gather_ints)
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
-        prefill_rows = PREFILL_ROWS if prefill_rows is None else int(prefill_rows)
+        prefill_rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
                 prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G]
         both = self._gather_ints(mine)
@@ -113,19 +120,23 @@ class GlmEngine:
         self.live: list[int] = []
 
     @staticmethod
-    def _geometry(text: dict, world: int, kv: str | None = None, dcp: int = 1):
+    def _geometry(text: dict, world: int, kv: str | None = None, dcp: int = 1, rows: int | None = None):
         """The Flash MLA geometry minus the KDA and hyper-connection terms, with the MTP head counted, and this family's
         own cache a slot: Flash counts a 512-wide latent and three indexer planes a layer, this family keeps the latent
         plus a 64-wide rope key a layer (and the MTP head's) and one indexer key plane a full-indexer layer (96,640 B a
         slot at TP4 against Flash's 126,912; TF_GLM_KV idx8 93,912, fp8 53,780, q8 55,992, q6 45,880, q5 40,824, q4
         35,768), and its token selection holds at most select.SELECT_BYTES at once. With ``dcp`` ranks interleaving the
-        positions a rank holds 1/dcp of every slot, plus the prompt chunks' exchange buffers (dcp.Scratch)."""
+        positions a rank holds 1/dcp of every slot, plus the prompt chunks' exchange buffers (dcp.Scratch). A quantized
+        latent without dcp adds the prompt chunks' latent scratch (forward.qscratch_slots, 1 KiB a slot), and prompt
+        chunks wider than geometry's 2,048 rows PROMPT_ROW_BYTES a row."""
 
-        from tensorfold.cuda.geometry import Geometry, mla_geometry
+        from tensorfold.cuda.geometry import PREFILL_ROWS, Geometry, mla_geometry
 
         from . import kv8
+        from .forward import qscratch_slots
         from .select import SELECT_BYTES
 
+        prompt_rows = PROMPT_ROWS if rows is None else int(rows)
         t = dict(text)
         t.pop("linear_attn_config", None)              # no KDA layers: drop its state terms
         t["layer_types"] = ["deepseek_sparse_attention"] * int(t["num_hidden_layers"])
@@ -142,17 +153,18 @@ class GlmEngine:
         flash_slot = (flash.bytes_at(hi) - flash.bytes_at(lo)) / (hi - lo)
         extra = 0
         if dcp > 1:
-            from tensorfold.cuda.geometry import PREFILL_ROWS
-
             own = own / dcp
             hl = int(text["num_attention_heads"]) // world
             lw, pw = int(text["kv_lora_rank"]), int(text["qk_rope_head_dim"])
-            rows = PREFILL_ROWS                        # the prompt buffers' qpack, qall, send and recv; ~20 MiB decode
-            extra = rows * hl * ((lw + pw) * 2 * (1 + dcp) + (lw // 2 + 1) * 4 * 2 * dcp) + (24 << 20)
-            extra += 2 * rows * dcp * 2048 * 8         # a prompt block's gathered selection candidates
+            r = prompt_rows                            # the prompt buffers' qpack, qall, send and recv; ~20 MiB decode
+            extra = r * hl * ((lw + pw) * 2 * (1 + dcp) + (lw // 2 + 1) * 4 * 2 * dcp) + (24 << 20)
+            extra += 2 * r * dcp * 2048 * 8            # a prompt block's gathered selection candidates
+        extra += max(0, prompt_rows - PREFILL_ROWS) * PROMPT_ROW_BYTES      # chunks wider than geometry's 2,048 rows
+        qs_row = 2 * int(text["kv_lora_rank"])
 
         def bytes_at(slots: int) -> int:
-            return int(flash.bytes_at(slots) + (own - flash_slot) * slots) + 3 * SELECT_BYTES + extra
+            return (int(flash.bytes_at(slots) + (own - flash_slot) * slots) + 3 * SELECT_BYTES + extra
+                    + qscratch_slots(slots, dcp, kv) * qs_row)
 
         return Geometry(bytes_at, flash.reserve, flash.minimum_slots)
 
