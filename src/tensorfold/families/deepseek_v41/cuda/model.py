@@ -179,7 +179,7 @@ def _engram_io():
         here = Path(__file__).parent
         from torch.utils import cpp_extension
 
-        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v1", sources=[str(here / "engram_io.cpp")],
+        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v2", sources=[str(here / "engram_io.cpp")],
                                             extra_cflags=["-O3"], verbose=False)
     return _engram_io.ext
 
@@ -268,8 +268,7 @@ class Engram:
             self.pinned[layer] = buf
         bw_v, bs_v = buf[0][:m], buf[1][:m]
         it = torch.from_numpy(flat)
-        self.io.gather_rows(fw, bw, rw, it, bw_v, self.threads)
-        self.io.gather_rows(fs, bs, rs, it, bs_v, self.threads)
+        self.io.gather_rows2(fw, bw, rw, fs, bs, rs, it, bw_v, bs_v, self.threads)
         gw = bw_v.cuda(non_blocking=True)
         gs = bs_v.cuda(non_blocking=True)
         buf[2].record()

@@ -60,6 +60,25 @@ class Drafter:
             K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, pos % self.ring_size, c.eps, KV_QUANT, c.rope_dim)
         dc.absorbed = start + n
 
+    @torch.inference_mode()
+    def absorb_many(self, dpool: "DraftPool", sc, items: list) -> None:
+        """``absorb`` for several streams in one pass over a ring pool: ``items`` (slot, taps [n, 3 d], start) each
+        (fewer than ring rows a stream). The same per-row arithmetic as one absorb a stream."""
+
+        c = self.m.cfg
+        taps = torch.cat([t for _, t, _ in items], 0).contiguous()
+        pos = torch.tensor([p for _, t, st in items for p in range(st, st + t.shape[0])], dtype=torch.long,
+                           device=taps.device)
+        slot = torch.tensor([sl for sl, t, _ in items for _ in range(t.shape[0])], dtype=torch.long, device=taps.device)
+        main_x = K.rmsnorm(mm(self.dw.main_proj, taps), self.dw.main_norm, c.eps)
+        rows = slot * dpool.ring_size + pos % dpool.ring_size
+        for lay, ring in zip(self.dw.blocks, dpool.rings):
+            cos, sin = self._cs(lay, sc)
+            y = mm(lay.wkv, main_x)
+            K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, rows, c.eps, KV_QUANT, c.rope_dim)
+        for sl, t, st in items:
+            dpool.views[sl].absorbed = st + t.shape[0]
+
     def _attention(self, lay, x, sc, ring, q0, pos=None, wpos=None):
         c = self.m.cfg
         n = x.shape[0]

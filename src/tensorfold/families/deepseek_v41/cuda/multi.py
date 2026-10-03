@@ -276,6 +276,7 @@ class MultiDecoder:
             self.dpool = DraftPool(d, slots)             # every slot's drafter rings in one plane a stage
         self.slots = [Slot(i, self.dpool.views[i] if d is not None else None) for i in range(slots)]
         self.extents = Extents(self.cap)              # every stream takes an extent of the one window
+        self._table_view = m.pool_view(self.pool, 0, 0, self.extents.total)   # RoPE tables for any position
         self.drafters: dict[int, object] = {}            # batched drafter graphs by drafting streams
         self.free = list(range(slots))
         self.max_rows = MAX_ROWS
@@ -455,6 +456,7 @@ class MultiDecoder:
             dt = time.perf_counter() - t0
             s.prefill_s += dt
             self.chunk_s, self.since_fill = dt, 0.0
+            self.round_end = None                      # (ROUND_STATS: a fill is not host time between rounds)
             if last is None:
                 return []
             self.filling.remove(s)
@@ -476,6 +478,7 @@ class MultiDecoder:
     def round(self, told: list | None = None) -> list[Stream]:
         """One round over every live stream; returns the streams that ended."""
 
+        self._t_enter = time.perf_counter()
         live = [s for s in self.streams.values() if not s.done]
         if told is None and self.filling:
             s = next((f for f in self.filling if self._quick(f)), self.filling[0])
@@ -506,6 +509,7 @@ class MultiDecoder:
                 torch.cuda.synchronize()
             t_agree = time.perf_counter() - ta0
             between = ta0 - self.round_end if getattr(self, "round_end", None) else 0.0
+            pre = ta0 - getattr(self, "_t_enter", ta0)                # inside round() before the step (op send)
             windows, kept = [], []
             marks = [time.perf_counter()]
 
@@ -535,6 +539,7 @@ class MultiDecoder:
             mark()
             done, r0, tokens = [], 0, 0
             t_absorb = 0.0
+            absorbs = []
             for (s, P, drafts), (_, _, _, _, window, _) in zip(kept, windows):
                 n = len(window)
                 target = e._sample(logits[r0:r0 + n], [P + 1 + i for i in range(n)], s.sampling)
@@ -544,9 +549,7 @@ class MultiDecoder:
                 new = drafts[:a] + [target[a]]
                 s.st.sc.length = P + a + 1
                 if s.draft and taps is not None:
-                    ta = time.perf_counter()
-                    e.drafter.absorb(s.st.dc, s.st.sc, taps[r0:r0 + a + 1], P)
-                    t_absorb += time.perf_counter() - ta
+                    absorbs.append((s.st.index, taps[r0:r0 + a + 1], P))
                 s.counted(n)
                 ends = self._ends(s)
                 for i, t in enumerate(new):
@@ -560,12 +563,18 @@ class MultiDecoder:
                 r0 += n
                 if s.done:
                     done.append(s)
+            if absorbs:                                  # every drafting stream's kept rows into its rings, one pass
+                ta = time.perf_counter()
+                e.drafter.absorb_many(self.dpool, self.m.pool_view(self.pool, 0, 0, self.extents.total) if
+                                      self._table_view is None else self._table_view, absorbs)
+                t_absorb += time.perf_counter() - ta
             self.rounds += 1
             self.round_log.append((len(live), r0, time.perf_counter() - t0, tokens))
             del self.round_log[:-4096]
             if ROUND_STATS:
                 mark()
-                st = self.stage.setdefault(len(live), [0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                st = self.stage.setdefault(len(live), [0, 0, 0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+                st[9] += pre if between < 1.0 else 0.0
                 st[0] += 1
                 st[1] += r0
                 st[2] += tokens
@@ -578,7 +587,8 @@ class MultiDecoder:
                 if st[0] % 100 == 0:
                     r = st[0]
                     print(f"[tensorfold] rank {e.rank} rounds at {len(live)} streams: {st[1] / r:.1f} rows, "
-                          f"{st[2] / r:.2f} tokens a round; ms between {1000 * st[8] / r:.1f} agree {1000 * st[7] / r:.1f} "
+                          f"{st[2] / r:.2f} tokens a round; ms between {1000 * st[8] / r:.1f} (in round() "
+                          f"{1000 * st[9] / r:.1f}) agree {1000 * st[7] / r:.1f} "
                           f"drafts {1000 * st[3] / r:.1f} forward {1000 * st[4] / r:.1f} sample {1000 * st[5] / r:.1f} "
                           f"absorb {1000 * st[6] / r:.1f}", flush=True)
             self.round_end = time.perf_counter()
@@ -587,6 +597,8 @@ class MultiDecoder:
             self._step(False)
 
     def finish(self, done: list[Stream]) -> None:
+        if ROUND_STATS and done:
+            self.round_end = None                      # (a finish's link step is not counted as host time either)
         if not done:
             return
         sids = [s.sid for s in done if s.sid in self.streams]

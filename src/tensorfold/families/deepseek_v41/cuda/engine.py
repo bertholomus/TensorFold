@@ -113,7 +113,13 @@ class DsEngine:
         self.concurrent = int(parallel) > 1
         self.multi = self.scheduler = None
         if self.concurrent:
+            import sys
+
             from .multi import MultiDecoder
+
+            # the scheduler thread shares the GIL with every reply's HTTP thread: at Python's default 5 ms switch
+            # interval it waited ~10 ms a round for the GIL between rounds (4 streams); 0.5 ms hands it back sooner
+            sys.setswitchinterval(float(os.environ.get("TF_DS_SWITCH_INTERVAL") or 0.0005))
 
             self.multi = MultiDecoder(self, slots=int(parallel), cap=self.limit + self.max_rows + 8)
             mu = self.multi                              # the warm-up's prompts run on slot 0 over the whole window
