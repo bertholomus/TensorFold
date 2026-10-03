@@ -415,3 +415,93 @@ def rowmm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> 
     bn = 32
     _rowmm[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, K=k, N=n, BN=bn, BK=128, num_warps=4)
     return out
+
+
+# -- the final collapse: RMSNorm(sum_j pre[j] h_j) (no mixes) ---------------------------------------------------------
+@triton.jit
+def _collapse_norm(X, PRE, NW, OUT, eps, D: tl.constexpr, BLOCK: tl.constexpr):
+    r = tl.program_id(0)
+    p0 = tl.load(PRE + r * 4 + 0)
+    p1 = tl.load(PRE + r * 4 + 1)
+    p2 = tl.load(PRE + r * 4 + 2)
+    p3 = tl.load(PRE + r * 4 + 3)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for c0 in range(0, D, BLOCK):
+        d = c0 + tl.arange(0, BLOCK)
+        c = (((p0 * tl.load(X + r * (4 * D) + d).to(tl.float32) + p1 * tl.load(X + r * (4 * D) + D + d).to(tl.float32))
+              + p2 * tl.load(X + r * (4 * D) + 2 * D + d).to(tl.float32))
+             + p3 * tl.load(X + r * (4 * D) + 3 * D + d).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        acc += c * c
+    rinv = 1.0 / tl.sqrt(tl.sum(acc, axis=0) / D + eps)
+    for c0 in range(0, D, BLOCK):
+        d = c0 + tl.arange(0, BLOCK)
+        c = (((p0 * tl.load(X + r * (4 * D) + d).to(tl.float32) + p1 * tl.load(X + r * (4 * D) + D + d).to(tl.float32))
+              + p2 * tl.load(X + r * (4 * D) + 2 * D + d).to(tl.float32))
+             + p3 * tl.load(X + r * (4 * D) + 3 * D + d).to(tl.float32)).to(tl.bfloat16).to(tl.float32)
+        tl.store(OUT + r * D + d, (tl.load(NW + d).to(tl.float32) * (c * rinv)).to(tl.bfloat16))
+
+
+def collapse_norm(h: torch.Tensor, pre: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
+    rows, _, d = h.shape
+    out = torch.empty((rows, d), dtype=torch.bfloat16, device=h.device)
+    _collapse_norm[(rows,)](h, pre, w, out, eps, D=d, BLOCK=1024, num_warps=8)
+    return out
+
+
+@triton.jit
+def _collapse(X, PRE, OUT, D: tl.constexpr, BLOCK: tl.constexpr):
+    r = tl.program_id(0)
+    cb = tl.program_id(1)
+    d = cb * BLOCK + tl.arange(0, BLOCK)
+    p0 = tl.load(PRE + r * 4 + 0)
+    p1 = tl.load(PRE + r * 4 + 1)
+    p2 = tl.load(PRE + r * 4 + 2)
+    p3 = tl.load(PRE + r * 4 + 3)
+    c = (((p0 * tl.load(X + r * (4 * D) + d).to(tl.float32) + p1 * tl.load(X + r * (4 * D) + D + d).to(tl.float32))
+          + p2 * tl.load(X + r * (4 * D) + 2 * D + d).to(tl.float32))
+         + p3 * tl.load(X + r * (4 * D) + 3 * D + d).to(tl.float32))
+    tl.store(OUT + r * D + d, c.to(tl.bfloat16))
+
+
+def collapse(h: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
+    rows, _, d = h.shape
+    out = torch.empty((rows, d), dtype=torch.bfloat16, device=h.device)
+    _collapse[(rows, d // 1024)](h, pre, out, D=d, BLOCK=1024, num_warps=4)
+    return out
+
+
+# -- Engram gate: per (row, stream) normalized dot of the stream with its key, signed sqrt, sigmoid; h + gate * v ----
+@triton.jit
+def _engram_gate(H, KV, QK, OUT, eps, D: tl.constexpr, BLOCK: tl.constexpr):
+    r = tl.program_id(0)
+    s = tl.program_id(1)
+    sh = tl.zeros((BLOCK,), dtype=tl.float32)
+    sk = tl.zeros((BLOCK,), dtype=tl.float32)
+    sd = tl.zeros((BLOCK,), dtype=tl.float32)
+    for c0 in range(0, D, BLOCK):
+        d = c0 + tl.arange(0, BLOCK)
+        h = tl.load(H + r * (4 * D) + s * D + d).to(tl.float32)
+        k = tl.load(KV + r * (5 * D) + s * D + d).to(tl.float32)
+        w = tl.load(QK + s * D + d)
+        sh += h * h
+        sk += k * k
+        sd += h * w * k
+    rstd = (1.0 / tl.sqrt(tl.sum(sh, axis=0) / D + eps)) * (1.0 / tl.sqrt(tl.sum(sk, axis=0) / D + eps))
+    dot = tl.sum(sd, axis=0) * rstd * (1.0 / tl.sqrt(D * 1.0))
+    mag = tl.sqrt(tl.maximum(tl.abs(dot), 1e-6))
+    sg = tl.where(dot < 0, -mag, mag)
+    gate = 1.0 / (1.0 + tl.exp(-sg))
+    for c0 in range(0, D, BLOCK):
+        d = c0 + tl.arange(0, BLOCK)
+        h = tl.load(H + r * (4 * D) + s * D + d).to(tl.float32)
+        v = tl.load(KV + r * (5 * D) + 4 * D + d).to(tl.float32)
+        tl.store(OUT + r * (4 * D) + s * D + d, (h + gate * v).to(tl.bfloat16))
+
+
+def engram_gate(h: torch.Tensor, kv: torch.Tensor, qk: torch.Tensor, eps: float) -> torch.Tensor:
+    """h [R, 4, D] bf16, kv [R, 5 * D] bf16 (4 keys then the value), qk [4, D] f32 -> new h."""
+
+    rows, _, d = h.shape
+    out = torch.empty_like(h)
+    _engram_gate[(rows, 4)](h, kv, qk, out, eps, D=d, BLOCK=1024, num_warps=4)
+    return out

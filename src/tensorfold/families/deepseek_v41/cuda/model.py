@@ -233,6 +233,8 @@ class Model:
         lo, hi = self.engram.cols
         e = self.engram.rows(lay.idx, hashes[:, lo:hi])
         kv = self.comm.sum(mm(lay.engram_wkv, e, F32)).to(BF16)
+        if KERNELS:
+            return K.engram_gate(h, kv.contiguous(), lay.engram_qk, c.eps)
         key, value = kv.split([c.hc * c.dim, c.dim], dim=-1)
         key = key.to(F32).unflatten(-1, (c.hc, c.dim))
         hf = h.to(F32)
@@ -567,7 +569,7 @@ class Model:
         sc.length = start + n
         if not all_logits:
             h, pre = h[-1:], pre[-1:]
-        xc = rms_norm(self.hc_pre(h, pre), w.norm, c.eps)
+        xc = K.collapse_norm(h.contiguous(), pre.contiguous(), w.norm, c.eps)
         local = mm(w.head, xc, F32)
         g = self.comm.gather(local)
         return g.permute(1, 0, 2).reshape(local.shape[0], -1)

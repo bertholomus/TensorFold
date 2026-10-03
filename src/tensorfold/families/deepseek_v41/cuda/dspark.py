@@ -107,8 +107,8 @@ class Drafter:
             K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
             K.hc_post(m.comm.gather(m.moe(lay, x, topk=self.topk)), h, post, comb, h)
             pre, pre_f = pre_f, pre
-        xc = m.hc_pre(h, pre)                                             # [n, d] (pre-norm, for the confidence)
-        local = mm(m.w.head, rms_norm(xc, self.dw.norm, c.eps), F32)
+        xc = K.collapse(h, pre)                                           # [n, d] (pre-norm, for the confidence)
+        local = mm(m.w.head, K.rmsnorm(xc, self.dw.norm, c.eps), F32)
         logits = m.comm.gather(local).permute(1, 0, 2).reshape(n, -1)
         out, embs = [token], []
         for i in range(n):
