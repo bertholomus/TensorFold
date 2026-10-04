@@ -15,6 +15,12 @@ import urllib.error
 import urllib.request
 
 TIERS = [None, "none", "off", "minimal", "low", "medium", "high", "xhigh", "max"]
+HARD = [
+    "Find all positive integers n < 1000 such that n^2 + 1 is divisible by 101 and n is congruent to 3 modulo 7. "
+    "List them and explain how you know the list is complete.",
+    "A 6x6 grid is filled with the numbers 1 to 36 so that consecutive numbers are in cells sharing a side. What is the "
+    "largest possible sum of the numbers on one of the two long diagonals? Justify the bound and give a construction.",
+]
 PROBLEMS = [
     "A train leaves at 09:40 and travels 237 km at 79 km/h, then waits 18 minutes, then travels 156 km at 104 km/h. "
     "At what time does it arrive? Give the time only.",
@@ -32,8 +38,10 @@ def main():
     p.add_argument("--key-file")
     p.add_argument("--max-tokens", type=int, default=12000)
     p.add_argument("--parallel", type=int, default=2)
+    p.add_argument("--hard", action="store_true", help="two longer problems instead of the three short ones")
     p.add_argument("--out", required=True)
     a = p.parse_args()
+    problems = HARD if a.hard else PROBLEMS
     key = None
     if a.key_file:
         line = [x for x in open(a.key_file).read().splitlines() if x.strip() and not x.startswith("#")][0]
@@ -62,7 +70,7 @@ def main():
         rendered[str(tier)] = {"effort_line": int(m.group(1)) if m else None, "thinking": "<think>" in text}
         print(json.dumps({str(tier): rendered[str(tier)]}), flush=True)
 
-    jobs = [(tier, i) for tier in TIERS for i in range(len(PROBLEMS))]
+    jobs = [(tier, i) for tier in TIERS for i in range(len(problems))]
     out, lock = {}, threading.Lock()
 
     def worker():
@@ -71,7 +79,7 @@ def main():
                 if not jobs:
                     return
                 tier, i = jobs.pop(0)
-            body = {"model": a.model, "messages": [{"role": "user", "content": PROBLEMS[i]}], "temperature": 0,
+            body = {"model": a.model, "messages": [{"role": "user", "content": problems[i]}], "temperature": 0,
                     "max_tokens": a.max_tokens}
             if tier:
                 body["reasoning_effort"] = tier
@@ -92,7 +100,7 @@ def main():
         t.join()
     summary = {}
     for tier in TIERS:
-        rr = [out[(str(tier), i)] for i in range(len(PROBLEMS)) if (str(tier), i) in out]
+        rr = [out[(str(tier), i)] for i in range(len(problems)) if (str(tier), i) in out]
         toks = [r["reasoning_tokens"] or 0 for r in rr]
         summary[str(tier)] = {**(rendered.get(str(tier)) or {}), "reasoning_tokens": toks,
                               "median": statistics.median(toks) if toks else None,

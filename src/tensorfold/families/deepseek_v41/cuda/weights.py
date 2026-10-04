@@ -8,11 +8,16 @@ everything per-token small: replicated. EXL3 splits stay on 128-wide Hadamard bl
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import shutil
 import struct
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
 import torch
 
 from tensorfold.cuda.exl3 import experts as exl3_experts
@@ -79,6 +84,171 @@ class Shards:
         self._files.clear()
 
 
+class RankCache:
+    """This rank's own bytes of the checkpoint, in the order the loader takes them, in one file (TF_DS_RANK_CACHE, a
+    directory): the column and row slices the TP split keeps, the dtypes the loader converts to. The first start writes
+    it beside its normal load; later starts read it ahead of use with parallel large reads instead of a seek and a
+    read per tensor of every shard (each rank used to read whole trellises to keep half their columns). A key of the
+    checkpoint (shard names, sizes, times), the parsed config, the rank split and this file's own source picks the
+    file; anything else rebuilds it. The cache is optional: a write error (disk full) turns it off for that start, and a
+    file that reads short or out of order is deleted so the next start writes it again."""
+
+    MAGIC = b"TFDSRK01"
+    AHEAD = 512 << 20                                    # bytes read ahead of the loader
+
+    def __init__(self, path: Path, index: list | None) -> None:
+        self.path, self.index, self.i = path, index, 0
+        self.reading = index is not None
+        if self.reading:
+            from concurrent.futures import ThreadPoolExecutor
+
+            self.fd = os.open(path, os.O_RDONLY)
+            self.pool = ThreadPoolExecutor(int(os.environ.get("TF_DS_RANK_CACHE_READERS") or 8))
+            self.ahead: deque = deque()
+            self.next, self.queued = 0, 0
+        else:
+            self.tmp = path.with_suffix(".partial")
+            self.f = open(self.tmp, "wb")
+            self.index, self.at = [], 0
+
+    @classmethod
+    def open(cls, root: str | None, model_dir: Path, rank: int, world: int, extra: str) -> "RankCache | None":
+        if not root:
+            return None
+        d = Path(root)
+        key = hashlib.sha256()
+        key.update(Path(__file__).read_bytes())
+        key.update(f"{rank}/{world}/{extra}".encode())
+        for f in sorted(Path(model_dir).glob("*.safetensors")) + [Path(model_dir) / "config.json"]:
+            st = f.stat()
+            key.update(f"{f.name}:{st.st_size}:{st.st_mtime_ns}".encode())
+        path = d / f"rank{rank}of{world}-{key.hexdigest()[:20]}.bin"
+        try:
+            with open(path, "rb") as f:
+                f.seek(-16, os.SEEK_END)
+                tail = f.read(16)
+                if tail[8:] != cls.MAGIC:
+                    raise ValueError("no footer")
+                at = struct.unpack("<Q", tail[:8])[0]
+                f.seek(at)
+                index = json.loads(f.read()[:-16])
+            return cls(path, index)
+        except (OSError, ValueError):
+            pass
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            for old in d.glob(f"rank{rank}of{world}-*"):     # one file a rank split: older keys go
+                old.unlink()
+            # a rank's file holds its share of the checkpoint plus the replicated tensors: no write without room
+            # for the whole checkpoint over world, a tenth more, and 2 GiB
+            need = sum(f.stat().st_size for f in Path(model_dir).glob("*.safetensors")) * 11 // (10 * world)
+            if shutil.disk_usage(d).free < need + (2 << 30):
+                print(f"[tensorfold] rank {rank}: rank cache off (needs ~{need / 2**30:.0f} GiB free in {d})",
+                      flush=True)
+                return None
+            return cls(path, None)
+        except OSError:
+            return None
+
+    def _fill(self) -> None:
+        while self.next < len(self.index) and self.queued < self.AHEAD:
+            _, _, _, off, n = self.index[self.next]
+            self.ahead.append(self.pool.submit(self._read, off, n))
+            self.queued += n
+            self.next += 1
+
+    def _read(self, off: int, n: int):
+        buf = np.empty(n, dtype=np.uint8)                 # no zero fill: pages are first touched inside preadv
+        view, got = memoryview(buf), 0
+        while got < n:
+            k = os.preadv(self.fd, [view[got:]], off + got)
+            if k <= 0:
+                raise IOError(f"short read of {self.path}")
+            got += k
+        return buf
+
+    def take(self, key: str) -> torch.Tensor:
+        if self.i >= len(self.index) or self.index[self.i][0] != key:
+            self.path.unlink(missing_ok=True)             # (the next start writes it again)
+            raise KeyError(f"rank cache out of order at {self.i}: {key}")
+        name, dtype, shape, _, n = self.index[self.i]
+        self._fill()
+        try:
+            buf = self.ahead.popleft().result()
+        except OSError:
+            self.path.unlink(missing_ok=True)
+            raise
+        self.queued -= n
+        self.i += 1
+        dt = getattr(torch, dtype)
+        t = torch.frombuffer(buf, dtype=dt) if n else torch.empty(0, dtype=dt)
+        return t.reshape(shape)
+
+    def put(self, key: str, t: torch.Tensor) -> None:
+        t = t.contiguous()
+        raw = t.reshape(-1).view(torch.uint8).numpy() if t.numel() else b""
+        self.f.write(memoryview(raw))
+        self.index.append((key, str(t.dtype).split(".")[1], list(t.shape), self.at, int(t.numel() * t.element_size())))
+        self.at += int(t.numel() * t.element_size())
+
+    def close(self, ok: bool = True) -> bool:
+        """True when a written file was published (or every kept tensor was read back)."""
+
+        if self.reading:
+            for f in self.ahead:
+                f.cancel()
+            self.pool.shutdown(wait=True)
+            os.close(self.fd)
+            if ok and self.i != len(self.index):
+                self.path.unlink(missing_ok=True)
+                return False
+            return ok
+        try:
+            if ok:
+                body = json.dumps(self.index).encode()
+                self.f.write(body + struct.pack("<Q", self.at) + self.MAGIC)
+                self.f.flush()
+                os.fsync(self.f.fileno())
+            self.f.close()
+            if ok:
+                os.replace(self.tmp, self.path)
+                return True
+            self.tmp.unlink(missing_ok=True)
+        except OSError:
+            self.tmp.unlink(missing_ok=True)
+        return False
+
+
+def _trim() -> None:
+    """Hand the loader's freed host buffers back to the OS: glibc keeps them in its arenas otherwise (7 GiB of a
+    rank's memory after a load from the rank cache, whose eight readers each fill an arena), memory the page cache and
+    the allocator ceiling then lack."""
+
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass
+
+
+def _kept(sh: Shards, key: str, make) -> torch.Tensor:
+    """A CPU tensor the loader keeps: from the rank cache when it is reading, else made (and written to it)."""
+
+    rc = getattr(sh, "cache", None)
+    if rc is not None and rc.reading:
+        return rc.take(key)
+    t = make()
+    if rc is not None:
+        try:
+            rc.put(key, t)
+        except OSError as exc:                            # a full or failing cache disk: carry on from the shards
+            print(f"[tensorfold] rank cache off ({exc}); loading from the shards", flush=True)
+            rc.close(ok=False)
+            sh.cache = None
+    return t
+
+
 def _codebook(sh: Shards, prefix: str) -> str:
     return "mul1" if f"{prefix}.mul1" in sh else "mcg" if f"{prefix}.mcg" in sh else "3inst"
 
@@ -88,16 +258,16 @@ def exl3_parts(sh: Shards, prefix: str, cols: tuple[int, int] | None = None, row
     """(trellis, suh, svh, codebook) of a group, optionally the output columns or input rows [lo, hi) only (multiples
     of 128); on the GPU unless ``device`` is None."""
 
+    key = f"{prefix}|{cols}|{rows}"
     if rows is not None:
-        tr = sh.get(f"{prefix}.trellis", rows=(rows[0] // 16, rows[1] // 16))
-        suh = sh.get(f"{prefix}.suh")[rows[0]:rows[1]]
+        tr = _kept(sh, key + "|tr", lambda: sh.get(f"{prefix}.trellis", rows=(rows[0] // 16, rows[1] // 16)))
+        suh = _kept(sh, key + "|suh", lambda: sh.get(f"{prefix}.suh")[rows[0]:rows[1]].contiguous())
     else:
-        tr = sh.get(f"{prefix}.trellis")
-        suh = sh.get(f"{prefix}.suh")
-    svh = sh.get(f"{prefix}.svh")
-    if cols is not None:
-        tr = tr[:, cols[0] // 16:cols[1] // 16]
-        svh = svh[cols[0]:cols[1]]
+        tr = _kept(sh, key + "|tr", lambda: sh.get(f"{prefix}.trellis")[:, cols[0] // 16:cols[1] // 16].contiguous()
+                   if cols is not None else sh.get(f"{prefix}.trellis"))
+        suh = _kept(sh, key + "|suh", lambda: sh.get(f"{prefix}.suh"))
+    svh = _kept(sh, key + "|svh", lambda: sh.get(f"{prefix}.svh")[cols[0]:cols[1]].contiguous() if cols is not None
+                else sh.get(f"{prefix}.svh"))
     tr, suh, svh = tr.contiguous(), suh.contiguous(), svh.contiguous()
     if device is not None:
         tr, suh, svh = tr.to(device), suh.to(device), svh.to(device)
@@ -191,8 +361,8 @@ def load_block(sh: Shards, cfg: Cfg, p: str, i: int, rank: int, world: int, n_ex
     ratio = cfg.compress_ratios[i]
 
     def plain(name: str, dtype=None) -> torch.Tensor:
-        t = sh.get(name)
-        return (t.to(dtype) if dtype is not None else t).contiguous().cuda()
+        return _kept(sh, f"{name}|{dtype}", lambda: (sh.get(name).to(dtype) if dtype is not None
+                                                      else sh.get(name)).contiguous()).cuda()
 
     lay = Layer(
         idx=i, ratio=ratio,
@@ -256,6 +426,22 @@ def load(model_dir: str | Path, rank: int, world: int, n_layers: int | None = No
     t0 = time.time()
     cfg = Cfg.read(model_dir)
     sh = Shards(model_dir)
+    # TF_DS_RANK_CACHE=<dir>: this rank's bytes in one file (RankCache), written on the first start
+    sh.cache = RankCache.open(os.environ.get("TF_DS_RANK_CACHE"), Path(model_dir), rank, world,
+                              f"{n_layers}/{bool(dspark)}/{cfg!r}")
+    if sh.cache is not None:
+        log(f"[tensorfold] rank {rank}: rank cache {'reading' if sh.cache.reading else 'writing'} {sh.cache.path}")
+    try:
+        return _load(sh, cfg, model_dir, rank, world, n_layers, log, dspark, t0)
+    except BaseException:
+        if sh.cache is not None:
+            sh.cache.close(ok=False)
+        raise
+
+
+def _load(sh, cfg, model_dir, rank, world, n_layers, log, dspark, t0) -> Weights:
+    import time
+
     d, H, hd = cfg.dim, cfg.n_heads, cfg.head_dim
     Hl = H // world
     gl = cfg.o_groups // world
@@ -263,8 +449,8 @@ def load(model_dir: str | Path, rank: int, world: int, n_layers: int | None = No
     assert inter_l % 128 == 0 and (Hl * hd) % 128 == 0
 
     def plain(name: str, dtype=None) -> torch.Tensor:
-        t = sh.get(name)
-        return (t.to(dtype) if dtype is not None else t).contiguous().cuda()
+        return _kept(sh, f"{name}|{dtype}", lambda: (sh.get(name).to(dtype) if dtype is not None
+                                                      else sh.get(name)).contiguous()).cuda()
 
     vocab_l = cfg.vocab // world
     w = Weights(cfg, rank, world, embed=plain("embed.weight"), norm=plain("norm.weight"),
@@ -282,15 +468,22 @@ def load(model_dir: str | Path, rank: int, world: int, n_layers: int | None = No
         last = f"mtp.{n - 1}"
 
         def plain(name: str, dtype=None) -> torch.Tensor:
-            t = sh.get(name)
-            return (t.to(dtype) if dtype is not None else t).contiguous().cuda()
+            return _kept(sh, f"{name}|{dtype}", lambda: (sh.get(name).to(dtype) if dtype is not None
+                                                          else sh.get(name)).contiguous()).cuda()
 
         blocks = [load_block(sh, cfg, f"mtp.{j}", cfg.n_layers + j, rank, world, cfg.dspark_routed) for j in range(n)]
         w.dspark = DSparkWeights(blocks, linear(sh, "mtp.0.main_proj"), plain("mtp.0.main_norm.weight"),
                                  plain(f"{last}.norm.weight"), plain(f"{last}.markov_head.embed.weight"),
                                  plain(f"{last}.markov_head.head.weight"), plain(f"{last}.confidence_head.proj.weight"))
         log(f"[tensorfold] rank {rank}: DSpark ({n} stages) loaded, {torch.cuda.memory_allocated() / 2**30:.1f} GiB")
+    if sh.cache is not None:
+        reading = sh.cache.reading
+        kept = sh.cache.close(ok=True)
+        log(f"[tensorfold] rank {rank}: weights in {time.time() - t0:.0f} s ("
+            + ("from the rank cache" if reading else "written to the rank cache" if kept
+               else "the rank cache write failed and was dropped") + ")")
     sh.close()
+    _trim()
     return w
 
 
