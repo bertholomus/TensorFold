@@ -6,6 +6,7 @@ usage (TP4, lane stopped; tp4_run.sh):
   python3 tools/tf_decode_depth.py MODEL RANK MASTER PORT CONTEXT TEXT DEPTHS [TOKENS=128] [REUSE=0,1,2]
   TEXT: a UTF-8 file (the prompt is its first DEPTH tokens and a question); DEPTHS: e.g. 32000,128000,240000
 Each depth prefills once; every decode run starts from the prompt's state (positions rewound: decoding writes past it).
+TF_DEPTH_DUMP=FILE: rank 0 writes every depth's serial and MTP replies as JSON (two settings' runs compared).
 """
 
 from __future__ import annotations
@@ -39,6 +40,7 @@ def main() -> None:
     say(f"== loaded in {time.time() - t0:.0f} s: cache {e.st.kv}, {e.st.capacity} slots")
     app = GlmApp(eng, model, "GLM") if rank == 0 else None
     question = "\n\nWhat is the text above about? Answer in a few paragraphs."
+    replies: dict = {}
     for depth in depths:
         if rank == 0:
             raw = Path(text_path).read_text(errors="ignore")
@@ -63,6 +65,7 @@ def main() -> None:
         s = dec.serial_decode(e, first, tokens, None, stop_eos=False)
         say(f"== {len(p)}-token prompt: prefill {pre:.1f} s ({len(p) / pre:.0f} tok/s); serial {s.tokens_per_second:.2f}"
             f" tok/s")
+        replies[str(depth)] = {"serial": [int(x) for x in s.tokens]}
         for mode in modes:
             mtp_mod.MTP_REUSE = mode
             rewind()
@@ -71,6 +74,13 @@ def main() -> None:
             say(f"   MTP-3 reuse {mode}: {m.tokens_per_second:.2f} tok/s, accepted {m.accepted} of {m.drafted} "
                 f"({m.accepted / max(1, m.drafted):.3f}), {m.rounds} rounds [ms/round: {st}]; == serial: "
                 f"{m.tokens == s.tokens}")
+            replies[str(depth)][f"mtp{mode}"] = [int(x) for x in m.tokens]
+    import os
+
+    if os.environ.get("TF_DEPTH_DUMP") and rank == 0:
+        import json
+
+        Path(os.environ["TF_DEPTH_DUMP"]).write_text(json.dumps(replies))
     eng.comm.barrier()
     say("== done")
 

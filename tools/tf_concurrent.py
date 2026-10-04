@@ -4,6 +4,7 @@ aggregate rate, and the kill test (stop one rank's container mid-round; every re
 seconds, none may hang).
 
 usage: tf_concurrent.py URL N [MAX_TOKENS=400] [TIMEOUT_S=600]
+  TF_CONC_PROMPTS=code: one-line coding requests (tools/tf_multi.py's) instead of the chat ones
 """
 
 from __future__ import annotations
@@ -22,6 +23,17 @@ TIMEOUT = float(sys.argv[4]) if len(sys.argv) > 4 else 600.0
 TOPICS = ["how a hash table works", "the history of the printing press", "how vaccines train the immune system",
           "the rules of chess for a beginner", "how a CPU executes an instruction", "the water cycle",
           "how compilers optimize loops", "the causes of the French Revolution"]
+CODING = ["Write a Python class implementing an LRU cache with O(1) get and put, with docstrings and unit tests.",
+          "Write a C function that parses one line of CSV into fields, handling quoted fields and escaped quotes, with a "
+          "small test in main().",
+          "Implement Dijkstra's shortest path algorithm in Rust with a binary heap, and show it on a small graph.",
+          "Write a Node.js Express server with CRUD endpoints for a todo list kept in memory, with input validation.",
+          "Write a Python script that reads a web server access log, counts HTTP status codes per hour and prints a "
+          "table.",
+          "Implement a thread-safe bounded queue in Go with Put, Get and Close, and a test that uses several goroutines.",
+          "Write a SQL schema for a small library system (books, members, loans) and five example queries.",
+          "Write a Bash script that backs up a directory to a timestamped tar.gz and keeps only the last seven backups."]
+CODE = __import__("os").environ.get("TF_CONC_PROMPTS") == "code"
 T0 = time.time()
 
 
@@ -31,7 +43,8 @@ def stamp() -> str:
 
 def one(i: int, out: list) -> None:
     body = {"model": "GLM", "stream": True, "max_tokens": MAX_TOKENS, "temperature": 0,
-            "messages": [{"role": "user", "content": f"Write a detailed explanation of {TOPICS[i % len(TOPICS)]}."}],
+            "messages": [{"role": "user", "content": CODING[i % len(CODING)] if CODE else
+                          f"Write a detailed explanation of {TOPICS[i % len(TOPICS)]}."}],
             "chat_template_kwargs": {"enable_thinking": False}}
     req = urllib.request.Request(f"{URL}/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})

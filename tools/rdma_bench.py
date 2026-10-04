@@ -1,6 +1,7 @@
 """The RDMA gather (tensorfold.cuda.rdma) against NCCL on the TP ranks: same bytes, and latency eager and in graphs.
 
 usage: python3 rdma_bench.py RANK WORLD MASTER PORT   (every rank, same args; rank 0 prints)
+  TF_RDMA_ROWS: the row counts (default 1,2,4,8; a concurrent round has 4 a stream: 16 at four streams)
 """
 
 from __future__ import annotations
@@ -31,13 +32,15 @@ def main() -> None:
     nccl.barrier()
     from tensorfold.cuda.rdma import device_names
 
+    rows = [int(v) for v in (os.environ.get("TF_RDMA_ROWS") or "1,2,4,8").split(",")]
     t = time.time()
-    rdma = RdmaGather(nccl.store, RANK, WORLD, max_bytes=8 * D * 4)
-    one = RdmaGather(nccl.store, RANK, WORLD, max_bytes=8 * D * 4, devices=device_names()[:1], prefix="tf_rdma1")
+    rdma = RdmaGather(nccl.store, RANK, WORLD, max_bytes=max(rows) * D * 4)
+    one = RdmaGather(nccl.store, RANK, WORLD, max_bytes=max(rows) * D * 4, devices=device_names()[:1],
+                     prefix="tf_rdma1")
     say(f"rdma gathers up in {time.time() - t:.1f}s: {rdma.devices} and {one.devices}")
 
     # the same bytes as NCCL, eager and in a graph, every row count
-    for R in (1, 2, 4, 8):
+    for R in rows:
         send = torch.randn((R * D,), device="cuda") * (RANK + 1)
         a = torch.empty((WORLD * R * D,), device="cuda")
         b = torch.full((WORLD * R * D,), float("nan"), device="cuda")
@@ -81,7 +84,7 @@ def main() -> None:
         torch.cuda.synchronize()
         return (time.perf_counter() - t) / reps * 1e3
 
-    for R in (1, 4):
+    for R in sorted({1, 4, max(rows)}):
         send = torch.zeros((R * D,), device="cuda")
         recv = torch.empty((WORLD * R * D,), device="cuda")
         gw = torch.cuda.CUDAGraph()
@@ -125,6 +128,57 @@ def main() -> None:
             say(f"   {label}: graph {bare:.1f} us, with work {with_work:.1f} us | probes (bare): stage {st / 1e3:.1f},"
                 f" doorbell->flags {net / 1e3:.1f}, copy-out {cp / 1e3:.1f} us ({n:.0f})")
             del g0, g1, gp
+    # a decode window's reduce + residual: gather + residual_add (today) vs the fused collect (collect_residual) vs the
+    # two-hop reduce (reduce_stage / reduce_finish); each rank's partial differs, x is the same on every rank. Every
+    # variant must give today's bits on every rank, then us a call in graphs (STAGE blocks 8).
+    from tensorfold.families.glm5_next.cuda import glue
+
+    say("-- reduce + residual a decode window: gather + residual_add vs fused collect vs two-hop reduce")
+    for R in rows:
+        x = (torch.randn((R, D), generator=torch.Generator().manual_seed(7 + R)) * 4).to(torch.bfloat16).cuda()
+        send = (torch.randn((R, D), generator=torch.Generator().manual_seed(1000 * RANK + R)) * 0.3).cuda()
+        recv = torch.empty((WORLD * R * D,), device="cuda")
+        outs = [torch.empty_like(x) for _ in range(3)]
+
+        def ref(o=outs[0]):
+            rdma.all_gather(send.reshape(-1), recv)
+            glue.residual_add(x, o, recv.view(WORLD, R, D))
+
+        def fused(o=outs[1]):
+            rdma.stage(send.reshape(-1), 8)
+            rdma.collect_residual(send.reshape(-1), x, o)
+
+        def two(o=outs[2]):
+            rdma.reduce_stage(send.reshape(-1), R, D, 8)
+            rdma.reduce_finish(send.reshape(-1), R, D, x, o, 8)
+
+        for f in (ref, fused, two):
+            f()
+        torch.cuda.synchronize()
+        nccl.barrier()
+        same = [torch.equal(outs[0].view(torch.int16), o.view(torch.int16)) for o in outs[1:]]
+        # every rank's rows must be the same rows (x + the same sum): gather rank 0's view of today's result
+        allx = torch.empty((WORLD * R * D // 2,), device="cuda")
+        rdma.all_gather(outs[0].view(torch.float32).reshape(-1).contiguous(), allx)
+        torch.cuda.synchronize()
+        across = all(torch.equal(allx.view(WORLD, -1)[0], allx.view(WORLD, -1)[k]) for k in range(WORLD))
+        ts = []
+        for f in (ref, fused, two):
+            gr = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gr):
+                for _ in range(N):
+                    f()
+            ts.append(timed(gr.replay) * 1e3 / N)
+            del gr
+        torch.cuda.synchronize()
+        for f, o in ((fused, outs[1]), (two, outs[2])):        # replays keep the bits
+            o.zero_()
+        fused()
+        two()
+        torch.cuda.synchronize()
+        same_after = [torch.equal(outs[0].view(torch.int16), o.view(torch.int16)) for o in outs[1:]]
+        say(f"R={R}: fused == today {same[0]} / {same_after[0]}, two-hop == today {same[1]} / {same_after[1]}, ranks "
+            f"agree {across}; us a call in graphs: today {ts[0]:.1f}, fused {ts[1]:.1f}, two-hop {ts[2]:.1f}")
     nccl.barrier()
     say(f"failure: {rdma.failure()!r} {one.failure()!r}")
     say("done")

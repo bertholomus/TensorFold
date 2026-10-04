@@ -10,18 +10,20 @@ its solo reply.
 usage (TP4, lane stopped; tp4_run.sh):
   python3 tools/tf_multi.py MODEL RANK MASTER PORT CONTEXT TEXT [STREAMS=4] [TOKENS=128] [PROMPTS=8]
   TEXT: a UTF-8 file; prompt i is a question over a slice of it, lengths from a few hundred tokens to CONTEXT / 4.
-  TF_MULTI_PROMPTS=chat: one-line chat requests instead (about 20 tokens: the batched fill of short prompts); mixed:
+  TF_MULTI_PROMPTS=chat: one-line chat requests instead (about 20 tokens: the batched fill of short prompts); code:
+  one-line coding requests (a program or module each, about 30 tokens); mixed:
   chat and text prompts alternating; resume: pairs of prompts sharing a ~20k-token body (run with TF_GLM_KEEP_SLOTS=1:
   the second of a pair resumes from the first one's warm slot; its reply must still equal its fresh solo run, and the
   rows it kept are logged); long: prompt 0 a TF_MULTI_LONG-token text (default CONTEXT minus 8,192) and chat
   requests after it (one long stream beside short ones, e.g. with TF_GLM_EXTENTS=1). Each group also logs its first
   tokens' latencies (from submit). TF_MULTI_GROUPS: the group sizes to run (default 1, 2, 4 and STREAMS).
   TF_MULTI_PROFILE=S: then for each group of TF_MULTI_PROFILE_GROUPS (default STREAMS) chat prompts at once: rounds,
-  rows, tokens and rank 0's host stages a round over 3 s unprofiled (the profiler inflates the host's stages), then rank
+  rows, tokens and rank 0's host stages a round over TF_MULTI_WINDOW (default 3) s unprofiled (the profiler inflates the host's stages), then rank
   0's kernel time by name over S seconds of their rounds (torch profiler, CUDA activity: the collectives' kernels and
   their waits included) and a round's share of it; with several groups, each kernel's cost a row (smallest to largest
   group). TF_MULTI_PROFILE_EAGER=1 profiles eager rounds (no graph replays); TF_MULTI_ONLY_PROFILE=1 skips the solo
   references and the equality groups (the profile alone).
+  TF_MULTI_DUMP=FILE: rank 0 writes the solo replies as JSON (two settings' runs compared token for token).
   TF_MULTI_LOCAL=1: one rank alone on one GPU (RANK 0's shard of TF_TP_WORLD, the collectives faked as tools/tf_rounds.py
   fakes them): the replies are not the lane's, but each must still equal its solo run bit for bit (batched fills,
   resumes, extents, draft depth), and the timings are this rank's compute without the fabric.
@@ -68,8 +70,9 @@ def main() -> None:
         eng_mod._store = lambda c: None
         comm = Alone(rank, int(os.environ.get("TF_TP_WORLD", "4")))
     t0 = time.time()
-    eng = GlmEngine(model, rank=rank, master=master, port=port, policy="3", context=context, context_explicit=True,
-                    parallel=streams, comm=comm)
+    # TF_MULTI_DEPTH: the concurrent rounds' MTP depth (default 3; with TF_GLM_DRAFT_CUT a deeper chain stops early)
+    eng = GlmEngine(model, rank=rank, master=master, port=port, policy=os.environ.get("TF_MULTI_DEPTH") or "3",
+                    context=context, context_explicit=True, parallel=streams, comm=comm)
     w = eng.w
     solo = dec.Engine(w, capacity=eng.multi.slot_cap, max_rows=MAX_ROWS, prefill_rows=eng.multi.prefill_rows,
                       graphs=True, graph_rows=GRAPH_ROWS, long_context=bool(w.meta.get("long_context")))
@@ -80,6 +83,19 @@ def main() -> None:
     topics = ["how a hash table works", "the history of the printing press", "how vaccines train the immune system",
               "the rules of chess for a beginner", "how a CPU executes an instruction", "the water cycle",
               "how compilers optimize loops", "the causes of the French Revolution"]
+    coding = ["Write a Python class implementing an LRU cache with O(1) get and put, with docstrings and unit tests.",
+              "Write a C function that parses one line of CSV into fields, handling quoted fields and escaped quotes, "
+              "with a small test in main().",
+              "Implement Dijkstra's shortest path algorithm in Rust with a binary heap, and show it on a small graph.",
+              "Write a Node.js Express server with CRUD endpoints for a todo list kept in memory, with input "
+              "validation.",
+              "Write a Python script that reads a web server access log, counts HTTP status codes per hour and prints "
+              "a table.",
+              "Implement a thread-safe bounded queue in Go with Put, Get and Close, and a test that uses several "
+              "goroutines.",
+              "Write a SQL schema for a small library system (books, members, loans) and five example queries.",
+              "Write a Bash script that backs up a directory to a timestamped tar.gz and keeps only the last seven "
+              "backups."]
     prompts = []
     for i in range(count):
         if rank == 0:
@@ -92,6 +108,8 @@ def main() -> None:
                 content = app.tok.decode(ids[:n_long]) + "\n\nSummarize the text above."
             elif kind in ("chat", "long") or (kind == "mixed" and i % 2 == 0):
                 content = f"Write a detailed explanation of {topics[i % len(topics)]}."
+            elif kind == "code":
+                content = coding[i % len(coding)]
             elif kind == "resume":                       # pair i // 2: one ~20k-token body, two questions
                 raw = Path(text_path).read_text(errors="ignore")
                 start = ((i // 2) * 7919 * 64) % max(1, len(raw) - 200000)
@@ -108,9 +126,11 @@ def main() -> None:
                               "temperature": 0, "chat_template_kwargs": {"enable_thinking": False}}, True).prompt
         prompts.append(eng._share(p if rank == 0 else None))
     only = os.environ.get("TF_MULTI_ONLY_PROFILE") == "1"
+    # TF_MULTI_NO_SOLO=1: the groups' rates without the solo references (replies are not compared)
+    no_solo = os.environ.get("TF_MULTI_NO_SOLO") == "1"
     # solo references (every rank: the same steps)
     refs, solo_s = [], 0.0
-    for p in ([] if only else prompts):
+    for p in ([] if only or no_solo else prompts):
         solo.kept = None                                 # every reference is a fresh prefill
         first = dec.prefill(solo, p, None)
         torch.cuda.synchronize()
@@ -122,6 +142,11 @@ def main() -> None:
     solo_tokens = sum(len(r) - 1 for r in refs)
     if refs:
         say(f"== solo: {solo_tokens} tokens in {solo_s:.1f} s of decode ({solo_tokens / solo_s:.2f} tok/s)")
+        dump = os.environ.get("TF_MULTI_DUMP")          # the solo replies as JSON (to compare two settings' runs)
+        if dump and rank == 0:
+            import json
+
+            Path(dump).write_text(json.dumps([list(map(int, r)) for r in refs]))
     if rank != 0:
         eng.follow()
         eng.comm.barrier()
@@ -163,6 +188,8 @@ def main() -> None:
                     th.join()
             wall = time.perf_counter() - t
             same = sum(r is not None and r[0] == ref for r, ref in zip(replies, refs))
+            if no_solo:
+                refs = [r[0] if r is not None else [] for r in replies]      # (nothing to compare against)
             kept = [r[1].get("cached", 0) for r in replies if r is not None]
             decode_s = sum(r[1]["decode_s"] for r in replies if r is not None)
             made = sum(len(r[0]) - 1 for r in replies if r is not None)
@@ -194,9 +221,11 @@ def main() -> None:
 
         groups = [g for g in (int(x) for x in (os.environ.get("TF_MULTI_PROFILE_GROUPS") or str(streams)).split(","))
                   if 0 < g <= streams]
-        chat = [app._prepare({"messages": [{"role": "user", "content": f"Write a detailed explanation of {topic}."}],
-                              "max_tokens": 4096, "temperature": 0,
-                              "chat_template_kwargs": {"enable_thinking": False}}, True).prompt for topic in topics]
+        # TF_MULTI_PROFILE_PROMPTS=code: the coding requests instead of the chat ones
+        asks = coding if os.environ.get("TF_MULTI_PROFILE_PROMPTS") == "code" else \
+            [f"Write a detailed explanation of {topic}." for topic in topics]
+        chat = [app._prepare({"messages": [{"role": "user", "content": ask}], "max_tokens": 4096, "temperature": 0,
+                              "chat_template_kwargs": {"enable_thinking": False}}, True).prompt for ask in asks]
         top = int(os.environ.get("TF_MULTI_TOP", "30"))
         seen = {}
         for g in groups:
@@ -230,12 +259,13 @@ def main() -> None:
                 return spans0(logits, spans, draft=draft, **kw)
 
             multi._sample_spans = spy
-            time.sleep(3.0)
+            time.sleep(float(os.environ.get("TF_MULTI_WINDOW") or 3.0))   # the unprofiled window (s)
             multi._sample_spans = spans0
             plain = multi.round_log[a:]
             n = max(1, len(plain))
             spent = sum(x[2] for x in plain)
-            say(f"-- {g} chat stream{'s' if g > 1 else ''} at once, unprofiled: {len(plain)} rounds, "
+            say(f"-- {g} {os.environ.get('TF_MULTI_PROFILE_PROMPTS') or 'chat'} stream{'s' if g > 1 else ''} at once, "
+                f"unprofiled: {len(plain)} rounds, "
                 f"{sum(x[1] for x in plain) / n:.1f} rows, {1e3 * spent / n:.1f} ms a round, "
                 f"{sum(x[3] for x in plain) / n:.2f} tokens a round ({sum(x[3] for x in plain) / max(spent, 1e-9):.1f} "
                 f"tok/s over the rounds); graphs {({k: multi.rounds[k] - r0[k] for k in r0})}; distinct routed experts "
