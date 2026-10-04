@@ -113,16 +113,18 @@ class StopStrings:
 
 
 def hide_tool_calls(text: str, *, finished: bool) -> str:
-    if _DSML_OPEN in text or (not finished and _partial_tag(text, _DSML_OPEN)):
-        cut = text.find(_DSML_OPEN)                    # DeepSeek DSML: everything from the calls block on is a call
-        if cut < 0:
-            return text[: len(text) - _partial_tag(text, _DSML_OPEN)]
-        rest = text[cut:]
-        end = rest.find(_DSML_CLOSE)
-        head = text[:cut]
+    cut = text.find(_DSML_OPEN)                        # DeepSeek DSML: a calls block is hidden whole
+    if cut >= 0:
+        head = _hide_tagged(text[:cut], finished=True)
+        end = text.find(_DSML_CLOSE, cut)
         if end < 0:
             return head
-        return head + hide_tool_calls(rest[end + len(_DSML_CLOSE):], finished=finished)
+        return head + hide_tool_calls(text[end + len(_DSML_CLOSE):], finished=finished)
+    shown = _hide_tagged(text, finished=finished)
+    return shown if finished else shown[: len(shown) - _partial_tag(shown, _DSML_OPEN)]
+
+
+def _hide_tagged(text: str, *, finished: bool) -> str:
     out: list[str] = []
     pos = 0
     while True:
