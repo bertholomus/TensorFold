@@ -421,6 +421,12 @@ class DsEngine:
                 print(f"[tensorfold] rank {self.rank} chunk at {s}: {time.perf_counter() - tc:.2f}s, allocated "
                       f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB, peak {torch.cuda.max_memory_allocated() / 2**30:.2f}, "
                       f"reserved {torch.cuda.memory_reserved() / 2**30:.2f}", flush=True)
+                from .model import TIMES
+                if TIMES and self.rank == 0:            # TF_DS_TIMING=1: the chunk's sections (ms), then reset
+                    print("[tensorfold] chunk sections ms " + " ".join(f"{k} {1000 * v:.1f}" for k, v in
+                                                                      sorted(TIMES.items(), key=lambda kv: -kv[1])),
+                          flush=True)
+                    TIMES.clear()
             if out is not None:
                 last = out
             if use_drafts and taps:

@@ -247,8 +247,10 @@ class BatchDraftGraph:
     positions, attending its own ring through per-row bases and its own five block rows) and one batched Markov loop.
     Drafts only propose: they may differ in the last bits from a stream's solo drafts, never a reply."""
 
-    def __init__(self, drafter: Drafter, sc, dpool: DraftPool, streams: int):
+    def __init__(self, drafter: Drafter, sc, dpool: DraftPool, streams: int, steps: int | None = None):
         self.d, self.sc, self.dp, self.N = drafter, sc, dpool, streams
+        # the Markov loop runs only as far as a round at this many streams verifies (its first drafts are the same)
+        self.steps = max(1, min(drafter.size, steps or drafter.size))
         dev = "cuda"
         n = drafter.size
         self.tokens = torch.zeros((streams,), dtype=torch.long, device=dev)
@@ -305,17 +307,18 @@ class BatchDraftGraph:
         xc = K.collapse(h, pre)
         local = mm(m.w.head, K.rmsnorm(xc, d.dw.norm, c.eps), F32)
         logits = m.comm.gather(local).permute(1, 0, 2).reshape(R, -1).view(N, n, -1)
-        out = torch.empty((N, n + 1), dtype=torch.long, device=dev)
+        steps = self.steps
+        out = torch.empty((N, steps + 1), dtype=torch.long, device=dev)
         out[:, 0] = self.tokens
         head = d.dw.markov_head                                           # [V, rank] fp16
         embs = []
-        for i in range(n):
+        for i in range(steps):
             e = d.dw.markov_embed[out[:, i]]                              # [N, rank]
             embs.append(e)
             out[:, i + 1] = (logits[:, i] + (e.to(torch.float16) @ head.t()).float()).argmax(-1)
-        conf_in = torch.cat([xc.float().view(N, n, -1), torch.stack(embs, 1).float()], -1)
-        conf = (conf_in @ d.dw.conf.float().t())[..., 0]                 # [N, n]
-        self.packed = torch.cat([out[:, 1:].to(F32), conf], 1)           # [N, 2 n]: one host read a round
+        conf_in = torch.cat([xc.float().view(N, n, -1)[:, :steps], torch.stack(embs, 1).float()], -1)
+        conf = (conf_in @ d.dw.conf.float().t())[..., 0]                 # [N, steps]
+        self.packed = torch.cat([out[:, 1:].to(F32), conf], 1)           # [N, 2 steps]: one host read a round
 
     def capture(self, pool=None):
         s = torch.cuda.Stream()
@@ -337,7 +340,7 @@ class BatchDraftGraph:
             self._body()
         else:
             self.graph.replay()
-        n = self.d.size
+        n = self.steps
         rows = self.packed.tolist()
         self.last_conf = [row[n:] for row in rows]       # the confidence head's logits, a list a stream
         return [[int(x) for x in row[:n]] for row in rows]

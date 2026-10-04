@@ -711,7 +711,7 @@ class Model:
                     K.rope_heads(iq, cos, sin, pos, rd)
                     if KV_QUANT:
                         iq = fp4_qd(iq, 32, e4m3_scale=False)
-                    wl = K.rowmm(x, lay.idx_proj_h) if n <= 16 else x.float() @ lay.idx_proj.t()
+                    wl = K.rowmm(x, lay.idx_proj_h) if n <= K.DECODE_ROWS else x.float() @ lay.idx_proj.t()
                     wts = (wl.to(BF16) * (c.idx_dim ** -0.5 * c.idx_heads ** -0.5))
                     kk = min(c.idx_topk, n_comp_end)
                     cidx = torch.empty((n, kk), dtype=torch.int64, device=x.device)
@@ -760,7 +760,7 @@ class Model:
             vl = lay.gate_b                   # no VL bias in this pack: image rows route as text (warned at load)
         if KERNELS:
             # decode / verify windows: the row-invariant matmul; prompt chunks: one cuBLAS GEMM
-            logits = K.rowmm(x, lay.gate_w) if n <= 16 else (x.float() @ lay.gate_w.float().t())
+            logits = K.rowmm(x, lay.gate_w) if n <= K.DECODE_ROWS else (x.float() @ lay.gate_w.float().t())
             pick = torch.empty((n, slots), dtype=torch.int32, device=x.device)
             wts = torch.empty((n, slots), dtype=F32, device=x.device)
             K.route(logits, lay.gate_b, topk, c.route_scale, shared_id, pick, wts)

@@ -8,12 +8,16 @@ Rounding follows DeepSeek's reference (fp32 math, bf16 where its tensors are bf1
 from __future__ import annotations
 
 import math
+import os
 
 import torch
 import triton
 import triton.language as tl
 
 HC_BLOCKS = 40          # fixed K split of the mHC mixing dots (a function of the shape only)
+# decode / verify windows: at most this many rows take the row-invariant kernels (one row a program, split keys);
+# larger calls (prompt chunks) take the tiled ones. Concurrent rounds stay within it (rounds.MAX_ROWS)
+DECODE_ROWS = int(os.environ.get("TF_DS_DECODE_ROWS") or 16)
 
 
 # -- mHC: mixes of the stream (for the next sublayer) + collapse with the carried pre-mix + RMSNorm ---------------
@@ -403,7 +407,7 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
     codes, scales = (comp if packed else (comp, None)) if has else (wsrc, None)
     n_idx = idx.shape[1] if has else 0
     # decode / verify windows split the keys (parallelism for a few rows); prompt chunks have rows enough
-    sp = ATTN_SPLITS if rows <= 16 else 1
+    sp = ATTN_SPLITS if rows <= DECODE_ROWS else 1
     groups = h // hb
     final = sp == 1
     picks = triton.cdiv(n_idx, bn) if has else 0
@@ -518,7 +522,7 @@ def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, IH: tl.constexpr, ID: tl.
 def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
                 out: torch.Tensor | None = None, base: torch.Tensor | None = None) -> torch.Tensor:
     """q [R, IH, ID] bf16, k bf16 [>= n, ID] or a packed FP4 pair (codes [N, ID/2], E8M0 [N, ID/32]),
-    w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r]). Decode / verify windows (R <= 16) take one row a program
+    w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r]). Decode / verify windows (R <= DECODE_ROWS) take one row a program
     (row-invariant); prompt chunks share each key tile among 8 rows."""
 
     rows, ih, idim = q.shape
@@ -527,12 +531,12 @@ def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
     packed = isinstance(k, tuple)
     codes, scales = k if packed else (k, k)
     bn = 64
-    if rows <= 16:
+    if rows <= DECODE_ROWS:
         _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, vis if base is None else base,
                                                  IH=ih, ID=idim, BN=bn, PACKED=packed, HAS_BASE=base is not None,
                                                  num_warps=4)
     else:
-        assert base is None, "concurrent rounds are decode windows (16 rows at most)"
+        assert base is None, "concurrent rounds are decode windows (DECODE_ROWS rows at most)"
         rbs = 8
         _index_score_rows[(triton.cdiv(rows, rbs), triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, rows,
                                                                           IH=ih, ID=idim, BN=bn, RB=rbs,

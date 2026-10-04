@@ -20,7 +20,7 @@ from .graph import BUCKET_MIN, bucket_for
 from .model import (KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, attn_in, mm, store_rows,
                     wo_a_out)
 
-MAX_ROWS = 16
+MAX_ROWS = K.DECODE_ROWS
 # TF_DS_ENGRAM_SPLIT=1 (default): a round is one graph a stretch of layers, cut before each Engram layer, so a layer's
 # Engram rows are read while the layers before it run (the arithmetic is the one-graph round's)
 ENGRAM_SPLIT = os.environ.get("TF_DS_ENGRAM_SPLIT", "1") == "1"

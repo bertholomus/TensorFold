@@ -64,8 +64,9 @@ DEPTH_POLICY = os.environ.get("TF_DS_DEPTH_POLICY", "conf")
 EVEN_MARGIN = float(os.environ.get("TF_DS_EVEN_MARGIN") or 1.1)
 EVEN_COHORT = int(os.environ.get("TF_DS_EVEN_COHORT") or 4)
 ROUND_MS = [float(x) for x in (os.environ.get("TF_DS_ROUND_MS") or
-                               "32.4,40.9,45.4,51.8,56.2,60.8,64.4,68.0,71.8,75.6,79.6,83.5,86.3,89.0,91.8,94.6").split(",")]
-DRAFT_MS = float(os.environ.get("TF_DS_DRAFT_MS") or 5.3)
+                               "30.0,35.2,39.9,44.9,48.6,52.1,55.6,59.1,62.7,66.3,69.6,72.9,75.5,78.2,81.3,84.4,"
+                               "87.5,90.6,93.7,96.8,99.9,103.0,106.1,109.2").split(",")]
+DRAFT_MS = float(os.environ.get("TF_DS_DRAFT_MS") or 5.4)
 # TF_DS_CONF_LOG=1: per draft depth, drafts verified and kept, and kept by confidence (sigmoid tenths), printed every
 # 200 rounds (the DSpark acceptance report)
 CONF_LOG = os.environ.get("TF_DS_CONF_LOG", "0") == "1"
@@ -402,7 +403,9 @@ class MultiDecoder:
         N = len(tokens)
         g = self.drafters.get(N)
         if g is None:
-            g = BatchDraftGraph(self.e.drafter, self.m.pool_view(self.pool, 0, 0, self.extents.total), self.dpool, N)
+            steps = None if DEPTH_POLICY == "even" else self._depth(N)       # "even" may verify the whole block
+            g = BatchDraftGraph(self.e.drafter, self.m.pool_view(self.pool, 0, 0, self.extents.total), self.dpool, N,
+                                steps=steps)
             g.tokens.copy_(torch.tensor(tokens, dtype=torch.long))
             g.q0.copy_(torch.tensor(q0, dtype=torch.long))
             g.slots.copy_(torch.tensor(slots, dtype=torch.long))
@@ -445,11 +448,9 @@ class MultiDecoder:
         if e.world < 2:
             return
         dgst = int.from_bytes(hashlib.sha256(json.dumps(plan).encode()).digest()[:8], "big")
-        mine = torch.tensor([dgst & 0x7FFFFFFF, (dgst >> 31) & 0x7FFFFFFF, dgst >> 62], dtype=torch.int64,
-                            device="cuda")
-        got = torch.empty((e.world * 3,), dtype=torch.int64, device="cuda")
-        e.nccl.all_gather(mine, got)
-        every = got.view(e.world, 3).tolist()
+        # 16-bit pieces as fp32 (exact): the model's gather, so a round's check rides the RDMA path (~0.1 ms, not ~0.9)
+        mine = torch.tensor([(dgst >> b) & 0xFFFF for b in (0, 16, 32, 48)], dtype=torch.float32, device="cuda")
+        every = self.m.comm.gather(mine).tolist()
         if any(row != every[0] for row in every):
             raise OutOfStep(f"the ranks planned different {what}s; its requests fail, serving goes on")
 
