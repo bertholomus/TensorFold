@@ -19,7 +19,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v4",
+    return load(name="tensorfold_exl3_linear_v5",
                 sources=[str(here / "linear.cpp"), str(here / "linear.cu"), str(here / "linear_grouped.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
@@ -254,26 +254,63 @@ class Exl3Group:
         if len(xs) != len(self.layers):
             raise ValueError(f"{len(self.layers)} inputs expected, got {len(xs)}")
         m = xs[0].shape[0]
-        dev = xs[0].device
         for x, layer in zip(xs, self.layers):
             if x.dim() != 2 or x.shape[1] != layer.k or x.shape[0] != m or not 1 <= m <= 128:
                 raise ValueError(f"x must be [{m} (1..128), {layer.k}], got {tuple(x.shape)}")
         if outs is None:
             outs = [torch.empty((m, layer.n), dtype=(out_dtypes[i] if out_dtypes else None) or xs[i].dtype,
-                                device=dev) for i, layer in enumerate(self.layers)]
-        ext = _ext()
+                                device=xs[0].device) for i, layer in enumerate(self.layers)]
+        return self.rotated(self.rotate(xs), outs)
+
+    def rotate(self, xs: list) -> list:
+        """Every layer's rotated input rows (``buffers``) from xs, one rot_many launch."""
+
+        xh = self.buffers(xs[0].shape[0], xs[0].device)
+        _ext().rot_many([_rows(x) for x in xs], self.suh, xh, PDL)
+        return xh
+
+    def buffers(self, m: int, dev) -> list:
+        """Rotated-input rows for m rows: [m, K_i] fp16 a layer, one buffer, each layer's rows 16-byte aligned."""
+
         ks = [layer.k for layer in self.layers]
         buf = torch.empty((m * sum(ks),), dtype=torch.float16, device=dev)
         xh, o = [], 0
-        for k in ks:                                          # one buffer, each layer's rows 16-byte aligned (K % 128)
+        for k in ks:                                          # (K % 128)
             xh.append(buf[o:o + m * k].view(m, k))
             o += m * k
-        ext.rot_many([_rows(x) for x in xs], self.suh, xh, PDL)
+        return xh
+
+    def rotated(self, xh: list, outs: list | None = None, out_dtypes: list | None = None, rot: list | None = None,
+                rope: tuple | None = None) -> list:
+        """The glinear launches on rotated rows ``xh`` (``buffers``; written by rot_many or by a kernel that folds the
+        rotation in, the same bits): ys[i] = xh[i] @ W_i + bias_i. ``rot``: a layer's outputs also rotated into the
+        next layer's input rows, (suh, rows [M, *] fp16, column offset) or None a layer (the bits rot_many makes of
+        y). ``rope``: (cos, sin fp32 [*, rd / 2], positions int64 [M], head dim, rope dim, layer flags): the flagged
+        layers' bf16 outputs leave with rope_heads applied (its bits)."""
+
+        m = xh[0].shape[0]
+        dev = xh[0].device
+        if outs is None:
+            outs = [torch.empty((m, layer.n), dtype=(out_dtypes[i] if out_dtypes else None) or torch.float16,
+                                device=dev) for i, layer in enumerate(self.layers)]
+        ext = _ext()
         for part, k2, cb, wk, words, s_k, s_nb, svh, bias, counters, sks, ns in self.launches:
             zn = sum(sk * m * n for sk, n in zip(sks, ns) if sk > 1)
             z = torch.empty((zn,), dtype=torch.float32, device=dev) if zn else None
-            ext.glinear([xh[i] for i in part], words, s_k, s_nb, svh, bias, [outs[i] for i in part], z, counters, sks,
-                        k2, cb, wk, PDL)
+            if rope is not None and any(rope[5][i] for i in part):
+                rs = [rot[i] for i in part] if rot is not None else [None] * len(part)
+                ext.glinear([xh[i] for i in part], words, s_k, s_nb, svh, bias, [outs[i] for i in part], z, counters,
+                            sks, k2, cb, wk, PDL, [r[0] if r else None for r in rs], [r[1] if r else None for r in rs],
+                            [r[2] if r else 0 for r in rs], [int(bool(rope[5][i])) for i in part], rope[0], rope[1],
+                            rope[2], rope[3], rope[4])
+            elif rot is not None and any(rot[i] is not None for i in part):
+                rs = [rot[i] for i in part]
+                ext.glinear([xh[i] for i in part], words, s_k, s_nb, svh, bias, [outs[i] for i in part], z, counters,
+                            sks, k2, cb, wk, PDL, [r[0] if r else None for r in rs], [r[1] if r else None for r in rs],
+                            [r[2] if r else 0 for r in rs])
+            else:
+                ext.glinear([xh[i] for i in part], words, s_k, s_nb, svh, bias, [outs[i] for i in part], z, counters,
+                            sks, k2, cb, wk, PDL)
         return outs
 
 

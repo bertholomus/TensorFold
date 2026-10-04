@@ -13,7 +13,10 @@ void exl3_glinear_cuda(const std::vector<at::Tensor>&, const std::vector<at::Ten
                        const std::vector<int64_t>&, const std::vector<at::Tensor>&,
                        const std::vector<c10::optional<at::Tensor>>&, const std::vector<at::Tensor>&,
                        const c10::optional<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<int64_t>&,
-                       int64_t, int64_t, int64_t, bool);
+                       int64_t, int64_t, int64_t, bool, const std::vector<c10::optional<at::Tensor>>&,
+                       const std::vector<c10::optional<at::Tensor>>&, const std::vector<int64_t>&,
+                       const std::vector<int64_t>&, const c10::optional<at::Tensor>&, const c10::optional<at::Tensor>&,
+                       const c10::optional<at::Tensor>&, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -108,7 +111,12 @@ void glinear(const std::vector<at::Tensor>& xhs, const std::vector<at::Tensor>& 
              const std::vector<at::Tensor>& svhs,
              const std::vector<c10::optional<at::Tensor>>& biases, const std::vector<at::Tensor>& ys,
              const c10::optional<at::Tensor>& Z, const std::vector<at::Tensor>& counters,
-             const std::vector<int64_t>& SK, int64_t K2, int64_t cb, int64_t WK, bool pdl) {
+             const std::vector<int64_t>& SK, int64_t K2, int64_t cb, int64_t WK, bool pdl,
+             const std::vector<c10::optional<at::Tensor>>& rsuhs = {},
+             const std::vector<c10::optional<at::Tensor>>& rxhs = {}, const std::vector<int64_t>& roffs = {},
+             const std::vector<int64_t>& ropes = {}, const c10::optional<at::Tensor>& rcos = c10::nullopt,
+             const c10::optional<at::Tensor>& rsin = c10::nullopt, const c10::optional<at::Tensor>& rpos = c10::nullopt,
+             int64_t rhd = 0, int64_t rrd = 0) {
     const size_t n = xhs.size();
     TORCH_CHECK(n >= 1 && (int)n <= exl3_glinear_max(), "1 to ", exl3_glinear_max(), " layers a launch");
     TORCH_CHECK(Ts.size() == n && stride_k.size() == n && stride_nb.size() == n && svhs.size() == n &&
@@ -151,8 +159,31 @@ void glinear(const std::vector<at::Tensor>& xhs, const std::vector<at::Tensor>& 
         check(*Z, at::kFloat, "Z");
         TORCH_CHECK(Z->numel() >= zneed, "Z too small");
     }
+    TORCH_CHECK(rsuhs.size() == rxhs.size() && rsuhs.size() == roffs.size() && (rsuhs.empty() || rsuhs.size() == n),
+                "rotation folds: one (suh, rows, offset) a layer, or none");
+    for (size_t i = 0; i < rsuhs.size(); ++i) {
+        if (!rsuhs[i] || !rxhs[i]) continue;
+        check(*rsuhs[i], at::kHalf, "rsuh");
+        check_rows(*rxhs[i], "rxh");
+        TORCH_CHECK(rxhs[i]->scalar_type() == at::kHalf && rxhs[i]->size(0) == M, "rxh: fp16 rows, the same M");
+        TORCH_CHECK(roffs[i] >= 0 && roffs[i] % 128 == 0 && roffs[i] + ys[i].size(1) <= rxhs[i]->size(1) &&
+                        roffs[i] + ys[i].size(1) <= rsuhs[i]->numel(),
+                    "the folded rotation's columns: 128-aligned, inside rxh and rsuh");
+    }
+    TORCH_CHECK(ropes.empty() || ropes.size() == n, "RoPE flags: one a layer, or none");
+    for (size_t i = 0; i < ropes.size(); ++i) {
+        if (!ropes[i]) continue;
+        TORCH_CHECK(rcos && rsin && rpos, "a folded RoPE needs its cos / sin tables and positions");
+        check(*rcos, at::kFloat, "rcos");
+        check(*rsin, at::kFloat, "rsin");
+        check(*rpos, at::kLong, "rpos");
+        TORCH_CHECK(ys[i].scalar_type() == at::kBFloat16, "a folded RoPE rotates bf16 outputs");
+        TORCH_CHECK(rhd % 128 == 0 && rrd % 4 == 0 && rrd <= 128 && ys[i].size(1) % rhd == 0 && rpos->numel() >= M,
+                    "a folded RoPE: heads of a multiple of 128 columns, its part inside their last 128");
+    }
     c10::cuda::CUDAGuard guard(xhs[0].device());
-    exl3_glinear_cuda(xhs, Ts, stride_k, stride_nb, svhs, biases, ys, Z, counters, SK, K2, cb, WK, pdl);
+    exl3_glinear_cuda(xhs, Ts, stride_k, stride_nb, svhs, biases, ys, Z, counters, SK, K2, cb, WK, pdl, rsuhs, rxhs,
+                      roffs, ropes, rcos, rsin, rpos, rhd, rrd);
 }
 
 // W [K, N] fp16 = W_q, the trellis tiles decoded; tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb words.
@@ -169,7 +200,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rot_in", &rot_in);
     m.def("linear", &linear);
     m.def("unpack", &unpack);
-    m.def("glinear", &glinear);
+    m.def("glinear", &glinear, py::arg("xhs"), py::arg("Ts"), py::arg("stride_k"), py::arg("stride_nb"),
+          py::arg("svhs"), py::arg("biases"), py::arg("ys"), py::arg("Z"), py::arg("counters"), py::arg("SK"),
+          py::arg("K2"), py::arg("cb"), py::arg("WK"), py::arg("pdl"),
+          py::arg("rsuhs") = std::vector<c10::optional<at::Tensor>>{},
+          py::arg("rxhs") = std::vector<c10::optional<at::Tensor>>{}, py::arg("roffs") = std::vector<int64_t>{},
+          py::arg("ropes") = std::vector<int64_t>{}, py::arg("rcos") = c10::nullopt, py::arg("rsin") = c10::nullopt,
+          py::arg("rpos") = c10::nullopt, py::arg("rhd") = 0, py::arg("rrd") = 0);
     m.def("glinear_max", &exl3_glinear_max);
     m.def("rot_many", &rot_many);
 }

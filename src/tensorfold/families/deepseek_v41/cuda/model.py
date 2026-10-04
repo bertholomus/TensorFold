@@ -205,6 +205,74 @@ def wo_a_out(lay, o: torch.Tensor) -> torch.Tensor:
     return u
 
 
+def _group(lay, key: str, layers: list):
+    g = getattr(lay, key, None)
+    if g is None:
+        from tensorfold.cuda.exl3.linear import Exl3Group
+
+        g = Exl3Group(layers)
+        setattr(lay, key, g)
+    return g
+
+
+def q_proj(lay, qa: torch.Tensor, eps: float, idx: bool, rope: tuple | None = None, kv: tuple | None = None) -> tuple:
+    """(qr, q, iq) = (rmsnorm(qa), qr @ wq_b, qr @ idx_wq_b or None) at decode sizes, the rotation of qr folded into the
+    RMSNorm (kernels.rmsnorm_rot) and both projections one group's glinear launches on it: the bits of rmsnorm + mm,
+    one RMSNorm launch and no rot_many. ``rope`` (cos, sin, positions, head dim, rope dim): q leaves wq_b's epilogue
+    with rope_heads applied (its bits). ``kv`` (y, cos, sin, pos, ring, slots, quant, rope dim): the window KV's
+    kv_norm_rope in the same launch as the RMSNorm (kernels.q_kv_norm)."""
+
+    layers = [lay.wq_b] + ([lay.idx_wq_b] if idx else [])
+    group = _group(lay, "_tf_q2" if idx else "_tf_q1", layers)
+    xh = group.buffers(qa.shape[0], qa.device)
+    rot = [(la.suh, t) for la, t in zip(layers, xh)]
+    if kv is not None:
+        y, cos, sin, pos, ring, slots, quant, rd = kv
+        qr = K.q_kv_norm(qa, lay.q_norm, eps, rot, y, lay.kv_norm, cos, sin, pos, ring, slots, quant, rd)
+    else:
+        qr = K.rmsnorm_rot(qa, lay.q_norm, eps, rot)
+    outs = group.rotated(xh, out_dtypes=[BF16] * len(layers),
+                         rope=None if rope is None else (*rope, [1] + [0] * (len(layers) - 1)))
+    return qr, outs[0], (outs[1] if idx else None)
+
+
+def wo_a_rot(lay, n: int, device, head_dim: int) -> tuple:
+    """(wo_a's suh concatenated, its group's rotated-input buffers for n rows, heads a slice): what
+    kernels.sparse_attn(rot=...) writes wo_a's inputs into (then wo_ab(lay, xh=...))."""
+
+    ga = _group(lay, "_tf_wo_a", lay.wo_a)
+    suh = getattr(lay, "_tf_wo_a_suh", None)
+    if suh is None:
+        suh = lay._tf_wo_a_suh = torch.cat([wo.suh for wo in lay.wo_a]).contiguous()
+    return suh, ga.buffers(n, device), lay.wo_a[0].k // head_dim
+
+
+def wo_ab(lay, o: torch.Tensor | None = None, xh: list | None = None, fold: bool = True) -> torch.Tensor:
+    """mm(wo_b, wo_a_out(lay, o), F32) at decode sizes in one rotation and two glinear launches: wo_a's group (its
+    inputs rotated from o, or given rotated in ``xh``) also writes wo_b's rotated input rows from its epilogue
+    (linear_grouped.cu rot_out: rot_many's bits of u), then wo_b's glinear on them. The same bits."""
+
+    ga = _group(lay, "_tf_wo_a", lay.wo_a)
+    gb = _group(lay, "_tf_wo_b", [lay.wo_b])
+    if xh is None:
+        n = o.shape[0]
+        og = o.view(n, len(lay.wo_a), -1)
+        xh = ga.rotate([og[:, g] for g in range(len(lay.wo_a))])
+    n = xh[0].shape[0]
+    u = torch.empty((n, sum(wo.n for wo in lay.wo_a)), dtype=BF16, device=xh[0].device)
+    outs, rot, c = [], [], 0
+    xb = gb.buffers(n, u.device) if fold else None
+    for wo in lay.wo_a:
+        outs.append(u[:, c:c + wo.n])
+        if fold:
+            rot.append((lay.wo_b.suh, xb[0], c))
+        c += wo.n
+    ga.rotated(xh, outs, rot=rot if fold else None)
+    if not fold:                                      # wo_b's input rotated by its own rot_many launch
+        return mm(lay.wo_b, u, F32)
+    return gb.rotated(xb, out_dtypes=[F32])[0]
+
+
 @dataclass
 class SeqCache:
     """One sequence's caches on this rank (replicated across ranks: KV is one latent shared by all heads)."""
@@ -711,7 +779,8 @@ class Model:
                     K.rope_heads(iq, cos, sin, pos, rd)
                     if KV_QUANT:
                         iq = fp4_qd(iq, 32, e4m3_scale=False)
-                    wl = K.rowmm(x, lay.idx_proj_h) if n <= K.DECODE_ROWS else x.float() @ lay.idx_proj.t()
+                    wl = ((K.rowmm2 if K.on("rowmm") else K.rowmm)(x, lay.idx_proj_h) if n <= K.DECODE_ROWS
+                          else x.float() @ lay.idx_proj.t())
                     wts = (wl.to(BF16) * (c.idx_dim ** -0.5 * c.idx_heads ** -0.5))
                     kk = min(c.idx_topk, n_comp_end)
                     cidx = torch.empty((n, kk), dtype=torch.int64, device=x.device)
@@ -760,9 +829,10 @@ class Model:
             vl = lay.gate_b                   # no VL bias in this pack: image rows route as text (warned at load)
         if KERNELS:
             # decode / verify windows: the row-invariant matmul; prompt chunks: one cuBLAS GEMM
-            logits = K.rowmm(x, lay.gate_w) if n <= K.DECODE_ROWS else (x.float() @ lay.gate_w.float().t())
             pick = torch.empty((n, slots), dtype=torch.int32, device=x.device)
             wts = torch.empty((n, slots), dtype=F32, device=x.device)
+            logits = ((K.rowmm2 if K.on("rowmm") else K.rowmm)(x, lay.gate_w) if n <= K.DECODE_ROWS
+                      else (x.float() @ lay.gate_w.float().t()))
             K.route(logits, lay.gate_b, topk, c.route_scale, shared_id, pick, wts)
             if img is not None:
                 # inside an image span the gate picks with its VL bias (a row a program: the other rows are unchanged)

@@ -36,6 +36,18 @@ struct GLayer {
     int* counters;                      // int32 [8 * N / 128], left zero
     long long ldx, ldy, stride_k, stride_nb;
     int y_dtype, K, N, SK, first;       // first: the layer's first block in the grid
+    // the next layer's input rotation folded in (or rsuh null): its rotated rows rxh[row * ldr + roff + col] =
+    // rot128_in(y as stored, rsuh[roff + col]), the bits rot_many makes of y
+    const half* rsuh;
+    half* rxh;
+    long long ldr;
+    int roff;
+    // RoPE folded in (or rcos null): the outputs' last rrd columns of every rhd-column head rotated in adjacent pairs
+    // by the row's position rpos[row], as rope_heads does to the stored bf16 values (its compiled fma order)
+    const float* rcos;
+    const float* rsin;
+    const long long* rpos;
+    int rhd, rrd;
 };
 
 struct GArgs {
@@ -90,6 +102,38 @@ __global__ void __launch_bounds__(128) rot_many_kernel(const __grid_constant__ R
     store4(L.xh, F16, (size_t)row * L.K + k, v);
 }
 
+// The finished outputs of one row's 128 columns (4 a lane), as stored in y, rotated into the next layer's input rows:
+// what rot_many computes from y (y's rounding, then rot128_in with the next layer's suh), from registers.
+__device__ __forceinline__ void rot_out(const GLayer& L, const float (&v)[4], int y_dtype, int lane, size_t row,
+                                        int col0) {
+    float u[4], s[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j)
+        u[j] = y_dtype == BF16 ? __bfloat162float(__float2bfloat16_rn(v[j]))
+             : y_dtype == F16 ? __half2float(__float2half_rn(v[j])) : v[j];
+    const int c = L.roff + col0 + 4 * lane;
+    load4(L.rsuh, F16, c, s);
+    rot128_in(u, s, lane);
+    store4(L.rxh, F16, row * L.ldr + c, u);
+}
+
+// rope_heads (forward) of one row's 128 stored columns (4 a lane) when they hold a head's rotary part: v rounded as
+// stored (bf16), then re = fma(xe, cs, -(xo sn)), im = fma(xe, sn, xo cs) on each adjacent pair (rope_heads' order)
+__device__ __forceinline__ void rope_out(const GLayer& L, float (&v)[4], int y_dtype, int lane, size_t row, int col0) {
+    const int d0 = (col0 % L.rhd) + 4 * lane, lo = L.rhd - L.rrd;
+    if (d0 < lo) return;
+    const long long p = L.rpos[row];
+#pragma unroll
+    for (int q = 0; q < 2; ++q) {
+        const int j = (d0 + 2 * q - lo) >> 1;
+        const float cs = L.rcos[p * (L.rrd >> 1) + j], sn = L.rsin[p * (L.rrd >> 1) + j];
+        const float xe = __bfloat162float(__float2bfloat16_rn(v[2 * q]));
+        const float xo = __bfloat162float(__float2bfloat16_rn(v[2 * q + 1]));
+        v[2 * q] = __fmaf_rn(xe, cs, -__fmul_rn(xo, sn));
+        v[2 * q + 1] = __fmaf_rn(xe, sn, __fmul_rn(xo, cs));
+    }
+}
+
 // linear_kernel for a block of any layer of the group (blocks of layer i: first_i .. first_i + N_i / 128 * SK_i - 1,
 // block b of them linear_kernel's (b % (N_i / 128), b / (N_i / 128))).
 // (4 warps: at most 170 registers, three programs an SM as linear_kernel gets, which nvcc otherwise gives up for the
@@ -123,6 +167,13 @@ __global__ void __launch_bounds__(WK * 32, WK == 4 ? 3 : 1) glinear_kernel(const
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g = lane >> 2, t = lane & 3;
     const int per_warp = (K >> 4) / SK / WK;
+    // the epilogue's tables (weights, read last): svh, the bias and the folded rotation's suh lines into L2 now (no
+    // data moved, nothing computed)
+    if (threadIdx.x < 2 && (SK == 1 || split == SK - 1)) {
+        asm volatile("prefetch.global.L2 [%0];" ::"l"(svh + nb * 128 + threadIdx.x * 64));
+        if (bias) asm volatile("prefetch.global.L2 [%0];" ::"l"(bias + nb * 128 + threadIdx.x * 64));
+        if (L.rsuh) asm volatile("prefetch.global.L2 [%0];" ::"l"(L.rsuh + L.roff + nb * 128 + threadIdx.x * 64));
+    }
     const int kt0 = split * (per_warp * WK) + warp * per_warp;
     const uint32_t* tiles = L.T + nb * L.stride_nb;
     const int col0 = nb * 128;
@@ -157,6 +208,11 @@ __global__ void __launch_bounds__(WK * 32, WK == 4 ? 3 : 1) glinear_kernel(const
         if (m0 == 0) {
             pdl_wait();                              // the first weights are on their way; the rows are ready now
             pdl_dependents();
+            if (L.rcos && threadIdx.x < M && threadIdx.x < 16) {   // the folded RoPE's rows of the tables, into L2
+                const long long p = L.rpos[threadIdx.x];
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(L.rcos + p * (L.rrd >> 1)));
+                asm volatile("prefetch.global.L2 [%0];" ::"l"(L.rsin + p * (L.rrd >> 1)));
+            }
         }
 #pragma unroll 1
         for (int i = 0; i < per_warp; ++i) {
@@ -212,7 +268,9 @@ __global__ void __launch_bounds__(WK * 32, WK == 4 ? 3 : 1) glinear_kernel(const
                         v[0] += q.x; v[1] += q.y; v[2] += q.z; v[3] += q.w;
                     }
                     finish(v, lane, svh, bias, col0 + 4 * lane);
+                    if (L.rcos) rope_out(L, v, y_dtype, lane, (size_t)(m0 + rlo + r), col0);
                     store4(y, y_dtype, (size_t)(m0 + rlo + r) * ldy + col0 + 4 * lane, v);
+                    if (L.rsuh) rot_out(L, v, y_dtype, lane, (size_t)(m0 + rlo + r), col0);
                 }
             } else {
                 for (int idx = threadIdx.x; idx < rn * 32; idx += WK * 32) {
@@ -243,7 +301,9 @@ __global__ void __launch_bounds__(WK * 32, WK == 4 ? 3 : 1) glinear_kernel(const
                     }
                     float v[4] = {s.x, s.y, s.z, s.w};
                     finish(v, lane, svh, bias, col0 + 4 * lane);
+                    if (L.rcos) rope_out(L, v, y_dtype, lane, (size_t)m0 + r, col0);
                     store4(y, y_dtype, ((size_t)m0 + r) * ldy + col0 + 4 * lane, v);
+                    if (L.rsuh) rot_out(L, v, y_dtype, lane, (size_t)m0 + r, col0);
                 }
                 if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
             }
@@ -309,7 +369,11 @@ void exl3_glinear_cuda(const std::vector<at::Tensor>& xhs, const std::vector<at:
                        const std::vector<at::Tensor>& svhs, const std::vector<c10::optional<at::Tensor>>& biases,
                        const std::vector<at::Tensor>& ys, const c10::optional<at::Tensor>& Z,
                        const std::vector<at::Tensor>& counters, const std::vector<int64_t>& SK, int64_t K2,
-                       int64_t cb, int64_t WK, bool pdl) {
+                       int64_t cb, int64_t WK, bool pdl, const std::vector<c10::optional<at::Tensor>>& rsuhs,
+                       const std::vector<c10::optional<at::Tensor>>& rxhs, const std::vector<int64_t>& roffs,
+                       const std::vector<int64_t>& ropes, const c10::optional<at::Tensor>& rcos,
+                       const c10::optional<at::Tensor>& rsin, const c10::optional<at::Tensor>& rpos, int64_t rhd,
+                       int64_t rrd) {
     const int n = (int)xhs.size();
     GArgs a;
     std::memset(&a, 0, sizeof(a));
@@ -341,6 +405,19 @@ void exl3_glinear_cuda(const std::vector<at::Tensor>& xhs, const std::vector<at:
         }
         l.first = blocks;
         blocks += (l.N / 128) * l.SK;
+        if (i < (int)rsuhs.size() && rsuhs[i] && rxhs[i]) {
+            l.rsuh = reinterpret_cast<const half*>(rsuhs[i]->data_ptr());
+            l.rxh = reinterpret_cast<half*>(rxhs[i]->data_ptr());
+            l.ldr = rxhs[i]->stride(0);
+            l.roff = (int)roffs[i];
+        }
+        if (i < (int)ropes.size() && ropes[i] && rcos && rsin && rpos) {
+            l.rcos = rcos->data_ptr<float>();
+            l.rsin = rsin->data_ptr<float>();
+            l.rpos = reinterpret_cast<const long long*>(rpos->data_ptr<int64_t>());
+            l.rhd = (int)rhd;
+            l.rrd = (int)rrd;
+        }
     }
     auto stream = at::cuda::getCurrentCUDAStream();
     const int smem = (int)(WK * std::min(a.M, 8) * 128 * sizeof(float));    // at most 32 KiB: no opt-in

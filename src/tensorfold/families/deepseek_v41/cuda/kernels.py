@@ -13,6 +13,7 @@ import os
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 HC_BLOCKS = 40          # fixed K split of the mHC mixing dots (a function of the shape only)
 # decode / verify windows: at most this many rows take the row-invariant kernels (one row a program, split keys);
@@ -114,9 +115,13 @@ def hc_pre(h: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.T
 
 
 @triton.jit
-def _hc_post(G, RS, X, XOUT, POST, COMB, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr):
+def _hc_post(G, RS, X, XOUT, POST, COMB, D: tl.constexpr, WORLD: tl.constexpr, BLOCK: tl.constexpr,
+             PDL: tl.constexpr = False):
     """y = bf16(rank-ordered sum of partials); out_k = post_k y + sum_j comb[j, k] x_j (fp32) -> bf16."""
 
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     cb = tl.program_id(1)
     d = cb * BLOCK + tl.arange(0, BLOCK)
@@ -145,12 +150,462 @@ def hc_post(gathered: torch.Tensor, h: torch.Tensor, post: torch.Tensor, comb: t
     world, rows, d = gathered.shape
     block = 1024
     _hc_post[(rows, d // block)](gathered, rows * d, h, out, post, comb, D=d, WORLD=world, BLOCK=block,
-                                 num_warps=4)
+                                 num_warps=4, **_pdl())
+
+
+# -- the decode round's small kernels, faster and with the same bits (SMALL_SWITCHES) --------------------------------
+# Each switch replaces kernels of the decode round with ones that keep every output's arithmetic: the same per-output
+# reduction trees (each tile keeps the old tile's per-row layout: a row's dot is one warp's, the same elements a lane,
+# the same butterfly), the same fp32 / bf16 roundings and the same fused multiply-adds, only more programs, shared
+# loads, unrolled loops and fewer launches. So a row's bits are those of 88ff611 whatever shares the launch. Every
+# switch is on unless its environment variable is "0" (A/B and debugging); set_switch() flips one at run time (a graph
+# keeps what it captured).
+SMALL_SWITCHES = {
+    "hc": os.environ.get("TF_DS_HC_FUSED", "1") != "0",          # hc_post fused into the next hc_pre's mixes, 120
+                                                                 # programs a row, an unrolled finish
+    "rowmm": os.environ.get("TF_DS_ROWMM2", "1") != "0",         # router / indexer weights: 4 outputs a program,
+                                                                 # rows share each weight tile, unrolled K
+    "glue": os.environ.get("TF_DS_ROUND_GLUE", "1") != "0",      # a round's index arithmetic once, not per layer
+    "rot_q": os.environ.get("TF_DS_ROT_Q", "1") != "0",          # the q RMSNorm writes wq_b's (and the indexer
+                                                                 # wq_b's) rotated input rows (no rot_many launch),
+                                                                 # wq_b's epilogue applies q's RoPE (no rope launch)
+    "rot_wob": os.environ.get("TF_DS_ROT_WOB", "1") != "0",      # wo_a's epilogue writes wo_b's rotated input rows
+    "rot_attn": os.environ.get("TF_DS_ROT_ATTN", "1") != "0",    # the attention merge also applies the inverse RoPE
+                                                                 # and writes wo_a's rotated input rows
+    "idx": os.environ.get("TF_DS_INDEXER_FUSED", "1") != "0",    # the indexer's glue in four launches: fp4_qd of q,
+                                                                 # the weights' rowmm + bf16 + scale, the scores with
+                                                                 # the candidate mask as top-k keys, one sort + mask
+    "comp": os.environ.get("TF_DS_COMP_FUSED", "1") != "0",      # the compressor's FP4 cache writes in one launch
+                                                                 # each (fp4_pack + the row writes)
+    "pdl": os.environ.get("TF_DS_TRITON_PDL", "1") != "0",       # the decode kernels as programmatic dependent
+                                                                 # launches (griddepcontrol): each waits for the one
+                                                                 # before it before reading anything it wrote
+}
+
+
+def set_switch(name: str, on: bool) -> None:
+    if name not in SMALL_SWITCHES:
+        raise KeyError(name)
+    SMALL_SWITCHES[name] = bool(on)
+
+
+def on(name: str) -> bool:
+    return SMALL_SWITCHES[name]
+
+
+def _pdl() -> dict:
+    """Launch options of a decode kernel that takes PDL: a programmatic dependent launch (sm_90+) when the "pdl"
+    switch is on. Such a kernel runs griddepcontrol.wait before it reads or writes anything a kernel before it touches
+    (only weights before it), then lets the next kernel launch; launched plainly, both are no-ops."""
+
+    return {"PDL": True, "launch_pdl": True} if SMALL_SWITCHES["pdl"] else {}
+
+
+@triton.jit
+def _bfly(v, e, BIT: tl.constexpr):
+    o = tl.gather(v, e ^ BIT, axis=1)
+    return tl.where((e & BIT) != 0, o - v, v + o)
+
+
+@triton.jit
+def _rot128(v, s, M: tl.constexpr):
+    """EXL3's input rotation of M 128-wide blocks (v, s [M, 128] fp32: values and the layer's suh): rot128_in's bits
+    (linear_common.cuh): the first butterfly as fma(v0, s0, +-(v1 s1)), then six butterflies lo + hi / lo - hi in bit
+    order, then the scale."""
+
+    e = tl.broadcast_to(tl.arange(0, 128)[None, :], (M, 128))
+    p = v * s
+    vo = tl.gather(v, e ^ 1, axis=1)
+    so = tl.gather(s, e ^ 1, axis=1)
+    po = tl.gather(p, e ^ 1, axis=1)
+    v = tl.where((e & 1) != 0, tl.fma(vo, so, -p), tl.fma(v, s, po))
+    v = _bfly(v, e, 2)
+    v = _bfly(v, e, 4)
+    v = _bfly(v, e, 8)
+    v = _bfly(v, e, 16)
+    v = _bfly(v, e, 32)
+    v = _bfly(v, e, 64)
+    return v * 0.08838834764831845
+
+
+# mHC, fused: the hc_post of the sublayer just gathered written into a second stream buffer and, in the same programs,
+# the mixes' partial dots of the new streams (what _hc_partial computes from them). A program takes one K block of one
+# row and 8 of the 24 mixes (an [8, 128] tile keeps _hc_partial's per-mix layout: 4 columns a lane, one warp a mix);
+# the first group of each block also writes the streams and the block's sum of squares (_hc_partial's 2-warp layout).
+@triton.jit
+def _hc_mix_rows(X, XO, G, RS, POST, COMB, PART, ws, r, b, mg, m, k, WIDE: tl.constexpr, D: tl.constexpr,
+                 NB: tl.constexpr, KB: tl.constexpr, SUB: tl.constexpr, MB: tl.constexpr, WORLD: tl.constexpr,
+                 POSTED: tl.constexpr):
+    """One row of _hc_mix_part (the weight tiles ws already loaded)."""
+
+    s = (b * KB) // D
+    col0 = b * KB - s * D
+    acc = tl.zeros((MB,), dtype=tl.float32)
+    ss = tl.zeros((SUB,), dtype=tl.float32)
+    if POSTED:
+        c0 = tl.load(COMB + r * 16 + 0 * 4 + s)
+        c1 = tl.load(COMB + r * 16 + 1 * 4 + s)
+        c2 = tl.load(COMB + r * 16 + 2 * 4 + s)
+        c3 = tl.load(COMB + r * 16 + 3 * 4 + s)
+        ps = tl.load(POST + r * 4 + s)
+    for t in tl.static_range(KB // SUB):
+        d = col0 + t * SUB + k
+        if POSTED:
+            ya = tl.load(G + r * D + d)
+            for q in tl.static_range(1, WORLD):
+                ya = ya + tl.load(G + q * RS + r * D + d)
+            y = ya.to(tl.bfloat16).to(tl.float32)
+            x0 = tl.load(X + r * WIDE + d).to(tl.float32)
+            x1 = tl.load(X + r * WIDE + D + d).to(tl.float32)
+            x2 = tl.load(X + r * WIDE + 2 * D + d).to(tl.float32)
+            x3 = tl.load(X + r * WIDE + 3 * D + d).to(tl.float32)
+            # _hc_post's contraction, spelled out: fma(ps, y, fma(c3, x3, fma(c2, x2, fma(c0, x0, c1 x1))))
+            v = tl.fma(ps, y, tl.fma(c3, x3, tl.fma(c2, x2, tl.fma(c0, x0, c1 * x1))))
+            xb = v.to(tl.bfloat16)
+            if mg == 0:
+                tl.store(XO + r * WIDE + s * D + d, xb)
+            x = xb.to(tl.float32)
+        else:
+            x = tl.load(X + r * WIDE + s * D + d).to(tl.float32)
+        acc += tl.sum(ws[t] * x[None, :], axis=1)
+        ss = tl.fma(x, x, ss)                                   # _hc_partial's fma(x, x, ss)
+    tl.store(PART + (r * NB + b) * 32 + m, acc)
+    if mg == 0:
+        tl.store(PART + (r * NB + b) * 32 + 24, tl.sum(ss, axis=0))
+
+
+# mHC, fused: the hc_post of the sublayer just gathered written into a second stream buffer and, in the same programs,
+# the mixes' partial dots of the new streams (what _hc_partial computes from them). A program takes one K block of RB
+# rows and 8 of the 24 mixes (an [8, 128] tile keeps _hc_partial's per-mix layout: 4 columns a lane, one warp a mix),
+# its weight tiles loaded once for its rows; the first group of each block also writes the streams and the block's
+# sum of squares (_hc_partial's 2-warp layout).
+@triton.jit
+def _hc_mix_part(X, XO, G, RS, POST, COMB, FN, PART, rows, WIDE: tl.constexpr, D: tl.constexpr, NB: tl.constexpr,
+                 SUB: tl.constexpr, MB: tl.constexpr, WORLD: tl.constexpr, POSTED: tl.constexpr, RB: tl.constexpr = 1,
+                 PDL: tl.constexpr = False):
+    r0 = tl.program_id(0) * RB
+    b = tl.program_id(1)
+    mg = tl.program_id(2)
+    KB: tl.constexpr = WIDE // NB
+    m = mg * MB + tl.arange(0, MB)
+    k = tl.arange(0, SUB)
+    ws = ()                                  # the mixing weights first: they may load while the kernel before runs
+    for t in tl.static_range(KB // SUB):
+        ws = ws + (tl.load(FN + m[:, None] * WIDE + b * KB + t * SUB + k[None, :]),)
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    if RB == 1:
+        _hc_mix_rows(X, XO, G, RS, POST, COMB, PART, ws, r0, b, mg, m, k, WIDE, D, NB, KB, SUB, MB, WORLD, POSTED)
+    else:
+        for i in tl.static_range(RB):
+            if r0 + i < rows:
+                _hc_mix_rows(X, XO, G, RS, POST, COMB, PART, ws, r0 + i, b, mg, m, k, WIDE, D, NB, KB, SUB, MB,
+                             WORLD, POSTED)
+
+
+@triton.jit
+def _prefetch_l2(ptrs):
+    """prefetch.global.L2 of every address in ptrs (no data moved into registers, nothing computed)."""
+
+    return tl.inline_asm_elementwise("prefetch.global.L2 [$1]; mov.b32 $0, 0;", "=r,l", [ptrs], dtype=tl.int32,
+                                     is_pure=False, pack=1)
+
+
+# _hc_finish's source with only the 40 partial sums' loop unrolled (adds alone: no contraction to change), so their
+# loads are in flight together, and the norm weight prefetched into L2 first (its loads sit in the output loop, after
+# stores they cannot pass); everything else is _hc_finish's code (its compiled collapse keeps its own fma pattern)
+@triton.jit
+def _hc_finish_u(X, PART, BASE, SCALE, PRE_IN, NW, OUT, PRE_OUT, POST, COMB, eps, hc_eps,
+                 D: tl.constexpr, NB: tl.constexpr, ITERS: tl.constexpr, BLOCK: tl.constexpr,
+                 PDL: tl.constexpr = False):
+    pl = tl.arange(0, BLOCK // 8)                               # one address a 128-byte line of the bf16 weight
+    _prefetch_l2(NW + tl.minimum(pl * 64, D - 1))
+    _prefetch_l2(BASE + tl.arange(0, 1))
+    _prefetch_l2(SCALE + tl.arange(0, 1))
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    m = tl.arange(0, 32)
+    mix = tl.zeros((32,), dtype=tl.float32)
+    ss = 0.0
+    for b in tl.static_range(NB):
+        mix += tl.load(PART + (r * NB + b) * 32 + m)
+        ss += tl.load(PART + (r * NB + b) * 32 + 24)
+    mix = mix * (1.0 / tl.sqrt(ss / (4 * D) + eps))
+    s0 = tl.load(SCALE + 0)
+    s1 = tl.load(SCALE + 1)
+    s2 = tl.load(SCALE + 2)
+    base = tl.load(BASE + m, mask=m < 24, other=0.0)
+    sv = tl.arange(0, 4)
+    pre_l = tl.sum(tl.where(m[None, :] == sv[:, None], (mix * s0 + base)[None, :], 0.0), axis=1)
+    post_l = tl.sum(tl.where(m[None, :] == (sv[:, None] + 4), (mix * s1 + base)[None, :], 0.0), axis=1)
+    pre = 1.0 / (1.0 + tl.exp(-pre_l)) + hc_eps
+    post = 2.0 * (1.0 / (1.0 + tl.exp(-post_l)))
+    ii = tl.arange(0, 4)[:, None]
+    jj = tl.arange(0, 4)[None, :]
+    flat = 8 + ii * 4 + jj
+    cl = tl.sum(tl.where(m[None, None, :] == flat[:, :, None], (mix * s2 + base)[None, None, :], 0.0), axis=2)
+    cmax = tl.max(cl, axis=1)
+    ce = tl.exp(cl - cmax[:, None])
+    comb = ce / tl.sum(ce, axis=1)[:, None] + hc_eps
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+    for _ in range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + hc_eps)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+    tl.store(PRE_OUT + r * 4 + sv, pre)
+    tl.store(POST + r * 4 + sv, post)
+    tl.store(COMB + r * 16 + ii * 4 + jj, comb)
+    # collapse with the carried pre-mix (the previous sublayer's), then RMSNorm, BLOCK columns at a time
+    p0 = tl.load(PRE_IN + r * 4 + 0)
+    p1 = tl.load(PRE_IN + r * 4 + 1)
+    p2 = tl.load(PRE_IN + r * 4 + 2)
+    p3 = tl.load(PRE_IN + r * 4 + 3)
+    acc = tl.zeros((BLOCK,), dtype=tl.float32)
+    for c0 in range(0, D, BLOCK):
+        d = c0 + tl.arange(0, BLOCK)
+        x0 = tl.load(X + r * (4 * D) + d).to(tl.float32)
+        x1 = tl.load(X + r * (4 * D) + D + d).to(tl.float32)
+        x2 = tl.load(X + r * (4 * D) + 2 * D + d).to(tl.float32)
+        x3 = tl.load(X + r * (4 * D) + 3 * D + d).to(tl.float32)
+        c = (((p0 * x0 + p1 * x1) + p2 * x2) + p3 * x3).to(tl.bfloat16).to(tl.float32)
+        acc += c * c
+    rinv = 1.0 / tl.sqrt(tl.sum(acc, axis=0) / D + eps)
+    for c0 in range(0, D, BLOCK):
+        d = c0 + tl.arange(0, BLOCK)
+        x0 = tl.load(X + r * (4 * D) + d).to(tl.float32)
+        x1 = tl.load(X + r * (4 * D) + D + d).to(tl.float32)
+        x2 = tl.load(X + r * (4 * D) + 2 * D + d).to(tl.float32)
+        x3 = tl.load(X + r * (4 * D) + 3 * D + d).to(tl.float32)
+        c = (((p0 * x0 + p1 * x1) + p2 * x2) + p3 * x3).to(tl.bfloat16).to(tl.float32)
+        w = tl.load(NW + d).to(tl.float32)
+        tl.store(OUT + r * D + d, (w * (c * rinv)).to(tl.bfloat16))
+
+
+def hc_pre2(h: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, pre_in: torch.Tensor,
+            norm_w: torch.Tensor, eps: float, hc_eps: float, iters: int, out: torch.Tensor, pre_out: torch.Tensor,
+            post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor, gathered: torch.Tensor | None = None,
+            h_out: torch.Tensor | None = None) -> torch.Tensor:
+    """hc_pre's outputs (the same bits), with the previous sublayer's hc_post fused in when ``gathered`` is given: the
+    post (reading h, post, comb) is written into ``h_out`` (not h: other programs still read h) and the mixes are those
+    of h_out. Returns the streams the mixes were taken of (h_out, or h)."""
+
+    rows = h.shape[0]
+    d = h.shape[-1]
+    wide = 4 * d
+    rb = 1 if rows <= 3 else 2                              # rows a program (sharing its weight tiles)
+    grid = (triton.cdiv(rows, rb), HC_BLOCKS, 3)
+    if gathered is not None:
+        assert h_out is not None and h_out.data_ptr() != h.data_ptr()
+        _hc_mix_part[grid](h, h_out, gathered, rows * d, post, comb, fn, part, rows, WIDE=wide, D=d, NB=HC_BLOCKS,
+                           SUB=128, MB=8, WORLD=gathered.shape[0], POSTED=True, RB=rb, num_warps=2, **_pdl())
+        src = h_out
+    else:
+        _hc_mix_part[grid](h, h, h, 0, post, comb, fn, part, rows, WIDE=wide, D=d, NB=HC_BLOCKS, SUB=128, MB=8,
+                           WORLD=1, POSTED=False, RB=rb, num_warps=2, **_pdl())
+        src = h
+    _hc_finish_u[(rows,)](src, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, D=d,
+                          NB=HC_BLOCKS, ITERS=iters, BLOCK=1024, num_warps=8, **_pdl())
+    return src
+
+
+# router / indexer weights: _rowmm's per-output arithmetic (an output's K chunks in order, each chunk one warp's: 8
+# columns a lane, the same butterfly) with 4 outputs a program (one warp each) and the program's whole weight slice
+# loaded up front (before the PDL wait), so the loads are all in flight together
+@triton.jit
+def _rowmm2(X, xs, W, OUT, scale, K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+            PDL: tl.constexpr = False, WTS: tl.constexpr = False):
+    r = tl.program_id(0)
+    nb = tl.program_id(1)
+    nn = nb * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    ws = ()
+    for t in tl.static_range(K // BK):
+        ws = ws + (tl.load(W + nn[:, None] * K + (t * BK + kk)[None, :], mask=(nn < N)[:, None], other=0.0),)
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    acc = tl.zeros((BN,), dtype=tl.float32)
+    for t in tl.static_range(K // BK):
+        x = tl.load(X + r * xs + t * BK + kk).to(tl.float32)
+        acc += tl.sum(ws[t].to(tl.float32) * x[None, :], axis=1)
+    if WTS:                         # the indexer's weights: (rowmm(x, w).to(bf16) * scale) -> bf16, torch's roundings
+        tl.store(OUT + r * N + nn, (acc.to(tl.bfloat16).to(tl.float32) * scale).to(tl.bfloat16), mask=nn < N)
+    else:
+        tl.store(OUT + r * N + nn, acc, mask=nn < N)
+
+
+ROWMM2_ROWS = 2          # rowmm2 up to this many rows (beyond, rowmm's tiles share the weights better in L2)
+
+
+def rowmm2(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
+    """rowmm's bits (x [R, K] @ w[N, K]^T -> fp32 [R, N], a row alone), faster at 1-2 rows."""
+
+    rows, k = x.shape
+    n = w.shape[0]
+    if rows > ROWMM2_ROWS or k % 256:
+        return rowmm(x, w, out)
+    if out is None:
+        out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
+    bn = 4 if n > 64 else 1                      # a narrow layer: one output (one warp) a program
+    _rowmm2[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, 1.0, K=k, N=n, BN=bn, BK=256, num_warps=bn,
+                                        **_pdl())
+    return out
+
+
+def rowmm_wts(x: torch.Tensor, w: torch.Tensor, scale: float) -> torch.Tensor:
+    """(rowmm(x, w).to(bf16) * scale) as bf16 [R, N] in one launch (decode windows), the same bits."""
+
+    rows, k = x.shape
+    n = w.shape[0]
+    out = torch.empty((rows, n), dtype=torch.bfloat16, device=x.device)
+    bn = 4 if n > 64 else 1
+    _rowmm2[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, scale, K=k, N=n, BN=bn, BK=256, num_warps=bn,
+                                        WTS=True, **_pdl())
+    return out
+
+
+# the indexer's / attention's q RMSNorm (_rmsnorm's arithmetic) and, from its bf16 rows, the rotated input rows of up
+# to two EXL3 linears that read them (wq_b, the indexer's wq_b): rot_many's bits
+@triton.jit
+def _rmsnorm_rot(X, xs, W, OUT, os_, eps, S0, H0, S1, H1, D: tl.constexpr, BLOCK: tl.constexpr, NROT: tl.constexpr,
+                 PDL: tl.constexpr = False):
+    pl = tl.minimum(tl.arange(0, BLOCK // 64) * 64, D - 1)       # the suh lines (read after the row's stores)
+    if NROT > 0:
+        _prefetch_l2(S0 + pl)
+    if NROT > 1:
+        _prefetch_l2(S1 + pl)
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    d = tl.arange(0, BLOCK)
+    ok = d < D
+    x = tl.load(X + r * xs + d, mask=ok, other=0.0).to(tl.float32)
+    rinv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
+    w = tl.load(W + d, mask=ok, other=0.0).to(tl.float32)
+    y = (w * (x * rinv)).to(tl.bfloat16)
+    tl.store(OUT + r * os_ + d, y, mask=ok)
+    NBK: tl.constexpr = BLOCK // 128
+    v = tl.reshape(y.to(tl.float32), (NBK, 128))
+    dd = tl.reshape(d, (NBK, 128))
+    okk = dd < D
+    if NROT > 0:
+        sv = tl.load(S0 + dd, mask=okk, other=0.0).to(tl.float32)
+        tl.store(H0 + r * D + dd, _rot128(v, sv, NBK).to(tl.float16), mask=okk)
+    if NROT > 1:
+        sv = tl.load(S1 + dd, mask=okk, other=0.0).to(tl.float32)
+        tl.store(H1 + r * D + dd, _rot128(v, sv, NBK).to(tl.float16), mask=okk)
+
+
+@triton.jit
+def _q_kv_norm(X, xs, W, OUT, os_, eps, S0, H0, S1, H1, Y, WK, COS, SIN, POS, KOUT, RING, SLOT_OF, ring_size,
+               QUANT: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr, NROT: tl.constexpr, DK: tl.constexpr,
+               RD: tl.constexpr, PDL: tl.constexpr = False):
+    """_rmsnorm_rot (programs (r, 0)) and _kv_norm_rope (programs (r, 1)) of the same rows in one launch: the two
+    independent norms after attn_in, each program the code of the kernel it replaces."""
+
+    if tl.program_id(1) == 0:
+        pl = tl.minimum(tl.arange(0, BLOCK // 64) * 64, D - 1)   # the suh lines (read after the row's stores)
+        if NROT > 0:
+            _prefetch_l2(S0 + pl)
+        if NROT > 1:
+            _prefetch_l2(S1 + pl)
+        _prefetch_l2(W + pl)                                     # and the norm weights (weights: before the wait)
+    else:
+        _prefetch_l2(WK + tl.arange(0, DK // 64) * 64)
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    if tl.program_id(1) == 0:
+        d = tl.arange(0, BLOCK)
+        ok = d < D
+        x = tl.load(X + r * xs + d, mask=ok, other=0.0).to(tl.float32)
+        rinv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
+        w = tl.load(W + d, mask=ok, other=0.0).to(tl.float32)
+        y = (w * (x * rinv)).to(tl.bfloat16)
+        tl.store(OUT + r * os_ + d, y, mask=ok)
+        NBK: tl.constexpr = BLOCK // 128
+        v = tl.reshape(y.to(tl.float32), (NBK, 128))
+        dd = tl.reshape(d, (NBK, 128))
+        okk = dd < D
+        if NROT > 0:
+            sv = tl.load(S0 + dd, mask=okk, other=0.0).to(tl.float32)
+            tl.store(H0 + r * D + dd, _rot128(v, sv, NBK).to(tl.float16), mask=okk)
+        if NROT > 1:
+            sv = tl.load(S1 + dd, mask=okk, other=0.0).to(tl.float32)
+            tl.store(H1 + r * D + dd, _rot128(v, sv, NBK).to(tl.float16), mask=okk)
+    else:
+        HALF: tl.constexpr = DK // 2
+        i = tl.arange(0, HALF)
+        xe = tl.load(Y + r * DK + 2 * i).to(tl.float32)
+        xo = tl.load(Y + r * DK + 2 * i + 1).to(tl.float32)
+        rinv = 1.0 / tl.sqrt((tl.sum(xe * xe, axis=0) + tl.sum(xo * xo, axis=0)) / DK + eps)
+        we = tl.load(WK + 2 * i).to(tl.float32)
+        wo = tl.load(WK + 2 * i + 1).to(tl.float32)
+        ne = (we * (xe * rinv)).to(tl.bfloat16).to(tl.float32)
+        no = (wo * (xo * rinv)).to(tl.bfloat16).to(tl.float32)
+        p = tl.load(POS + r)
+        PAIRS0: tl.constexpr = HALF - RD // 2
+        j = tl.maximum(i - PAIRS0, 0)
+        cs = tl.load(COS + p * (RD // 2) + j)
+        sn = tl.load(SIN + p * (RD // 2) + j)
+        rot = i >= PAIRS0
+        re = tl.where(rot, (ne * cs - no * sn), ne).to(tl.bfloat16).to(tl.float32)
+        im = tl.where(rot, (ne * sn + no * cs), no).to(tl.bfloat16).to(tl.float32)
+        if QUANT:
+            # 32-element blocks = 16 pairs
+            a = tl.maximum(tl.abs(re), tl.abs(im))
+            amax = tl.max(tl.reshape(a, (HALF // 16, 16)), axis=1)
+            s = _pow2_ceil(tl.maximum(amax, 1e-4) / 448.0)
+            sb = tl.reshape(tl.broadcast_to(s[:, None], (HALF // 16, 16)), (HALF,))
+            re = (tl.minimum(tl.maximum(re / sb, -448.0), 448.0)).to(tl.float8e4nv).to(tl.float32) * sb
+            im = (tl.minimum(tl.maximum(im / sb, -448.0), 448.0)).to(tl.float8e4nv).to(tl.float32) * sb
+        tl.store(KOUT + r * DK + 2 * i, re.to(tl.bfloat16))
+        tl.store(KOUT + r * DK + 2 * i + 1, im.to(tl.bfloat16))
+        slot = tl.load(SLOT_OF + r)
+        if slot >= 0:
+            tl.store(RING + slot * DK + 2 * i, re.to(tl.bfloat16))
+            tl.store(RING + slot * DK + 2 * i + 1, im.to(tl.bfloat16))
+
+
+def q_kv_norm(x: torch.Tensor, w: torch.Tensor, eps: float, rot: list, y: torch.Tensor, wk: torch.Tensor,
+              cos: torch.Tensor, sin: torch.Tensor, pos: torch.Tensor, ring: torch.Tensor, slots: torch.Tensor,
+              quant: bool, rd: int) -> torch.Tensor:
+    """rmsnorm_rot(x, w, eps, rot) and kv_norm_rope(y, wk, cos, sin, pos, ring, slots, eps, quant, rd) in one launch;
+    returns rmsnorm_rot's rows."""
+
+    rows, d = x.shape
+    dk = y.shape[1]
+    assert d <= 2048
+    out = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
+    kout = torch.empty_like(y)
+    st = [t for pair in rot for t in pair] + [out, out] * (2 - len(rot))
+    _q_kv_norm[(rows, 2)](x, x.stride(0), w, out, out.stride(0), eps, *st, y, wk, cos, sin, pos, kout, ring, slots,
+                          ring.shape[0], QUANT=quant, D=d, BLOCK=triton.next_power_of_2(d), NROT=len(rot), DK=dk, RD=rd,
+                          num_warps=4, **_pdl())
+    return out
+
+
+def rmsnorm_rot(x: torch.Tensor, w: torch.Tensor, eps: float, rot: list,
+                out: torch.Tensor | None = None) -> torch.Tensor:
+    rows, d = x.shape
+    if out is None:
+        out = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
+    st = [t for pair in rot for t in pair] + [out, out] * (2 - len(rot))
+    _rmsnorm_rot[(rows,)](x, x.stride(0), w, out, out.stride(0), eps, *st, D=d, BLOCK=triton.next_power_of_2(d),
+                          NROT=len(rot), num_warps=4 if d <= 2048 else 8, **_pdl())
+    return out
 
 
 # -- RMSNorm (DeepSeek: bf16(w * (x * rsqrt(mean(x^2) + eps)))) ----------------------------------------------------
 @triton.jit
-def _rmsnorm(X, xs, W, OUT, os_, eps, D: tl.constexpr, BLOCK: tl.constexpr):
+def _rmsnorm(X, xs, W, OUT, os_, eps, D: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     d = tl.arange(0, BLOCK)
     ok = d < D
@@ -165,7 +620,7 @@ def rmsnorm(x: torch.Tensor, w: torch.Tensor, eps: float, out: torch.Tensor | No
     if out is None:
         out = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
     _rmsnorm[(rows,)](x, x.stride(0), w, out, out.stride(0), eps, D=d, BLOCK=triton.next_power_of_2(d),
-                      num_warps=4 if d <= 2048 else 8)
+                      num_warps=4 if d <= 2048 else 8, **_pdl())
     return out
 
 
@@ -190,7 +645,10 @@ def _e2m1(code):
 # -- the window KV: RMSNorm, RoPE on the last 64 (adjacent pairs), FP8 quant-dequant per 32, into the ring ------
 @triton.jit
 def _kv_norm_rope(Y, W, COS, SIN, POS, OUT, RING, SLOT_OF, ring_size, eps, QUANT: tl.constexpr,
-                  D: tl.constexpr, RD: tl.constexpr):
+                  D: tl.constexpr, RD: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     HALF: tl.constexpr = D // 2
     i = tl.arange(0, HALF)
@@ -232,14 +690,17 @@ def kv_norm_rope(y: torch.Tensor, w: torch.Tensor, cos: torch.Tensor, sin: torch
     if out is None:
         out = torch.empty_like(y)
     _kv_norm_rope[(rows,)](y, w, cos, sin, pos, out, ring, slots, ring.shape[0], eps, QUANT=quant, D=d, RD=rd,
-                           num_warps=4)
+                           num_warps=4, **_pdl())
     return out
 
 
 # -- RoPE on the last RD dims of every head (q forward, attention output inverse) -----------------------------------
 @triton.jit
 def _rope_heads(X, COS, SIN, POS, H: tl.constexpr, HD: tl.constexpr, RD: tl.constexpr, INV: tl.constexpr,
-                HB: tl.constexpr):
+                HB: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     hb = tl.program_id(1)
     h = hb * HB + tl.arange(0, HB)
@@ -262,7 +723,7 @@ def rope_heads(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, pos: torch
 
     rows, h, hd = x.shape
     hb = min(h, 16)
-    _rope_heads[(rows, h // hb)](x, cos, sin, pos, H=h, HD=hd, RD=rd, INV=inverse, HB=hb, num_warps=4)
+    _rope_heads[(rows, h // hb)](x, cos, sin, pos, H=h, HD=hd, RD=rd, INV=inverse, HB=hb, num_warps=4, **_pdl())
     return x
 
 
@@ -307,7 +768,10 @@ def _comp_keys(COMP, CSC, row, ok, hc, HD: tl.constexpr, BN: tl.constexpr, PACKE
 def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, SINK, OUT, scale, ring_size, n_idx, RBASE, CBASE,
                       H: tl.constexpr, HD: tl.constexpr, HB: tl.constexpr, WIN: tl.constexpr, BN: tl.constexpr,
                       RING: tl.constexpr, HAS_COMP: tl.constexpr, PACKED: tl.constexpr, SPLITS: tl.constexpr,
-                      NBLK: tl.constexpr, FINAL: tl.constexpr, HAS_BASE: tl.constexpr):
+                      NBLK: tl.constexpr, FINAL: tl.constexpr, HAS_BASE: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     hb = tl.program_id(1)
     sp = tl.program_id(2)
@@ -366,7 +830,10 @@ def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, SINK, OUT, 
 
 @triton.jit
 def _sparse_attn_merge(PM, PL, PO, SINK, OUT, H: tl.constexpr, HD: tl.constexpr, HB: tl.constexpr,
-                       SPLITS: tl.constexpr):
+                       SPLITS: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     hb = tl.program_id(1)
     hh = tl.arange(0, HB)
@@ -387,13 +854,75 @@ def _sparse_attn_merge(PM, PL, PO, SINK, OUT, H: tl.constexpr, HD: tl.constexpr,
     tl.store(OUT + r * (H * HD) + h[:, None] * HD + d[None, :], (acc / l[:, None]).to(tl.bfloat16))
 
 
+@triton.jit
+def _sparse_attn_merge_rot(PM, PL, PO, SINK, OUT, COS, SIN, POS, SUH, XH, rows, H: tl.constexpr, HD: tl.constexpr,
+                           HB: tl.constexpr, SPLITS: tl.constexpr, RD: tl.constexpr, GH: tl.constexpr,
+                           PDL: tl.constexpr = False):
+    """_sparse_attn_merge for one head a program (its arithmetic is per head: the same bits as the HB-head program),
+    then, through OUT, rope_heads' inverse RoPE of the head and wo_a's input rotation of it (GH heads a slice, the
+    slices' suh concatenated in SUH, their rotated rows in XH: slice g's [rows, GH * HD] block at
+    g * rows * GH * HD)."""
+
+    h = tl.program_id(1)
+    _prefetch_l2(SUH + h * HD + tl.arange(0, HD // 64) * 64)    # wo_a's suh of this head (read last, after barriers)
+    _prefetch_l2(SINK + h + tl.arange(0, 1))
+    pp = tl.load(POS + tl.program_id(0))                       # (positions: a round input, no kernel writes them)
+    _prefetch_l2(COS + pp * (RD // 2) + tl.arange(0, 1))
+    _prefetch_l2(SIN + pp * (RD // 2) + tl.arange(0, 1))
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    d = tl.arange(0, HD)
+    base0 = (r * (H // HB) + h // HB) * SPLITS
+    hi = h % HB
+    m = -1e30
+    for sp in range(SPLITS):
+        m = tl.maximum(m, tl.load(PM + (base0 + sp) * HB + hi))
+    l = 0.0
+    acc = tl.zeros((HD,), dtype=tl.float32)
+    for sp in range(SPLITS):
+        ms = tl.load(PM + (base0 + sp) * HB + hi)
+        a = tl.exp(ms - m)
+        l += tl.load(PL + (base0 + sp) * HB + hi) * a
+        acc += tl.load(PO + (base0 + sp) * HB * HD + hi * HD + d) * a
+    l += tl.exp(tl.load(SINK + h) - m)
+    ob = OUT + r * (H * HD) + h * HD
+    tl.store(ob + d, (acc / l).to(tl.bfloat16))
+    tl.debug_barrier()
+    # inverse RoPE on the last RD dims (rope_heads, INV), its compiled contraction spelled out: re = fma(xe, cs,
+    # -(xo sn)), im = fma(xe, sn, xo cs) (checked against rope_heads on 16M random pairs: no other order matches)
+    j = tl.arange(0, RD // 2)
+    p = tl.load(POS + r)
+    cs = tl.load(COS + p * (RD // 2) + j)
+    sn = tl.load(SIN + p * (RD // 2) + j)
+    sn = -sn
+    rb = ob + (HD - RD) + 2 * j
+    xe = tl.load(rb).to(tl.float32)
+    xo = tl.load(rb + 1).to(tl.float32)
+    tl.store(rb, tl.fma(xe, cs, -(xo * sn)).to(tl.bfloat16))
+    tl.store(rb + 1, tl.fma(xe, sn, xo * cs).to(tl.bfloat16))
+    tl.debug_barrier()
+    # wo_a's input rotation of the head: its HD / 128 blocks (slice g = h // GH, columns (h % GH) * HD ..)
+    NBK: tl.constexpr = HD // 128
+    bi = tl.arange(0, NBK)
+    c = tl.arange(0, 128)
+    v = tl.load(ob + bi[:, None] * 128 + c[None, :]).to(tl.float32)
+    s = tl.load(SUH + h * HD + bi[:, None] * 128 + c[None, :]).to(tl.float32)
+    y = _rot128(v, s, NBK)
+    g = h // GH
+    col = (h % GH) * HD + bi * 128
+    tl.store(XH + g * (rows * GH * HD) + r * (GH * HD) + col[:, None] + c[None, :], y.to(tl.float16))
+
+
 ATTN_SPLITS = 8
 
 
 def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: torch.Tensor, ring: bool,
                 comp, idx: torch.Tensor | None, pos: torch.Tensor, scale: float, window: int,
                 out: torch.Tensor | None = None, wbase: torch.Tensor | None = None,
-                cbase: torch.Tensor | None = None, ring_rows: int | None = None) -> torch.Tensor:
+                cbase: torch.Tensor | None = None, ring_rows: int | None = None,
+                rot: tuple | None = None) -> torch.Tensor:
     """q [R, H, HD] bf16 -> o [R, H, HD]; window keys from ``wsrc`` (a ring: slot = position % size; else linear from
     position wlo[0]); compressed keys comp[idx[r, j]] (idx -1 = none). ``comp`` is a bf16 [N, HD] tensor or a packed
     FP4 pair (codes uint8 [N, HD/2], E4M3 scales uint8 [N, HD/16])."""
@@ -435,16 +964,28 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
                                           pm, pl, po, sink, out, scale, ring_size, n_idx,
                                           wbase if based else pos, (cbase if cbase is not None else wbase) if based else pos,
                                           H=h, HD=hd, HB=hb, WIN=window, BN=bn, RING=ring, HAS_COMP=has, PACKED=packed,
-                                          SPLITS=sp, NBLK=nblk, FINAL=final, HAS_BASE=based, num_warps=4, num_stages=1)
-    if not final:
-        _sparse_attn_merge[(rows, groups)](pm, pl, po, sink, out, H=h, HD=hd, HB=hb, SPLITS=sp, num_warps=8)
+                                          SPLITS=sp, NBLK=nblk, FINAL=final, HAS_BASE=based, num_warps=4, num_stages=1,
+                                          **_pdl())
+    if not final and rot is not None:
+        # rot = (cos, sin, rope dim, wo_a's suh concatenated, its rotated rows' buffer, heads a slice): the merge, the
+        # inverse RoPE and wo_a's input rotation in one launch (o is still written, roped)
+        cos, sin, rd, suh, xh, gh = rot
+        _sparse_attn_merge_rot[(rows, h)](pm, pl, po, sink, out, cos, sin, pos, suh, xh, rows, H=h, HD=hd, HB=hb,
+                                          SPLITS=sp, RD=rd, GH=gh, num_warps=4, **_pdl())
+    elif not final:
+        _sparse_attn_merge[(rows, groups)](pm, pl, po, sink, out, H=h, HD=hd, HB=hb, SPLITS=sp, num_warps=8,
+                                           **_pdl())
     return out
 
 
 # -- indexer scores: sum_h relu(q_h . k_t) w_h over t < n, masked past each row's visible count -------------------
 @triton.jit
-def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr,
-                 PACKED: tl.constexpr, HAS_BASE: tl.constexpr):
+def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, CAND, cs, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr,
+                 PACKED: tl.constexpr, HAS_BASE: tl.constexpr, PDL: tl.constexpr = False,
+                 HAS_CAND: tl.constexpr = False, CB: tl.constexpr = 8, KEYS: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     b = tl.program_id(1)
     HALF: tl.constexpr = ID // 2
@@ -478,7 +1019,16 @@ def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, IH: tl.constexpr, ID: tl.constex
     sc = tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
     vis = tl.load(VIS + r)
     sc = tl.where(t < vis, sc, float("-inf"))
-    tl.store(OUT + r * n + t, sc, mask=ok)
+    if HAS_CAND:                       # apply_candidates: -inf outside the candidate pool's blocks
+        keep = tl.load(CAND + r * cs + t // CB, mask=ok, other=0)
+        sc = tl.where(keep != 0, sc, float("-inf"))
+    if KEYS:                           # topk_indices' keys: the score's bits in total order above, ~index below
+        bits = tl.where(sc == 0.0, 0, sc.to(tl.int32, bitcast=True))    # (score + 0.0: -0 as +0)
+        ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
+        key = (ordered << 32) | (0xFFFFFFFF - t.to(tl.int64))
+        tl.store(OUT + r * n + t, key, mask=ok)
+    else:
+        tl.store(OUT + r * n + t, sc, mask=ok)
 
 
 @triton.jit
@@ -533,8 +1083,8 @@ def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
     bn = 64
     if rows <= DECODE_ROWS:
         _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, vis if base is None else base,
-                                                 IH=ih, ID=idim, BN=bn, PACKED=packed, HAS_BASE=base is not None,
-                                                 num_warps=4)
+                                                 vis, 0, IH=ih, ID=idim, BN=bn, PACKED=packed,
+                                                 HAS_BASE=base is not None, num_warps=4, **_pdl())
     else:
         assert base is None, "concurrent rounds are decode windows (DECODE_ROWS rows at most)"
         rbs = 8
@@ -544,14 +1094,236 @@ def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
     return out
 
 
+def index_keys(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int, base: torch.Tensor | None = None,
+               cand: torch.Tensor | None = None, cand_block: int = 8) -> torch.Tensor:
+    """topk_indices' int64 keys [R, n] of index_score's scores (decode windows), with apply_candidates' mask (``cand``:
+    the pool's block mask [R, >= ceil(n / cand_block)]) folded in: one launch for index_score + apply_candidates +
+    the keys' six torch ops, the same keys."""
+
+    rows, ih, idim = q.shape
+    assert rows <= DECODE_ROWS
+    out = torch.empty((rows, n), dtype=torch.int64, device=q.device)
+    packed = isinstance(k, tuple)
+    codes, scales = k if packed else (k, k)
+    bn = 64
+    has_cand = cand is not None
+    cv = cand.view(torch.uint8) if has_cand else vis
+    _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, vis if base is None else base,
+                                             cv, cv.stride(0) if has_cand else 0, IH=ih, ID=idim, BN=bn,
+                                             PACKED=packed, HAS_BASE=base is not None, num_warps=4,
+                                             HAS_CAND=has_cand, CB=cand_block, KEYS=True, **_pdl())
+    return out
+
+
+@triton.jit
+def _topk_finish(TOP, VIS, OUT, KK: tl.constexpr, PDL: tl.constexpr = False):
+    """topk_indices' tail and the visible mask: the selected keys' indices sorted ascending, -1 at or past vis[r]."""
+
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    j = tl.arange(0, KK)
+    key = tl.load(TOP + r * KK + j)
+    idx = 0xFFFFFFFF - (key & 0xFFFFFFFF)
+    idx = tl.sort(idx)
+    vis = tl.load(VIS + r)
+    tl.store(OUT + r * KK + j, tl.where(idx < vis, idx, -1))
+
+
+def topk_select(keys: torch.Tensor, k: int, vis: torch.Tensor) -> torch.Tensor:
+    """torch.where(topk_indices(score, k) < vis[:, None], ..., -1) from index_keys' keys: torch's top-k of the keys,
+    then one launch for the indices, their sort and the mask (k a power of two). The same int64 [R, k]."""
+
+    top = keys.topk(k, dim=-1, sorted=False).values.contiguous()
+    rows = keys.shape[0]
+    out = torch.empty((rows, k), dtype=torch.int64, device=keys.device)
+    _topk_finish[(rows,)](top, vis, out, KK=k, num_warps=4, **_pdl())
+    return out
+
+
+@triton.jit
+def _score_keys(S, OUT, n, BN: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    t = tl.program_id(1) * BN + tl.arange(0, BN)
+    ok = t < n
+    sc = tl.load(S + r * n + t, mask=ok, other=0.0)
+    bits = tl.where(sc == 0.0, 0, sc.to(tl.int32, bitcast=True))
+    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
+    tl.store(OUT + r * n + t, (ordered << 32) | (0xFFFFFFFF - t.to(tl.int64)), mask=ok)
+
+
+def score_keys(score: torch.Tensor) -> torch.Tensor:
+    """topk_indices' int64 keys of fp32 scores [R, n] (contiguous), one launch."""
+
+    rows, n = score.shape
+    out = torch.empty((rows, n), dtype=torch.int64, device=score.device)
+    _score_keys[(rows, triton.cdiv(n, 1024))](score, out, n, BN=1024, num_warps=4, **_pdl())
+    return out
+
+
+# fp4_qd(x, 32, e4m3_scale=False) (the indexer's q): 32-element blocks, a power-of-two scale (ops._pow2_ceil of
+# amax / 6, amax floored at 6 * 2^-126), values rounded to E2M1 (ties to the even code), in one launch with the bits of
+# the torch ops (IEEE divisions, the scale built from its exponent bits as ldexp makes it)
+@triton.jit
+def _fp4qd_p2(X, OUT, nblk, BLKS: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    pb = tl.program_id(0)
+    bi = pb * BLKS + tl.arange(0, BLKS)
+    e = tl.arange(0, 32)
+    okb = bi < nblk
+    v = tl.load(X + bi[:, None] * 32 + e[None, :], mask=okb[:, None], other=0.0).to(tl.float32)
+    amax = tl.max(tl.abs(v), axis=1)
+    sv = tl.math.div_rn(tl.maximum(amax, 6 * 2.0 ** -126), 6.0)
+    bits = sv.to(tl.int32, bitcast=True)
+    ex = ((bits >> 23) & 0xFF) + tl.where((bits & 0x7FFFFF) != 0, 1, 0)
+    sc = (ex << 23).to(tl.float32, bitcast=True)              # 2^(exp - 127 + (mantissa != 0))
+    t = tl.minimum(tl.maximum(tl.math.div_rn(v, sc[:, None]), -6.0), 6.0)
+    a = tl.abs(t)
+    idx = ((a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32) + (a > 1.75).to(tl.int32)
+           + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32) + (a > 5.0).to(tl.int32))
+    tie = (a == 0.75) | (a == 1.75) | (a == 3.5)              # a tie at an odd code's lower midpoint: up to the even
+    idx = tl.where(tie, idx + 1, idx)
+    g = tl.where(idx < 4, idx.to(tl.float32) * 0.5, tl.where(idx == 4, 2.0, tl.where(idx == 5, 3.0,
+                                                                                         tl.where(idx == 6, 4.0, 6.0))))
+    q = (g.to(tl.int32, bitcast=True) | (t.to(tl.int32, bitcast=True) & -2147483648)).to(tl.float32, bitcast=True)
+    tl.store(OUT + bi[:, None] * 32 + e[None, :], (q * sc[:, None]).to(tl.bfloat16), mask=okb[:, None])
+
+
+def fp4_qd_p2(x: torch.Tensor) -> torch.Tensor:
+    """ops.fp4_qd(x, 32, e4m3_scale=False) of a bf16 tensor (numel a multiple of 32), one launch."""
+
+    out = torch.empty_like(x)
+    nblk = x.numel() // 32
+    blks = 32
+    _fp4qd_p2[(triton.cdiv(nblk, blks),)](x, out, nblk, BLKS=blks, num_warps=4, **_pdl())
+    return out
+
+
+@triton.jit
+def _e2m1_round(t):
+    """ops._e2m1_code's magnitude index of t (already clamped to [-6, 6]): round to nearest, ties to the even code."""
+
+    a = tl.abs(t)
+    idx = ((a > 0.25).to(tl.int32) + (a > 0.75).to(tl.int32) + (a > 1.25).to(tl.int32) + (a > 1.75).to(tl.int32)
+           + (a > 2.5).to(tl.int32) + (a > 3.5).to(tl.int32) + (a > 5.0).to(tl.int32))
+    return tl.where((a == 0.75) | (a == 1.75) | (a == 3.5), idx + 1, idx)
+
+
+# store_rows of a packed FP4 cache (ops.fp4_pack + the two row writes) in one launch: per row, BLOCK-element blocks
+# with an E4M3 scale (torch's float -> float8_e4m3fn rounding, spelled out in integer ops) or a power-of-two (E8M0)
+# scale, E2M1 codes (byte j: element j low, element j + D / 2 high), written to the cache rows ROWS[r]
+@triton.jit
+def _fp4_store(X, xs, CODES, SCALES, ROWS, D: tl.constexpr, BLOCK: tl.constexpr, E4M3: tl.constexpr,
+               PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    NB: tl.constexpr = D // BLOCK
+    HALF: tl.constexpr = D // 2
+    blk = tl.arange(0, NB)
+    e = tl.arange(0, BLOCK)
+    v = tl.load(X + r * xs + blk[:, None] * BLOCK + e[None, :]).to(tl.float32)
+    amax = tl.max(tl.abs(v), axis=1)
+    if E4M3:
+        f = tl.math.div_rn(tl.maximum(amax, 6 * 2.0 ** -9), 6.0)
+        fb = f.to(tl.int32, bitcast=True)
+        sub = (f + 16384.0).to(tl.int32, bitcast=True) - (141 << 23)          # below 2^-6: the denormal add
+        nor = (fb + (-120 << 23) + 0x7FFFF + ((fb >> 20) & 1)) >> 20           # RNE of the normal range
+        nor = tl.where(nor == 0x7F, 0x7E, nor)
+        sb = tl.where(fb >= (1087 << 20), 0x7E, tl.where(fb < (121 << 23), sub, nor))
+        sc = sb.to(tl.uint8).to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    else:
+        f = tl.math.div_rn(tl.maximum(amax, 6 * 2.0 ** -126), 6.0)
+        bits = f.to(tl.int32, bitcast=True)
+        sb = ((bits >> 23) & 0xFF) + tl.where((bits & 0x7FFFFF) != 0, 1, 0)
+        sc = (sb << 23).to(tl.float32, bitcast=True)
+    t = tl.minimum(tl.maximum(tl.math.div_rn(v, sc[:, None]), -6.0), 6.0)
+    idx = _e2m1_round(t)
+    code = idx | tl.where((t < 0) & (idx > 0), 8, 0)
+    pair = tl.permute(tl.reshape(code, (2, HALF)), (1, 0))                 # [HALF, 2]: element j, element j + D/2
+    lo, hi = tl.split(pair)
+    j = tl.arange(0, HALF)
+    row = tl.load(ROWS + r)
+    tl.store(CODES + row * HALF + j, (lo | (hi << 4)).to(tl.uint8))
+    tl.store(SCALES + row * NB + blk, sb.to(tl.uint8))
+
+
+def fp4_store(x: torch.Tensor, cache: tuple, rows: torch.Tensor, block: int, e4m3: bool) -> None:
+    """model.store_rows(cache, rows, x, block, e4m3) for a packed cache, one launch, the same bytes."""
+
+    n, d = x.shape
+    _fp4_store[(n,)](x, x.stride(0), cache[0], cache[1], rows, D=d, BLOCK=block, E4M3=e4m3, num_warps=4, **_pdl())
+
+
+# the round's first streams: every row's embedding copied into its hc streams, the carried pre-mix [1, 0, 0, 0]
+# (embed[ids][:, None].expand(-1, hc, -1).contiguous() and pre = zeros; pre[:, 0] = 1, in one launch)
+@triton.jit
+def _embed_init(EMB, IDS, H, PRE, D: tl.constexpr, HC: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    cb = tl.program_id(1)
+    d = cb * BLOCK + tl.arange(0, BLOCK)
+    tok = tl.load(IDS + r)
+    v = tl.load(EMB + tok * D + d)
+    for s in tl.static_range(HC):
+        tl.store(H + (r * HC + s) * D + d, v)
+    if cb == 0:
+        j = tl.arange(0, HC)
+        tl.store(PRE + r * HC + j, tl.where(j == 0, 1.0, 0.0))
+
+
+def embed_init(embed: torch.Tensor, ids: torch.Tensor, hc: int) -> tuple:
+    rows = ids.shape[0]
+    d = embed.shape[1]
+    h = torch.empty((rows, hc, d), dtype=embed.dtype, device=ids.device)
+    pre = torch.empty((rows, hc), dtype=torch.float32, device=ids.device)
+    _embed_init[(rows, d // 1024)](embed, ids, h, pre, D=d, HC=hc, BLOCK=1024, num_warps=4, **_pdl())
+    return h, pre
+
+
+# a DSpark tap: h.to(fp32).mean(1).to(bf16) (torch's mean: ((x0 + x1) + x2) + x3, then / 4, checked bit for bit on
+# streams of mixed magnitudes) written into its column block of the taps buffer (no cat)
+@triton.jit
+def _tap(H, OUT, os_, D: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    d = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    x0 = tl.load(H + r * 4 * D + d).to(tl.float32)
+    x1 = tl.load(H + r * 4 * D + D + d).to(tl.float32)
+    x2 = tl.load(H + r * 4 * D + 2 * D + d).to(tl.float32)
+    x3 = tl.load(H + r * 4 * D + 3 * D + d).to(tl.float32)
+    tl.store(OUT + r * os_ + d, ((((x0 + x1) + x2) + x3) / 4.0).to(tl.bfloat16))
+
+
+def tap(h: torch.Tensor, out: torch.Tensor) -> None:
+    """out [R, D] (a column block of the taps buffer) = h.to(fp32).mean(1).to(bf16) for h [R, 4, D] bf16."""
+
+    rows, hc, d = h.shape
+    assert hc == 4
+    _tap[(rows, d // 1024)](h, out, out.stride(0), D=d, BLOCK=1024, num_warps=4, **_pdl())
+
+
 # -- MoE gate: sqrt(softplus(logits)), top-k by logits + bias, weights normalized and scaled; shared expert last ----
 @triton.jit
-def _route(L, BIAS, PICK, WTS, scale, shared_id, NE: tl.constexpr, NB: tl.constexpr, TOPK: tl.constexpr,
-           SLOTS: tl.constexpr, SP: tl.constexpr):
-    r = tl.program_id(0)
+def _route_row(L, BIAS, PICK, WTS, scale, shared_id, NE: tl.constexpr, NB: tl.constexpr, TOPK: tl.constexpr,
+               SLOTS: tl.constexpr, SP: tl.constexpr, CG: tl.constexpr):
     e = tl.arange(0, NB)
     ok = e < NE
-    lg = tl.load(L + r * NE + e, mask=ok, other=0.0)
+    if CG:                             # logits other programs just wrote: past this SM's L1
+        lg = tl.load(L + e, mask=ok, other=0.0, cache_modifier=".cg")
+    else:
+        lg = tl.load(L + e, mask=ok, other=0.0)
     sp = tl.where(lg > 20.0, lg, tl.log(1.0 + tl.exp(lg)))
     sc = tl.sqrt(sp)
     b = tl.load(BIAS + e, mask=ok, other=0.0)
@@ -569,20 +1341,38 @@ def _route(L, BIAS, PICK, WTS, scale, shared_id, NE: tl.constexpr, NB: tl.conste
         tot += v
         sel = tl.where(e == idx, float("-inf"), sel)
     ws = tl.where(s < TOPK, ws / (tot + 1e-20) * scale, 1.0)
-    tl.store(PICK + r * SLOTS + s, picks, mask=s < SLOTS)
-    tl.store(WTS + r * SLOTS + s, ws, mask=s < SLOTS)
+    tl.store(PICK + s, picks, mask=s < SLOTS)
+    tl.store(WTS + s, ws, mask=s < SLOTS)
+
+
+@triton.jit
+def _route(L, BIAS, PICK, WTS, scale, shared_id, NE: tl.constexpr, NB: tl.constexpr, TOPK: tl.constexpr,
+           SLOTS: tl.constexpr, SP: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        _prefetch_l2(BIAS + tl.minimum(tl.arange(0, NB // 32) * 32, NE - 1))   # the bias (a weight) while waiting
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    _route_row(L + r * NE, BIAS, PICK + r * SLOTS, WTS + r * SLOTS, scale, shared_id, NE, NB, TOPK, SLOTS, SP, False)
 
 
 def route(logits: torch.Tensor, bias: torch.Tensor, topk: int, scale: float, shared_id: int,
           pick: torch.Tensor, wts: torch.Tensor) -> None:
     rows, ne = logits.shape
+    # one warp a row (switch "rowmm"): its reductions are a max, a min index and a one-element sum, exact in any
+    # layout, so the picks and weights are the 4-warp launch's; no cross-warp barriers in its six rounds
+    nw = 1 if SMALL_SWITCHES["rowmm"] else 4
     _route[(rows,)](logits, bias, pick, wts, scale, shared_id, NE=ne, NB=triton.next_power_of_2(ne), TOPK=topk,
-                    SLOTS=pick.shape[1], SP=triton.next_power_of_2(pick.shape[1]), num_warps=4)
+                    SLOTS=pick.shape[1], SP=triton.next_power_of_2(pick.shape[1]), num_warps=nw, **_pdl())
 
 
 # -- row-invariant small matmul y[r] = x[r] @ W^T (fp32 accumulate in fixed K order): router, hc, indexer weights ---
 @triton.jit
-def _rowmm(X, xs, W, OUT, K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr):
+def _rowmm(X, xs, W, OUT, K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+           PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     nb = tl.program_id(1)
     nn = nb * BN + tl.arange(0, BN)
@@ -603,13 +1393,16 @@ def rowmm(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> 
     if out is None:
         out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
     bn = 8
-    _rowmm[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, K=k, N=n, BN=bn, BK=256, num_warps=4)
+    _rowmm[(rows, triton.cdiv(n, bn))](x, x.stride(0), w, out, K=k, N=n, BN=bn, BK=256, num_warps=4, **_pdl())
     return out
 
 
 # -- the final collapse: RMSNorm(sum_j pre[j] h_j) (no mixes) ---------------------------------------------------------
 @triton.jit
-def _collapse_norm(X, PRE, NW, OUT, eps, D: tl.constexpr, BLOCK: tl.constexpr):
+def _collapse_norm(X, PRE, NW, OUT, eps, D: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     p0 = tl.load(PRE + r * 4 + 0)
     p1 = tl.load(PRE + r * 4 + 1)
@@ -634,7 +1427,7 @@ def _collapse_norm(X, PRE, NW, OUT, eps, D: tl.constexpr, BLOCK: tl.constexpr):
 def collapse_norm(h: torch.Tensor, pre: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
     rows, _, d = h.shape
     out = torch.empty((rows, d), dtype=torch.bfloat16, device=h.device)
-    _collapse_norm[(rows,)](h, pre, w, out, eps, D=d, BLOCK=1024, num_warps=8)
+    _collapse_norm[(rows,)](h, pre, w, out, eps, D=d, BLOCK=1024, num_warps=8, **_pdl())
     return out
 
 
@@ -662,7 +1455,10 @@ def collapse(h: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
 
 # -- Engram gate: per (row, stream) normalized dot of the stream with its key, signed sqrt, sigmoid; h + gate * v ----
 @triton.jit
-def _engram_gate(H, KV, QK, OUT, eps, D: tl.constexpr, BLOCK: tl.constexpr):
+def _engram_gate(H, KV, QK, OUT, eps, D: tl.constexpr, BLOCK: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
     r = tl.program_id(0)
     s = tl.program_id(1)
     sh = tl.zeros((BLOCK,), dtype=tl.float32)
@@ -693,7 +1489,7 @@ def engram_gate(h: torch.Tensor, kv: torch.Tensor, qk: torch.Tensor, eps: float)
 
     rows, _, d = h.shape
     out = torch.empty_like(h)
-    _engram_gate[(rows, 4)](h, kv, qk, out, eps, D=d, BLOCK=1024, num_warps=4)
+    _engram_gate[(rows, 4)](h, kv, qk, out, eps, D=d, BLOCK=1024, num_warps=4, **_pdl())
     return out
 
 
