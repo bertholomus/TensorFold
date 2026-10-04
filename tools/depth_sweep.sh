@@ -1,7 +1,7 @@
 #!/bin/bash
 # Sweep MTP draft depth on TP4: restart with --mtp-drafts D, run tf_greedy, check equality vs serial, log speed.
 for D in "$@"; do
-  for n in 1 2 3 4; do ssh -o BatchMode=yes -n ascent-0$n 'docker rm -f tf-tp4 >/dev/null 2>&1' 2>&1 | grep -v local/bin/env; done
+  for n in 1 2 3 4; do ssh -o BatchMode=yes -n spark$n 'docker rm -f tf-tp4 >/dev/null 2>&1' 2>&1 | grep -v local/bin/env; done
   bash /tmp/rq/tf/tp4_start.sh 32768 "--mtp-drafts $D" >/dev/null
   for i in $(seq 1 36); do sleep 15; s=$(ssh -o BatchMode=yes -n spark1 'docker logs tf-tp4 2>&1 | grep -cE "serving|Traceback|^tensorfold:"' 2>/dev/null); [ "${s:-0}" != "0" ] && break; done
   echo "=== depth $D"

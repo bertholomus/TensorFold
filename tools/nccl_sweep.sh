@@ -1,7 +1,7 @@
 #!/bin/bash
 # In the tf container on every rank (tp4_run.sh): nccl_bench.py once per NCCL setting below, a port each.
 # Entries are "ENV ASSIGNMENTS|MODE" (MODE allgather or p2p); "base" is the env tp4_start.sh gives; @DUAL is this
-# node's two active RoCE devices (mlx5_0,mlx5_2 on A1/A2; rocep1s0f0,roceP2p1s0f0 on A3/A4).
+# node's two active RoCE devices (mlx5_0,mlx5_2 on nodes 1-2; rocep1s0f0,roceP2p1s0f0 on nodes 3-4).
 # usage: nccl_sweep.sh RANK [FIRST_PORT]
 RANK=$1
 PORT=${2:-29700}
