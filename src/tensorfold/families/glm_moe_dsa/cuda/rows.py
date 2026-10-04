@@ -36,7 +36,8 @@ class Tables:
     its stream), ``base`` int64 [rows] (its stream's first pool row), and ``seg`` int32 [streams, 2] (each stream's
     first row in the window and its row count; unused entries 0 rows). ``dense`` / ``sparse``: whether some row sits
     below / at or past the dense limit (the kernels a round runs); ``bucket``: the scored-token bucket of its deepest
-    row past the limit."""
+    row past the limit. ``segments`` (decode context parallelism, host side): each stream's (first row, rows, first
+    local pool row, end, first position), its slot's rows of the pool as one rank holds them."""
 
     def __init__(self, rows: int, streams: int, device) -> None:
         self.rows, self.streams = rows, streams
@@ -50,9 +51,12 @@ class Tables:
         self.dense = self.sparse = False
         self.bucket = 0
         self.R = 0
+        self.segments: list[tuple[int, int, int, int, int]] = []
 
-    def fill(self, windows: list[tuple[int, int, int]], dense_limit: int) -> int:
-        """``windows``: each stream's (pool base, first position, rows), in window order. Returns the rows."""
+    def fill(self, windows: list[tuple[int, ...]], dense_limit: int) -> int:
+        """``windows``: each stream's (pool base, first position, rows), in window order, with decode context
+        parallelism a fourth entry: the local pool rows its slot holds from that base (``segments``). Returns the
+        rows."""
 
         from .select import sparse_bucket
 
@@ -63,12 +67,16 @@ class Tables:
         r = 0
         deepest = -1
         self.dense = self.sparse = False
-        for i, (b0, p0, n) in enumerate(windows):
+        self.segments = []
+        for i, win in enumerate(windows):
+            b0, p0, n = win[0], win[1], win[2]
             if r + n > self.rows:
                 raise ValueError(f"a round of more than {self.rows} rows")
             pos[r:r + n] = range(p0, p0 + n)
             base[r:r + n] = b0
             seg[i] = (r, n)
+            if len(win) > 3:
+                self.segments.append((r, n, b0, b0 + win[3], p0))
             if p0 < dense_limit:
                 self.dense = True
             if p0 + n - 1 >= dense_limit:

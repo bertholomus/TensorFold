@@ -387,6 +387,12 @@ def write_rows(rows: torch.Tensor, cache, pos_dev: torch.Tensor, G: int = 1, ran
         latent_mod.latent_write(rows, cache, pos_dev)
 
 
+def held_rows(p, lo: int, hi: int):
+    """Rows [lo, hi) of a cache plane: a concurrent stream's slot (views; an FP8 or quantized plane's own)."""
+
+    return p[lo:hi] if isinstance(p, torch.Tensor) else p.rows(lo, hi)
+
+
 def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, R: int,
               nch: int | None, index, host_pos: int | None,
               sparse_np: int | None = None, pc: torch.Tensor | None = None, reuse: bool = False) -> torch.Tensor:
@@ -406,8 +412,12 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
     G = w.meta.get("dcp", 1)                 # dcp: the cache's positions interleaved over G ranks
     inv = invariant.INVARIANT and b.prefill and G == 1   # the chunk-invariant prompt path (invariant.py)
     t = getattr(b, "rows_t", None)           # a concurrent round (rows.Tables): every row its own stream's position
-    if t is not None and (G > 1 or reuse):
-        raise ValueError("a concurrent round runs neither with decode context parallelism nor MTP index reuse")
+    if t is not None and reuse:
+        raise ValueError("a concurrent round runs without MTP index reuse")
+    # dcp in a concurrent round: each stream's rows over its slot's planes (the rows this rank holds of them)
+    segs = t.segments if t is not None and G > 1 else None
+    if segs is not None and sum(n for _, n, _, _, _ in segs) != R:
+        raise ValueError("a concurrent round with decode context parallelism needs every stream's slot (rows.Tables)")
 
     def keys(sc: X3Scratch | None) -> None:
         """This window's latent, rope key and (full layers) indexer key, into their caches at the window's slots."""
@@ -419,7 +429,11 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         with prof.timed("dsa: rope"):
             rope_mod.apply_key(b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
         with prof.timed("dsa: latent write"):
-            if t is not None:                # a concurrent round: each row at its own stream's slot
+            if segs is not None:             # dcp: each stream's rows into its slot, the positions this rank holds
+                for r0, n, lo, hi, _ in segs:
+                    write_rows(b.lat[r0:r0 + n, :c.kv_lora], held_rows(lc, lo, hi), t.pos[r0:r0 + 1], G, w.rank)
+                    write_rows(b.lat[r0:r0 + n, c.kv_lora:], held_rows(pc, lo, hi), t.pos[r0:r0 + 1], G, w.rank)
+            elif t is not None:              # a concurrent round: each row at its own stream's slot
                 rows_mod.write(b.lat[:R, :c.kv_lora], lc, t)
                 rows_mod.write(b.lat[:R, c.kv_lora:], pc, t)
             else:
@@ -431,7 +445,10 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
                 mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
                 glue.layernorm(b.ik[:R], ix.ln_w, ix.ln_b, c.eps, b.ik[:R])
                 rope_mod.apply_index(b.ik[:R], b.cos[:R], b.sin[:R], c, 1)
-                if t is not None:
+                if segs is not None:
+                    for r0, n, lo, hi, _ in segs:
+                        write_rows(b.ik[r0:r0 + n], held_rows(index, lo, hi), t.pos[r0:r0 + 1], G, w.rank)
+                elif t is not None:
                     rows_mod.write(b.ik[:R], index, t)
                 elif host_pos is not None and isinstance(index, torch.Tensor) and G == 1:
                     index[host_pos:host_pos + R].copy_(b.ik[:R])
@@ -463,6 +480,27 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         qp = mla_pe.gather_pe(b.q[:R], c.qk_nope, b.qp[:R])
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
+    if segs is not None:
+        # dcp in a concurrent round: each stream's window through the single-stream dcp selection and attention over its
+        # slot's planes, every rank taking the streams in the same order (the exchanges pair up). A row's keys, chunks
+        # and merges are its solo window's (rows never meet), so a row keeps the solo dcp bits.
+        sel = long_ctx and a.index is not None
+        if sel and any(p0 + n - 1 >= c.dense_limit for _, n, _, _, p0 in segs):
+            with prof.timed("dsa: select tokens"):
+                index_inputs(w, b, a.index, R)
+        with prof.timed("dsa: attention (dcp)"):
+            for r0, n, lo, hi, p0 in segs:
+                pv = t.pos[r0:r0 + 1]
+                if sel and p0 + n - 1 >= c.dense_limit:
+                    dcp_mod.select(w, b.qi[r0:r0 + n], b.iw[r0:r0 + n], held_rows(index, lo, hi), None, n,
+                                   c.index_topk, pv, tokens=b.tokens[r0:r0 + n], counts=b.counts[r0:r0 + n],
+                                   bucket=select_mod.sparse_bucket(p0, n, G))
+                dcp_mod.attention(w, qa[r0:r0 + n], qp[r0:r0 + n], held_rows(lc, lo, hi), held_rows(pc, lo, hi),
+                                  b.tokens[r0:r0 + n], b.counts[r0:r0 + n], pv, ol[r0:r0 + n], scale, b.dcp,
+                                  c.index_topk)
+        with prof.timed("dsa: expand"):
+            o = mla_pe.expand_v(ol, a.absorb, b.vn[:R], exact=True).view(R, HL * c.v_dim)
+        return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
     if t is not None:
         # a concurrent round: rows below the dense limit attend densely, rows past it their selection (each row's
         # keys are its own stream's; the kernels and their order are the single-stream ones)

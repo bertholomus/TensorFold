@@ -81,8 +81,6 @@ class GlmEngine:
         # each rank holds its vocabulary span of the embedding (weights.embed_span), not the whole table
         rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
         streams = max(1, int(parallel))
-        if streams > 1 and G > 1:
-            raise ValueError("--parallel and TF_GLM_DCP (decode context parallelism) do not run together yet")
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: self._geometry(text, world, dcp=G, rows=rows, streams=streams),
                                    embed_transform(split_weights(rule, world), cfg.vocab, world, rank),

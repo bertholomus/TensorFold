@@ -334,3 +334,30 @@ def test_the_draft_cut_ends_unlikely_chains_under_concurrency(monkeypatch, strea
         assert ss[0].draft_probs == [0.9, 0.45] and len(ss[1].draft_probs) == 3
         # the step that drafted the cut token ran (its MTP row goes back next round, as a rejected draft's does)
         assert ss[0].st.st.mtp_drafted == 2 and ss[1].st.st.mtp_drafted == 2
+
+
+def test_dcp_rounds_address_each_stream_by_its_slots_local_rows():
+    """Decode context parallelism over 4 ranks: a slot holds its positions' local rows of the pool on every rank (fixed
+    slots and extents alike), and a round's tables keep each stream's (first row, rows, local rows, first position)
+    for the attention's single-stream dcp calls; without dcp the tables keep no segments."""
+    from tensorfold.families.glm_moe_dsa.cuda import multi
+    from tensorfold.families.glm_moe_dsa.cuda.dcp import local_slots
+    from tensorfold.families.glm_moe_dsa.cuda.rows import Tables
+
+    m = multi.MultiDecoder.__new__(multi.MultiDecoder)
+    m.dcp = 4
+    held = local_slots(65536, 4)                       # 16,385 rows a slot on each rank
+    fixed = multi.Slot(1, held * 4, None, 65536)       # slot 1 of fixed slots
+    assert m.held(fixed) == (held, 2 * held)
+    assert m.window(fixed, 700, 4) == (held, 700, 4, held)
+    ext = multi.Slot(2, 6144, None, 4096)              # an extent at pool row 6,144 (global), 4,096 rows
+    assert m.held(ext) == (1536, 1536 + local_slots(4096, 4))
+    t = Tables(16, 4, None)
+    R = t.fill([m.window(fixed, 700, 4), m.window(ext, 30000, 3)], 2048)
+    assert R == 7 and t.segments == [(0, 4, held, 2 * held, 700), (4, 3, 1536, 1536 + 1025, 30000)]
+    assert t.pos_host[:7].tolist() == [700, 701, 702, 703, 30000, 30001, 30002]
+    assert t.dense and t.sparse
+    t.fill([(0, 5, 2)], 2048)
+    assert t.segments == []
+    m.dcp = 1
+    assert m.window(fixed, 700, 4) == (fixed.base, 700, 4)

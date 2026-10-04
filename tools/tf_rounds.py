@@ -46,6 +46,13 @@ class Alone:
     def barrier(self) -> None:
         torch.cuda.synchronize()
 
+    def grouped(self, sends, recvs) -> None:
+        """Decode context parallelism's prompt-chunk exchange (each group to the rank that owns it): alone, every group
+        comes back as this rank sent it (the replies are not the lane's; solo and concurrent runs see the same)."""
+
+        for (s, _), (r, _) in zip(sends, recvs):
+            r.copy_(s)
+
 
 class Quiet:
     """No followers to tell and no peers to watch (multi.Link / multi.Watchdog stand-in)."""

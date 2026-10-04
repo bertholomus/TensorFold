@@ -20,7 +20,12 @@ window in one forward a round, each reply exactly its solo run (pipeline/CONCURR
   each (``Link``) before running it; every rank checks the step's digest with one small all-gather before its model
   collectives (``OutOfStep``: the step fails on every rank at the same point, nobody waits on anybody).
 
-Grammars (structured output), logprobs and DCP are not served with ``--parallel`` yet.
+- **Decode context parallelism** (TF_GLM_DCP): each slot's positions interleave over the ranks as the single-stream
+  mode's do (dcp.py), a slot holding its local rows of the pool on every rank; a round runs each stream's window
+  through the single-stream dcp selection and attention over its slot (forward.dsa_block), so a stream's rows keep
+  their solo dcp bits. These rounds run eager and fill every prompt through the single-stream path.
+
+Grammars (structured output) and logprobs are not served with ``--parallel`` yet.
 """
 
 from __future__ import annotations
@@ -346,12 +351,13 @@ def _rows_view(p, lo: int, hi: int):
     return p[lo:hi] if isinstance(p, torch.Tensor) else p.rows(lo, hi)
 
 
-def slot_state(pool: fwd.State, lo: int, hi: int) -> fwd.State:
-    """A single-stream State over pool rows [lo, hi): view planes, its own positions."""
+def slot_state(pool: fwd.State, lo: int, hi: int, capacity: int | None = None) -> fwd.State:
+    """A single-stream State over pool rows [lo, hi): view planes, its own positions (``capacity``: its window, with
+    decode context parallelism larger than the rows it holds)."""
 
     v = copy.copy(pool)
     dev = pool.pos_dev.device
-    v.capacity = hi - lo
+    v.capacity = hi - lo if capacity is None else int(capacity)
     v.pos, v.mtp_len, v.mtp_drafted = 0, 0, 0
     v.pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
     v.mtp_pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
@@ -380,12 +386,13 @@ class Slot:
 class MultiDecoder:
     """Rounds over the live streams; ``slots`` streams at most, each with ``slot_cap`` cache rows."""
 
+    dcp = 1                                              # decode context parallelism's ranks (w.meta["dcp"])
+
     def __init__(self, w, *, slots: int, slot_cap: int, depth: int, prefill_rows: int, graphs: bool = True) -> None:
         from .decode import Engine
 
-        if w.meta.get("dcp", 1) > 1:
-            raise ValueError("--parallel and decode context parallelism (TF_GLM_DCP) do not run together yet")
         dev = w.device
+        self.dcp = int(w.meta.get("dcp", 1))             # dcp: a slot holds its positions' local rows on each rank
         self.w, self.depth, self.slot_cap, self.prefill_rows = w, int(depth), int(slot_cap), int(prefill_rows)
         self.eos = tuple(w.cfg.eos)
         width = self.depth + 1                           # a stream's window: its pending token and its drafts
@@ -395,6 +402,13 @@ class MultiDecoder:
             self.pool = fwd.State(w, slot_cap, width)
             self.extents = Extents(slot_cap)
             self.slots = [Slot(i, 0, None) for i in range(slots)]
+        elif self.dcp > 1:                               # slot s: local rows [s * held, (s + 1) * held) of the pool
+            from .dcp import local_slots
+
+            held = local_slots(slot_cap, self.dcp)
+            self.pool = fwd.State(w, slots * held * self.dcp, width)
+            self.slots = [Slot(i, i * held * self.dcp, slot_state(self.pool, i * held, (i + 1) * held, slot_cap),
+                               slot_cap) for i in range(slots)]
         else:
             self.pool = fwd.State(w, slots * slot_cap, width)
             self.slots = [Slot(i, i * slot_cap, slot_state(self.pool, i * slot_cap, (i + 1) * slot_cap), slot_cap)
@@ -424,7 +438,7 @@ class MultiDecoder:
         one.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}
         # fresh short prompts' batched fills: round kernels over FILL_ROWS rows (its MTP rows reuse the buffers)
         self.short = tiny_rows(w)                        # whole prompts this short fill with the decode kernels
-        self.tiny = min(self.short, FILL_ROWS)
+        self.tiny = min(self.short, FILL_ROWS) if self.dcp == 1 else 0      # (dcp: every prompt fills alone)
         self.fbuf = None
         if self.tiny > 0:
             fb = self.fbuf = fwd.Buffers(w, FILL_ROWS, self.tiny)
@@ -438,7 +452,7 @@ class MultiDecoder:
         self.next_id = 0
         self.kept_n = 0                                  # warm slots kept so far (each slot's ``used`` stamp)
         self.chunk_s, self.since_fill = 0.0, 0.0         # rank 0's fill pacing: the last chunk's time, decoding since
-        self.graphs = {} if graphs and dev.type == "cuda" else None
+        self.graphs = {} if graphs and dev.type == "cuda" and self.dcp == 1 else None     # (dcp rounds: eager)
         self.mtp_graphs = {} if self.graphs is not None and MTP_GRAPHS else None
         self.graph_pool = torch.cuda.graph_pool_handle() if self.graphs is not None else None
         self.link: Link | None = None                    # rank 0 with followers: each step goes to them first
@@ -451,6 +465,24 @@ class MultiDecoder:
         # (acceptance, commits), draft (_draft_all), emit (take), between (the host from one round's end to the next)
         self.stage_s = {k: 0.0 for k in ("plan", "forward", "sample", "keep", "draft", "emit", "between")}
         self.round_end = None
+
+    def held(self, slot: Slot) -> tuple[int, int]:
+        """The pool rows ``slot`` holds on this rank: [base, base + size), with dcp its positions' local rows."""
+
+        if self.dcp == 1:
+            return slot.base, slot.base + slot.size
+        from .dcp import local_slots
+
+        lo = slot.base // self.dcp
+        return lo, lo + local_slots(slot.size, self.dcp)
+
+    def window(self, slot: Slot, pos: int, n: int) -> tuple[int, ...]:
+        """A stream's entry in a round's tables (rows.Tables.fill): with dcp its slot's local rows too."""
+
+        if self.dcp == 1:
+            return slot.base, pos, n
+        lo, hi = self.held(slot)
+        return lo, pos, n, hi - lo
 
     # -- the scheduler's interface ------------------------------------------------------------------------------------
     def live(self) -> int:
@@ -566,7 +598,8 @@ class MultiDecoder:
             kept[0].size, kept[0].kept, kept[0].st = 0, None, None
             start = ext.take(need)
         slot.base, slot.size = start, ext.size(need)
-        slot.st = slot_state(self.pool, start, start + slot.size)
+        lo, hi = self.held(slot)
+        slot.st = slot_state(self.pool, lo, hi) if self.dcp == 1 else slot_state(self.pool, lo, hi, slot.size)
 
     def _fill(self, s: Stream) -> list[Stream]:
         """One prompt chunk of ``s`` on its slot's views: decode.prefill's steps for that chunk, in its chunks. The last
@@ -762,7 +795,7 @@ class MultiDecoder:
         w, b = self.w, self.buf
         windows = [[s.out[-1]] + list(s.drafts) for s in live]
         t = b.rows_t
-        R = t.fill([(s.st.base, s.st.st.pos, len(tok)) for s, tok in zip(live, windows)], w.cfg.dense_limit)
+        R = t.fill([self.window(s.st, s.st.st.pos, len(tok)) for s, tok in zip(live, windows)], w.cfg.dense_limit)
         b.staged.synchronize()
         b.ids_host[:R].numpy()[:] = [x for tok in windows for x in tok]
         b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
@@ -976,7 +1009,7 @@ class MultiDecoder:
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
                 st.mtp_drafted = 0
         # the absorb: each stream's kept main rows (its final-normed hidden rows) with the tokens that follow them
-        n = mb.rows_t.fill([(s.st.base, s.st.st.mtp_len, keep) for s, _, keep, _ in todo], w.cfg.dense_limit)
+        n = mb.rows_t.fill([self.window(s.st, s.st.st.mtp_len, keep) for s, _, keep, _ in todo], w.cfg.dense_limit)
         mb.hin[:n].copy_(torch.cat([b.fnormed[a0:a0 + keep] for _, a0, keep, _ in todo]))
         heads, r = [], 0
         for _, _, keep, _ in todo:
@@ -1007,7 +1040,7 @@ class MultiDecoder:
             if not nxt:
                 return
             # the next step: one row a stream, its last draft and the head's own output row
-            n = mb.rows_t.fill([(s.st.base, s.st.st.mtp_len, 1) for _, s, _ in nxt], w.cfg.dense_limit)
+            n = mb.rows_t.fill([self.window(s.st, s.st.st.mtp_len, 1) for _, s, _ in nxt], w.cfg.dense_limit)
             picked = torch.tensor([i for i, _, _ in nxt], dtype=torch.int64, device=mb.hin.device)
             mb.hin[:n].copy_(torch.index_select(mb.fnormed, 0, picked))
             logits = self._mtp(n, [d for _, _, d in nxt], list(range(n)))
