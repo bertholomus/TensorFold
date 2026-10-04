@@ -6,6 +6,9 @@
 > (`DESIGN.md`, `REPORT.md`, `ATTRIBUTION.md`). `NOTICE` lists every upstream file this fork changes. Upstream
 > TensorFold is at https://github.com/ashhart/TensorFold; the text below is upstream's README, unchanged, and its
 > install commands install upstream, not this fork.
+>
+> Weights: [Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw)
+> (MIT), an EXL3 quant of [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
 
 TensorFold serves language models on Apple Silicon and NVIDIA GPUs through an OpenAI-compatible API.
 Each model family supplies its own kernels and draft verification.
