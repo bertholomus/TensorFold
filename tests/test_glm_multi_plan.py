@@ -361,3 +361,20 @@ def test_dcp_rounds_address_each_stream_by_its_slots_local_rows():
     assert t.segments == []
     m.dcp = 1
     assert m.window(fixed, 700, 4) == (fixed.base, 700, 4)
+
+
+def test_warm_up_precaptures_every_dense_round_and_draft_step_shape():
+    """PRECAPTURE's shapes: dense rounds of 1 .. slots x width rows, and draft steps of k streams with k .. k x width rows
+    (every stream 1 .. width of them), spread evenly."""
+    from tensorfold.families.glm_moe_dsa.cuda import multi
+
+    rounds, steps = multi.precapture_shapes(4, 4)
+    assert rounds == list(range(1, 17))
+    assert len(steps) == 4 + 7 + 10 + 13 and steps[0] == (1, 1) and steps[-1] == (4, 16)
+    for k, n in steps:
+        rows = multi.spread(n, k)
+        assert len(rows) == k and sum(rows) == n and all(1 <= r <= 4 for r in rows)
+        assert max(rows) - min(rows) <= 1
+    for R in rounds:                     # a round's rows over the fewest streams of at most width rows each
+        rows = multi.spread(R, -(-R // 4))
+        assert sum(rows) == R and all(1 <= r <= 4 for r in rows) and len(rows) <= 4

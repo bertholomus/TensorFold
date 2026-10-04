@@ -49,6 +49,11 @@ MAX_GRAPHS = 96                  # round graphs kept (rows x passes x bucket); p
 # same inputs: the same drafts (TF_GLM_MTP_GRAPHS=0: eager, as before)
 MTP_GRAPHS = os.environ.get("TF_GLM_MTP_GRAPHS", "1") == "1"
 MAX_MTP_GRAPHS = 64
+# warm-up captures every dense round shape and every draft step's shape before any request, so a burst's first rounds
+# replay graphs instead of capturing them (34-62 captures took 5-13 % off the first pass of 4 code streams on TP4); the
+# captures run while every slot is free and write only rows a later prompt fills before reading (TF_GLM_PRECAPTURE=0:
+# captured on first use, as before)
+PRECAPTURE = os.environ.get("TF_GLM_PRECAPTURE", "1") == "1"
 DECODE_SHARE = float(os.environ.get("TF_GLM_DECODE_SHARE") or 0.5)   # decoding's share of the time while prompts fill
 # drafts a stream chains by how many streams decode (TF_GLM_PARALLEL_DEPTH="3,3,2,2": 3 alone or beside one other, 2
 # at three or four): a round's rows grow with every stream's window, and deeper drafts pay off less as rows grow
@@ -117,6 +122,20 @@ class Extents:
 
     def largest(self) -> int:
         return max((b - a for a, b in self.gaps), default=0)
+
+
+def precapture_shapes(slots: int, width: int) -> tuple[list[int], list[tuple[int, int]]]:
+    """The shapes warm-up captures: dense rounds of 1 .. slots x width rows, and draft steps of k drafting streams with
+    n rows (each stream 1 .. width of them: k <= n <= k x width)."""
+
+    return (list(range(1, slots * width + 1)),
+            [(k, n) for k in range(1, slots + 1) for n in range(k, k * width + 1)])
+
+
+def spread(n: int, k: int) -> list[int]:
+    """n rows over k streams as evenly as they go (the first streams one more)."""
+
+    return [n // k + (1 if i < n % k else 0) for i in range(k)]
 
 
 def resume_at(kept, prompt, step: int, short: int = 0) -> int:
@@ -899,6 +918,7 @@ class MultiDecoder:
 
         link, self.link = self.link, None
         try:
+            self._precapture()
             for sizes in ([24], [40] * min(2, len(self.slots)), [200]):
                 group = [Stream([1] * n, 3) for n in sizes]
                 for s in group:
@@ -908,6 +928,45 @@ class MultiDecoder:
                 self.finish(group)
         finally:
             self.link = link
+
+    def _precapture(self) -> None:
+        """PRECAPTURE: every dense round shape and every draft step's shape as graphs, while every slot is free (each rank
+        runs the same captures in the same order: their collectives pair up)."""
+
+        if self.graphs is None or not PRECAPTURE:
+            return
+        t0, caps = time.perf_counter(), self.rounds["captured"]
+        b, dl = self.buf, self.w.cfg.dense_limit
+        rounds, steps = precapture_shapes(len(self.slots), self.depth + 1)
+        for R in rounds:
+            if R > b.rows_t.rows:
+                break
+            rows = spread(R, -(-R // (self.depth + 1)))
+            b.rows_t.fill([(sl.base, 0, n) for sl, n in zip(self.slots, rows)], dl)
+            b.ids[:R].zero_()
+            key = b.rows_t.key()
+            if key not in self.graphs and len(self.graphs) < MAX_GRAPHS:
+                self._capture(key, R)
+        mb = self.mbuf
+        if self.mtp_graphs is None or mb is None or self.depth == 0:     # (no draft steps)
+            steps = []
+        for k, n in steps:
+            if n > mb.rows_t.rows:
+                continue
+            rows = spread(n, k)
+            mb.rows_t.fill([(sl.base, 0, r) for sl, r in zip(self.slots, rows)], dl)
+            heads = [sum(rows[:i + 1]) - 1 for i in range(k)]
+            mb.heads_host[:k].numpy()[:] = heads
+            mb.heads[:k].copy_(mb.heads_host[:k])
+            mb.ids[:n].zero_()
+            mb.hin[:n].zero_()
+            key = (k,) + mb.rows_t.key()
+            if key not in self.mtp_graphs and len(self.mtp_graphs) < MAX_MTP_GRAPHS:
+                self._capture_mtp(key, n, k)
+        torch.cuda.synchronize()
+        if self.w.rank == 0:
+            print(f"[tensorfold] warm-up captured {self.rounds['captured'] - caps} graphs ({len(self.graphs)} rounds, "
+                  f"{len(self.mtp_graphs or {})} draft steps) in {time.perf_counter() - t0:.1f}s", flush=True)
 
     # -- the round's parts ---------------------------------------------------------------------------------------------
     def _forward(self, R: int) -> torch.Tensor:
