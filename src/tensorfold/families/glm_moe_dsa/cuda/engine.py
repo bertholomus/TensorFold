@@ -92,18 +92,18 @@ class GlmEngine:
         long_context = self.limit > cfg.dense_limit
         prefill_rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
         from .decode import DEPTH_COST
-        from .multi import DRAFT_CUT, EXTENTS, FILL_ROWS, KEEP, QUICK_ROWS
+        from .multi import CUT_STREAMS, DRAFT_CUT, EXTENTS, FILL_ROWS, KEEP, QUICK_ROWS
 
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
                 prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G, streams,
                 FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
-                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6)]
+                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS]
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
             raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
                                " TF_GLM_EMBED_SPLIT, TF_GLM_KV, TF_GLM_DRAFT_VOCAB, TF_GLM_DCP, --parallel, "
                                "TF_GLM_FILL_ROWS, TF_GLM_QUICK_ROWS, TF_GLM_DEPTH_COST, TF_GLM_KEEP_SLOTS, "
-                               "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT):"
+                               "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT, TF_GLM_DRAFT_CUT_STREAMS):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
         if rank == 0 and kv8.parse(kv8.MODE) != ("bf16", "bf16"):
             lat, idx = kv8.parse(kv8.MODE)

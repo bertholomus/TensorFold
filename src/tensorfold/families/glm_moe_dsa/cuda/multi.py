@@ -48,13 +48,17 @@ DECODE_SHARE = float(os.environ.get("TF_GLM_DECODE_SHARE") or 0.5)   # decoding'
 # drafts a stream chains by how many streams decode (TF_GLM_PARALLEL_DEPTH="3,3,2,2": 3 alone or beside one other, 2
 # at three or four): a round's rows grow with every stream's window, and deeper drafts pay off less as rows grow
 DEPTH_BY = [int(x) for x in (os.environ.get("TF_GLM_PARALLEL_DEPTH") or "").split(",") if x.strip()]
-# TF_GLM_DRAFT_CUT (e.g. 0.3): with two or more streams decoding, a stream's draft chain stops at the first draft whose
-# chain probability (the MTP head's probabilities of its drafts so far, multiplied) falls below this; that draft is not
-# verified. A concurrent round's draft row costs mostly the routed experts' weight reads it adds (~6 ms of a ~150 ms
-# 4-stream round), so an unlikely draft costs more than it is expected to add. 0: off. Drafts only propose: replies
+# TF_GLM_DRAFT_CUT (default 0.6): with TF_GLM_DRAFT_CUT_STREAMS (default 4, at least 2) or more streams decoding, a
+# stream's draft chain stops at the first draft whose chain probability (the MTP head's probabilities of its drafts so
+# far, multiplied) falls below this; that draft is not verified. A concurrent round's draft row costs mostly the routed
+# experts' weight reads it adds, and what a row must earn grows with the streams: on TP4 a 4-stream chat round is ~160
+# ms for ~10.7 tokens and a row ~6-7 ms of it (worth it above ~45 % kept), a 2-stream round ~103 ms for ~5.5 tokens and
+# a row ~3.5 ms (above ~19 %). Drafts under 0.6 were kept 25-35 %: at 4 streams the cut took a round from 16 rows to
+# 12.1, 66.3 -> 71.0 tok/s over the rounds; at 2 streams it cost 53.0 -> 46.9. 0: off. Drafts only propose: replies
 # are the same. TF_GLM_DRAFT_STATS=1: each round's drafts by chain probability (tenths) and how many were kept
 # (``draft_stats``), to set the cut.
-DRAFT_CUT = float(os.environ.get("TF_GLM_DRAFT_CUT") or 0)
+DRAFT_CUT = float(os.environ.get("TF_GLM_DRAFT_CUT") or 0.6)
+CUT_STREAMS = max(2, int(os.environ.get("TF_GLM_DRAFT_CUT_STREAMS") or 4))
 DRAFT_STATS = os.environ.get("TF_GLM_DRAFT_STATS", "0") == "1"
 # fresh prompts of at most tiny_rows tokens fill together, up to this many rows a forward (TF_GLM_FILL_ROWS; 0: each
 # alone through the single-stream path)
@@ -982,7 +986,7 @@ class MultiDecoder:
         for s, _, keep, _ in todo:
             s.st.st.set_mtp_len(s.st.st.mtp_len + keep)
         active = [s for s, *_ in todo]
-        cut = DRAFT_CUT if busy >= 2 else 0.0
+        cut = DRAFT_CUT if busy >= CUT_STREAMS else 0.0
         chain = {s.sid: 1.0 for s in active}
         for j in range(self.depth):
             nxt = []

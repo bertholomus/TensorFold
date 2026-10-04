@@ -315,20 +315,22 @@ def _drafter(probs, streams):
     return m, ss
 
 
-@pytest.mark.parametrize("streams,cut,want", [
-    (2, 0.3, [[100, 101], [100, 101, 102]]),       # 0.9 x 0.5 = 0.45, x 0.5 = 0.225 < 0.3: stream 0 stops at two
-    (2, 0.0, [[100, 101, 102], [100, 101, 102]]),  # no cut: the whole chain
-    (1, 0.3, [[100, 101, 102]]),                  # one stream: no cut (its rows are cheap)
+@pytest.mark.parametrize("streams,cut,floor,want", [
+    (2, 0.3, 2, [[100, 101], [100, 101, 102]]),       # 0.9 x 0.5 = 0.45, x 0.5 = 0.225 < 0.3: stream 0 stops at two
+    (2, 0.3, 4, [[100, 101, 102], [100, 101, 102]]),  # fewer streams than TF_GLM_DRAFT_CUT_STREAMS: no cut
+    (2, 0.0, 2, [[100, 101, 102], [100, 101, 102]]),  # no cut: the whole chain
+    (1, 0.3, 2, [[100, 101, 102]]),                  # one stream: no cut (its rows are cheap)
 ])
-def test_the_draft_cut_ends_unlikely_chains_under_concurrency(monkeypatch, streams, cut, want):
+def test_the_draft_cut_ends_unlikely_chains_under_concurrency(monkeypatch, streams, cut, floor, want):
     from tensorfold.families.glm_moe_dsa.cuda import multi
 
     monkeypatch.setattr(multi, "DRAFT_CUT", cut)
+    monkeypatch.setattr(multi, "CUT_STREAMS", floor)
     monkeypatch.setattr(multi, "DRAFT_STATS", False)
     m, ss = _drafter({0: [0.9, 0.5, 0.5], 1: [0.95, 0.9, 0.9]}, streams)
     multi.MultiDecoder._draft_all(m, [(s, 0, 1, [7]) for s in ss])
     assert [s.drafts for s in ss] == want
-    if cut and streams > 1:
+    if cut and streams >= floor:
         assert ss[0].draft_probs == [0.9, 0.45] and len(ss[1].draft_probs) == 3
         # the step that drafted the cut token ran (its MTP row goes back next round, as a rejected draft's does)
         assert ss[0].st.st.mtp_drafted == 2 and ss[1].st.st.mtp_drafted == 2
