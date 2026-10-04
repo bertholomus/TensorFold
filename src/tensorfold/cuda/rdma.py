@@ -23,7 +23,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_rdma_gather_v5", sources=[str(here / "rdma_gather.cu")],
+    return load(name="tensorfold_rdma_gather_v6", sources=[str(here / "rdma_gather.cu")],
                 extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
 
 

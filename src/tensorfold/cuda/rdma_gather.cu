@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <random>
@@ -393,10 +394,20 @@ void proxy_loop(Gather* gp) {
     std::vector<int> done(g.slots, 0);
     std::vector<std::vector<uint64_t>> got(g.world, std::vector<uint64_t>(nd, 0));   // per peer: last part per device
     std::vector<uint64_t> published(g.world, 0);
-    std::vector<std::pair<uint32_t, int>> owner;                                       // qp_num -> peer
+    // qp_num -> peer, per device: a QP number is unique on its own device only, and the two ports' QPs can share
+    // numbers (a completion on device d belongs to one of device d's QPs; looking it up over every device credited a
+    // receive to the wrong peer and reposted it on that peer's full queue: "ibv_post_recv failed")
+    std::vector<std::vector<std::pair<uint32_t, int>>> owner(nd);
     for (int d = 0; d < nd; ++d)
         for (int p = 0; p < g.world; ++p)
-            if (g.nics[d].qps[p]) owner.push_back({g.nics[d].qps[p]->qp_num, p});
+            if (g.nics[d].qps[p]) owner[d].push_back({g.nics[d].qps[p]->qp_num, p});
+    for (int d = 1; d < nd; ++d)                          // say so when numbers repeat across devices (now harmless)
+        for (auto& a : owner[d])
+            for (int e = 0; e < d; ++e)
+                for (auto& b : owner[e])
+                    if (a.first == b.first)
+                        fprintf(stderr, "[tensorfold] rdma gather: QP number %u on device %d (peer %d) is also device %d's "
+                                "(peer %d)\n", a.first, d, a.second, e, b.second);
     ibv_wc wc[64];
     const volatile uint64_t* doorbell = g.doorbell;
     while (g.running.load(std::memory_order_relaxed)) {
@@ -451,7 +462,7 @@ void proxy_loop(Gather* gp) {
                 }
                 if (wc[i].opcode == IBV_WC_RECV_RDMA_WITH_IMM) {
                     int p = -1;
-                    for (auto& o : owner)
+                    for (auto& o : owner[d])
                         if (o.first == wc[i].qp_num) p = o.second;
                     if (p < 0) {
                         fail(g, "receive completion on an unknown QP");
