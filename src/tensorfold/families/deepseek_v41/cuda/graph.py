@@ -15,7 +15,7 @@ import torch
 
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
-from .model import KV_QUANT, RAW, Model, SeqCache, _candidates, apply_candidates, mm, store_rows
+from .model import KV_QUANT, RAW, Model, SeqCache, _candidates, apply_candidates, attn_in, mm, store_rows, wo_a_out
 
 BUCKET_MIN = int(os.environ.get("TF_DS_BUCKET_MIN") or 1024)
 
@@ -54,24 +54,24 @@ class StaticDecoder:
         ratio = lay.ratio
         pos = self.pos
         cos, sin = m._cs(lay.idx, sc)
-        qr = K.rmsnorm(mm(lay.wq_a, x), lay.q_norm, c.eps)
+        qa, ykv, ckv, cgate = attn_in(lay, x, comp=bool(ratio))         # wq_a, wkv, the compressor's: one launch
+        qr = K.rmsnorm(qa, lay.q_norm, c.eps)
         q = mm(lay.wq_b, qr).view(n, m.Hl, hd)
         K.rope_heads(q, cos, sin, pos, rd)
         ring = sc.ring[lay.idx]
         R = sc.ring_size
-        K.kv_norm_rope(mm(lay.wkv, x), lay.kv_norm, cos, sin, pos, ring, pos % R, c.eps, KV_QUANT, rd)
+        K.kv_norm_rope(ykv, lay.kv_norm, cos, sin, pos, ring, pos % R, c.eps, KV_QUANT, rd)
         comp, cidx = None, None
         if ratio:
             if lay.comp_wkv is not None:
                 cc = sc.comp[lay.idx]
                 scratch = (cc[0] if isinstance(cc, tuple) else cc).shape[0] - 1
                 if ratio == 1:
-                    lat = K.rmsnorm(mm(lay.comp_wkv, x), lay.comp_norm, c.eps)
+                    lat = K.rmsnorm(ckv, lay.comp_norm, c.eps)
                     groups = pos
                     target = pos
                 else:
-                    kvr = mm(lay.comp_wkv, x, F32)
-                    scr = mm(lay.comp_wgate, x, F32)
+                    kvr, scr = ckv, cgate
                     rk, rs = sc.comp_raw[lay.idx]
                     rk[pos % RAW] = kvr
                     rs[pos % RAW] = scr
@@ -112,9 +112,7 @@ class StaticDecoder:
             comp = sc.comp[src]
         o = K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
-        og = o.view(n, len(lay.wo_a), -1)
-        u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
-        return mm(lay.wo_b, u, F32)
+        return mm(lay.wo_b, wo_a_out(lay, o), F32)
 
     def _body(self):
         m, c, w = self.m, self.m.cfg, self.m.w

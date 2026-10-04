@@ -72,9 +72,11 @@ class Pool {
     int64_t gen_ = 0;
 };
 
-Pool& pool(int threads) {
-    static Pool* p = new Pool(std::max(1, threads - 1));   // the caller is one more reader (never destroyed)
-    return *p;
+Pool& pool(int threads, int which = 0) {
+    // pool 0 serves the reads a step waits for; pool 1 the reads started ahead of a prompt chunk, pool 2 a round's
+    static Pool* p[3] = {new Pool(std::max(1, threads - 1)), new Pool(std::max(1, threads - 1)),
+                         new Pool(std::max(1, threads - 1))};
+    return *p[which];
 }
 
 bool read_row(int fd, uint8_t* dst, int64_t bytes, int64_t off) {
@@ -90,8 +92,8 @@ bool read_row(int fd, uint8_t* dst, int64_t bytes, int64_t off) {
 }  // namespace
 
 // A layer's rows: idx [n] row ids; weight rows (fd_w, base_w, row_w bytes) into out_w, scale rows into out_s.
-void gather_rows2(int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int64_t base_s, int64_t row_s,
-                  const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads) {
+static void gather_rows2_on(int which, int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int64_t base_s,
+                            int64_t row_s, const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads) {
     TORCH_CHECK(idx.dtype() == at::kLong && idx.is_contiguous() && !idx.is_cuda(), "idx: contiguous int64 CPU");
     TORCH_CHECK(out_w.dtype() == at::kByte && out_w.is_contiguous() && !out_w.is_cuda(), "out_w: contiguous uint8 CPU");
     TORCH_CHECK(out_s.dtype() == at::kByte && out_s.is_contiguous() && !out_s.is_cuda(), "out_s: contiguous uint8 CPU");
@@ -107,8 +109,26 @@ void gather_rows2(int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int
                           : read_row((int)fd_w, dw + i * row_w, row_w, base_w + ix[i] * row_w);
         if (!ok) failed = 1;
     };
-    pool((int)threads).run(2 * n, job);
+    pool((int)threads, which).run(2 * n, job);
     TORCH_CHECK(!failed, "Engram row read failed");
+}
+
+void gather_rows2(int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int64_t base_s, int64_t row_s,
+                  const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads) {
+    gather_rows2_on(0, fd_w, base_w, row_w, fd_s, base_s, row_s, idx, out_w, out_s, threads);
+}
+
+// The same on the second pool, for reads started ahead of the step that needs them.
+void gather_rows2_bg(int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int64_t base_s, int64_t row_s,
+                     const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads) {
+    gather_rows2_on(1, fd_w, base_w, row_w, fd_s, base_s, row_s, idx, out_w, out_s, threads);
+}
+
+// The same on pool ``which`` (1: ahead of a prompt chunk, 2: ahead of a decode round's layers).
+void gather_rows2_at(int64_t which, int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int64_t base_s,
+                     int64_t row_s, const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads) {
+    TORCH_CHECK(which >= 0 && which <= 2, "pool 0, 1 or 2");
+    gather_rows2_on((int)which, fd_w, base_w, row_w, fd_s, base_s, row_s, idx, out_w, out_s, threads);
 }
 
 // The single-table call (kept for tools): rows of one table.
@@ -131,5 +151,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gather_rows", &gather_rows, "parallel preads of rows into a CPU buffer",
           py::call_guard<py::gil_scoped_release>());
     m.def("gather_rows2", &gather_rows2, "a layer's weight and scale rows in one parallel pass",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("gather_rows2_bg", &gather_rows2_bg, "gather_rows2 on the background pool",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("gather_rows2_at", &gather_rows2_at, "gather_rows2 on reader pool 0, 1 or 2",
           py::call_guard<py::gil_scoped_release>());
 }

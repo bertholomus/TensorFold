@@ -14,7 +14,8 @@ import torch
 
 from ..ops import BF16, F32, rms_norm
 from . import kernels as K
-from .model import KV_QUANT, Model, mm
+from . import model as _model
+from .model import KV_QUANT, Model, attn_in, mm, wo_a_out
 
 
 @dataclass
@@ -43,6 +44,19 @@ class Drafter:
     def _cs(self, lay, sc):
         return self.m._cs(lay.idx, sc)
 
+    def stage_kv(self, main_x: torch.Tensor) -> list:
+        """Every stage's wkv of main_x: one grouped launch at decode sizes (model.GROUPED), else one mm a stage; the
+        same bits either way."""
+
+        if not _model.GROUPED or _model.EXACT_MM or main_x.shape[0] > 128:
+            return [mm(lay.wkv, main_x) for lay in self.dw.blocks]
+        group = getattr(self, "_kv_group", None)
+        if group is None:
+            from tensorfold.cuda.exl3.linear import Exl3Group
+
+            group = self._kv_group = Exl3Group([lay.wkv for lay in self.dw.blocks])
+        return group([main_x] * len(self.dw.blocks), out_dtypes=[BF16] * len(self.dw.blocks))
+
     @torch.inference_mode()
     def absorb(self, dc: DraftCache, sc, taps: torch.Tensor, start: int) -> None:
         """Target taps [n, 3 * d] of positions start .. start + n - 1 into every stage's window ring."""
@@ -54,9 +68,8 @@ class Drafter:
         first = start + n - keep
         pos = torch.arange(first, first + keep, device=taps.device)
         main_x = K.rmsnorm(mm(self.dw.main_proj, taps.contiguous()), self.dw.main_norm, c.eps)
-        for lay, ring in zip(self.dw.blocks, dc.rings):
+        for lay, ring, y in zip(self.dw.blocks, dc.rings, self.stage_kv(main_x)):
             cos, sin = self._cs(lay, sc)
-            y = mm(lay.wkv, main_x)
             K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, pos % self.ring_size, c.eps, KV_QUANT, c.rope_dim)
         dc.absorbed = start + n
 
@@ -72,9 +85,8 @@ class Drafter:
         slot = torch.tensor([sl for sl, t, _ in items for _ in range(t.shape[0])], dtype=torch.long, device=taps.device)
         main_x = K.rmsnorm(mm(self.dw.main_proj, taps), self.dw.main_norm, c.eps)
         rows = slot * dpool.ring_size + pos % dpool.ring_size
-        for lay, ring in zip(self.dw.blocks, dpool.rings):
+        for lay, ring, y in zip(self.dw.blocks, dpool.rings, self.stage_kv(main_x)):
             cos, sin = self._cs(lay, sc)
-            y = mm(lay.wkv, main_x)
             K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, rows, c.eps, KV_QUANT, c.rope_dim)
         for sl, t, st in items:
             dpool.views[sl].absorbed = st + t.shape[0]
@@ -86,10 +98,11 @@ class Drafter:
         cos, sin = self._cs(lay, sc)
         if pos is None:
             pos = torch.arange(q0, q0 + n, device=x.device)
-        qr = K.rmsnorm(mm(lay.wq_a, x), lay.q_norm, c.eps)
+        qa, ykv, _, _ = attn_in(lay, x, comp=False)                       # wq_a and wkv: one launch
+        qr = K.rmsnorm(qa, lay.q_norm, c.eps)
         q = mm(lay.wq_b, qr).view(n, self.m.Hl, hd)
         K.rope_heads(q, cos, sin, pos, rd)
-        kvb = K.kv_norm_rope(mm(lay.wkv, x), lay.kv_norm, cos, sin, pos, ring, self.m._neg(n), c.eps, KV_QUANT, rd)
+        kvb = K.kv_norm_rope(ykv, lay.kv_norm, cos, sin, pos, ring, self.m._neg(n), c.eps, KV_QUANT, rd)
         bidx = self._block_idx.get(n)
         if bidx is None:
             bidx = self._block_idx[n] = torch.arange(n, device=x.device).repeat(n, 1).contiguous()
@@ -98,9 +111,7 @@ class Drafter:
         # every row sees the 128 newest absorbed positions and every block row (no mask inside the block)
         o = K.sparse_attn(q, lay.sink, ring, self.m._zero, True, kvb, bidx, wpos, hd ** -0.5, c.window)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
-        og = o.view(n, len(lay.wo_a), -1)
-        u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
-        return mm(lay.wo_b, u, F32)
+        return mm(lay.wo_b, wo_a_out(lay, o), F32)
 
     @torch.inference_mode()
     def draft(self, dc: DraftCache, sc, token: int, q0: int) -> tuple[list[int], torch.Tensor]:
@@ -253,16 +264,15 @@ class BatchDraftGraph:
         n = x.shape[0]
         rd, hd = c.rope_dim, c.head_dim
         cos, sin = d._cs(lay, self.sc)
-        qr = K.rmsnorm(mm(lay.wq_a, x), lay.q_norm, c.eps)
+        qa, ykv, _, _ = attn_in(lay, x, comp=False)                       # wq_a and wkv: one launch
+        qr = K.rmsnorm(qa, lay.q_norm, c.eps)
         q = mm(lay.wq_b, qr).view(n, d.m.Hl, hd)
         K.rope_heads(q, cos, sin, pos, rd)
-        kvb = K.kv_norm_rope(mm(lay.wkv, x), lay.kv_norm, cos, sin, pos, ring, d.m._neg(n), c.eps, KV_QUANT, rd)
+        kvb = K.kv_norm_rope(ykv, lay.kv_norm, cos, sin, pos, ring, d.m._neg(n), c.eps, KV_QUANT, rd)
         o = K.sparse_attn(q, lay.sink, ring, d.m._zero, True, kvb, self.bidx, wpos, hd ** -0.5, c.window,
                           wbase=rbase, cbase=self.zero, ring_rows=self.dp.ring_size)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
-        og = o.view(n, len(lay.wo_a), -1)
-        u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
-        return mm(lay.wo_b, u, F32)
+        return mm(lay.wo_b, wo_a_out(lay, o), F32)
 
     def _body(self):
         d, m, c = self.d, self.d.m, self.d.m.cfg

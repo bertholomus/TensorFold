@@ -10,6 +10,7 @@ a bare key) and never printed.
   python3 kit_bench.py --base http://127.0.0.1:8000 --model M --key-file <API_KEY_FILE> ready --timeout 3600
   python3 kit_bench.py ... decode     --out decode.json
   python3 kit_bench.py ... concurrent --streams 2,4 --out conc.json
+  python3 kit_bench.py ... sustained --streams 4 --seconds 90 --out sustained.json   (N in flight for the window)
   python3 kit_bench.py ... prefill    --lengths 8192,32768,131072 --out prefill.json
   python3 kit_bench.py ... depth      --lengths 131072 --tokens 256 --out depth.json
   python3 kit_bench.py ... oracle     --out oracle.jsonl
@@ -226,6 +227,61 @@ def cmd_concurrent(c: Client, a) -> list:
     return rows
 
 
+def cmd_sustained(c: Client, a) -> list:
+    """Sustained load: exactly N requests in flight for a fixed window (a new request starts as each one ends, every
+    prompt distinct). Aggregate tok/s over the window counts each reply's tokens spread evenly over its decode span and
+    clipped to the window; per-request decode rate and TTFT as p50 / p95."""
+
+    rows = []
+    for n in [int(x) for x in a.streams.split(",")]:
+        prompts = PROMPT_SETS[a.set]
+        lock = threading.Lock()
+        done: list = []
+        counter = [0]
+        t_start = time.perf_counter() + 0.5                       # every worker's first request starts here
+        t_end = t_start + a.seconds
+
+        def worker() -> None:
+            while True:
+                with lock:
+                    k = counter[0]
+                    counter[0] += 1
+                now = time.perf_counter()
+                if now < t_start:
+                    time.sleep(t_start - now)
+                elif now >= t_end:
+                    return
+                name, prompt = prompts[k % len(prompts)]
+                r = c.stream(decode_body(prompt + f" (request {k})", a.tokens), "/v1/chat/completions")
+                r["prompt"] = name
+                with lock:
+                    done.append(r)
+
+        threads = [threading.Thread(target=worker) for _ in range(n)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+        win = 0.0
+        for r in done:
+            first, last, tokens = r["start"] + (r["ttft_s"] or 0.0), r["start"] + (r["ttft_s"] or 0.0) + (r["decode_s"] or 0.0), r["tokens"] or 0
+            if last <= first:
+                win += tokens if t_start <= first <= t_end else 0
+            else:
+                win += tokens * max(0.0, min(last, t_end) - max(first, t_start)) / (last - first)
+        rates = sorted(r["decode_tps"] for r in done if r["decode_tps"])
+        ttfts = sorted(r["ttft_s"] for r in done if r["ttft_s"] is not None)
+
+        def pct(v, q):
+            return round(v[min(len(v) - 1, int(q * (len(v) - 1) + 0.5))], 3) if v else None
+
+        row = {"streams": n, "seconds": a.seconds, "max_tokens": a.tokens, "set": a.set, "requests": len(done),
+               "aggregate_tps": round(win / a.seconds, 2), "per_stream_tps_p50": pct(rates, 0.5),
+               "per_stream_tps_p95": pct(rates, 0.95), "per_stream_tps_p05": pct(rates, 0.05),
+               "ttft_s_p50": pct(ttfts, 0.5), "ttft_s_p95": pct(ttfts, 0.95)}
+        print(json.dumps(row), flush=True)
+        rows.append(row)
+    return rows
+
+
 def filler_ids(c: Client, length: int, seed: int) -> list[int]:
     rng = random.Random(seed)
     salt = " ".join(f"{rng.randrange(10**9)}" for _ in range(8))
@@ -306,6 +362,8 @@ def main() -> None:
     s = sub.add_parser("concurrent"); s.add_argument("--streams", default="2,4"); s.add_argument("--tokens", type=int, default=256)
     s.add_argument("--set", choices=sorted(PROMPT_SETS), default="a")
     s.add_argument("--reps", type=int, default=2)
+    s = sub.add_parser("sustained"); s.add_argument("--streams", default="4"); s.add_argument("--tokens", type=int, default=256)
+    s.add_argument("--set", choices=sorted(PROMPT_SETS), default="b"); s.add_argument("--seconds", type=float, default=90)
     s = sub.add_parser("prefill"); s.add_argument("--lengths", default="8192,32768,131072"); s.add_argument("--reps", type=int, default=1)
     s = sub.add_parser("depth"); s.add_argument("--lengths", default="131072"); s.add_argument("--tokens", type=int, default=256)
     s = sub.add_parser("oracle"); s.add_argument("--gen-tokens", type=int, default=64); s.add_argument("--topk", type=int, default=20)
@@ -316,8 +374,8 @@ def main() -> None:
     if a.cmd == "oracle":
         cmd_oracle(c, a)
         return
-    out = {"ready": cmd_ready, "decode": cmd_decode, "concurrent": cmd_concurrent, "prefill": cmd_prefill,
-           "depth": cmd_depth}[a.cmd](c, a)
+    out = {"ready": cmd_ready, "decode": cmd_decode, "concurrent": cmd_concurrent, "sustained": cmd_sustained,
+           "prefill": cmd_prefill, "depth": cmd_depth}[a.cmd](c, a)
     print(json.dumps(out)[:2000] if a.cmd == "ready" else "", flush=True)
     if a.out:
         with open(a.out, "w") as f:

@@ -55,7 +55,14 @@ ROUND_STATS = os.environ.get("TF_DS_ROUND_STATS", "0") == "1"
 # TF_DS_DEPTH_POLICY=conf (default; "fixed": the table depth): each stream verifies the k (<= its table depth, up to the drafter's block) with the most
 # expected tokens a millisecond: expected tokens from the confidence head's prefix survivals, the round's cost from a
 # fixed table of forward ms by rows (TF_DS_ROUND_MS, a pure function of state every rank holds: no live timers)
+# "even": while the drafting streams started together (their rounds within TF_DS_EVEN_COHORT), the stream with the
+# most rounds left (its remaining tokens over its tokens a round lately) takes the k with the most expected tokens a
+# millisecond, up to the drafter's block in the rows left, and every other stream the fewest drafts (<= its table
+# depth) whose expected tokens still end it before that one (by TF_DS_EVEN_MARGIN): a burst's streams end together
+# and its rounds stay short. Streams that did not start together get "conf".
 DEPTH_POLICY = os.environ.get("TF_DS_DEPTH_POLICY", "conf")
+EVEN_MARGIN = float(os.environ.get("TF_DS_EVEN_MARGIN") or 1.1)
+EVEN_COHORT = int(os.environ.get("TF_DS_EVEN_COHORT") or 4)
 ROUND_MS = [float(x) for x in (os.environ.get("TF_DS_ROUND_MS") or
                                "32.4,40.9,45.4,51.8,56.2,60.8,64.4,68.0,71.8,75.6,79.6,83.5,86.3,89.0,91.8,94.6").split(",")]
 DRAFT_MS = float(os.environ.get("TF_DS_DRAFT_MS") or 5.3)
@@ -377,7 +384,7 @@ class MultiDecoder:
             for R in range(self.max_rows, 0, -1):
                 if (R, self.runner.bucket(b)) in (self.runner.graphs or {}):
                     continue
-                self.runner.forward([(0, 0, self.extents.total, b - R, host[b - R:b], host)])
+                self.runner.forward([(0, 0, self.extents.total, b - R, host[b - R:b], host)], replay=False)
                 n += 1
         if self.e.drafter is not None:
             for k in range(1, len(self.slots) + 1):
@@ -781,6 +788,40 @@ class MultiDecoder:
                 best, best_v = kk, v
         return best
 
+    def _even_k(self, live: list[Stream], drafting: list[Stream], confs: list, k: int) -> dict:
+        """TF_DS_DEPTH_POLICY=even: each drafting stream's k (a pure function of state every rank holds)."""
+
+        import math
+
+        def expected(cf: list[float], n: int) -> float:
+            surv, e = 1.0, 1.0
+            for j in range(n):
+                surv *= 1.0 / (1.0 + math.exp(-float(cf[j])))
+                e += surv
+            return e
+
+        left = [(s.count - len(s.out)) / max(1.0, getattr(s, "per_round", 2.0)) for s in drafting]
+        c = max(range(len(drafting)), key=lambda i: (left[i], -i))
+        ks, rows = {}, len(live)
+        for i, (s, cf) in enumerate(zip(drafting, confs)):
+            if i == c:
+                continue
+            need = EVEN_MARGIN * (s.count - len(s.out)) / max(1.0, left[c])
+            kk, top = 0, min(k, s.count - len(s.out), len(cf))
+            while kk < top and expected(cf, kk) < need:
+                kk += 1
+            ks[s.sid] = kk
+            rows += kk
+        s, cf = drafting[c], confs[c]
+        top = max(0, min(self.depth_most, s.count - len(s.out), len(cf), self.max_rows - rows))
+        best, best_v = 0, -1.0
+        for kk in range(top + 1):
+            v = expected(cf, kk) / (ROUND_MS[min(len(ROUND_MS), rows + kk) - 1] + DRAFT_MS)
+            if v > best_v:
+                best, best_v = kk, v
+        ks[s.sid] = best
+        return ks
+
     def _depth(self, live: int) -> int:
         k = DEPTH_BY[min(live, len(DEPTH_BY)) - 1] if DEPTH_BY else self.depth_most
         return max(0, min(k, self.depth_most, self.max_rows // max(live, 1) - 1))
@@ -836,9 +877,15 @@ class MultiDecoder:
                 rows = self._drafts([s.pending for s in drafting], [s.st.sc.length for s in drafting],
                                     [s.st.index for s in drafting])
                 conf_rows = self.drafters[len(drafting)].last_conf
+                even = None
+                if DEPTH_POLICY == "even" and len(drafting) > 1 and \
+                        max(s.rounds for s in drafting) - min(s.rounds for s in drafting) <= EVEN_COHORT:
+                    even = self._even_k(live, drafting, conf_rows, k)
                 for s, r, cf in zip(drafting, rows, conf_rows):
                     kk = want[s.sid]
-                    if DEPTH_POLICY == "conf":
+                    if even is not None:
+                        kk = even[s.sid]
+                    elif DEPTH_POLICY in ("conf", "even"):
                         kk = self._choose_k(cf, kk, len(live))
                     if CONF_LOG:
                         self.k_hist.setdefault(len(live), [0] * 8)[kk] += 1
@@ -887,6 +934,7 @@ class MultiDecoder:
                         new = new[:i + 1]
                         break
                 new = new[:s.count - len(s.out)]
+                s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
                 s.pending = new[-1]
                 s.take(new, ends)
                 tokens += len(new)

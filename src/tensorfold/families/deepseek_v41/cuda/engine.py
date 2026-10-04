@@ -29,6 +29,8 @@ ADAPTIVE = os.environ.get("TF_DS_ADAPTIVE", "0") == "1"
 # before serving: caches at full size, the Triton kernels prompt chunks use, every decode graph (each window size at each
 # context bucket) and the drafter's graph, so no request pays a kernel build or a graph capture
 WARM = os.environ.get("TF_DS_WARM", "1") != "0"
+# the tower's warm-up image: "small" (default) or "largest" (logs the largest image's time and memory peak)
+VISION_WARM = os.environ.get("TF_DS_VISION_WARM") or "small"
 # synthetic prompt lengths for the warm-up: row and key counts of 1, multiples of 16 and others (Triton specializes
 # integer arguments on those), short prompts on the window ring, every pick-block bucket of the prompt attention, prompts
 # past the decoder replay window at even and odd offsets (pointer alignment), a second chunk
@@ -192,8 +194,12 @@ class DsEngine:
         try:
             for n in WARM_LENGTHS:
                 if n + 8 <= self.limit:
-                    self._run(ids[:n], 6, None, False, lambda new: None, self.drafter is not None)
-            self._run(ids[:17], 3, None, False, lambda new: None, False)
+                    if self.concurrent:     # --parallel decodes through round graphs (multi.warm): prompt kernels only
+                        self._sample(self.prefill(self.sc, self.dc, ids[:n]), [n], None)
+                    else:
+                        self._run(ids[:n], 6, None, False, lambda new: None, self.drafter is not None)
+            if not self.concurrent:
+                self._run(ids[:17], 3, None, False, lambda new: None, False)
             if self.vcfg is not None:
                 self.vision_warm(ids)
         finally:
@@ -218,11 +224,16 @@ class DsEngine:
         prompt = list(ids[:k + 20])
         prompt[5:5 + k] = [self.vcfg.image_token_id] * k
         rows = torch.zeros((k, self.vcfg.model_dim), dtype=torch.bfloat16, device="cuda")
-        self._run(prompt, 4, None, False, lambda new: None, self.drafter is not None, image=(list(range(5, 5 + k)), rows))
+        if self.concurrent:
+            self.prefill(self.sc, self.dc, prompt, image=(list(range(5, 5 + k)), rows))
+        else:
+            self._run(prompt, 4, None, False, lambda new: None, self.drafter is not None,
+                      image=(list(range(5, 5 + k)), rows))
         if self.tower is not None:
             from .vision import Picture, plan_grid
 
-            n_h, n_w, bh, bw = plan_grid(4096, 4096, self.vcfg)
+            side = 4096 if VISION_WARM == "largest" else 448        # the tower has no shape-tuned kernels to build
+            n_h, n_w, bh, bw = plan_grid(side, side, self.vcfg)
             p = self.vcfg.patch
             pic = Picture(torch.zeros((bh // p * (bw // p), 3, p, p), dtype=torch.bfloat16), bh // p, bw // p, n_h, n_w)
             torch.cuda.synchronize()
@@ -231,7 +242,7 @@ class DsEngine:
             t0 = time.perf_counter()
             self.tower.span_rows(pic)
             torch.cuda.synchronize()
-            print(f"[tensorfold] vision warm-up: largest image ({pic.tokens} tokens, {bh}x{bw} px) "
+            print(f"[tensorfold] vision warm-up: {VISION_WARM} image ({pic.tokens} tokens, {bh}x{bw} px) "
                   f"{1000 * (time.perf_counter() - t0):.0f} ms, peak +{(torch.cuda.max_memory_allocated() - base) / 2**30:.2f} "
                   f"GiB", flush=True)
 
@@ -382,8 +393,20 @@ class DsEngine:
             host = list(prompt)
             for p in positions:
                 host[p] = -1                  # Engram's hashing: no n-gram reaches into an image span
+        def ahead(a: int) -> None:                     # the chunk at ``a``: its Engram rows start reading now
+            if m.engram is None or m.engram.bg is None or a >= len(prompt):
+                return
+            hs = m.engram.hashes(host, a, min(len(prompt), a + PREFILL_CHUNK) - a)
+            lo, hi = m.engram.cols
+            for i in self.w.cfg.engram_layers:
+                if i < len(self.w.layers):
+                    m.engram.prefetch(i, hs[:, self.w.cfg.engram_layers.index(i), lo:hi], lane=1)
+
         for s in range(start, len(prompt), PREFILL_CHUNK):
             e = min(len(prompt), s + PREFILL_CHUNK)
+            if s == start:
+                ahead(s)
+            ahead(e)                                   # the next chunk's rows read while this one runs
             ids = torch.tensor(prompt[s:e], dtype=torch.long, device="cuda")
             taps: list | None = [] if use_drafts else None
             block = None

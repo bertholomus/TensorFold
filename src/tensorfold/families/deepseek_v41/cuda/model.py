@@ -29,6 +29,10 @@ RING_EXTRA = 16                     # window ring slots beyond the 128-token win
 KV_QUANT = os.environ.get("TF_DS_KV", "native") != "bf16"
 KERNELS = os.environ.get("TF_DS_KERNELS", "1") != "0"      # 0: the plain-torch phase-1 path (A/B and debugging)
 TIMING = os.environ.get("TF_DS_TIMING", "0") == "1"        # per-section wall times (synchronizing; profiling only)
+# TF_DS_ENGRAM_PREFETCH=1 (default): a prompt chunk reads its Engram rows ahead on a second reader pool
+ENGRAM_PREFETCH = os.environ.get("TF_DS_ENGRAM_PREFETCH", "1") == "1"
+# TF_DS_ENGRAM_RANDOM=1 (default): the tables' files are read without readahead (a row is 264 bytes at a random offset)
+ENGRAM_RANDOM = os.environ.get("TF_DS_ENGRAM_RANDOM", "1") == "1"
 TIMES: dict = {}
 
 
@@ -102,6 +106,11 @@ class Comm:
 
 
 EXACT_MM = os.environ.get("TF_DS_EXACT_MM", "0") == "1"     # test mode: fp32 dequantized weights, fp32 matmuls
+# 1: decode-sized linears (<= 128 rows) as grouped EXL3 launches (linear_grouped.cu): the projections of one input in
+# one launch (wq_a, wkv and the compressor's), wo_a's four slices in one launch read and written in place (no slice
+# copies, no cat), one input rotation launch per group, programmatic dependent launches. Every output has the bits of
+# the per-layer path (0), so it changes no token.
+GROUPED = os.environ.get("TF_DS_GROUPED_LINEAR", "1") != "0"
 
 
 def _had(device) -> torch.Tensor:
@@ -133,12 +142,67 @@ def mm(layer, x: torch.Tensor, out_dtype=BF16, ws: exl3_prefill.Workspace | None
         w = dequant_fp32(None, layer.suh, layer.svh, layer.k, layer.n, layer=layer)
         return (x.float() @ w).to(out_dtype)
     if m <= 128:
+        if GROUPED:
+            return layer.grouped(x, out_dtype=out_dtype)
         return layer(x.contiguous(), out_dtype=out_dtype)
     out = torch.empty((m, layer.n), dtype=out_dtype, device=x.device)
     return exl3_prefill.matmul(layer, x.contiguous(), out, ws or _WS)
 
 
 _WS = exl3_prefill.Workspace()
+
+
+def attn_in(lay, x: torch.Tensor, comp: bool = True) -> tuple:
+    """The projections of an attention block's input rows x: (wq_a bf16, wkv bf16, compressor wkv, compressor wgate),
+    the compressor's (``comp`` and the layer has one) in its dtype (bf16 at ratio 1, fp32 else), else None. One grouped
+    launch at decode sizes (``GROUPED``), else one ``mm`` each; the same bits either way."""
+
+    ck = comp and lay.comp_wkv is not None
+    cg = ck and lay.comp_wgate is not None
+    ck_dt = BF16 if lay.ratio == 1 else F32
+    if not GROUPED or EXACT_MM or x.shape[0] > 128:
+        return (mm(lay.wq_a, x), mm(lay.wkv, x), mm(lay.comp_wkv, x, ck_dt) if ck else None,
+                mm(lay.comp_wgate, x, F32) if cg else None)
+    key = "_tf_in_c" if ck else "_tf_in"
+    spec = getattr(lay, key, None)
+    if spec is None:
+        from tensorfold.cuda.exl3.linear import Exl3Group
+
+        layers, dts = [lay.wq_a, lay.wkv], [BF16, BF16]
+        if ck:
+            layers.append(lay.comp_wkv)
+            dts.append(ck_dt)
+        if cg:
+            layers.append(lay.comp_wgate)
+            dts.append(F32)
+        spec = (Exl3Group(layers), dts)
+        setattr(lay, key, spec)
+    group, dts = spec
+    out = group([x] * len(dts), out_dtypes=dts)
+    return tuple(out) + (None,) * (4 - len(out))
+
+
+def wo_a_out(lay, o: torch.Tensor) -> torch.Tensor:
+    """u [n, groups * o_rank] bf16: the wo_a slices of attention output o [n, heads, head_dim] (contiguous), slice g on
+    o's g-th column block. Grouped (``GROUPED``): one launch reading the column blocks in place and writing straight
+    into u's column blocks; else one ``mm`` a slice on a copied block, then a cat. The same bits either way."""
+
+    n = o.shape[0]
+    og = o.view(n, len(lay.wo_a), -1)
+    if not GROUPED or EXACT_MM or n > 128:
+        return torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
+    group = getattr(lay, "_tf_wo_a", None)
+    if group is None:
+        from tensorfold.cuda.exl3.linear import Exl3Group
+
+        group = lay._tf_wo_a = Exl3Group(lay.wo_a)
+    u = torch.empty((n, sum(wo.n for wo in lay.wo_a)), dtype=BF16, device=o.device)
+    outs, c = [], 0
+    for wo in lay.wo_a:
+        outs.append(u[:, c:c + wo.n])
+        c += wo.n
+    group([og[:, g] for g in range(len(lay.wo_a))], outs)
+    return u
 
 
 @dataclass
@@ -179,7 +243,7 @@ def _engram_io():
         here = Path(__file__).parent
         from torch.utils import cpp_extension
 
-        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v2", sources=[str(here / "engram_io.cpp")],
+        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v4", sources=[str(here / "engram_io.cpp")],
                                             extra_cflags=["-O3"], verbose=False)
     return _engram_io.ext
 
@@ -216,13 +280,19 @@ class Engram:
                 size = struct.unpack("<Q", f.read(8))[0]
                 header = json.loads(f.read(size))
             fd = os.open(str(path), os.O_RDONLY)
+            if ENGRAM_RANDOM:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
             for name, e in header.items():
                 if name.endswith("engram.embed.weight") or name.endswith("engram.embed.scale"):
                     lo, hi = e["data_offsets"]
                     self.files[name] = (fd, 8 + size + lo, int(np.prod(e["shape"][1:])))
         self.io = _engram_io()
-        self.threads = int(os.environ.get("TF_DS_ENGRAM_THREADS") or 48)
+        self.threads = int(os.environ.get("TF_DS_ENGRAM_THREADS") or 128)
         self.pinned: dict = {}
+        # reads started ahead (prompt chunks, decode rounds): a background thread a lane, pinned slots a layer
+        self.ahead: list = []                         # (layer, flat ids, future, slot)
+        self.ring: dict = {}
+        self.bg = {1: ThreadPoolExecutor(1), 2: ThreadPoolExecutor(1)} if ENGRAM_PREFETCH else None
 
     def hashes(self, tokens: list[int], start: int, n: int) -> np.ndarray:
         """Row ids [n, L, cols] for positions start .. start + n - 1 of ``tokens`` (the whole sequence so far)."""
@@ -250,6 +320,39 @@ class Engram:
             out.append(rolling[..., None] % self.np_primes[None, :, (i - 1) * H:i * H])
         return np.concatenate(out, -1) + self.np_offsets[None]
 
+    def prefetch(self, layer: int, idx: np.ndarray, lane: int = 1) -> None:
+        """Start reading idx's rows in the background; ``rows`` with the same ids takes them from there. Lane 1 (prompt
+        chunks) and lane 2 (decode rounds) have their own thread and reader pool, so a round never waits behind a
+        chunk's read."""
+
+        if self.bg is None:
+            return
+        flat = np.ascontiguousarray(idx.reshape(-1), dtype=np.int64)
+        if any(a[0] == layer and np.array_equal(a[1], flat) for a in self.ahead):
+            return
+        while len(self.ahead) >= 8:                   # unclaimed reads (a dropped prompt): the oldest goes
+            self.ahead.pop(0)[2].result()
+        fw, bw, rw = self.files[f"layers.{layer}.engram.embed.weight"]
+        fs, bs, rs = self.files[f"layers.{layer}.engram.embed.scale"]
+        m = flat.shape[0]
+        slots = self.ring.setdefault(layer, [])
+        busy = {id(a[3]) for a in self.ahead}
+        k = next((j for j, sl in enumerate(slots) if id(sl) not in busy), len(slots))
+        slot = slots[k] if k < len(slots) else None
+        if slot is not None:
+            slot[2].synchronize()                     # its last copy to the GPU has landed
+        if slot is None or slot[0].shape[0] < m:
+            slot = (torch.empty((max(m, 64), rw), dtype=torch.uint8, pin_memory=True),
+                    torch.empty((max(m, 64), rs), dtype=torch.uint8, pin_memory=True), torch.cuda.Event())
+            if k < len(slots):
+                slots[k] = slot
+            else:
+                slots.append(slot)
+        it = torch.from_numpy(flat)
+        fut = self.bg[lane].submit(self.io.gather_rows2_at, lane, fw, bw, rw, fs, bs, rs, it, slot[0][:m],
+                                   slot[1][:m], self.threads)
+        self.ahead.append((layer, flat, fut, slot))
+
     def rows(self, layer: int, idx: np.ndarray) -> torch.Tensor:
         """idx [n, cols] (this rank's columns, host) -> bf16 [n, cols * head_dim] on the GPU, no device sync."""
 
@@ -257,6 +360,14 @@ class Engram:
         fs, bs, rs = self.files[f"layers.{layer}.engram.embed.scale"]
         flat = np.ascontiguousarray(idx.reshape(-1), dtype=np.int64)
         m = flat.shape[0]
+        hit = next((a for a in self.ahead if a[0] == layer and np.array_equal(a[1], flat)), None)
+        if hit is not None:                           # read ahead: the same bytes, from its slot
+            self.ahead.remove(hit)
+            hit[2].result()
+            gw = hit[3][0][:m].cuda(non_blocking=True)
+            gs = hit[3][1][:m].cuda(non_blocking=True)
+            hit[3][2].record()
+            return self._decode(gw, gs, m, rw, idx.shape[0])
         # one pinned staging pair a layer, grown (never shrunk); the copy out of it finishes before it is refilled
         buf = self.pinned.get(layer)
         if buf is not None:
@@ -272,11 +383,15 @@ class Engram:
         gw = bw_v.cuda(non_blocking=True)
         gs = bs_v.cuda(non_blocking=True)
         buf[2].record()
+        return self._decode(gw, gs, m, rw, idx.shape[0])
+
+    @staticmethod
+    def _decode(gw: torch.Tensor, gs: torch.Tensor, m: int, rw: int, n: int) -> torch.Tensor:
         v = gw.view(torch.float8_e4m3fn).to(F32)
         e = gs.to(torch.int32) - 127
         sc = torch.ldexp(torch.ones_like(e, dtype=F32), e)
         v = (v.view(m, rw // 32, 32) * sc[..., None]).view(m, rw)
-        return v.to(BF16).reshape(idx.shape[0], -1)
+        return v.to(BF16).reshape(n, -1)
 
 
 class Model:
@@ -562,10 +677,10 @@ class Model:
         rd, hd = c.rope_dim, c.head_dim
         ratio = lay.ratio
         cos, sin = self._cs(lay.idx, sc)
-        qr = K.rmsnorm(mm(lay.wq_a, x), lay.q_norm, c.eps)
+        qa, y, _, _ = attn_in(lay, x, comp=False)
+        qr = K.rmsnorm(qa, lay.q_norm, c.eps)
         q = mm(lay.wq_b, qr).view(n, self.Hl, hd)
         K.rope_heads(q, cos, sin, pos, rd)
-        y = mm(lay.wkv, x)
         ring = sc.ring[lay.idx]
         R = sc.ring_size
         ring_mode = n <= RING_EXTRA
@@ -624,9 +739,7 @@ class Model:
         if not ring_mode:
             keep = min(n, R)
             ring[pos[-keep:] % R] = kv[-keep:]
-        og = o.view(n, len(lay.wo_a), -1)
-        u = torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
-        return mm(lay.wo_b, u, F32)
+        return mm(lay.wo_b, wo_a_out(lay, o), F32)
 
     def _neg(self, n: int) -> torch.Tensor:
         t = self.scratch.get(("neg", n))
