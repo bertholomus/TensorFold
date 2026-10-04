@@ -39,6 +39,22 @@ MMA_KB = 4                        # experts_grouped.cuh's MMA_KB
 # grouped_mma3's gate/up columns a program: 4 (512, a TP4 rank's whole width: the rows rotated once a mat; 5.3 against
 # 6.1 ms a 2,048-row layer at 2) or 2 (256)
 MMA3_NW = int(os.environ.get("TF_EXL3_MMA3_NW") or 4)
+# decode windows (the one-tile path, ``grouped``): the programs launch expert-major (an expert's column blocks of one K
+# range side by side, the grid's unused experts last; TF_EXL3_GROUPED_ORDER=0: expert-minor, as before), and the picks
+# group with group2 (group's outputs, entry for entry, from a shared-memory count: 33 -> 9 us at 16 rows on GB10;
+# TF_EXL3_GROUP2=0: group). The same programs and the same members either way: every row keeps its bits.
+GROUPED_ORDER = int(os.environ.get("TF_EXL3_GROUPED_ORDER") or 1)
+GROUP2 = os.environ.get("TF_EXL3_GROUP2", "1") == "1"
+GROUP2_MAX = 12288                # group2's shared memory: R x slots picks plus E counts (ints) within 48 KiB
+# decode windows' grouped programs stream each warp's trellis words and member rows through S shared-memory stages
+# (grouped_sm_kernel: the same programs, the same bits; with the order and group2 a 16-row layer 1,246 -> 1,159 us on
+# GB10); TF_EXL3_GROUPED_STAGES=3, 4 or 6 (default), 0: one step in registers (grouped_kernel, as before)
+GROUPED_STAGES = int(os.environ.get("TF_EXL3_GROUPED_STAGES") or 6)
+# TF_EXL3_DECODE_Y=0: a decode window whose caller says its per-slot outputs go unused (``y_unused``: it never reads y
+# and never leaves a non-routed slot's output there) skips writing them, as prompt chunks do: a non-routed slot then
+# adds w * 0, which is what its never-written zero in y gave (the same bits); 1 MB of fp32 writes a layer a 4-row
+# window, 3.5 MB at 16 rows (TF_EXL3_DECODE_Y=1: written anyway, as before)
+DECODE_Y = os.environ.get("TF_EXL3_DECODE_Y", "0") != "0"
 
 
 @lru_cache(maxsize=1)
@@ -47,7 +63,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v12", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v20", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -201,10 +217,23 @@ class Scratch:
         return self.ids[:maxu], self.members_buf[:maxu * R].view(maxu, R)
 
 
+def _stages(ex: Exl3RoutedExperts, cfg) -> int:
+    """GROUPED_STAGES where grouped_sm_kernel runs this layer: the (8 n tiles, 4 warps) setting and 16-byte aligned
+    trellises (each tile is 16 K2 bytes, so every stage's chunks are then aligned); else 0."""
+
+    if GROUPED_STAGES <= 0 or cfg[0] != 8 or cfg[1] != 4:
+        return 0
+    ok = getattr(ex, "_aligned", None)
+    if ok is None:
+        ok = all(int(p) % 16 == 0 for t in (ex.gate_ptr, ex.up_ptr, ex.down_ptr) for p in t.tolist())
+        ex._aligned = ok
+    return GROUPED_STAGES if ok else 0
+
+
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
            group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None,
-           kernel: str | None = None, exact_rows: int | None = None) -> torch.Tensor:
+           kernel: str | None = None, exact_rows: int | None = None, y_unused: bool = False) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts`` (plus
     ``add`` [R, D] fp32 added last, in the same launch, when given).
 
@@ -239,7 +268,10 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         busiest = int(torch.bincount(pick[:R].reshape(-1).long(), minlength=E + 1)[:E].max())
         members = s.members_buf[:ids.shape[0] * max(16, -(-busiest // 16) * 16)].view(ids.shape[0], -1)
     if group and not fast:
-        ext.group(pick, ids, s.count, members, R, slots, E)
+        if GROUP2 and R * slots + E <= GROUP2_MAX:
+            ext.group2(pick, ids, s.count, members, R, slots, E)
+        else:
+            ext.group(pick, ids, s.count, members, R, slots, E)
     if s.y is None and not (fast and wts is not None):        # prompt buffers: the one-tile path's per-slot outputs
         s.y = torch.zeros((s.rows * slots, D), dtype=torch.float32, device=x.device)
     kern = PROMPT_KERNEL if kernel is None else kernel
@@ -273,7 +305,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
                          I, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_gu[0], ex.k2_gu[1], 1)
     else:
         ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                    P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
+                    P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1], GROUPED_ORDER,
+                    _stages(ex, s.cfg_gu))
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1 if fast else sk, slots, E,
                         float(limit), act_mode)
     nt, w, sk, pf = s.cfg_d
@@ -303,7 +336,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
                          I, D, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_d[0], ex.k2_d[1], 0)
     else:
         ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                    D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
+                    D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1], GROUPED_ORDER,
+                    _stages(ex, s.cfg_d))
     if wts is None:
         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, dsk, slots, E)
         return s.y[:P]
@@ -311,8 +345,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         out = torch.empty((R, D), dtype=torch.float32, device=x.device)
     # the down epilogue and the combine in one launch (the same arithmetic in the same order as the two); a prompt
     # chunk leaves the per-slot outputs unwritten (453 MB a layer at 2,048 rows that nothing reads)
-    ext.down_combine(s.z, pick, ex.svh_d, s.no_y if fast else s.y, wts, s.no_y if add is None else add, out, R, P, D,
-                     dsk, slots, E, 0 if fast else 1, int(add is not None))
+    keep_y = not fast and (DECODE_Y or not y_unused)
+    ext.down_combine(s.z, pick, ex.svh_d, s.y if keep_y else s.no_y, wts, s.no_y if add is None else add, out, R, P,
+                     D, dsk, slots, E, int(keep_y), int(add is not None))
     return out
 
 

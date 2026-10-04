@@ -18,6 +18,11 @@ import triton.language as tl
 
 from tensorfold.families.glm5_next.cuda.latent import CHUNK, HB, KT, _merge
 
+# a round's dense attention stores no partials for chunks past a row's position and its merge reads none
+# (_merge_rows: the stored values' constants instead): the same bits; at chat / code positions (a few hundred tokens)
+# 4 of the dense window's 5 chunks a row are empty (TF_GLM_DENSE_SKIP=0: every chunk stored and merged, as before)
+DENSE_SKIP = __import__("os").environ.get("TF_GLM_DENSE_SKIP", "1") == "1"
+
 from . import kv8 as kv8_mod
 from .kv8 import Kv8
 from .kvq import KvQ, _put_plane, rotate as _q_rotate, tile as _q_tile
@@ -185,7 +190,7 @@ def write(rows: torch.Tensor, cache, t: Tables) -> None:
 @triton.jit
 def _dense_rows(QA, QP, LC, LS, HQ, PC, POS, BASE, PO, PM, PL, R, DL, H: tl.constexpr, LW: tl.constexpr,
                 PW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr,
-                KV8: tl.constexpr, QB: tl.constexpr):
+                KV8: tl.constexpr, QB: tl.constexpr, SKIP: tl.constexpr = 0):
     """mla_pe._dense_chunks_pe with row r at POS[r] over its stream's keys from BASE[r]; rows at or past DL (the dense
     limit: their sparse pass overwrites them) attend nothing here."""
 
@@ -215,10 +220,40 @@ def _dense_rows(QA, QP, LC, LS, HQ, PC, POS, BASE, PO, PM, PL, R, DL, H: tl.cons
                             QB)
         if QB > 0:
             o = _q_rotate(o, HQ, HBT, LW)
-    base = (c * R + r) * H + hh
-    tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
-    tl.store(PM + base, m, mask=hok)
-    tl.store(PL + base, l, mask=hok)
+    if (SKIP == 0) | ((start <= limit) & (limit < DL)):     # (SKIP: an empty chunk's partials are never read)
+        base = (c * R + r) * H + hh
+        tl.store(PO + base[:, None] * LW + k[None, :], o, mask=hok[:, None])
+        tl.store(PM + base, m, mask=hok)
+        tl.store(PL + base, l, mask=hok)
+
+
+@triton.jit
+def _merge_rows(PO, PM, PL, OUT, POS, R, DL, H: tl.constexpr, LW: tl.constexpr, NCH: tl.constexpr, CH: tl.constexpr):
+    """latent._merge for _dense_rows' partials (SKIP): chunks past row r's position (or every chunk of a row at or past
+    the dense limit) are the values _dense_rows would have stored for them (m -inf, l 0, o 0), not loads, so the same
+    arithmetic in the same order: the same bits, without the empty chunks' stores and loads."""
+
+    r = tl.program_id(0)
+    h = tl.program_id(1)
+    limit = tl.load(POS + r)
+    k = tl.arange(0, LW)
+    m = float("-inf")
+    l = 0.0
+    o = tl.zeros((LW,), tl.float32)
+    for c in range(NCH):
+        live = (c * CH <= limit) & (limit < DL)
+        base = (c * R + r) * H + h
+        cm = tl.load(PM + base, mask=live, other=float("-inf"))
+        cl = tl.load(PL + base, mask=live, other=0.0)
+        co = tl.load(PO + base * LW + k, mask=live & (k >= 0), other=0.0)
+        active = cl > 0.0
+        next_m = tl.where(active, tl.maximum(m, cm), m)
+        a = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+        b = tl.where(active, tl.exp(cm - next_m), 0.0)
+        o = o * a + co * b
+        l = l * a + cl * b
+        m = next_m
+    tl.store(OUT + (r * H + h) * LW + k, (o / l).to(tl.bfloat16))
 
 
 @triton.jit
@@ -271,10 +306,15 @@ def dense_attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Ten
         raise ValueError(f"rows.dense_attention: {R} rows, width {LW} past the scratch's {s.part_rows}, {s.lw}")
     n = nch * R * H
     rows, scales, h32, kv8, qb = _planes(cache)
+    skip = 1 if DENSE_SKIP else 0
     _dense_rows[(R, triton.cdiv(H, HB), nch)](qa, qp, rows, scales, h32, pcache, t.pos, t.base, s.po[:n * LW],
                                               s.pm[:n], s.pl[:n], R, dense_limit, H=H, LW=LW, PW=PW, CH=CHUNK,
-                                              SCALE=scale, HBT=HB, KTT=KT, KV8=kv8, QB=qb, num_warps=4, num_stages=3)
-    _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+                                              SCALE=scale, HBT=HB, KTT=KT, KV8=kv8, QB=qb, SKIP=skip, num_warps=4,
+                                              num_stages=3)
+    if skip:
+        _merge_rows[(R, H)](s.po, s.pm, s.pl, out, t.pos, R, dense_limit, H=H, LW=LW, NCH=nch, CH=CHUNK, num_warps=4)
+    else:
+        _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
     return out
 
 

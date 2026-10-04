@@ -395,6 +395,10 @@ PROMPT_RB = 64
 # 256 per head); "triton": _absorb_rows / _expand_rows; "bmm": one batched tensor-core matmul a head (fp32 sums in
 # cuBLAS's order: a prompt chunk's rows no longer match the decode kernels' bits) (TF_GLM_ABSORB)
 ABSORB = os.environ.get("TF_GLM_ABSORB") or "bmm"
+# decode windows (up to PROMPT_RB rows): "cuda" (default) runs latent_rows.cu's absorb / expand over the window's rows
+# (latent's sums in their order, the same bits, without latent's barrier and shared-memory round trip a row: 41.9 ->
+# 23.7 us absorb, 38.5 -> 22.8 us expand at 16 rows on GB10); "triton": latent's own kernels (TF_GLM_DECODE_ABSORB)
+DECODE_ABSORB = os.environ.get("TF_GLM_DECODE_ABSORB") or "cuda"
 
 
 @lru_cache(maxsize=1)
@@ -460,6 +464,10 @@ def absorb_q(q: torch.Tensor, a, out: torch.Tensor, exact: bool = False, blocks:
         invariant.blocked(lambda x, y: torch.bmm(x.transpose(0, 1), a.wk[:, :D], out=y.transpose(0, 1)), R, [q], [out])
         return out
     if R <= PROMPT_RB or isinstance(a, latent.AbsorbQ4):
+        if (DECODE_ABSORB == "cuda" and not isinstance(a, latent.AbsorbQ4) and _exact_shapes(a) and q.is_contiguous()
+                and out.is_contiguous()):
+            _rows_ext().absorb(q, a.wk, out, max(1, R))
+            return out
         return latent.absorb_q(q, a, out)
     mode = "triton" if exact else ABSORB
     if mode == "bmm":
@@ -489,6 +497,10 @@ def expand_v(o_lat: torch.Tensor, a, out: torch.Tensor, exact: bool = False, blo
                           [o_lat], [out])
         return out
     if R <= PROMPT_RB or isinstance(a, latent.AbsorbQ4):
+        if (DECODE_ABSORB == "cuda" and not isinstance(a, latent.AbsorbQ4) and _exact_shapes(a)
+                and o_lat.is_contiguous() and out.is_contiguous()):
+            _rows_ext().expand(o_lat, a.wv, out, max(1, R))
+            return out
         return latent.expand_v(o_lat, a, out)
     mode = "triton" if exact else ABSORB
     if mode == "bmm":

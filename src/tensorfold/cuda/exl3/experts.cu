@@ -71,6 +71,73 @@ __global__ void __launch_bounds__(GROUP_THREADS) group_kernel(const int* __restr
     }
 }
 
+// group_kernel's outputs, entry for entry, in a fraction of its time: the picks counted with shared-memory atomics
+// (group_kernel compared every pick with every expert: E x n steps on one SM, 9-34 us a decode window), the used
+// experts placed in id order by one scan, each used expert's members listed in row order by its own thread.
+constexpr int GROUP2_THREADS = 256;
+constexpr int GROUP2_PER_THREAD = 4;        // experts a thread at most: E <= 1,024
+
+__global__ void __launch_bounds__(GROUP2_THREADS) group2_kernel(const int* __restrict__ pick, int* __restrict__ uids,
+                                                                int* __restrict__ ucount, int* __restrict__ members,
+                                                                int R, int slots, int E, int maxm) {
+    extern __shared__ int sh2[];                                   // [n] picks, then [E] counts
+    __shared__ int warp_tot[GROUP2_THREADS / 32];
+    const int n = R * slots;
+    int* sh_pick = sh2;
+    int* cnt = sh2 + n;
+    for (int e = threadIdx.x; e < E; e += GROUP2_THREADS) cnt[e] = 0;
+    for (int i = threadIdx.x; i < n; i += GROUP2_THREADS) sh_pick[i] = pick[i];
+    __syncthreads();
+    for (int i = threadIdx.x; i < n; i += GROUP2_THREADS) {
+        const int e = sh_pick[i];
+        if (e >= 0 && e < E) atomicAdd(cnt + e, 1);
+    }
+    __syncthreads();
+    // a thread's experts are contiguous (thread t: experts per t .. per t + per - 1), so places go in id order
+    const int per = (E + GROUP2_THREADS - 1) / GROUP2_THREADS;
+    int c[GROUP2_PER_THREAD];
+    int used = 0;
+#pragma unroll
+    for (int q = 0; q < GROUP2_PER_THREAD; ++q) {
+        const int e = threadIdx.x * per + q;
+        c[q] = (q < per && e < E) ? cnt[e] : 0;
+        used += c[q] > 0;
+    }
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    int inc = used;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int v = __shfl_up_sync(0xffffffffu, inc, o);
+        if (lane >= o) inc += v;
+    }
+    if (lane == 31) warp_tot[warp] = inc;
+    __syncthreads();
+    if (warp == 0) {
+        const int v = lane < GROUP2_THREADS / 32 ? warp_tot[lane] : 0;
+        int s = v;
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int x = __shfl_up_sync(0xffffffffu, s, o);
+            if (lane >= o) s += x;
+        }
+        if (lane < GROUP2_THREADS / 32) warp_tot[lane] = s - v;    // exclusive per warp
+        if (lane == GROUP2_THREADS / 32 - 1) ucount[0] = s;
+    }
+    __syncthreads();
+    int place = warp_tot[warp] + inc - used;
+#pragma unroll
+    for (int q = 0; q < GROUP2_PER_THREAD; ++q) {
+        if (c[q] == 0) continue;
+        const int e = threadIdx.x * per + q;
+        uids[place] = e;
+        int j = 0;
+        for (int i = 0; i < n && j < maxm; ++i)
+            if (sh_pick[i] == e) members[place * maxm + j++] = (i / slots) * 32 + (i % slots);
+        for (; j < maxm; ++j) members[place * maxm + j] = -1;
+        ++place;
+    }
+}
+
 // The same grouping for any number of rows (prompt chunks; group_kernel stages every pick in one block's shared memory):
 // a block per expert counts its members, then a block per used expert takes its place in id order and lists its
 // members in row order, -1 after the last.
@@ -343,6 +410,9 @@ __global__ void combine_y_kernel(const __nv_bfloat16* __restrict__ Y, const int*
 // ---------------------------------------------------------------------------------------------------------------
 
 namespace tf_exl3x {
+extern template void grouped_sm_launch<0>(const GroupedArgs&, cudaStream_t);
+extern template void grouped_sm_launch<1>(const GroupedArgs&, cudaStream_t);
+extern template void grouped_sm_launch<2>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
@@ -370,7 +440,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi) {
+                        int64_t hi, int64_t order, int64_t stages) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -386,7 +456,17 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
     a.nexp_max = (int)uids.size(0);
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
+    a.order = (int)order;
+    a.stages = (int)stages;
     auto stream = at::cuda::getCurrentCUDAStream();
+    if (stages > 0) {
+        if (cb == 0) tf_exl3x::grouped_sm_launch<0>(a, stream);
+        else if (cb == 1) tf_exl3x::grouped_sm_launch<1>(a, stream);
+        else if (cb == 2) tf_exl3x::grouped_sm_launch<2>(a, stream);
+        else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+        return;
+    }
     if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
     else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
     else if (cb == 2) tf_exl3x::grouped_launch<2>(a, stream);
@@ -593,6 +673,18 @@ void exl3x_group_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucou
         C10_CUDA_CHECK(cudaFuncSetAttribute(group_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     }
     group_kernel<<<1, GROUP_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
+        pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
+        (int)slots, (int)E, (int)members.size(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_group2_cuda(const at::Tensor& pick, at::Tensor& uids, at::Tensor& ucount, at::Tensor& members, int64_t R,
+                       int64_t slots, int64_t E) {
+    TORCH_CHECK(E <= GROUP2_THREADS * GROUP2_PER_THREAD, "too many experts for group2");
+    TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+    const size_t smem = (size_t)(R * slots + E) * sizeof(int);
+    TORCH_CHECK(smem <= 48 * 1024, "group2: ", R, " rows x ", slots, " slots past its shared memory (use group)");
+    group2_kernel<<<1, GROUP2_THREADS, smem, at::cuda::getCurrentCUDAStream()>>>(
         pick.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(), (int)R,
         (int)slots, (int)E, (int)members.size(1));
     C10_CUDA_KERNEL_LAUNCH_CHECK();

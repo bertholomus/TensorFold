@@ -277,13 +277,19 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots) {
-    const int u = blockIdx.x;
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int order) {
+    // order 0: blocks (expert u, n block, split / mat / member tile); order 1: the same blocks expert-major (u slowest,
+    // then split / mat / member tile, n blocks fastest): an expert's n blocks of one k range run side by side (whole
+    // k rows of its trellis together) and the grid's unused experts come last. The same programs either way.
+    const int NBY = N / (16 * NT);
+    const int u = order ? (int)blockIdx.y : (int)blockIdx.x;
     if (u >= ucount[0]) return;
+    const int by = order ? (int)(blockIdx.x % NBY) : (int)blockIdx.y;
+    const int bz = order ? (int)(blockIdx.x / NBY) : (int)blockIdx.z;
     const int MT = (maxm + 15) / 16;
-    const int mtile = blockIdx.z % MT;
-    const int split = (blockIdx.z / MT) % SK;
-    const int mat = blockIdx.z / MT / SK;
+    const int mtile = bz % MT;
+    const int split = (bz / MT) % SK;
+    const int mat = bz / MT / SK;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -306,7 +312,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
 
     const int per_split = KT / SK, per_warp = per_split / W;
     const int kt0 = split * per_split + warp * per_warp;
-    const int nt0 = blockIdx.y * NT;
+    const int nt0 = by * NT;
 
     float acc[NT][2][4];
 #pragma unroll
@@ -1312,6 +1318,8 @@ struct GroupedArgs {
     int mats, nt, warps, pf, lo, hi;
     int g = 1;           // grouped_rows: member tiles a program
     int fold = 0;        // grouped_rows / grouped_mma: one program runs every split (writes their sum: Z [mats, 1, P, N])
+    int order = 0;       // grouped: 1 launches its blocks expert-major (grouped_kernel)
+    int stages = 0;      // grouped: > 0 streams each warp's weights through that many shared-memory stages
 };
 
 template <int CB>
@@ -1448,14 +1456,257 @@ void grouped_down3_launch(const GroupedArgs& a, const half* svh, const float* wt
 #undef TF_LAUNCH_C
 }
 
+// -- decode windows with each warp's trellis words through shared memory ------------------------------------------
+// grouped_kernel's programs (the same chains from zero over the same k tiles, the warps added in order, the same Z
+// writes: the same bits) with a warp's weight words streamed through a ring of S shared-memory stages (cp.async, S - 1
+// k steps ahead) instead of one step in registers. ncu on GB10 (16 rows, 3 bits): grouped_kernel holds 12 warps an SM
+// (168 registers, 33 KB of shared memory a block), issues on 24 % of cycles and spends 70 % of its stalls waiting on
+// global loads, so it needs more bytes in flight, which registers cannot hold. A lane reads the two words its windows
+// span straight from the stage (no shuffles), the x fragments load a step ahead, and once the k loop ends the ring's
+// memory holds the warps' sums for the in-order add.
+template <int CB, int K2>
+__device__ __forceinline__ void decode_tile_sm(const uint32_t* tw, const LaneMap<K2>& m, int lane, uint32_t (&b0)[2],
+                                               uint32_t (&b1)[2]) {
+    uint32_t st[8];
+    if constexpr (K2 == 8) {
+        const uint32_t w0 = tw[lane];
+        const uint32_t p = tw[(lane + 31) & 31];
+        const uint32_t s = __funnelshift_r(w0, p, 20);
+        st[0] = (s >> 8) & 0xffffu;
+        st[1] = (s >> 4) & 0xffffu;
+        st[2] = s & 0xffffu;
+        st[3] = w0 >> 16;
+        st[4] = (w0 >> 12) & 0xffffu;
+        st[5] = (w0 >> 8) & 0xffffu;
+        st[6] = (w0 >> 4) & 0xffffu;
+        st[7] = w0 & 0xffffu;
+    } else {
+        constexpr int GV = Fmt<K2>::GV, NG = Fmt<K2>::NG;
+#pragma unroll
+        for (int g = 0; g < NG; ++g) {
+            const uint32_t whi = tw[m.hi[g]];
+            const uint32_t wlo = tw[m.lo[g]];
+            const uint64_t mm = ((((uint64_t)wlo) << 32) | whi) >> m.sh[g];
+#pragma unroll
+            for (int j = 0; j < GV; ++j) st[g * GV + j] = (uint32_t)(mm >> Fmt<K2>::off(j)) & 0xffffu;
+        }
+    }
+    b0[0] = cb_pair<CB>(st[0], st[1]);
+    b0[1] = cb_pair<CB>(st[2], st[3]);
+    b1[0] = cb_pair<CB>(st[4], st[5]);
+    b1[1] = cb_pair<CB>(st[6], st[7]);
+}
+
+// warp_tiles over a warp's ring: a stage is one k step's NT tiles (their words are contiguous and 16-byte aligned: a
+// tile is 16 K2 bytes) and the member rows' 16 x values of that step (32 bytes a row: 16 rows x 8 words), both copied by
+// cp.async S - 1 steps ahead. (ncu: with the x fragments loaded from global memory a step ahead, half of all stall
+// samples sat on the move that consumes them: the weights streaming through L2 evict the rotated rows, so each x load
+// waits on DRAM.) Rows past the tile's members are never copied; their fragments are zero, as load_pair gives them.
+template <int K2, int NT>
+__host__ __device__ constexpr int sm_stage_words() {
+    return NT * Fmt<K2>::TW + 16 * 8;
+}
+
+template <int CB, int K2, int NT, int S>
+__device__ __forceinline__ void warp_tiles_sm(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+                                              const half* __restrict__ X, int K, const int* rows, bool ok0, bool ok1,
+                                              int lane, float (&acc)[NT][2][4], uint32_t* ring) {
+    constexpr int TW = Fmt<K2>::TW;
+    constexpr int SW = NT * TW;                       // weight words a stage: one k step's NT tiles
+    constexpr int STW = sm_stage_words<K2, NT>();     // a stage: the weights, then 16 rows x 8 words of x
+    constexpr int CH = SW / 4;                        // the weights' 16-byte chunks
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW;
+    const int xr = rows[lane >> 1];                   // lane's x chunk: member row lane / 2, half lane & 1
+    const half* xs = X + (size_t)(xr < 0 ? 0 : xr) * K + (size_t)kt0 * 16 + 8 * (lane & 1);
+    auto issue = [&](int it) {
+        uint32_t* dst = ring + (it % S) * STW;
+        const uint32_t* src = tp + (size_t)it * kstride;
+        for (int c = lane; c < CH; c += 32) cp_async16(dst + 4 * c, src + 4 * c, true);
+        if (xr >= 0) cp_async16(dst + SW + 4 * lane, xs + (size_t)it * 16, true);
+    };
+#pragma unroll
+    for (int d = 0; d < S - 1; ++d) {
+        if (d < nkt) issue(d);
+        cp_async_commit();
+    }
+    const int g = lane >> 2, t = lane & 3;
+    for (int it = 0; it < nkt; ++it) {
+        if (it + S - 1 < nkt) issue(it + S - 1);     // into the stage step it - 1 used (every lane is done with it)
+        cp_async_commit();
+        cp_async_wait<S - 1>();                      // this lane's copies of step it are in
+        __syncwarp();                                // and every lane's
+        const uint32_t* st = ring + (it % S) * STW;
+        const uint32_t* xw = st + SW;                // row r's 16 values: words 8 r .. 8 r + 7
+        uint32_t a[4];
+        a[0] = ok0 ? xw[8 * g + t] : 0u;
+        a[1] = ok1 ? xw[8 * (g + 8) + t] : 0u;
+        a[2] = ok0 ? xw[8 * g + t + 4] : 0u;
+        a[3] = ok1 ? xw[8 * (g + 8) + t + 4] : 0u;
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            uint32_t b0[2], b1[2];
+            decode_tile_sm<CB, K2>(st + i * TW, map, lane, b0, b1);
+            mma16816(acc[i][0], a, b0);
+            mma16816(acc[i][1], a, b1);
+        }
+        __syncwarp();                                // every lane is done with this stage before it is refilled
+    }
+}
+
+// the ring, or the warps' sums of half the columns (the add runs in two halves): whichever is larger
+template <int NT, int W, int S, int HI>
+__host__ __device__ constexpr int sm_ring_bytes() {
+    return W * S * sm_stage_words<HI, NT>() * 4 > W * 16 * NT * 8 * 4 ? W * S * sm_stage_words<HI, NT>() * 4
+                                                                        : W * 16 * NT * 8 * 4;
+}
+
+template <int CB, int NT, int W, int S, int LO, int HI>
+__global__ void __launch_bounds__(W * 32) grouped_sm_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int order) {
+    extern __shared__ __align__(16) uint32_t sm_ring[];
+    const int NBY = N / (16 * NT);
+    const int u = order ? (int)blockIdx.y : (int)blockIdx.x;
+    if (u >= ucount[0]) return;
+    const int by = order ? (int)(blockIdx.x % NBY) : (int)blockIdx.y;
+    const int bz = order ? (int)(blockIdx.x / NBY) : (int)blockIdx.z;
+    const int MT = (maxm + 15) / 16;
+    const int mtile = bz % MT;
+    const int split = (bz / MT) % SK;
+    const int mat = bz / MT / SK;
+    const half* X = mat ? X1 : X0;
+    const int e = uids[u];
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int k2 = mat ? K2_1[e] : K2_0[e];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int KT = K >> 4, NTILES = N >> 4;
+
+    __shared__ int rows_sh[16];
+    if (threadIdx.x < 16) {
+        const int m = mtile * 16 + threadIdx.x;
+        const int code = m < maxm ? members[u * maxm + m] : -1;
+        rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+    }
+    __syncthreads();
+    if (rows_sh[0] < 0) return;                           // members come first, so this tile is empty
+    const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+
+    const int per_split = KT / SK, per_warp = per_split / W;
+    const int kt0 = split * per_split + warp * per_warp;
+    const int nt0 = by * NT;
+
+    float acc[NT][2][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+
+    uint32_t* ring = sm_ring + warp * (S * sm_stage_words<HI, NT>());
+    switch (k2) {
+#define TF_EXL3X_SM_CASE(K2_)                                                                                   \
+    case K2_:                                                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+            warp_tiles_sm<CB, K2_, NT, S>(T, NTILES, kt0, per_warp, nt0, X, K, rows_sh, r0 >= 0, r1 >= 0, lane, \
+                                          acc, ring);                                                           \
+        else                                                                                                    \
+            __trap();                                                                                           \
+        break;
+        TF_EXL3X_SM_CASE(2)
+        TF_EXL3X_SM_CASE(3)
+        TF_EXL3X_SM_CASE(4)
+        TF_EXL3X_SM_CASE(5)
+        TF_EXL3X_SM_CASE(6)
+        TF_EXL3X_SM_CASE(7)
+        TF_EXL3X_SM_CASE(8)
+        TF_EXL3X_SM_CASE(9)
+        TF_EXL3X_SM_CASE(10)
+        TF_EXL3X_SM_CASE(11)
+        TF_EXL3X_SM_CASE(12)
+        TF_EXL3X_SM_CASE(13)
+        TF_EXL3X_SM_CASE(14)
+        TF_EXL3X_SM_CASE(15)
+        TF_EXL3X_SM_CASE(16)
+#undef TF_EXL3X_SM_CASE
+        default:
+            __trap();
+    }
+
+    // warps' partial sums through the ring's memory, added in warp order (grouped_kernel's red), half the columns at a
+    // time (half the shared memory: more blocks an SM)
+    constexpr int HC = NT * 8;                           // columns a half
+    float* red = reinterpret_cast<float*>(sm_ring);      // [W][16][HC]
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        __syncthreads();                                 // the ring (first half) or the last half's sums are free
+#pragma unroll
+        for (int i = half * NT / 2; i < (half + 1) * NT / 2; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int col = (i - half * NT / 2) * 16 + h * 8 + 2 * t;
+                red[(warp * 16 + g) * HC + col] = acc[i][h][0];
+                red[(warp * 16 + g) * HC + col + 1] = acc[i][h][1];
+                red[(warp * 16 + g + 8) * HC + col] = acc[i][h][2];
+                red[(warp * 16 + g + 8) * HC + col + 1] = acc[i][h][3];
+            }
+        __syncthreads();
+        for (int idx = threadIdx.x; idx < 16 * HC; idx += W * 32) {
+            const int row = idx / HC, col = idx % HC;
+            const int r = rows_sh[row];
+            if (r < 0) continue;
+            float s = red[row * HC + col];
+#pragma unroll
+            for (int w = 1; w < W; ++w) s += red[(w * 16 + row) * HC + col];
+            Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + half * HC + col] = s;
+        }
+    }
+}
+
+template <int CB>
+void grouped_sm_launch(const GroupedArgs& a, cudaStream_t stream) {
+    TORCH_CHECK(a.nt == 8 && a.warps == 4, "grouped_sm: the (8 n tiles, 4 warps) setting only, not nt=", a.nt,
+                " warps=", a.warps);
+    const int MT = (a.maxm + 15) / 16;
+    const int NBY = a.N / (16 * a.nt), NZ = a.mats * a.SK * MT;
+    const dim3 grid = a.order ? dim3((unsigned)(NBY * NZ), (unsigned)a.nexp_max)
+                              : dim3((unsigned)a.nexp_max, (unsigned)NBY, (unsigned)NZ);
+#define TF_LAUNCH(S_, LO_, HI_)                                                                                 \
+    do {                                                                                                        \
+        auto kernel = grouped_sm_kernel<CB, 8, 4, S_, LO_, HI_>;                                                \
+        constexpr int smem = sm_ring_bytes<8, 4, S_, HI_>();                                                    \
+        if (smem > 48 * 1024) cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);  \
+        kernel<<<grid, 128, smem, stream>>>(a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount,        \
+                                             a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, a.slots, a.order);   \
+    } while (0)
+#define TF_RANGES(S_)                                                                                           \
+    if (a.lo == 6 && a.hi == 6) TF_LAUNCH(S_, 6, 6);                                                           \
+    else if (a.lo == 8 && a.hi == 8) TF_LAUNCH(S_, 8, 8);                                                      \
+    else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(S_, 2, 10);                                                    \
+    else TF_LAUNCH(S_, 2, 16);
+    if (a.stages == 3) { TF_RANGES(3) }
+    else if (a.stages == 4) { TF_RANGES(4) }
+    else if (a.stages == 6) { TF_RANGES(6) }
+    else TORCH_CHECK(false, "grouped_sm: 3, 4 or 6 stages, not ", a.stages);
+#undef TF_RANGES
+#undef TF_LAUNCH
+}
+
 template <int CB>
 void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MT = (a.maxm + 15) / 16;
-    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+    const int NBY = a.N / (16 * a.nt), NZ = a.mats * a.SK * MT;
+    const dim3 grid = a.order ? dim3((unsigned)(NBY * NZ), (unsigned)a.nexp_max)
+                              : dim3((unsigned)a.nexp_max, (unsigned)NBY, (unsigned)NZ);
 #define TF_LAUNCH(NT_, W_, PF_, LO_, HI_)                                                                       \
     grouped_kernel<CB, NT_, W_, PF_, LO_, HI_><<<grid, W_ * 32, 0, stream>>>(                                   \
         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
-        a.slots)
+        a.slots, a.order)
 #define TF_RANGES(NT_, W_, PF_)                                                                                 \
     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(NT_, W_, PF_, 8, 8);                                                  \
     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(NT_, W_, PF_, 2, 10);                                           \

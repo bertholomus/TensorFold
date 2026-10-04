@@ -34,6 +34,16 @@ SIDE = os.environ.get("TF_GLM_SIDE", "1") != "0"
 # sums rows R r / world ..), sums them in rank order (residual_add's arithmetic) and gathers the bf16 sums back in row
 # order: 2.7x fewer bytes than "gather" (every fp32 partial to every rank, summed by residual_add), the same bits
 PROMPT_REDUCE = os.environ.get("TF_GLM_PROMPT_REDUCE") or "rows"
+# decode windows on the RDMA gather (without decode context parallelism): gather() only stages the fp32 partial and
+# residual() runs the collect and residual_add's arithmetic in one launch, never writing the gathered [world, R, D] copy
+# (1.6 MB a 16-row window) or reading it back; the same bits (TF_GLM_FUSED_RESIDUAL=0: gather, then residual_add, as
+# before). TF_RDMA_STAGE_BLOCKS: blocks that copy a staged partial (default 8; 1: one, as before)
+FUSED_RESIDUAL = os.environ.get("TF_GLM_FUSED_RESIDUAL", "1") == "1"
+STAGE_BLOCKS = int(os.environ.get("TF_RDMA_STAGE_BLOCKS") or 8)
+# decode windows of TF_GLM_REDUCE_ROWS rows or more (default 9) reduce in two hops on the RDMA gather instead (each rank
+# sends each peer only the rows that peer owns, owners sum in rank order and gather the bf16 branches back: 2.7x fewer
+# bytes, residual_add's arithmetic, the same bits; TP4 at 16 rows 82.9 -> 59.4 us a reduce + residual); 0: off
+REDUCE_ROWS = int(os.environ.get("TF_GLM_REDUCE_ROWS") or 9)
 
 
 # prompt chunks' routed experts (exl3.experts.routed's kernel): "mma3" (gate/up rotating its rows from the layer
@@ -55,6 +65,22 @@ COMM_PRIORITY = int(os.environ.get("TF_GLM_COMM_PRIORITY", "-1"))   # the comm s
 SHARED_INLINE = os.environ.get("TF_GLM_SHARED_INLINE", "1") != "0"
 
 
+class Pending:
+    """A decode window's fp32 rank partial staged on the RDMA gather (TF_GLM_FUSED_RESIDUAL): residual() collects every
+    rank's and adds them to x in one launch."""
+
+    def __init__(self, rdma, part: torch.Tensor) -> None:
+        self.rdma, self.part = rdma, part
+
+
+class PendingReduce:
+    """A decode window's fp32 rank partial on its way through the two-hop reduce (TF_GLM_REDUCE_ROWS): residual()
+    finishes it into x."""
+
+    def __init__(self, rdma, part: torch.Tensor) -> None:
+        self.rdma, self.part = rdma, part
+
+
 class Rows:
     """A prompt chunk's reduced partials as the bf16 branch residual_add would add, in row order (``done``: the comm
     stream's event when the reduction runs beside compute)."""
@@ -70,6 +96,17 @@ def gather(w: Weights, b, R: int):
     residual."""
 
     world = w.world
+    if (FUSED_RESIDUAL or REDUCE_ROWS) and not b.prefill and w.comm is not None and world > 1 \
+            and w.meta.get("dcp", 1) == 1:
+        rdma = getattr(w.comm, "rdma", None)
+        part = b.part[:R]
+        if rdma is not None and part.is_contiguous() and rdma.fits(part.reshape(-1)):
+            if REDUCE_ROWS and R >= REDUCE_ROWS:
+                rdma.reduce_stage(part.reshape(-1), R, part.shape[1], STAGE_BLOCKS)
+                return PendingReduce(rdma, part)
+            if FUSED_RESIDUAL:
+                rdma.stage(part.reshape(-1), STAGE_BLOCKS)
+                return Pending(rdma, part)
     if not (b.prefill and PROMPT_REDUCE == "rows" and w.comm is not None and world > 2):
         return flash_gather(w, b, R)                     # (two ranks would save a quarter of the bytes)
     D = b.part.shape[1]
@@ -106,7 +143,11 @@ def gather(w: Weights, b, R: int):
 def residual(x: torch.Tensor, xout: torch.Tensor, g) -> None:
     """x + the gathered partials' bf16 sum (residual_add), from fp32 partials or Rows."""
 
-    if isinstance(g, Rows):
+    if isinstance(g, Pending):
+        g.rdma.collect_residual(g.part.reshape(-1), x, xout)
+    elif isinstance(g, PendingReduce):
+        g.rdma.reduce_finish(g.part.reshape(-1), g.part.shape[0], g.part.shape[1], x, xout, STAGE_BLOCKS)
+    elif isinstance(g, Rows):
         if g.done is not None:
             torch.cuda.current_stream().wait_event(g.done)
         glue.residual_add(x, xout, g.bg.view(1, *g.bg.shape))   # one bf16 "partial": x + the branch, as residual_add
@@ -557,10 +598,12 @@ def moe_block(layer: LayerW, w: Weights, b: Buffers, R: int) -> torch.Tensor:
         # GLM-5.3 has no swiglu_limit; the bf16 activation roundings are the GLM family's. A concurrent forward of 64
         # rows or more (a batched fill) groups as a prompt chunk does, on "mma": the decode windows' bits
         rows_t = getattr(b, "rows_t", None)
+        # (the per-slot outputs y go unused here: the shared expert is added after the combine, never through y)
         x3experts.routed(b.normed[:R], b.pick[:R], b.wts[:R], m.experts.ex, b.moe, b.part[:R], R,
                          limit=math.inf, act_mode=x3experts.ACT_BF16, add=b.sy[:R] if inline else None,
                          kernel=PROMPT_EXPERTS if rows_t is None else "mma",
-                         exact_rows=1 if invariant.INVARIANT and b.prefill and rows_t is None else None)
+                         exact_rows=1 if invariant.INVARIANT and b.prefill and rows_t is None else None,
+                         y_unused=True)
     if b.side is not None:
         join(b)
     elif not inline:

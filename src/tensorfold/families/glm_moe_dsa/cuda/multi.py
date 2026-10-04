@@ -39,6 +39,11 @@ from tensorfold.cuda.streams import Stream
 from . import forward as fwd, rows as rows_mod
 
 MAX_GRAPHS = 96                  # round graphs kept (rows x passes x bucket); past it a new shape runs eager
+# each draft step's MTP forward replays a CUDA graph captured per (heads, rows, passes, bucket) on first use, as the
+# single-stream engine's drafts do (Graphs.mtp), instead of launching its ~70 kernels eagerly; the same kernels on the
+# same inputs: the same drafts (TF_GLM_MTP_GRAPHS=0: eager, as before)
+MTP_GRAPHS = os.environ.get("TF_GLM_MTP_GRAPHS", "1") == "1"
+MAX_MTP_GRAPHS = 64
 DECODE_SHARE = float(os.environ.get("TF_GLM_DECODE_SHARE") or 0.5)   # decoding's share of the time while prompts fill
 # drafts a stream chains by how many streams decode (TF_GLM_PARALLEL_DEPTH="3,3,2,2": 3 alone or beside one other, 2
 # at three or four): a round's rows grow with every stream's window, and deeper drafts pay off less as rows grow
@@ -399,6 +404,9 @@ class MultiDecoder:
             self.mbuf.rows_t, self.mbuf.stream_rows = rows_mod.Tables(rows, slots, dev), 1 + width
             self.mbuf.mhead = torch.empty((rows, w.cfg.hidden), dtype=torch.bfloat16, device=dev)
             self.mbuf.zero_first = False
+            # a draft step's head rows (one a drafting stream) where a captured MTP graph reads them
+            self.mbuf.heads = torch.zeros((slots,), dtype=torch.int64, device=dev)
+            self.mbuf.heads_host = torch.zeros((slots,), dtype=torch.int64).pin_memory()
         # a stream's prompt and its first draft chain: the single-stream engine on its slot's views
         self.one = Engine.__new__(Engine)
         one = self.one
@@ -427,12 +435,13 @@ class MultiDecoder:
         self.kept_n = 0                                  # warm slots kept so far (each slot's ``used`` stamp)
         self.chunk_s, self.since_fill = 0.0, 0.0         # rank 0's fill pacing: the last chunk's time, decoding since
         self.graphs = {} if graphs and dev.type == "cuda" else None
+        self.mtp_graphs = {} if self.graphs is not None and MTP_GRAPHS else None
         self.graph_pool = torch.cuda.graph_pool_handle() if self.graphs is not None else None
         self.link: Link | None = None                    # rank 0 with followers: each step goes to them first
         self.watch: Watchdog | None = None               # several ranks: a lost rank breaks the lane on every rank
         self.accept: dict = {}                           # TF_GLM_DEPTH_COST: each stream's draft depth by acceptance
         self.draft_stats = [[0, 0] for _ in range(10)]   # TF_GLM_DRAFT_STATS: drafts and kept ones by chain probability
-        self.rounds = {"graph": 0, "eager": 0, "captured": 0}
+        self.rounds = {"graph": 0, "eager": 0, "captured": 0, "mtp_graph": 0}
         self.round_log: list[tuple[int, int, float, int]] = []   # (streams decoding, rows, seconds, tokens) a round
         # seconds of every round's stages: plan (tables, ids), forward (replay or eager, to the sync), sample, keep
         # (acceptance, commits), draft (_draft_all), emit (take), between (the host from one round's end to the next)
@@ -1007,14 +1016,48 @@ class MultiDecoder:
         from .mtp import mtp_compute_rows
 
         mb = self.mbuf
+        k = len(heads)
         mb.staged.synchronize()
         mb.ids_host[:n].numpy()[:] = tokens
         mb.ids[:n].copy_(mb.ids_host[:n], non_blocking=True)
-        mb.staged.record()
-        out = mtp_compute_rows(self.w, self.pool, mb, n, torch.tensor(heads, dtype=torch.int64, device=mb.ids.device))
+        if self.mtp_graphs is None:
+            mb.staged.record()
+            out = mtp_compute_rows(self.w, self.pool, mb, n,
+                                   torch.tensor(heads, dtype=torch.int64, device=mb.ids.device))
+        else:
+            mb.heads_host[:k].numpy()[:] = heads
+            mb.heads[:k].copy_(mb.heads_host[:k], non_blocking=True)
+            mb.staged.record()
+            key = (k,) + mb.rows_t.key()
+            g = self.mtp_graphs.get(key)
+            if g is None and len(self.mtp_graphs) < MAX_MTP_GRAPHS:
+                g = self._capture_mtp(key, n, k)
+            if g is not None:
+                self.rounds["mtp_graph"] += 1
+                g.replay()
+                out = mb.logits[:k, :(self.w.head if self.w.draft_head is None else self.w.draft_head).n]
+            else:
+                out = mtp_compute_rows(self.w, self.pool, mb, n, mb.heads[:k])
         torch.cuda.synchronize()
         self._alive()
         return out
+
+    def _capture_mtp(self, key, n: int, k: int):
+        """A draft step's MTP forward as a CUDA graph; its warm-up runs write the same MTP cache rows the step writes (the
+        same rows of the same inputs: the same bits), as the round graphs' do."""
+
+        from .mtp import mtp_compute_rows
+
+        w, mb = self.w, self.mbuf
+        for _ in range(2):
+            mtp_compute_rows(w, self.pool, mb, n, mb.heads[:k])
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, pool=self.graph_pool):
+            mtp_compute_rows(w, self.pool, mb, n, mb.heads[:k])
+        self.mtp_graphs[key] = g
+        self.rounds["captured"] += 1
+        return g
 
     # -- followers ------------------------------------------------------------------------------------------------------
     @torch.no_grad()

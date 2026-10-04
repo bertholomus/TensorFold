@@ -23,7 +23,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_rdma_gather_v3", sources=[str(here / "rdma_gather.cu")],
+    return load(name="tensorfold_rdma_gather_v5", sources=[str(here / "rdma_gather.cu")],
                 extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
 
 
@@ -90,6 +90,37 @@ class RdmaGather:
 
     def all_gather(self, send: torch.Tensor, recv: torch.Tensor) -> None:
         self.ext.gather(self.h, send, recv)
+
+    def stage(self, send: torch.Tensor, blocks: int = 1) -> None:
+        """all_gather's first half (``blocks`` > 1: the copy over several blocks); collect_residual finishes it, and
+        nothing else may use this gather in between."""
+
+        self.ext.stage(self.h, send, int(blocks))
+
+    def collect_residual(self, own: torch.Tensor, x: torch.Tensor, xout: torch.Tensor) -> None:
+        """xout = bf16(x + bf16(every rank's partial added in rank order)): the staged gather's collect and residual_add
+        in one launch (``own``: the tensor staged)."""
+
+        self.ext.collect_residual(self.h, own, x, xout)
+
+    def reduce_stage(self, send: torch.Tensor, R: int, D: int, blocks: int = 1) -> None:
+        """The two-hop reduce's first launch: send [R, D] fp32 staged so that each peer gets the rows it owns ([R k /
+        world, R (k + 1) / world) for rank k); reduce_finish completes it, nothing else on this gather in between."""
+
+        self.ext.reduce_stage(self.h, send, int(R), int(D), int(blocks))
+
+    def reduce_finish(self, send: torch.Tensor, R: int, D: int, x: torch.Tensor, xout: torch.Tensor,
+                      blocks: int = 1) -> None:
+        """xout = bf16(x + bf16(every rank's partial in rank order)) (residual_add's arithmetic): this rank's rows
+        summed, their bf16 branch all-gathered, added to x (``send``: the tensor reduce_stage staged)."""
+
+        maxr = -(-int(R) // self.world)
+        mine = getattr(self, "_mine", None)
+        if mine is None or mine.numel() < maxr * D:
+            # first call before any graph capture (warm-up runs): the largest window's rows
+            most = max(maxr, self.max_bytes // (4 * D) // self.world + 1) * D
+            mine = self._mine = torch.zeros((most,), dtype=torch.bfloat16, device=send.device)
+        self.ext.reduce_finish(self.h, send, int(R), int(D), mine, x, xout, int(blocks))
 
     def failure(self) -> str:
         return self.ext.failure(self.h)

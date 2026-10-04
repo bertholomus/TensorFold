@@ -18,6 +18,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <pthread.h>
@@ -83,6 +84,7 @@ struct Gather {
     uint64_t* sent = nullptr;             // [slots]: the last sequence whose writes from a slot completed
     uint64_t* abort_word = nullptr;       // nonzero: every wait gives up (a peer is gone)
     uint64_t* seq = nullptr;              // device: gathers so far
+    unsigned* stage_done = nullptr;       // device: blocks of a multi-block stage that finished copying (0 between)
     uint64_t* probe = nullptr;            // device: summed ns (stage, doorbell -> flags, copy-out), count, doorbell time
     bool probing = false;
     std::vector<Nic> nics;
@@ -116,7 +118,8 @@ T* dev(T* host_ptr) {
 __global__ void __launch_bounds__(STAGE_THREADS) stage_kernel(const float4* __restrict__ src, int n4, char* send_ring,
                                                                uint64_t* sizes, uint64_t* doorbell, const uint64_t* sent,
                                                                uint64_t* seq, int slots, uint64_t max_bytes,
-                                                               uint64_t* probe, const uint64_t* abort_word) {
+                                                               uint64_t* probe, const uint64_t* abort_word,
+                                                               uint64_t word = 0) {
     __shared__ uint64_t s_seq;
     const uint64_t t0 = now_ns();
     if (threadIdx.x == 0) {
@@ -137,13 +140,195 @@ __global__ void __launch_bounds__(STAGE_THREADS) stage_kernel(const float4* __re
     if (threadIdx.x == 0) {
         __threadfence_system();
         *seq = q;
-        store_sys(sizes + slot, (uint64_t)n4 * 16);
+        store_sys(sizes + slot, word ? word : (uint64_t)n4 * 16);
         store_sys(doorbell, q);
         if (probe) {
             probe[0] += now_ns() - t0;
             probe[4] = now_ns();
         }
     }
+}
+
+// stage_kernel's work over several blocks (a concurrent round's partials are 16 rows x 6,144 floats: one block copies
+// them in ~10 us): every block waits for the slot and copies its share; the last block to finish (a device counter,
+// reset by it) publishes the sequence, the size and the doorbell, as stage_kernel's thread 0 does. No block can read the
+// sequence after it moves: the last block finishes after every block has started.
+__global__ void __launch_bounds__(STAGE_THREADS) stage_multi_kernel(const float4* __restrict__ src, int n4,
+                                                                     char* send_ring, uint64_t* sizes,
+                                                                     uint64_t* doorbell, const uint64_t* sent,
+                                                                     uint64_t* seq, unsigned* done, int slots,
+                                                                     uint64_t max_bytes, uint64_t* probe,
+                                                                     const uint64_t* abort_word, uint64_t word = 0) {
+    __shared__ uint64_t s_seq;
+    __shared__ bool s_last;
+    const uint64_t t0 = now_ns();
+    if (threadIdx.x == 0) {
+        const uint64_t q = *seq + 1;
+        const int slot = (int)(q % slots);
+        if (q > (uint64_t)slots)
+            for (uint32_t i = 1; load_sys(sent + slot) + slots < q; ++i)
+                if ((i & 1023) == 0 && load_sys(abort_word)) break;
+        s_seq = q;
+    }
+    __syncthreads();
+    const uint64_t q = s_seq;
+    const int slot = (int)(q % slots);
+    float4* dst = reinterpret_cast<float4*>(send_ring + (size_t)slot * max_bytes);
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) dst[i] = src[i];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) s_last = atomicAdd(done, 1u) == gridDim.x - 1;
+    __syncthreads();
+    if (s_last && threadIdx.x == 0) {
+        __threadfence_system();
+        *done = 0u;
+        *seq = q;
+        store_sys(sizes + slot, word ? word : (uint64_t)n4 * 16);
+        store_sys(doorbell, q);
+        if (probe) {
+            probe[0] += now_ns() - t0;
+            probe[4] = now_ns();
+        }
+    }
+}
+
+// residual_add's arithmetic (glm5_next glue._residual_add) for 4 values: the world partials added in rank order in fp32,
+// rounded to bf16 (the branch), added to x and rounded to bf16.
+template <typename Part>
+__device__ __forceinline__ void residual4(Part part, int world, const __nv_bfloat16* __restrict__ x,
+                                          __nv_bfloat16* __restrict__ xout, size_t i4) {
+    float4 acc = part(0);
+    for (int p = 1; p < world; ++p) {
+        const float4 v = part(p);
+        acc.x = __fadd_rn(acc.x, v.x);
+        acc.y = __fadd_rn(acc.y, v.y);
+        acc.z = __fadd_rn(acc.z, v.z);
+        acc.w = __fadd_rn(acc.w, v.w);
+    }
+    const uint2 xr = *reinterpret_cast<const uint2*>(x + 4 * i4);
+    const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xr.x));
+    const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xr.y));
+    const float b0 = __bfloat162float(__float2bfloat16_rn(acc.x)), b1 = __bfloat162float(__float2bfloat16_rn(acc.y));
+    const float b2 = __bfloat162float(__float2bfloat16_rn(acc.z)), b3 = __bfloat162float(__float2bfloat16_rn(acc.w));
+    __nv_bfloat162 o01 = __floats2bfloat162_rn(__fadd_rn(x01.x, b0), __fadd_rn(x01.y, b1));
+    __nv_bfloat162 o23 = __floats2bfloat162_rn(__fadd_rn(x23.x, b2), __fadd_rn(x23.y, b3));
+    uint2 o;
+    o.x = *reinterpret_cast<uint32_t*>(&o01);
+    o.y = *reinterpret_cast<uint32_t*>(&o23);
+    *reinterpret_cast<uint2*>(xout + 4 * i4) = o;
+}
+
+// collect_kernel and residual_add in one launch: wait for every peer's flag at this sequence, then x + bf16(the partials
+// in rank order) from the receive slots (and this rank's own partial), never writing the gathered [world, R, D] copy.
+__global__ void __launch_bounds__(COLLECT_THREADS) collect_residual_kernel(
+    const float4* __restrict__ own, int n4, const char* recv_ring, const uint64_t* flags, const uint64_t* seq,
+    int rank, int world, int slots, uint64_t max_bytes, const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ xout, uint64_t* probe, const uint64_t* abort_word) {
+    const uint64_t q = *seq;
+    const int slot = (int)(q % slots);
+    if (threadIdx.x < world && threadIdx.x != rank)
+        for (uint32_t i = 1; load_sys(flags + (size_t)slot * world + threadIdx.x) < q; ++i)
+            if ((i & 1023) == 0 && load_sys(abort_word)) break;
+    __syncthreads();
+    const uint64_t t2 = now_ns();
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) {
+        residual4([&](int p) -> float4 {
+                      if (p == rank) return own[i];
+                      return __ldcv(reinterpret_cast<const float4*>(recv_ring + ((size_t)slot * world + p) * max_bytes) + i);
+                  },
+                  world, x, xout, (size_t)i);
+    }
+    if (probe && blockIdx.x == 0) {
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            probe[1] += t2 - probe[4];
+            probe[2] += now_ns() - t2;
+            probe[3] += 1;
+        }
+    }
+}
+
+// -- the two-hop reduce of a decode window's partials (bf16 branches: 2.7x fewer bytes than every fp32 partial to every
+// rank), the same arithmetic as residual_add. Rank k owns rows [R k / world, R (k + 1) / world).
+__device__ __forceinline__ int row_cut(int R, int k, int world) { return (int)(((long long)R * k) / world); }
+
+__device__ __forceinline__ void wait_peers(const uint64_t* flags, int slot, int world, int rank, uint64_t q,
+                                           const uint64_t* abort_word) {
+    if (threadIdx.x < world && threadIdx.x != rank)
+        for (uint32_t i = 1; load_sys(flags + (size_t)slot * world + threadIdx.x) < q; ++i)
+            if ((i & 1023) == 0 && load_sys(abort_word)) break;
+    __syncthreads();
+}
+
+// After a scatter stage: every peer's slice of this rank's rows is at the start of its receive slot; out [rows, D] bf16 =
+// bf16(the partials added in rank order) for this rank's rows (residual_add's branch).
+__global__ void __launch_bounds__(COLLECT_THREADS) reduce_rows_kernel(
+    const float4* __restrict__ own, const char* recv_ring, const uint64_t* flags, const uint64_t* seq, int rank,
+    int world, int slots, uint64_t max_bytes, int R, int D, __nv_bfloat16* __restrict__ out, const uint64_t* abort_word) {
+    const uint64_t q = *seq;
+    const int slot = (int)(q % slots);
+    wait_peers(flags, slot, world, rank, q, abort_word);
+    const int c0 = row_cut(R, rank, world), rows = row_cut(R, rank + 1, world) - c0, D4 = D / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < rows * D4; i += gridDim.x * blockDim.x) {
+        auto part = [&](int p) -> float4 {
+            if (p == rank) return own[(size_t)c0 * D4 + i];
+            return __ldcv(reinterpret_cast<const float4*>(recv_ring + ((size_t)slot * world + p) * max_bytes) + i);
+        };
+        float4 acc = part(0);
+        for (int p = 1; p < world; ++p) {
+            const float4 v = part(p);
+            acc.x = __fadd_rn(acc.x, v.x);
+            acc.y = __fadd_rn(acc.y, v.y);
+            acc.z = __fadd_rn(acc.z, v.z);
+            acc.w = __fadd_rn(acc.w, v.w);
+        }
+        __nv_bfloat162 a = __floats2bfloat162_rn(acc.x, acc.y), b = __floats2bfloat162_rn(acc.z, acc.w);
+        uint2 o;
+        o.x = *reinterpret_cast<uint32_t*>(&a);
+        o.y = *reinterpret_cast<uint32_t*>(&b);
+        *reinterpret_cast<uint2*>(out + 4 * (size_t)i) = o;
+    }
+}
+
+// After the branch rows' all-gather: xout = bf16(x + branch) for all R rows, owner k's rows at the start of its receive
+// slot (this rank's own from ``mine``).
+__global__ void __launch_bounds__(COLLECT_THREADS) collect_rows_residual_kernel(
+    const __nv_bfloat16* __restrict__ mine, const char* recv_ring, const uint64_t* flags, const uint64_t* seq, int rank,
+    int world, int slots, uint64_t max_bytes, int R, int D, const __nv_bfloat16* __restrict__ x,
+    __nv_bfloat16* __restrict__ xout, const uint64_t* abort_word) {
+    const uint64_t q = *seq;
+    const int slot = (int)(q % slots);
+    wait_peers(flags, slot, world, rank, q, abort_word);
+    const int D4 = D / 4;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < R * D4; i += gridDim.x * blockDim.x) {
+        const int r = i / D4, c4 = i - r * D4;
+        int k = world - 1;
+        while (k > 0 && row_cut(R, k, world) > r) --k;
+        const int j = r - row_cut(R, k, world);
+        const __nv_bfloat16* src = k == rank ? mine
+            : reinterpret_cast<const __nv_bfloat16*>(recv_ring + ((size_t)slot * world + k) * max_bytes);
+        uint2 bv;
+        if (k == rank) bv = *reinterpret_cast<const uint2*>(src + (size_t)j * D + 4 * c4);
+        else bv = __ldcv(reinterpret_cast<const uint2*>(src + (size_t)j * D + 4 * c4));
+        const uint2 xr = *reinterpret_cast<const uint2*>(x + 4 * (size_t)i);
+        const float2 x01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xr.x));
+        const float2 x23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&xr.y));
+        const float2 b01 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bv.x));
+        const float2 b23 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bv.y));
+        __nv_bfloat162 o01 = __floats2bfloat162_rn(__fadd_rn(x01.x, b01.x), __fadd_rn(x01.y, b01.y));
+        __nv_bfloat162 o23 = __floats2bfloat162_rn(__fadd_rn(x23.x, b23.x), __fadd_rn(x23.y, b23.y));
+        uint2 o;
+        o.x = *reinterpret_cast<uint32_t*>(&o01);
+        o.y = *reinterpret_cast<uint32_t*>(&o23);
+        *reinterpret_cast<uint2*>(xout + 4 * (size_t)i) = o;
+    }
+}
+
+// residual4 over partials already in device memory ([world, n4] float4): the fused collect's arithmetic, for tests.
+__global__ void rank_residual_kernel(const float4* __restrict__ parts, int n4, int world,
+                                     const __nv_bfloat16* __restrict__ x, __nv_bfloat16* __restrict__ xout) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x)
+        residual4([&](int p) -> float4 { return parts[(size_t)p * n4 + i]; }, world, x, xout, (size_t)i);
 }
 
 // Wait for every peer's flag at this sequence, then copy the slots (and this rank's own source) out in rank order.
@@ -220,15 +405,21 @@ void proxy_loop(Gather* gp) {
             const uint64_t q = posted + 1;
             const int slot = (int)(q % g.slots);
             __atomic_thread_fence(__ATOMIC_ACQUIRE);
-            const uint64_t n = ((volatile uint64_t*)g.sizes)[slot];
-            const uint64_t unit = ((n / 16) / nd) * 16;   // whole 16-byte units a device, the last takes the rest
+            const uint64_t word = ((volatile uint64_t*)g.sizes)[slot];
+            // a scatter stage (bit 63; rows in bits 0-23, a row's bytes in bits 24-47): peer p gets the rows it owns,
+            // [R p / world, R (p + 1) / world), at the start of its slot for this rank; else every peer gets all n bytes
+            const bool scatter = (word >> 63) != 0;
+            const uint64_t rows = word & 0xffffffull, rowb = (word >> 24) & 0xffffffull;
             for (int d = 0; d < nd; ++d) {
-                const uint64_t off = unit * d, len = d == nd - 1 ? n - off : unit;
                 for (int p = 0; p < g.world; ++p) {
                     if (p == g.rank) continue;
+                    const uint64_t base = scatter ? rows * p / g.world * rowb : 0;
+                    const uint64_t n = scatter ? (rows * (p + 1) / g.world) * rowb - base : word;
+                    const uint64_t unit = ((n / 16) / nd) * 16;   // whole 16-byte units a device, the last the rest
+                    const uint64_t off = unit * d, len = d == nd - 1 ? n - off : unit;
                     const Peer& peer = g.peers[p];
-                    ibv_sge sge{(uint64_t)(uintptr_t)(g.send_ring + (size_t)slot * g.max_bytes + off), (uint32_t)len,
-                                g.nics[d].mr->lkey};
+                    ibv_sge sge{(uint64_t)(uintptr_t)(g.send_ring + (size_t)slot * g.max_bytes + base + off),
+                                (uint32_t)len, g.nics[d].mr->lkey};
                     ibv_send_wr wr{};
                     wr.wr_id = q;
                     wr.sg_list = &sge;
@@ -372,6 +563,8 @@ int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, co
     C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->seq), 8));
     C10_CUDA_CHECK(cudaMemset(g->seq, 0, 8));
     C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->probe), 8 * 8));
+    C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->stage_done), 4));
+    C10_CUDA_CHECK(cudaMemset(g->stage_done, 0, 4));
     C10_CUDA_CHECK(cudaMemset(g->probe, 0, 8 * 8));
     for (const auto& name : devices) g->nics.push_back(open_nic(name, *g, (int)world, (int)rank));
     g->peers.assign(world, Peer{});
@@ -505,9 +698,142 @@ void gather(int64_t h, const at::Tensor& send, at::Tensor recv) {
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// The first half of gather: send [n] (fp32) staged and announced (blocks > 1: stage_multi_kernel); collect_residual
+// finishes it. Nothing else may use this gather between the two.
+void stage(int64_t h, const at::Tensor& send, int64_t blocks) {
+    Gather& g = get(h);
+    TORCH_CHECK(send.is_cuda() && send.scalar_type() == at::kFloat && send.is_contiguous(),
+                "rdma stage: a contiguous fp32 CUDA tensor");
+    const int64_t n = send.numel();
+    TORCH_CHECK(n % 4 == 0 && (uint64_t)n * 4 <= g.max_bytes, "rdma stage: ", n, " floats (a multiple of 4, at most ",
+                g.max_bytes / 4, ")");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(send.data_ptr()) % 16 == 0, "rdma stage: a 16-byte aligned tensor");
+    if (g.failed.load()) TORCH_CHECK(false, "rdma gather: ", g.why);
+    const int n4 = (int)(n / 4);
+    uint64_t* probe = g.probing ? g.probe : nullptr;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int nb = (int)std::max<int64_t>(1, std::min<int64_t>(blocks, (n4 + STAGE_THREADS - 1) / STAGE_THREADS));
+    if (nb == 1)
+        stage_kernel<<<1, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(send.data_ptr()), n4,
+                                                      dev(g.send_ring), dev(g.sizes), dev(g.doorbell), dev(g.sent),
+                                                      g.seq, g.slots, g.max_bytes, probe, dev(g.abort_word));
+    else
+        stage_multi_kernel<<<nb, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(send.data_ptr()), n4,
+                                                             dev(g.send_ring), dev(g.sizes), dev(g.doorbell),
+                                                             dev(g.sent), g.seq, g.stage_done, g.slots, g.max_bytes,
+                                                             probe, dev(g.abort_word));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// The second half: xout [R, D] bf16 = x + bf16(every rank's partial in rank order) (residual_add's arithmetic), from the
+// receive slots of the gather the last stage started; own = this rank's partial (the tensor staged).
+void collect_residual(int64_t h, const at::Tensor& own, const at::Tensor& x, at::Tensor xout) {
+    Gather& g = get(h);
+    TORCH_CHECK(own.is_cuda() && own.scalar_type() == at::kFloat && own.is_contiguous(), "rdma collect: fp32 own");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && xout.scalar_type() == at::kBFloat16 && x.is_contiguous() &&
+                    xout.is_contiguous() && x.numel() == own.numel() && xout.numel() == own.numel(),
+                "rdma collect: x and xout bf16, contiguous, as many values as the partial");
+    TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr()) % 8 == 0 && reinterpret_cast<uintptr_t>(xout.data_ptr()) % 8 == 0,
+                "rdma collect: 8-byte aligned x and xout");
+    const int n4 = (int)(own.numel() / 4);
+    uint64_t* probe = g.probing ? g.probe : nullptr;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int blocks = std::max(1, std::min(32, (n4 + COLLECT_THREADS - 1) / COLLECT_THREADS));
+    collect_residual_kernel<<<blocks, COLLECT_THREADS, 0, stream>>>(
+        reinterpret_cast<const float4*>(own.data_ptr()), n4, dev(g.recv_ring), dev(g.flags), g.seq, g.rank, g.world,
+        g.slots, g.max_bytes, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(xout.data_ptr()), probe, dev(g.abort_word));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// The two-hop reduce of a decode window's partial send [R, D] fp32 into xout = bf16(x + bf16(the partials in rank order)):
+// a scatter stage (each peer gets its rows), reduce_rows (this rank's rows' bf16 branch into ``mine`` [ceil(R / world),
+// D]), a plain stage of ``mine`` (as fp32 words), and collect_rows_residual. ``part1``: only the first launch (the rest
+// with reduce_finish), so the partial goes out as soon as it exists.
+void reduce_stage(int64_t h, const at::Tensor& send, int64_t R, int64_t D, int64_t blocks) {
+    Gather& g = get(h);
+    TORCH_CHECK(send.is_cuda() && send.scalar_type() == at::kFloat && send.is_contiguous() && send.numel() == R * D,
+                "rdma reduce: a contiguous fp32 [R, D] partial");
+    TORCH_CHECK(D % 4 == 0 && R >= 1 && R < (1 << 24) && (uint64_t)R * D * 4 <= g.max_bytes && D * 4 < (1 << 24),
+                "rdma reduce: shape");
+    if (g.failed.load()) TORCH_CHECK(false, "rdma gather: ", g.why);
+    const int n4 = (int)(R * D / 4);
+    const uint64_t word = (1ull << 63) | ((uint64_t)(D * 4) << 24) | (uint64_t)R;
+    uint64_t* probe = g.probing ? g.probe : nullptr;
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int nb = (int)std::max<int64_t>(1, std::min<int64_t>(blocks, (n4 + STAGE_THREADS - 1) / STAGE_THREADS));
+    if (nb == 1)
+        stage_kernel<<<1, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(send.data_ptr()), n4,
+                                                      dev(g.send_ring), dev(g.sizes), dev(g.doorbell), dev(g.sent),
+                                                      g.seq, g.slots, g.max_bytes, probe, dev(g.abort_word), word);
+    else
+        stage_multi_kernel<<<nb, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(send.data_ptr()), n4,
+                                                             dev(g.send_ring), dev(g.sizes), dev(g.doorbell),
+                                                             dev(g.sent), g.seq, g.stage_done, g.slots, g.max_bytes,
+                                                             probe, dev(g.abort_word), word);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void reduce_finish(int64_t h, const at::Tensor& send, int64_t R, int64_t D, at::Tensor mine, const at::Tensor& x,
+                   at::Tensor xout, int64_t blocks) {
+    Gather& g = get(h);
+    const int maxr = (int)((R + g.world - 1) / g.world);
+    TORCH_CHECK(mine.scalar_type() == at::kBFloat16 && mine.is_contiguous() && mine.numel() >= (int64_t)maxr * D,
+                "rdma reduce: mine bf16 [ceil(R / world), D]");
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && xout.scalar_type() == at::kBFloat16 && x.is_contiguous() &&
+                    xout.is_contiguous() && x.numel() == R * D && xout.numel() == R * D, "rdma reduce: x / xout");
+    TORCH_CHECK((int64_t)maxr * D * 2 <= (int64_t)g.max_bytes && ((int64_t)maxr * D * 2) % 16 == 0, "rdma reduce: rows");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int D4 = (int)(D / 4);
+    reduce_rows_kernel<<<std::max(1, std::min(16, (maxr * D4 + COLLECT_THREADS - 1) / COLLECT_THREADS)),
+                         COLLECT_THREADS, 0, stream>>>(
+        reinterpret_cast<const float4*>(send.data_ptr()), dev(g.recv_ring), dev(g.flags), g.seq, g.rank, g.world,
+        g.slots, g.max_bytes, (int)R, (int)D, reinterpret_cast<__nv_bfloat16*>(mine.data_ptr()), dev(g.abort_word));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    // the branch rows (padded to maxr rows) all-gathered as fp32 words
+    const int n4 = (int)((int64_t)maxr * D * 2 / 16);
+    uint64_t* probe = g.probing ? g.probe : nullptr;
+    const int nb = (int)std::max<int64_t>(1, std::min<int64_t>(blocks, (n4 + STAGE_THREADS - 1) / STAGE_THREADS));
+    if (nb == 1)
+        stage_kernel<<<1, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(mine.data_ptr()), n4,
+                                                      dev(g.send_ring), dev(g.sizes), dev(g.doorbell), dev(g.sent),
+                                                      g.seq, g.slots, g.max_bytes, probe, dev(g.abort_word));
+    else
+        stage_multi_kernel<<<nb, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(mine.data_ptr()), n4,
+                                                             dev(g.send_ring), dev(g.sizes), dev(g.doorbell),
+                                                             dev(g.sent), g.seq, g.stage_done, g.slots, g.max_bytes,
+                                                             probe, dev(g.abort_word));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    collect_rows_residual_kernel<<<std::max(1, std::min(32, (int)((R * D4 + COLLECT_THREADS - 1) / COLLECT_THREADS))),
+                                   COLLECT_THREADS, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(mine.data_ptr()), dev(g.recv_ring), dev(g.flags), g.seq, g.rank,
+        g.world, g.slots, g.max_bytes, (int)R, (int)D, reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+        reinterpret_cast<__nv_bfloat16*>(xout.data_ptr()), dev(g.abort_word));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// collect_residual's arithmetic over partials in device memory ([world, ...] fp32): for tests against residual_add.
+void rank_residual(const at::Tensor& parts, const at::Tensor& x, at::Tensor xout) {
+    TORCH_CHECK(parts.is_cuda() && parts.scalar_type() == at::kFloat && parts.is_contiguous() && parts.dim() >= 2,
+                "rank_residual: fp32 [world, ...] partials");
+    const int world = (int)parts.size(0);
+    const int n4 = (int)(parts.numel() / world / 4);
+    TORCH_CHECK(x.numel() == n4 * 4 && xout.numel() == n4 * 4, "rank_residual: x / xout sizes");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    rank_residual_kernel<<<std::max(1, std::min(64, (n4 + 255) / 256)), 256, 0, stream>>>(
+        reinterpret_cast<const float4*>(parts.data_ptr()), n4, world,
+        reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<__nv_bfloat16*>(xout.data_ptr()));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("stage", &stage);
+    m.def("collect_residual", &collect_residual);
+    m.def("rank_residual", &rank_residual);
+    m.def("reduce_stage", &reduce_stage);
+    m.def("reduce_finish", &reduce_finish);
     m.def("create", &create);
     m.def("local_info", &local_info);
     m.def("connect", &link_peers);
