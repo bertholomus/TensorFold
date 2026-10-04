@@ -15,7 +15,8 @@ import torch
 
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
-from .model import KV_QUANT, RAW, Model, SeqCache, _candidates, apply_candidates, attn_in, mm, store_rows, wo_a_out
+from .model import (KV_QUANT, RAW, Model, SeqCache, _candidates, apply_candidates, attn_in, l2_fork, l2_join, mm,
+                    moe_side, store_rows, wo_a_out)
 
 BUCKET_MIN = int(os.environ.get("TF_DS_BUCKET_MIN") or 1024)
 
@@ -58,6 +59,7 @@ class StaticDecoder:
         qr = K.rmsnorm(qa, lay.q_norm, c.eps)
         q = mm(lay.wq_b, qr).view(n, m.Hl, hd)
         K.rope_heads(q, cos, sin, pos, rd)
+        l2_fork(m, lay, "attn")                                         # wo_a (and wo_b) into L2 after wq_b
         ring = sc.ring[lay.idx]
         R = sc.ring_size
         K.kv_norm_rope(ykv, lay.kv_norm, cos, sin, pos, ring, pos % R, c.eps, KV_QUANT, rd)
@@ -112,7 +114,9 @@ class StaticDecoder:
             comp = sc.comp[src]
         o = K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
-        return mm(lay.wo_b, wo_a_out(lay, o), F32)
+        out = mm(lay.wo_b, wo_a_out(lay, o), F32)
+        l2_fork(m, lay, "moe")                                          # the MoE's mHC mix, gate, shared expert
+        return out
 
     def _body(self):
         m, c, w = self.m, self.m.cfg, self.m.w
@@ -130,7 +134,7 @@ class StaticDecoder:
         comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
         shared: dict = {}
         taps = []
-        for lay in w.layers:
+        for li, lay in enumerate(w.layers):
             if lay.engram_wkv is not None and lay.idx in self.e_in:
                 kv = m.comm.sum(mm(lay.engram_wkv, self.e_in[lay.idx], F32)).to(BF16)
                 h = K.engram_gate(h, kv.contiguous(), lay.engram_qk, c.eps)
@@ -141,8 +145,11 @@ class StaticDecoder:
             K.hc_post(m.comm.gather(self._attention(lay, x, shared)), h, post, comb, h)
             fn, scale, base = lay.hc_ffn
             K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
-            K.hc_post(m.comm.gather(m.moe(lay, x)), h, post, comb, h)
+            y = m.moe(lay, x, shared_side=moe_side())               # the gate is in L2 by then
+            l2_fork(m, lay, "next", w.layers[li + 1] if li + 1 < len(w.layers) else w.head)
+            K.hc_post(m.comm.gather(y), h, post, comb, h)
             pre, pre_f = pre_f, pre
+        l2_join(m)
         xc = K.collapse_norm(h, pre.contiguous(), w.norm, c.eps)
         local = mm(w.head, xc, F32)
         g = m.comm.gather(local)

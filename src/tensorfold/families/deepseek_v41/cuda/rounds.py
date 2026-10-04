@@ -16,9 +16,10 @@ import torch
 
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
+from . import model as _model
 from .graph import BUCKET_MIN, bucket_for
-from .model import (KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, attn_in, mm, q_proj,
-                    store_rows, wo_a_out, wo_a_rot, wo_ab)
+from .model import (KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, attn_in, l2_fork,
+                    l2_join, mm, moe_side, q_proj, store_rows, wo_a_out, wo_a_rot, wo_ab)
 
 MAX_ROWS = K.DECODE_ROWS
 # TF_DS_ENGRAM_SPLIT=1 (default): a round is one graph a stretch of layers, cut before each Engram layer, so a layer's
@@ -131,6 +132,7 @@ class RoundDecoder:
         qr = K.rmsnorm(qa, lay.q_norm, c.eps)
         q = mm(lay.wq_b, qr).view(n, m.Hl, hd)
         K.rope_heads(q, cos, sin, pos, rd)
+        l2_fork(m, lay, "attn")                                         # wo_a (and wo_b) into L2 after wq_b
         ring = pool.ring[lay.idx]
         wbase = slot * RS
         K.kv_norm_rope(ykv, lay.kv_norm, cos, sin, pos, ring, wbase + pos % RS, c.eps, KV_QUANT, rd)
@@ -187,7 +189,9 @@ class RoundDecoder:
         o = K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window,
                           wbase=wbase, cbase=cbase, ring_rows=RS)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
-        return mm(lay.wo_b, wo_a_out(lay, o), F32)
+        out = mm(lay.wo_b, wo_a_out(lay, o), F32)
+        l2_fork(m, lay, "moe")                                          # the MoE's mHC mix, gate, shared expert
+        return out
 
     def _attention2(self, lay, x, shared, cos, sin):
         """_attention with the small-kernel switches (kernels.SMALL_SWITCHES): "glue" takes the round's index tensors
@@ -220,6 +224,7 @@ class RoundDecoder:
             qr = K.rmsnorm(qa, lay.q_norm, c.eps)
             q = mm(lay.wq_b, qr).view(n, m.Hl, hd)
             K.rope_heads(q, cos, sin, pos, rd)
+        l2_fork(m, lay, "attn")                                         # wo_a (and wo_b) into L2 after wq_b
         ring, wbase, comp, cidx, cbase = self._kv_idx(lay, x, ykv, ckv, cgate, shared, cos, sin, ix, iq, qr, idx_all,
                                                       kv_done=rot)
         if K.on("rot_attn"):
@@ -227,13 +232,17 @@ class RoundDecoder:
             suh, xh, gh = wo_a_rot(lay, n, x.device, hd)
             K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window,
                           wbase=wbase, cbase=cbase, ring_rows=RS, rot=(cos, sin, rd, suh, xh[0], gh))
-            return wo_ab(lay, xh=xh, fold=K.on("rot_wob"))
-        o = K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window,
-                          wbase=wbase, cbase=cbase, ring_rows=RS)
-        K.rope_heads(o, cos, sin, pos, rd, inverse=True)
-        if K.on("rot_wob"):
-            return wo_ab(lay, o)                             # wo_a's epilogue rotates for wo_b
-        return mm(lay.wo_b, wo_a_out(lay, o), F32)
+            out = wo_ab(lay, xh=xh, fold=K.on("rot_wob"))
+        else:
+            o = K.sparse_attn(q, lay.sink, ring, m._zero, True, comp, cidx, pos, hd ** -0.5, c.window,
+                              wbase=wbase, cbase=cbase, ring_rows=RS)
+            K.rope_heads(o, cos, sin, pos, rd, inverse=True)
+            if K.on("rot_wob"):
+                out = wo_ab(lay, o)                          # wo_a's epilogue rotates for wo_b
+            else:
+                out = mm(lay.wo_b, wo_a_out(lay, o), F32)
+        l2_fork(m, lay, "moe")                                          # the MoE's mHC mix, gate, shared expert
+        return out
 
     def _kv_idx(self, lay, x, ykv, ckv, cgate, shared, cos, sin, ix, iq, qr, idx_all, kv_done=False):
         """The window KV into the ring, the compressor's caches (a kv-source layer) and the indexer's selection:
@@ -365,10 +374,10 @@ class RoundDecoder:
         else:
             h, pre, x, part, pre_a, pre_f, post, comb, shared, taps = self._state
         if K.on("hc"):
-            h, pre, pre_f = self._layers_fused(w.layers[first:end], h, pre, x, part, pre_a, pre_f, post, comb, shared,
-                                               taps)
+            h, pre, pre_f = self._layers_fused(first, end, h, pre, x, part, pre_a, pre_f, post, comb, shared, taps)
         else:
-            for lay in w.layers[first:end]:
+            for li in range(first, end):
+                lay = w.layers[li]
                 if lay.engram_wkv is not None and lay.idx in self.e_in:
                     kv = m.comm.sum(mm(lay.engram_wkv, self.e_in[lay.idx], F32)).to(BF16)
                     h = K.engram_gate(h, kv.contiguous(), lay.engram_qk, c.eps)
@@ -382,8 +391,11 @@ class RoundDecoder:
                 fn, scale, base = lay.hc_ffn
                 K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb,
                          part)
-                K.hc_post(m.comm.gather(m.moe(lay, x)), h, post, comb, h)
+                y = m.moe(lay, x, shared_side=moe_side())           # the gate is in L2 by then
+                self._l2_next(li, end)
+                K.hc_post(m.comm.gather(y), h, post, comb, h)
                 pre, pre_f = pre_f, pre
+        l2_join(m)                                              # a captured stretch ends with its prefetches done
         self._idx = {}
         if end < len(w.layers):
             self._state = (h, pre, x, part, pre_a, pre_f, post, comb, shared, taps)
@@ -399,11 +411,19 @@ class RoundDecoder:
         else:
             self.taps = torch.cat(taps, -1) if taps else None
 
-    def _layers_fused(self, layers, h, pre, x, part, pre_a, pre_f, post, comb, shared, taps):
-        """The layer loop with each sublayer's hc_post fused into the next hc_pre (kernels.hc_pre2: the post written
-        into a second stream buffer, the mixes taken of it in the same programs). A post the next sublayer cannot take
-        (an Engram layer's gate reads the streams first, the stretch's end) runs alone (hc_post in place). The same
-        bits; a tap is taken of the same streams (after the fused kernel wrote them)."""
+    def _l2_next(self, li: int, end: int) -> None:
+        """After layer li's experts: the next layer's first weights into L2 (the head's after the last layer); a
+        stretch's graph waits for its last fork at its end, so that one is smaller."""
+
+        w = self.m.w
+        l2_fork(self.m, w.layers[li], "next", w.layers[li + 1] if li + 1 < len(w.layers) else w.head,
+                mb=_model.L2_STRETCH_END_MB if li + 1 == end < len(w.layers) else None)
+
+    def _layers_fused(self, first, end, h, pre, x, part, pre_a, pre_f, post, comb, shared, taps):
+        """Layers [first, end) with each sublayer's hc_post fused into the next hc_pre (kernels.hc_pre2: the post
+        written into a second stream buffer, the mixes taken of it in the same programs). A post the next sublayer
+        cannot take (an Engram layer's gate reads the streams first, the stretch's end) runs alone (hc_post in place).
+        The same bits; a tap is taken of the same streams (after the fused kernel wrote them)."""
 
         m, c = self.m, self.m.cfg
         view = self.table
@@ -422,7 +442,8 @@ class RoundDecoder:
             spare = h
             return out
 
-        for lay in layers:
+        for li in range(first, end):
+            lay = m.w.layers[li]
             if lay.engram_wkv is not None and lay.idx in self.e_in:
                 if pending is not None:
                     K.hc_post(pending, h, post, comb, h)
@@ -445,7 +466,9 @@ class RoundDecoder:
                     taps.append(h.to(F32).mean(1).to(BF16))
             pending = m.comm.gather(self._attention(lay, x, shared, cos, sin))
             h = pre_mix(h, lay.hc_ffn, pre_a, lay.ffn_norm, pre_f)
-            pending = m.comm.gather(m.moe(lay, x))
+            y = m.moe(lay, x, shared_side=moe_side())               # the gate is in L2 by then
+            self._l2_next(li, end)
+            pending = m.comm.gather(y)
             pre, pre_f = pre_f, pre
         if pending is not None:
             K.hc_post(pending, h, post, comb, h)

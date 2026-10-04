@@ -230,7 +230,8 @@ class Scratch:
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
            group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None,
-           kernel: str | None = None, decode: str | None = None) -> torch.Tensor:
+           kernel: str | None = None, decode: str | None = None,
+           before_down: torch.cuda.Event | None = None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts`` (plus
     ``add`` [R, D] fp32 added last, in the same launch, when given).
 
@@ -239,6 +240,10 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     several member rows (``kernel``, default PROMPT_KERNEL), every row's arithmetic the one-tile launch's (the same
     bits) for "mma" and "rows"; "mma2" / "mma3" sum in their own order. Decode windows take ``decode`` (default DECODE):
     "fused", "cp" or "old", the same bits.
+
+    ``before_down``: an event the launches wait for before the ones that read the per-slot outputs of slots this call
+    does not compute (picks >= E, whose y the caller writes into ``s.y``, e.g. from another stream): the fused decode
+    waits just before its down launch, every other path before its first launch.
     """
 
     ext = _ext()
@@ -254,7 +259,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
             and getattr(s, "cnt_gu", None) is not None and s.y is not None
             and tuple(s.cfg_gu[:2]) == (8, 4) and tuple(s.cfg_d[:3]) == (8, 4, 1) and I % 128 == 0 and D % 128 == 0
             and slots <= 32 and R <= 128 and x.stride(1) == 1):
-        return _routed_fused(ext, x, pick, wts, ex, s, out, R, ids, members, limit, act_mode, add)
+        return _routed_fused(ext, x, pick, wts, ex, s, out, R, ids, members, limit, act_mode, add, before_down)
+    if before_down is not None:
+        torch.cuda.current_stream().wait_event(before_down)
     fast = chunk and (PROMPT if prompt is None else prompt) and all(
         n % (16 * t[0]) == 0 for n, t in ((I, PROMPT_TILES["gateup"]), (D, PROMPT_TILES["down"])))
     if fast:
@@ -353,7 +360,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     return out
 
 
-def _routed_fused(ext, x, pick, wts, ex, s, out, R, ids, members, limit, act_mode, add):
+def _routed_fused(ext, x, pick, wts, ex, s, out, R, ids, members, limit, act_mode, add, before_down=None):
     """routed()'s decode window in three launches (DECODE "fused"): the six launches' arithmetic, in the same order."""
 
     D, I, E, slots = ex.dims, ex.width, ex.count, s.slots
@@ -372,6 +379,8 @@ def _routed_fused(ext, x, pick, wts, ex, s, out, R, ids, members, limit, act_mod
                        P, s.cfg_gu[2], slots, ex.cb, DECODE_STAGES, ex.k2_gu[0], ex.k2_gu[1], 1, pick, E, ex.svh_g,
                        ex.svh_u, ex.suh_d, s.xd, float(limit), act_mode, s.y, s.no_y, s.no_y, s.no_y, 0, 0, 1,
                        s.cnt_gu, int(DECODE_PDL), s.ready, s.ready_cnt, s.epoch, ready)
+    if before_down is not None:            # the slots computed elsewhere: their y is in s.y before down combines
+        torch.cuda.current_stream().wait_event(before_down)
     ext.grouped_decode(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
                        D, P, 1, slots, ex.cb, DECODE_STAGES, ex.k2_d[0], ex.k2_d[1], 2, pick, E, ex.svh_d, ex.svh_d,
                        ex.svh_d, s.xd, float(limit), act_mode, s.y, w, a, o, int(has_wts), int(has_add), 1, s.cnt_d,

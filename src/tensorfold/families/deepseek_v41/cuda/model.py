@@ -113,6 +113,92 @@ EXACT_MM = os.environ.get("TF_DS_EXACT_MM", "0") == "1"     # test mode: fp32 de
 GROUPED = os.environ.get("TF_DS_GROUPED_LINEAR", "1") != "0"
 
 
+# Decode-window overlap (decode bodies: rounds.py, graph.py; the MoE: Model.moe). None of it changes an operation, an
+# input or an order: every output has the bits of the plain sequence, and every row stays independent of the window.
+# TF_DS_L2_PREFETCH=1 (default): weights the kernels ahead read are pulled into L2 on a side stream (exl3/prefetch.py,
+# paced waves) while the main stream runs kernels that leave DRAM idle: after wq_b, wo_a's slices then wo_b for the
+# attention kernels' span; after wo_b, the MoE's mHC mix, gate and shared expert during the gather and the norms; after
+# the experts, the next layer's Engram projection (when Engram runs), mHC mix, input projections and wq_b (the head
+# after the last layer) during the gather and the norms. Each fork's bytes are capped (TF_DS_L2_{ATTN,MOE,NEXT}_MB; L2
+# is 24 MB on GB10). TF_DS_L2_PREFETCH=0: no fork, no join, no side stream (the plain decode graphs).
+L2_PREFETCH = os.environ.get("TF_DS_L2_PREFETCH", "1") != "0"
+# TF_DS_SHARED_OVERLAP=1 (default 0): a decode body's MoE (Model.moe(..., shared_side=True)) runs the shared expert on
+# a side stream from the MoE input on, beside the gate's matmul, the routing and the routed experts' gate/up (the shared
+# expert needs no routing); its per-slot output lands where the routed launches' combine reads a slot they do not
+# compute, and the routed down launch waits for it. (On the one-GPU proxy it is level with prefetching the shared
+# expert's trellises in the "moe" fork, which it replaces.)
+SHARED_OVERLAP = os.environ.get("TF_DS_SHARED_OVERLAP", "0") == "1"
+L2_ATTN_MB = int(os.environ.get("TF_DS_L2_ATTN_MB") or 16)
+L2_MOE_MB = int(os.environ.get("TF_DS_L2_MOE_MB") or 16)
+L2_NEXT_MB = int(os.environ.get("TF_DS_L2_NEXT_MB") or 16)
+
+
+def _l2_tensors(model, lay, kind: str, nxt=None) -> list:
+    """The weights a fork prefetches, in the order the kernels after it read them; ``nxt`` for "next": the next layer,
+    or the head (an Exl3Linear) after the last layer. (The grouped launches and q_proj's group read these same
+    tensors: an Exl3Group keeps each layer's own words.)"""
+
+    if kind == "attn":
+        return [wo.words for wo in lay.wo_a] + [lay.wo_b.words]
+    if kind == "moe":
+        ex = lay.experts
+        e = ex.count
+        # the shared expert's trellises unless SHARED_OVERLAP computes it beside the gate (it streams them itself then)
+        shared = [ex.keep[e - 1], ex.keep[2 * e - 1], ex.keep[3 * e - 1]] if len(ex.keep) == 3 * e else []
+        return [lay.hc_ffn[0], lay.gate_w] + ([] if SHARED_OVERLAP else shared)
+    if kind == "next" and nxt is not None:
+        if not hasattr(nxt, "wq_a"):                                    # the head
+            return [nxt.words]
+        engram = [nxt.engram_wkv.words] if nxt.engram_wkv is not None and model.engram is not None else []
+        comp = [nxt.comp_wkv.words if nxt.comp_wkv is not None and nxt.ratio else None,
+                nxt.comp_wgate.words if nxt.comp_wgate is not None and nxt.ratio else None]
+        return engram + [nxt.hc_attn[0], nxt.wq_a.words, nxt.wkv.words] + comp + [nxt.wq_b.words]
+    return []
+
+
+# a "next" fork that ends a captured stretch (rounds.py, before an Engram layer): the graph waits for it at its end
+L2_STRETCH_END_MB = 4
+
+
+def l2_fork(model, lay, kind: str, nxt=None, after: torch.cuda.Event | None = None, mb: int | None = None) -> None:
+    """Decode bodies: prefetch what follows ``kind`` ("attn" after wq_b, "moe" after wo_b, "next" after the experts,
+    ``nxt`` the next layer or the head) into L2 on the model's side stream (L2_PREFETCH; a no-op otherwise), once the
+    current stream's work so far (and ``after``, when given) is done; at most ``mb`` MiB when given, else the kind's
+    budget."""
+
+    if not L2_PREFETCH or EXACT_MM:
+        return
+    from tensorfold.cuda.exl3 import prefetch as PF
+
+    budget = (mb if mb is not None else {"attn": L2_ATTN_MB, "moe": L2_MOE_MB, "next": L2_NEXT_MB}.get(kind, 0)) << 20
+    if budget <= 0:
+        return
+    key = (kind, budget, id(nxt), SHARED_OVERLAP, model.engram is not None)
+    cache = lay.__dict__.setdefault("_tf_l2", {})
+    rng = cache.get(key)
+    if rng is None:
+        rng = cache[key] = PF.ranges(_l2_tensors(model, lay, kind, nxt), budget)
+    side = model.__dict__.get("_tf_l2_side")
+    if side is None:
+        side = model._tf_l2_side = PF.SideStream()
+    side.fork(rng, after)
+
+
+def moe_side() -> bool:
+    """Whether the decode bodies' MoE runs the shared expert on its side stream (Model.moe(shared_side=...)): only
+    when the "moe" fork has put the layer's gate into L2 first."""
+
+    return SHARED_OVERLAP and L2_PREFETCH and L2_MOE_MB > 0
+
+
+def l2_join(model) -> None:
+    """The current stream waits for every prefetch forked so far (before a captured body ends)."""
+
+    side = model.__dict__.get("_tf_l2_side")
+    if side is not None:
+        side.join()
+
+
 def _had(device) -> torch.Tensor:
     h = getattr(_had, "h", None)
     if h is None:
@@ -818,7 +904,11 @@ class Model:
         return t
 
     # -- MoE -------------------------------------------------------------------------------------------------------
-    def moe(self, lay, x: torch.Tensor, topk: int | None = None, img: torch.Tensor | None = None) -> torch.Tensor:
+    def moe(self, lay, x: torch.Tensor, topk: int | None = None, img: torch.Tensor | None = None,
+            shared_side: bool = False) -> torch.Tensor:
+        """fp32 partial [n, d] of the MoE. ``shared_side`` (the decode bodies, which prefetch this layer's mHC mix and
+        gate into L2 first): with SHARED_OVERLAP a decode window's shared expert runs on a side stream (_shared_side).
+        (Without the gate in L2 the side stream's DRAM traffic slows the gate's matmul by more than it overlaps.)"""
         c = self.cfg
         n = x.shape[0]
         topk = topk or c.topk
@@ -827,6 +917,11 @@ class Model:
         vl = getattr(lay, "gate_b_vl", None)
         if img is not None and vl is None:
             vl = lay.gate_b                   # no VL bias in this pack: image rows route as text (warned at load)
+        side_done = None
+        if shared_side and KERNELS and SHARED_OVERLAP and not EXACT_MM and n < exl3_experts.EXACT_ROWS:
+            # the shared expert starts now on the side stream; the routing marks its slot as computed elsewhere
+            side_done = self._shared_side(lay, x, n, slots)
+            shared_id = lay.experts.count
         if KERNELS:
             # decode / verify windows: the row-invariant matmul; prompt chunks: one cuBLAS GEMM
             pick = torch.empty((n, slots), dtype=torch.int32, device=x.device)
@@ -851,6 +946,14 @@ class Model:
             wts = wts * c.route_scale
             pick = torch.cat([ind, torch.full((n, 1), shared_id, dtype=ind.dtype, device=x.device)], 1).to(torch.int32)
             wts = torch.cat([wts, torch.ones((n, 1), dtype=F32, device=x.device)], 1).contiguous()
+        s = self._moe_scratch(lay, n, slots)
+        if EXACT_MM:
+            return self._moe_exact(lay, x, pick, wts)
+        out = exl3_experts.routed(x.contiguous(), pick.contiguous(), wts, lay.experts, s, None, n,
+                                  limit=c.swiglu_limit, act_mode=exl3_experts.ACT_F32, before_down=side_done)
+        return out                                                        # fp32 partial [n, d]
+
+    def _moe_scratch(self, lay, n: int, slots: int) -> "exl3_experts.Scratch":
         prompt = n >= 64
         skey = ("moe", slots, lay.experts.count, prompt)
         s = self.scratch.get(skey)
@@ -862,11 +965,35 @@ class Model:
             self.scratch.pop(skey, None)
             s = exl3_experts.Scratch(lay.experts, rows=max(n, 64) if not prompt else n, slots=slots, prompt=prompt)
             self.scratch[skey] = s
-        if EXACT_MM:
-            return self._moe_exact(lay, x, pick, wts)
-        out = exl3_experts.routed(x.contiguous(), pick.contiguous(), wts, lay.experts, s, None, n,
-                                  limit=c.swiglu_limit, act_mode=exl3_experts.ACT_F32)
-        return out                                                        # fp32 partial [n, d]
+        return s
+
+    def _shared_side(self, lay, x: torch.Tensor, n: int, slots: int) -> torch.cuda.Event:
+        """SHARED_OVERLAP: the shared expert of x's n rows on the side stream, from now on: exl3_experts.routed with
+        only the shared slot picked (the last; the routed slots marked >= E), no weights, writing each row's shared
+        per-slot output into the decode scratch's y (shared with the side scratch), where the routed call's combine
+        reads the slot it does not compute. Returns the event the routed down launch waits for."""
+
+        ex = lay.experts
+        s = self._moe_scratch(lay, n, slots)
+        key = ("moe_side", slots, ex.count)
+        ss = self.scratch.get(key)
+        if ss is None:
+            # its own buffers, counters and readiness flags; y is the decode scratch's (made once, never replaced)
+            ss = exl3_experts.Scratch(ex, rows=64, slots=slots)
+            ss.y = s.y
+            ss.pick = torch.full((64, slots), ex.count, dtype=torch.int32, device=x.device)
+            ss.pick[:, -1] = ex.count - 1
+            self.scratch[key] = ss
+        side = self.__dict__.get("_tf_moe_side")
+        if side is None:
+            side = self._tf_moe_side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            exl3_experts.routed(x.contiguous(), ss.pick[:n], None, ex, ss, None, n, limit=self.cfg.swiglu_limit,
+                                act_mode=exl3_experts.ACT_F32)
+        done = torch.cuda.Event()
+        done.record(side)
+        return done
 
     def _moe_exact(self, lay, x, pick, wts):
         """Test mode: each picked expert dequantized to fp32 (the reference's arithmetic, split by rank)."""
