@@ -1,9 +1,9 @@
 # GLM-5.3-Flash TP4 per-rank weight math
 
-Checkpoint: `/tank/models/llm/banked/GLM-5.3-BF16` (config.json).
+Checkpoint: `<BF16_DIR>` (config.json).
 Quant recipe: `convert.py -b 3.0 -hq` — routed experts average 3.0 bpw, attention 5 bpw,
 dense MLP 4 bpw, output head 6 bpw, final average 3.04 bpw.
-Target: 4x GB10 (121 GiB each, `ascent-01..04`), TP world = 4 (`TF_TP_WORLD=4`),
+Target: 4x GB10 (121 GiB each, `spark1..04`), TP world = 4 (`TF_TP_WORLD=4`),
 budget ~94 GiB/rank for weights + KV. Every number below is an exact integer byte count
 divided by 4 ranks; GiB = bytes / 2^30. Re-derive with `python tools/verify_shape_math.py`.
 

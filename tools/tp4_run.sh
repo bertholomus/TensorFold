@@ -1,10 +1,10 @@
 #!/bin/bash
-# Run one command on every TP4 rank (ascent-01..04, rank 0 = A1) in throwaway containers, e.g. tf_profile.py.
+# Run one command on every TP4 rank (spark1..spark4, rank 0 = spark1) in throwaway containers, e.g. tf_profile.py.
 # "{rank}" in CMD becomes each node's rank. Stop the tf-tp4 lane first: each rank needs the GPU's memory.
-# usage: tp4_run.sh NAME "CMD"     (logs: ssh ascent-01 docker logs NAME; NCCL_DEBUG=INFO tp4_run.sh ... for transport)
+# usage: tp4_run.sh NAME "CMD"     (logs: ssh spark1 docker logs NAME; NCCL_DEBUG=INFO tp4_run.sh ... for transport)
 NAME=$1
 CMD=$2
-# RDMA device names: spark-os (kindling, 64 KiB kernel) names every node's ports rocep1s0f0 / roceP2p1s0f0; DGX OS named
+# RDMA device names: some OS images names every node's ports rocep1s0f0 / roceP2p1s0f0; DGX OS named
 # the first two nodes' ports mlx5_0 / mlx5_2. Read them from each node as tp4_start.sh does.
 declare -A HCA
 for n in 1 2 3 4; do

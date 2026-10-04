@@ -1,7 +1,7 @@
 #!/bin/bash
-# Acceptance gate for the live TP4 lane, run on ascent-01: wait for it to serve, greedy equality against the serial
+# Acceptance gate for the live TP4 lane, run on spark1: wait for it to serve, greedy equality against the serial
 # reference (tf_greedy.py), then tf_bench.py, then the engine's decode lines. Output: opt/gate_LABEL.log.
-# usage (on ascent-01): bash ~/ai/glm53-tf/TensorFold/tools/tf_gate.sh LABEL [REFERENCE_JSON]
+# usage (on spark1): bash ~/ai/glm53-tf/TensorFold/tools/tf_gate.sh LABEL [REFERENCE_JSON]
 LABEL=$1
 REF=${2:-$HOME/ai/glm53-tf/opt/greedy_serial.ref.json}
 cd ~/ai/glm53-tf || exit 1

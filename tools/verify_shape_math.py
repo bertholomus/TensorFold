@@ -7,7 +7,7 @@ Recipe: convert.py -b 3.0 -hq  (experts 3.0, attn 5, dense 4, head 6 bpw)
 import json
 from pathlib import Path
 
-CFG = json.loads(Path("/tank/models/llm/banked/GLM-5.3-BF16/config.json").read_text())
+CFG = json.loads(Path("<BF16_DIR>/config.json").read_text())
 D = CFG["hidden_size"]
 L = CFG["num_hidden_layers"]
 H = CFG["num_attention_heads"]

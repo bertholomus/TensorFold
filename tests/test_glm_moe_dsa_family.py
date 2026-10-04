@@ -24,7 +24,7 @@ torch = pytest.importorskip("torch")
 if torch.cuda.is_available():          # these tests must never touch a GPU even where one exists
     pytest.skip("CPU-only glm_moe_dsa family tests", allow_module_level=True)
 
-REAL_CONFIG = Path("/tank/models/llm/banked/GLM-5.3-BF16/config.json")
+REAL_CONFIG = Path(os.environ.get("GLM53_BF16_DIR", "/models/GLM-5.3-BF16")) / "config.json"
 REAL_DIR = REAL_CONFIG.parent
 
 
@@ -359,7 +359,7 @@ def test_kernel_glue_imports_stay_lazy():
 
 # ---------------------------------------------------------------- our 3.0 bpw conversion's layout (headers only)
 
-QUANT_WORK = Path("/tank/projects/deepspec-cache/quants/glm53-exl3-3.0bpw-work/qtensors")
+QUANT_WORK = Path(os.environ.get("GLM53_QUANT_WORK", "/models/glm53-exl3-3.0bpw-work")) / "qtensors"
 
 
 def _headers(path: Path) -> dict:

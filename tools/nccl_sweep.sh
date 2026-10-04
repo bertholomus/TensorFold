@@ -19,7 +19,7 @@ for entry in "${CONFIGS[@]}"; do
   mode=${entry#*|}
   vars=""
   [ "$cfg" != "base" ] && vars="${cfg//@DUAL/$DUAL}"
-  env $vars timeout 180 python3 "$HERE/nccl_bench.py" "$RANK" 4 10.200.10.1 "$PORT" "$cfg" "$mode" 2>&1 \
+  env $vars timeout 180 python3 "$HERE/nccl_bench.py" "$RANK" 4 10.0.0.1 "$PORT" "$cfg" "$mode" 2>&1 \
     | grep -E "^\[|Error|error|assert" | grep -v "NCCL WARN"
   PORT=$((PORT + 1))
   sleep 2
