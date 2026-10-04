@@ -39,6 +39,21 @@ MMA_KB = 4                        # experts_grouped.cuh's MMA_KB
 # grouped_mma3's gate/up columns a program: 4 (512, a TP4 rank's whole width: the rows rotated once a mat; 5.3 against
 # 6.1 ms a 2,048-row layer at 2) or 2 (256)
 MMA3_NW = int(os.environ.get("TF_EXL3_MMA3_NW") or 4)
+# decode windows (fewer than EXACT_ROWS rows), every row's bits the same in all three:
+#   "fused": three launches: decode_prep (grouping + gate/up's input rotation), grouped_decode for gate/up with the gate/up
+#            epilogue in the program that completes each (expert, 128 columns), grouped_decode for down with each slot's
+#            output and the rows' combine in it (GB10, a DeepSeek-V4.1 TP2 rank's layer, 1-16 rows: 7-13% faster than
+#            "old", 225-242 GB/s from DRAM; tools/dsv41/expert_decode_bench.py);
+#   "cp":    the six launches with grouped_cp_kernel (trellis words copied 16 bytes a lane through shared memory);
+#   "old":   the six launches with grouped_kernel (4-byte lane loads).
+DECODE = os.environ.get("TF_EXL3_DECODE") or "fused"
+DECODE_STAGES = 3                 # each warp's ring of shared-memory stages (grouped_cp_launch's one setting)
+# fused decode: gate/up and down launched as programmatic dependents (sm_90+: a grid starts on the SMs its predecessor
+# frees; down copies its first trellis steps before it waits)
+DECODE_PDL = os.environ.get("TF_EXL3_DECODE_PDL", "1") != "0"
+# fused decode with DECODE_PDL: each down program waits only for its own expert's rows (published by the gate/up program
+# that finishes the expert's epilogues) instead of the whole gate/up grid, so down overlaps gate/up's last programs
+DECODE_READY = os.environ.get("TF_EXL3_DECODE_READY", "1") != "0"
 
 
 @lru_cache(maxsize=1)
@@ -47,7 +62,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v12", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v13", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -96,6 +111,7 @@ class Exl3RoutedExperts:
     k2_d: tuple[int, int]
     trellis_bytes: torch.Tensor   # int64 [E], gate + up + down trellis bytes of each expert (for GB/s)
     keep: list = field(default_factory=list, repr=False)
+    aligned16: bool = False       # every trellis starts on a 16-byte boundary (the decode kernel's 16-byte copies)
 
     def nbytes_read(self, ids: Sequence[int]) -> int:
         return int(self.trellis_bytes[list(ids)].sum())
@@ -136,9 +152,10 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
         return out
 
     tb = torch.tensor([(D * I // 256) * (gks[e] + uks[e] + dks[e]) * 16 for e in range(E)], dtype=torch.int64)
+    aligned = all(t.data_ptr() % 16 == 0 for t in keep)
     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
-                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep)
+                             (min(gks + uks), max(gks + uks)), (min(dks), max(dks)), tb, keep, aligned)
 
 
 def prepare_stacked(gt: torch.Tensor, ut: torch.Tensor, dt: torch.Tensor, suh_g, suh_u, svh_g, svh_u, suh_d, svh_d,
@@ -187,6 +204,15 @@ class Scratch:
         self.y = None if prompt else torch.zeros((P, D), dtype=torch.float32, device=device)
         self.no_y = torch.zeros((1,), dtype=torch.float32, device=device)       # a pointer for calls that skip y
         maxu = min(P, ex.count)
+        # the fused decode launches' counters, one per (expert place, 128 columns of I) and per (row, 128 columns of D);
+        # zero between launches (each launch's last program of a block resets its counter)
+        self.cnt_gu = None if prompt else torch.zeros((maxu * max(1, I // 128),), dtype=torch.int32, device=device)
+        self.cnt_d = None if prompt else torch.zeros((rows * max(1, D // 128),), dtype=torch.int32, device=device)
+        # ... and the experts' readiness for down (DECODE_READY): a launch number, the number an expert's rows were last
+        # published under, the epilogues done so far
+        self.epoch = torch.zeros((1,), dtype=torch.int32, device=device)
+        self.ready = torch.zeros((max(1, maxu),), dtype=torch.int32, device=device)
+        self.ready_cnt = torch.zeros((max(1, maxu),), dtype=torch.int32, device=device)
         self.ids = torch.zeros((maxu,), dtype=torch.int32, device=device)
         self.count = torch.zeros((1,), dtype=torch.int32, device=device)
         self.counts = torch.zeros((ex.count,), dtype=torch.int32, device=device)     # members an expert (prompt chunks)
@@ -204,14 +230,15 @@ class Scratch:
 def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Exl3RoutedExperts, s: Scratch,
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
            group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None,
-           kernel: str | None = None) -> torch.Tensor:
+           kernel: str | None = None, decode: str | None = None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts`` (plus
     ``add`` [R, D] fp32 added last, in the same launch, when given).
 
     Decode windows make no host sync. Prompt chunks (``group`` and R >= EXACT_ROWS) read the busiest expert's row count
     once; with ``prompt`` (default TF_EXL3_PROMPT_TILES) they group in parallel and decode each weight tile once for
     several member rows (``kernel``, default PROMPT_KERNEL), every row's arithmetic the one-tile launch's (the same
-    bits) for "mma" and "rows"; "mma2" / "mma3" sum in their own order.
+    bits) for "mma" and "rows"; "mma2" / "mma3" sum in their own order. Decode windows take ``decode`` (default DECODE):
+    "fused", "cp" or "old", the same bits.
     """
 
     ext = _ext()
@@ -222,6 +249,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         raise ValueError(f"{R} rows but the scratch holds {s.rows}")
     ids, members = s.window(R)
     chunk = group and R >= EXACT_ROWS
+    mode = DECODE if decode is None else decode
+    if (mode == "fused" and group and not chunk and getattr(ex, "aligned16", False)
+            and getattr(s, "cnt_gu", None) is not None and s.y is not None
+            and tuple(s.cfg_gu[:2]) == (8, 4) and tuple(s.cfg_d[:3]) == (8, 4, 1) and I % 128 == 0 and D % 128 == 0
+            and slots <= 32 and R <= 128 and x.stride(1) == 1):
+        return _routed_fused(ext, x, pick, wts, ex, s, out, R, ids, members, limit, act_mode, add)
     fast = chunk and (PROMPT if prompt is None else prompt) and all(
         n % (16 * t[0]) == 0 for n, t in ((I, PROMPT_TILES["gateup"]), (D, PROMPT_TILES["down"])))
     if fast:
@@ -274,8 +307,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         ext.grouped_rows(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
                          I, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_gu[0], ex.k2_gu[1], 1)
     else:
+        cp = DECODE_STAGES if (mode != "old" and ex.aligned16 and nt == 8 and w == 4) else 0
         ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                    P, sk, slots, ex.cb, nt, w, pf, ex.k2_gu[0], ex.k2_gu[1])
+                    P, sk, slots, ex.cb, nt, w, cp or pf, ex.k2_gu[0], ex.k2_gu[1], int(cp > 0))
     ext.gateup_epilogue(s.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, s.xd, R, P, I, 1 if fast else sk, slots, E,
                         float(limit), act_mode)
     nt, w, sk, pf = s.cfg_d
@@ -304,8 +338,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         ext.grouped_rows(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
                          I, D, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_d[0], ex.k2_d[1], 0)
     else:
+        cp = DECODE_STAGES if (mode != "old" and ex.aligned16 and nt == 8 and w == 4) else 0
         ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
-                    D, P, sk, slots, ex.cb, nt, w, pf, ex.k2_d[0], ex.k2_d[1])
+                    D, P, sk, slots, ex.cb, nt, w, cp or pf, ex.k2_d[0], ex.k2_d[1], int(cp > 0))
     if wts is None:
         ext.down_epilogue(s.z, pick, ex.svh_d, s.y, R, P, D, dsk, slots, E)
         return s.y[:P]
@@ -316,6 +351,32 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     ext.down_combine(s.z, pick, ex.svh_d, s.no_y if fast else s.y, wts, s.no_y if add is None else add, out, R, P, D,
                      dsk, slots, E, 0 if fast else 1, int(add is not None))
     return out
+
+
+def _routed_fused(ext, x, pick, wts, ex, s, out, R, ids, members, limit, act_mode, add):
+    """routed()'s decode window in three launches (DECODE "fused"): the six launches' arithmetic, in the same order."""
+
+    D, I, E, slots = ex.dims, ex.width, ex.count, s.slots
+    P = R * slots
+    has_wts = wts is not None
+    has_add = has_wts and add is not None
+    if has_wts and out is None:
+        out = torch.empty((R, D), dtype=torch.float32, device=x.device)
+    o = out if has_wts else s.no_y
+    w = wts if has_wts else s.no_y
+    a = add if has_add else s.no_y
+    ready = int(DECODE_PDL and DECODE_READY)
+    ext.decode_prep(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, ids, s.count, members, R, D, slots, E, w,
+                    s.y, a, o, int(has_wts), int(has_add), 1, s.epoch, ready)
+    ext.grouped_decode(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
+                       P, s.cfg_gu[2], slots, ex.cb, DECODE_STAGES, ex.k2_gu[0], ex.k2_gu[1], 1, pick, E, ex.svh_g,
+                       ex.svh_u, ex.suh_d, s.xd, float(limit), act_mode, s.y, s.no_y, s.no_y, s.no_y, 0, 0, 1,
+                       s.cnt_gu, int(DECODE_PDL), s.ready, s.ready_cnt, s.epoch, ready)
+    ext.grouped_decode(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
+                       D, P, 1, slots, ex.cb, DECODE_STAGES, ex.k2_d[0], ex.k2_d[1], 2, pick, E, ex.svh_d, ex.svh_d,
+                       ex.svh_d, s.xd, float(limit), act_mode, s.y, w, a, o, int(has_wts), int(has_add), 1, s.cnt_d,
+                       int(DECODE_PDL), s.ready, s.ready_cnt, s.epoch, ready)
+    return out if has_wts else s.y[:P]
 
 
 def dequant(trellis: torch.Tensor, codebook: int | str) -> torch.Tensor:

@@ -4,7 +4,7 @@
 void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                         const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&,
                         int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                        int64_t, int64_t);
+                        int64_t, int64_t, int64_t);
 void exl3x_grouped_rows_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
@@ -43,6 +43,18 @@ void exl3x_down_combine_cuda(const at::Tensor&, const at::Tensor&, const at::Ten
                              const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                              int64_t);
 
+void exl3x_decode_prep_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                            at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t,
+                            int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t,
+                            int64_t, int64_t, at::Tensor&, int64_t);
+void exl3x_grouped_decode_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                               const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                               const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                               int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&, int64_t,
+                               const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, double, int64_t,
+                               at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t,
+                               int64_t, at::Tensor&, int64_t, at::Tensor&, at::Tensor&, at::Tensor&, int64_t);
+
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
                 ": expected a contiguous CUDA tensor of the right dtype");
@@ -51,7 +63,8 @@ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
 void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
              const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
-             int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi) {
+             int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo, int64_t hi,
+             int64_t cp) {
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -66,7 +79,7 @@ void grouped(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, 
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt, warps,
-                       pf, lo, hi);
+                       pf, lo, hi, cp);
 }
 
 void grouped_rows(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
@@ -292,9 +305,108 @@ void down_combine(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor&
     exl3x_down_combine_cuda(Z, pick, svh_d, y, wts, add, out, rows, P, D, SK, slots, E, store_y, has_add);
 }
 
+void decode_prep(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
+                 const at::Tensor& suh1, at::Tensor out0, at::Tensor out1, at::Tensor uids, at::Tensor ucount,
+                 at::Tensor members, int64_t rows, int64_t K, int64_t slots, int64_t E, const at::Tensor& wts,
+                 const at::Tensor& y, const at::Tensor& add, at::Tensor out, int64_t has_wts, int64_t has_add,
+                 int64_t store_y, at::Tensor epoch, int64_t has_epoch) {
+    TORCH_CHECK(x.is_cuda() && x.stride(1) == 1, "x: rows of contiguous values");
+    check(pick, at::kInt, "pick");
+    check(suh0, at::kHalf, "suh0");
+    check(suh1, at::kHalf, "suh1");
+    check(out0, at::kHalf, "out0");
+    check(out1, at::kHalf, "out1");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    TORCH_CHECK(out0.numel() >= rows * slots * K && out1.numel() >= rows * slots * K, "rotated rows too small");
+    TORCH_CHECK(pick.numel() >= rows * slots, "pick too small");
+    TORCH_CHECK(uids.numel() >= std::min<int64_t>(rows * slots, E), "uids too small");
+    TORCH_CHECK(members.size(1) >= 1, "members");
+    if (has_wts) {
+        check(wts, at::kFloat, "wts");
+        check(y, at::kFloat, "y");
+        check(out, at::kFloat, "out");
+        TORCH_CHECK(out.dim() == 2 && out.size(0) >= rows, "out [rows, D]");
+        TORCH_CHECK(y.numel() >= rows * slots * out.size(1), "y too small");
+        if (has_add) check(add, at::kFloat, "add");
+    }
+    c10::cuda::CUDAGuard guard(x.device());
+    if (has_epoch) check(epoch, at::kInt, "epoch");
+    exl3x_decode_prep_cuda(x, x_stride, pick, suh0, suh1, out0, out1, uids, ucount, members, rows, K, slots, E, wts, y,
+                           add, out, has_wts, has_add, store_y, epoch, has_epoch);
+}
+
+void grouped_decode(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                    const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+                    const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P,
+                    int64_t SK, int64_t slots, int64_t cb, int64_t stages, int64_t lo, int64_t hi, int64_t epi,
+                    const at::Tensor& pick, int64_t E, const at::Tensor& svh0, const at::Tensor& svh1,
+                    const at::Tensor& suh_d, at::Tensor xd, double limit, int64_t act_mode, at::Tensor y,
+                    const at::Tensor& wts, const at::Tensor& add, at::Tensor out, int64_t has_wts, int64_t has_add,
+                    int64_t store_y, at::Tensor cnt, int64_t pdl, at::Tensor ready, at::Tensor ready_cnt,
+                    at::Tensor epoch, int64_t use_ready) {
+    check(X0, at::kHalf, "X0");
+    check(X1, at::kHalf, "X1");
+    check(TP0, at::kLong, "TP0");
+    check(TP1, at::kLong, "TP1");
+    check(B0, at::kInt, "B0");
+    check(B1, at::kInt, "B1");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(Z, at::kFloat, "Z");
+    check(pick, at::kInt, "pick");
+    check(cnt, at::kInt, "cnt");
+    if (use_ready) {
+        check(ready, at::kInt, "ready");
+        check(ready_cnt, at::kInt, "ready_cnt");
+        check(epoch, at::kInt, "epoch");
+    }
+    TORCH_CHECK(epi >= 0 && epi <= 2, "epi 0, 1 or 2");
+    TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
+    TORCH_CHECK(epi == 2 || Z.numel() >= mats * SK * P * N, "Z too small");
+    TORCH_CHECK(pick.numel() >= P, "pick too small");
+    TORCH_CHECK(P % slots == 0, "P = rows x slots");
+    if (epi == 1) {
+        TORCH_CHECK(mats == 2, "the gate/up epilogue takes gate and up");
+        check(svh0, at::kHalf, "svh_g");
+        check(svh1, at::kHalf, "svh_u");
+        check(suh_d, at::kHalf, "suh_d");
+        check(xd, at::kHalf, "xd");
+        TORCH_CHECK(xd.numel() >= P * N, "xd too small");
+    } else if (epi == 2) {
+        check(svh0, at::kHalf, "svh_d");
+        check(y, at::kFloat, "y");
+        TORCH_CHECK(y.numel() >= P * N, "y too small");
+        if (has_wts) {
+            check(wts, at::kFloat, "wts");
+            check(out, at::kFloat, "out");
+            TORCH_CHECK(wts.numel() >= P && out.numel() >= (P / slots) * N, "wts / out too small");
+            if (has_add) check(add, at::kFloat, "add");
+        }
+    }
+    c10::cuda::CUDAGuard guard(X0.device());
+    exl3x_grouped_decode_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb,
+                              stages, lo, hi, epi, pick, E, svh0, svh1, suh_d, xd, limit, act_mode, y, wts, add, out,
+                              has_wts, has_add, store_y, cnt, pdl, ready, ready_cnt, epoch, use_ready);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("grouped", &grouped);
+    m.def("grouped", &grouped, py::arg("X0"), py::arg("X1"), py::arg("TP0"), py::arg("TP1"), py::arg("B0"),
+          py::arg("B1"), py::arg("uids"), py::arg("ucount"), py::arg("members"), py::arg("Z"), py::arg("mats"),
+          py::arg("K"), py::arg("N"), py::arg("P"), py::arg("SK"), py::arg("slots"), py::arg("cb"), py::arg("nt"),
+          py::arg("warps"), py::arg("pf"), py::arg("lo"), py::arg("hi"), py::arg("cp") = 0);
     m.def("grouped_rows", &grouped_rows);
+    m.def("grouped_decode", &grouped_decode, py::arg("X0"), py::arg("X1"), py::arg("TP0"), py::arg("TP1"),
+          py::arg("B0"), py::arg("B1"), py::arg("uids"), py::arg("ucount"), py::arg("members"), py::arg("Z"),
+          py::arg("mats"), py::arg("K"), py::arg("N"), py::arg("P"), py::arg("SK"), py::arg("slots"), py::arg("cb"),
+          py::arg("stages"), py::arg("lo"), py::arg("hi"), py::arg("epi"), py::arg("pick"), py::arg("E"),
+          py::arg("svh0"), py::arg("svh1"), py::arg("suh_d"), py::arg("xd"), py::arg("limit"), py::arg("act_mode"),
+          py::arg("y"), py::arg("wts"), py::arg("add"), py::arg("out"), py::arg("has_wts"), py::arg("has_add"),
+          py::arg("store_y"), py::arg("cnt"), py::arg("pdl"), py::arg("ready"), py::arg("ready_cnt"),
+          py::arg("epoch"), py::arg("use_ready"));
+    m.def("decode_prep", &decode_prep);
     m.def("grouped_mma", &grouped_mma);
     m.def("grouped_mma2", &grouped_mma2);
     m.def("grouped_mma3", &grouped_mma3);

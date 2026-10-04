@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
@@ -18,7 +19,8 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v3", sources=[str(here / "linear.cpp"), str(here / "linear.cu")],
+    return load(name="tensorfold_exl3_linear_v4",
+                sources=[str(here / "linear.cpp"), str(here / "linear.cu"), str(here / "linear_grouped.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
 
@@ -184,12 +186,95 @@ class Exl3Linear:
                    self.counters, self.k2, CODEBOOK_IDS[self.codebook], sk, wk)
         return out
 
+    def grouped(self, x: torch.Tensor, out: torch.Tensor | None = None,
+                out_dtype: torch.dtype | None = None) -> torch.Tensor:
+        """The same y as ``__call__`` (bit for bit) through the grouped kernels (``Exl3Group`` of this layer alone):
+        x and ``out`` may be row-strided views, and both launches are programmatic dependent launches."""
+
+        if self.split[1] not in (4, 8):                     # a plan the grouped kernels do not take
+            return self(x.contiguous(), out=out, out_dtype=out_dtype)
+        g = getattr(self, "_group1", None)
+        if g is None:
+            g = self._group1 = Exl3Group([self])
+        return g([x], None if out is None else [out], [out_dtype or x.dtype])[0]
+
     def unpack(self, out: torch.Tensor | None = None) -> torch.Tensor:
         """W_q [K, N] fp16 decoded on the GPU from either layout, into ``out`` when given."""
 
         w = out if out is not None else torch.empty((self.k, self.n), dtype=torch.float16, device=self.words.device)
         _ext().unpack(self.words, w, *self.strides, self.k2, CODEBOOK_IDS[self.codebook])
         return w
+
+
+def _rows(x: torch.Tensor) -> torch.Tensor:
+    """x as the grouped kernel reads rows: unit column stride, 16-byte aligned rows a multiple of 4 elements apart."""
+
+    if x.dim() == 2 and x.stride(1) == 1 and x.stride(0) % 4 == 0 and x.data_ptr() % 16 == 0:
+        return x
+    return x.contiguous()
+
+
+# grouped launches as programmatic dependent launches (sm_90+): each may start while the kernel before it finishes,
+# reading only weights until that kernel is done (TF_EXL3_PDL=0: plain launches); the bits are the same either way
+PDL = os.environ.get("TF_EXL3_PDL", "1") != "0"
+
+
+class Exl3Group:
+    """Up to ``glinear_max()`` EXL3 layers of the same rows in few launches (``linear_grouped.cu``): one ``rot_many``
+    launch rotating every layer's input (each its own suh), then one ``glinear`` launch for each (bits, codebook, warps
+    a program) set. A layer keeps its own plan, K ranges and reduction order, so every output has the bits of the
+    layer's own ``__call__``, whatever shares the launch. Inputs and outputs may be row-strided views (unit column
+    stride, 16-byte aligned rows): the slices of one tensor in, column blocks of one tensor out, no copies."""
+
+    def __init__(self, layers: list):
+        self.layers = list(layers)
+        if len({id(layer) for layer in self.layers}) != len(self.layers):
+            raise ValueError("a layer may appear once in a group (its split-K counters are its own)")
+        for layer in self.layers:
+            if layer.split[1] not in (4, 8):
+                raise ValueError(f"grouped launches take 4 or 8 warps a program, not {layer.split[1]}")
+        self.cap = int(_ext().glinear_max())
+        if len(self.layers) > self.cap:
+            raise ValueError(f"at most {self.cap} layers a group")
+        self.suh = [layer.suh for layer in self.layers]
+        sets: dict = {}
+        for i, layer in enumerate(self.layers):
+            sets.setdefault((layer.k2, CODEBOOK_IDS[layer.codebook], layer.split[1]), []).append(i)
+        self.launches = []
+        for (k2, cb, wk), part in sets.items():
+            ls = [self.layers[i] for i in part]
+            self.launches.append((part, k2, cb, wk, [la.words for la in ls], [la.strides[0] for la in ls],
+                                  [la.strides[1] for la in ls], [la.svh for la in ls], [la.bias for la in ls],
+                                  [la.counters for la in ls], [la.split[0] for la in ls], [la.n for la in ls]))
+
+    def __call__(self, xs: list, outs: list | None = None, out_dtypes: list | None = None) -> list:
+        """ys[i] [M, N_i] = xs[i] [M, K_i] @ W_i + bias_i for M = 1..128 (the same tensor may be every layer's input);
+        ``outs`` are written in place when given, else made with ``out_dtypes`` (default: the input's dtype)."""
+
+        if len(xs) != len(self.layers):
+            raise ValueError(f"{len(self.layers)} inputs expected, got {len(xs)}")
+        m = xs[0].shape[0]
+        dev = xs[0].device
+        for x, layer in zip(xs, self.layers):
+            if x.dim() != 2 or x.shape[1] != layer.k or x.shape[0] != m or not 1 <= m <= 128:
+                raise ValueError(f"x must be [{m} (1..128), {layer.k}], got {tuple(x.shape)}")
+        if outs is None:
+            outs = [torch.empty((m, layer.n), dtype=(out_dtypes[i] if out_dtypes else None) or xs[i].dtype,
+                                device=dev) for i, layer in enumerate(self.layers)]
+        ext = _ext()
+        ks = [layer.k for layer in self.layers]
+        buf = torch.empty((m * sum(ks),), dtype=torch.float16, device=dev)
+        xh, o = [], 0
+        for k in ks:                                          # one buffer, each layer's rows 16-byte aligned (K % 128)
+            xh.append(buf[o:o + m * k].view(m, k))
+            o += m * k
+        ext.rot_many([_rows(x) for x in xs], self.suh, xh, PDL)
+        for part, k2, cb, wk, words, s_k, s_nb, svh, bias, counters, sks, ns in self.launches:
+            zn = sum(sk * m * n for sk, n in zip(sks, ns) if sk > 1)
+            z = torch.empty((zn,), dtype=torch.float32, device=dev) if zn else None
+            ext.glinear([xh[i] for i in part], words, s_k, s_nb, svh, bias, [outs[i] for i in part], z, counters, sks,
+                        k2, cb, wk, PDL)
+        return outs
 
 
 def unpack_cuda(trellis: torch.Tensor, codebook: str) -> torch.Tensor:

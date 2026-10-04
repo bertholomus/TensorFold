@@ -338,6 +338,100 @@ __global__ void combine_y_kernel(const __nv_bfloat16* __restrict__ Y, const int*
     *reinterpret_cast<float4*>(out + (size_t)r * D + d) = o;
 }
 
+// Decode windows' first launch: block 0 groups the picks (group_kernel's output: distinct experts < E in id order,
+// members row * 32 + slot in row order, -1 after the last), each pick in parallel: its expert's place is the number of
+// distinct routed experts with a smaller id, its member position the number of earlier picks of the same expert; with
+// wts it also combines the rows that route no slot (down_combine's arithmetic: their slots' y, or 0). The other blocks
+// run rot_in_kernel's programs, a warp each (the same arithmetic).
+constexpr int PREP_THREADS = 256;
+
+template <typename TIN>
+__global__ void __launch_bounds__(PREP_THREADS) decode_prep_kernel(
+    const TIN* __restrict__ x, int x_stride, const int* __restrict__ pick, const half* __restrict__ suh0,
+    const half* __restrict__ suh1, half* __restrict__ out0, half* __restrict__ out1, int K, int slots, int E, int R,
+    int* __restrict__ uids, int* __restrict__ ucount, int* __restrict__ members, int maxm,
+    const float* __restrict__ wts, const float* __restrict__ y, const float* __restrict__ add, float* __restrict__ out,
+    int D, int store_y, int* __restrict__ epoch) {
+    const int n = R * slots;
+    asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory");   // gate/up (it waits for this grid's end)
+    if (blockIdx.x == 0 && threadIdx.x == 0 && epoch != nullptr) epoch[0] += 1;     // this launch's number
+    if (blockIdx.x == 0) {
+        extern __shared__ int sh_prep[];
+        int* sp = sh_prep;
+        int* first = sh_prep + n;
+        for (int i = threadIdx.x; i < n; i += PREP_THREADS) sp[i] = pick[i];
+        __syncthreads();
+        for (int i = threadIdx.x; i < n; i += PREP_THREADS) {
+            const int e = sp[i];
+            int f = e >= 0 && e < E;
+            for (int j = 0; f && j < i; ++j) f = sp[j] != e;
+            first[i] = f;
+        }
+        __syncthreads();
+        int used = 0;
+        for (int i = threadIdx.x; i < n; i += PREP_THREADS) {
+            const int e = sp[i];
+            if (e < 0 || e >= E) continue;
+            int place = 0, pos = 0, tot = 0;
+            for (int j = 0; j < n; ++j) {
+                const int ej = sp[j];
+                place += first[j] && ej < e;
+                tot += ej == e;
+                pos += ej == e && j < i;
+            }
+            if (pos < maxm) members[place * maxm + pos] = (i / slots) * 32 + (i % slots);
+            if (first[i]) {
+                uids[place] = e;
+                for (int k = tot; k < maxm; ++k) members[place * maxm + k] = -1;
+                ++used;
+            }
+        }
+        __shared__ int used_sh;
+        if (threadIdx.x == 0) used_sh = 0;
+        __syncthreads();
+        if (used) atomicAdd(&used_sh, used);
+        __syncthreads();
+        if (threadIdx.x == 0) ucount[0] = used_sh;
+        if (wts == nullptr) return;
+        for (int r = 0; r < R; ++r) {
+            int routed = 0;
+            for (int q = 0; q < slots; ++q) routed += sp[r * slots + q] >= 0 && sp[r * slots + q] < E;
+            if (routed) continue;
+            for (int d = threadIdx.x * 4; d < D; d += PREP_THREADS * 4) {
+                float acc[4] = {0.f, 0.f, 0.f, 0.f};
+                for (int q = 0; q < slots; ++q) {
+                    const float w = wts[r * slots + q];
+#pragma unroll
+                    for (int j = 0; j < 4; ++j)
+                        acc[j] = fmaf(w, store_y ? y[((size_t)r * slots + q) * D + d + j] : 0.f, acc[j]);
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    out[(size_t)r * D + d + j] = add ? __fadd_rn(acc[j], add[(size_t)r * D + d + j]) : acc[j];
+            }
+        }
+        return;
+    }
+    // rot_in_kernel's program (member row p, 128-block blk, matrix mat), one a warp
+    const int nblk = K / 128;
+    const int item = (blockIdx.x - 1) * (PREP_THREADS / 32) + (threadIdx.x >> 5);
+    if (item >= n * nblk * 2) return;
+    const int p = item / (nblk * 2), mat = (item / nblk) % 2, blk = item % nblk;
+    const int row = p / slots;
+    const int e = pick[p];
+    if (e < 0 || e >= E) return;
+    const int lane = threadIdx.x & 31;
+    const half* suh = (mat ? suh1 : suh0) + (size_t)e * K + blk * 128 + 4 * lane;
+    const TIN* xr = x + (size_t)row * x_stride + blk * 128 + 4 * lane;
+    float v[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) v[j] = to_f<TIN>(xr[j]) * __half2float(suh[j]);
+    fwht128(v, lane);
+    half* o = (mat ? out1 : out0) + (size_t)p * K + blk * 128 + 4 * lane;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
 }  // namespace
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -346,6 +440,9 @@ namespace tf_exl3x {
 extern template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_launch<2>(const GroupedArgs&, cudaStream_t);
+extern template void grouped_cp_launch<0>(const GroupedArgs&, const DecodeEpi&, int, int, cudaStream_t);
+extern template void grouped_cp_launch<1>(const GroupedArgs&, const DecodeEpi&, int, int, cudaStream_t);
+extern template void grouped_cp_launch<2>(const GroupedArgs&, const DecodeEpi&, int, int, cudaStream_t);
 extern template void grouped_rows_launch<0>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_rows_launch<1>(const GroupedArgs&, cudaStream_t);
 extern template void grouped_rows_launch<2>(const GroupedArgs&, cudaStream_t);
@@ -370,7 +467,7 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
                         const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                         const at::Tensor& members, at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P,
                         int64_t SK, int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t lo,
-                        int64_t hi) {
+                        int64_t hi, int64_t cp) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -387,10 +484,19 @@ void exl3x_grouped_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Te
     a.nexp_max = (int)uids.size(0);
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
     auto stream = at::cuda::getCurrentCUDAStream();
-    if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
-    else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
-    else if (cb == 2) tf_exl3x::grouped_launch<2>(a, stream);
-    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    if (cp) {
+        // the 16-byte copies need every trellis 16-byte aligned (checked once per layer by the caller)
+        const tf_exl3x::DecodeEpi ep;
+        if (cb == 0) tf_exl3x::grouped_cp_launch<0>(a, ep, 0, 0, stream);
+        else if (cb == 1) tf_exl3x::grouped_cp_launch<1>(a, ep, 0, 0, stream);
+        else if (cb == 2) tf_exl3x::grouped_cp_launch<2>(a, ep, 0, 0, stream);
+        else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    } else {
+        if (cb == 0) tf_exl3x::grouped_launch<0>(a, stream);
+        else if (cb == 1) tf_exl3x::grouped_launch<1>(a, stream);
+        else if (cb == 2) tf_exl3x::grouped_launch<2>(a, stream);
+        else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    }
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -671,5 +777,102 @@ void exl3x_down_combine_cuda(const at::Tensor& Z, const at::Tensor& pick, const 
         Z.data_ptr<float>(), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
         y.data_ptr<float>(), wts.data_ptr<float>(), has_add ? add.data_ptr<float>() : nullptr, out.data_ptr<float>(),
         (int)P, (int)D, (int)SK, (int)E, (int)slots, (int)store_y);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_decode_prep_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
+                            const at::Tensor& suh1, at::Tensor& out0, at::Tensor& out1, at::Tensor& uids,
+                            at::Tensor& ucount, at::Tensor& members, int64_t rows, int64_t K, int64_t slots, int64_t E,
+                            const at::Tensor& wts, const at::Tensor& y, const at::Tensor& add, at::Tensor& out,
+                            int64_t has_wts, int64_t has_add, int64_t store_y, at::Tensor& epoch, int64_t has_epoch) {
+    TORCH_CHECK(slots <= 32, "at most 32 slots a row");
+    TORCH_CHECK(K % 128 == 0, "K a multiple of 128");
+    const int n = (int)(rows * slots);
+    const size_t smem = (size_t)2 * n * sizeof(int);
+    TORCH_CHECK(smem <= 48 * 1024, "decode prep: ", n, " picks are too many for one grouping block");
+    const int items = n * (int)(K / 128) * 2;
+    const unsigned blocks = 1 + (unsigned)((items + PREP_THREADS / 32 - 1) / (PREP_THREADS / 32));
+    const int D = has_wts ? (int)out.size(1) : 0;
+    TORCH_CHECK(!has_wts || D % 4 == 0, "decode prep: D a multiple of 4");
+    auto stream = at::cuda::getCurrentCUDAStream();
+    auto s0 = reinterpret_cast<const half*>(suh0.data_ptr());
+    auto s1 = reinterpret_cast<const half*>(suh1.data_ptr());
+    auto o0 = reinterpret_cast<half*>(out0.data_ptr());
+    auto o1 = reinterpret_cast<half*>(out1.data_ptr());
+    const float* w = has_wts ? wts.data_ptr<float>() : nullptr;
+    const float* yp = has_wts ? y.data_ptr<float>() : nullptr;
+    const float* ad = has_add ? add.data_ptr<float>() : nullptr;
+    float* op = has_wts ? out.data_ptr<float>() : nullptr;
+#define TF_PREP(T_)                                                                                             \
+    decode_prep_kernel<T_><<<blocks, PREP_THREADS, smem, stream>>>(                                             \
+        reinterpret_cast<const T_*>(x.data_ptr()), (int)x_stride, pick.data_ptr<int>(), s0, s1, o0, o1, (int)K,  \
+        (int)slots, (int)E, (int)rows, uids.data_ptr<int>(), ucount.data_ptr<int>(), members.data_ptr<int>(),    \
+        (int)members.size(1), w, yp, ad, op, D, (int)store_y, has_epoch ? epoch.data_ptr<int>() : nullptr)
+    if (x.scalar_type() == at::kBFloat16) TF_PREP(__nv_bfloat16);
+    else TF_PREP(half);
+#undef TF_PREP
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// grouped_cp_kernel with a decode epilogue: epi 1 (gate/up: svh0 = svh_g, svh1 = svh_u, suh_d, xd), epi 2 (down, one
+// split: svh0 = svh_d, y, and with has_wts the combine into out, + add with has_add); pdl: launched as a programmatic
+// dependent; use_ready: down waits per expert (ready, ready_cnt, epoch: the scratch's, epoch counted by decode_prep)
+void exl3x_grouped_decode_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0,
+                               const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
+                               const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members,
+                               at::Tensor& Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots,
+                               int64_t cb, int64_t stages, int64_t lo, int64_t hi, int64_t epi, const at::Tensor& pick,
+                               int64_t E, const at::Tensor& svh0, const at::Tensor& svh1, const at::Tensor& suh_d,
+                               at::Tensor& xd, double limit, int64_t act_mode, at::Tensor& y, const at::Tensor& wts,
+                               const at::Tensor& add, at::Tensor& out, int64_t has_wts, int64_t has_add,
+                               int64_t store_y, at::Tensor& cnt, int64_t pdl, at::Tensor& ready,
+                               at::Tensor& ready_cnt, at::Tensor& epoch, int64_t use_ready) {
+    TORCH_CHECK(K % (16 * SK * 4) == 0 && N % 128 == 0, "K and N must split evenly");
+    tf_exl3x::GroupedArgs a;
+    a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
+    a.x1 = reinterpret_cast<const half*>(X1.data_ptr());
+    a.tp0 = TP0.data_ptr<int64_t>();
+    a.tp1 = TP1.data_ptr<int64_t>();
+    a.k2_0 = B0.data_ptr<int>();
+    a.k2_1 = B1.data_ptr<int>();
+    a.uids = uids.data_ptr<int>();
+    a.ucount = ucount.data_ptr<int>();
+    a.members = members.data_ptr<int>();
+    a.z = Z.data_ptr<float>();
+    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
+    a.nexp_max = (int)uids.size(0);
+    a.mats = (int)mats; a.nt = 8; a.warps = 4; a.pf = (int)stages; a.lo = (int)lo; a.hi = (int)hi;
+    tf_exl3x::DecodeEpi ep;
+    if (use_ready) {
+        ep.ready = ready.data_ptr<int>();
+        ep.ready_cnt = ready_cnt.data_ptr<int>();
+        ep.epoch = epoch.data_ptr<int>();
+        TORCH_CHECK(ready.numel() >= a.nexp_max && ready_cnt.numel() >= a.nexp_max, "ready flags too small");
+    }
+    ep.pick = pick.data_ptr<int>();
+    ep.E = (int)E;
+    ep.cnt = cnt.data_ptr<int>();
+    if (epi == 1) {
+        ep.svh_g = reinterpret_cast<const half*>(svh0.data_ptr());
+        ep.svh_u = reinterpret_cast<const half*>(svh1.data_ptr());
+        ep.suh_d = reinterpret_cast<const half*>(suh_d.data_ptr());
+        ep.xd = reinterpret_cast<half*>(xd.data_ptr());
+        ep.limit = (float)limit;
+        ep.act_mode = (int)act_mode;
+        TORCH_CHECK(cnt.numel() >= a.nexp_max * (N / 128), "decode counters too small");
+    } else if (epi == 2) {
+        ep.svh_d = reinterpret_cast<const half*>(svh0.data_ptr());
+        ep.y = y.data_ptr<float>();
+        ep.wts = has_wts ? wts.data_ptr<float>() : nullptr;
+        ep.add = has_add ? add.data_ptr<float>() : nullptr;
+        ep.out = has_wts ? out.data_ptr<float>() : nullptr;
+        ep.store_y = (int)store_y;
+        TORCH_CHECK(cnt.numel() >= (P / slots) * (N / 128), "decode counters too small");
+    }
+    auto stream = at::cuda::getCurrentCUDAStream();
+    if (cb == 0) tf_exl3x::grouped_cp_launch<0>(a, ep, (int)epi, (int)pdl, stream);
+    else if (cb == 1) tf_exl3x::grouped_cp_launch<1>(a, ep, (int)epi, (int)pdl, stream);
+    else if (cb == 2) tf_exl3x::grouped_cp_launch<2>(a, ep, (int)epi, (int)pdl, stream);
+    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

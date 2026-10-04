@@ -3,6 +3,7 @@
 
 namespace tf_exl3x {
 template void grouped_launch<0>(const GroupedArgs&, cudaStream_t);
+template void grouped_cp_launch<0>(const GroupedArgs&, const DecodeEpi&, int, int, cudaStream_t);
 template void grouped_rows_launch<0>(const GroupedArgs&, cudaStream_t);
 template void grouped_mma_launch<0>(const GroupedArgs&, cudaStream_t);
 template void grouped_mma2_launch<0>(const GroupedArgs&, cudaStream_t);

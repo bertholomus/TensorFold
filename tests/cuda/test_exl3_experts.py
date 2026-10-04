@@ -7,6 +7,10 @@
 - Mixed-K layers (a bit width per expert matrix, codebooks 3inst / mcg / mul1): each row gives identical bits alone
   and inside windows of 1, 2, 3, 16, 17, 64 and 128 rows, and agrees with a float64 reference.
 - A layer captured in CUDA graphs at 1, 2, 4 and 8 rows replays to exactly the eager call's output.
+- The decode windows' three paths (routed(decode=...): "old" grouped_kernel in six launches, "cp" grouped_cp_kernel in
+  six launches, "fused" in three launches with the epilogues and the combine inside, with and without programmatic
+  dependent launch and per-expert readiness) give the same bits, row by row, alone and inside windows, eager and in
+  CUDA graphs replayed many times on one scratch.
 """
 
 from __future__ import annotations
@@ -329,7 +333,8 @@ def test_fused_down_and_combine_equal_the_separate_launches(slots):
         P, sk = R * slots, scratch.cfg_d[2]
 
         scratch.y[:P].copy_(shared)
-        fused = experts.routed(x, sel, w, ex, scratch, None, R).clone()
+        # the six-launch path ("old"): the fused decode path never writes the down partials to scratch.z
+        fused = experts.routed(x, sel, w, ex, scratch, None, R, decode="old").clone()
         y_fused = scratch.y[:P].clone()
         # the same call's down projection output is still in scratch.z: finish it with the two separate launches
         scratch.y[:P].copy_(shared)
@@ -385,3 +390,118 @@ def test_lane_map_extracts_every_window():
                         off = end(p_last, k2) - end(p, k2)
                         assert off + 16 <= 64, (k2, lane, g, j, off)
                         assert (mm >> off) & 0xFFFF == state(p), (k2, lane, g, j)
+
+
+# ----------------------------------------------------------------------------------------- decode window paths
+
+DECODE_FLAGS = [
+    ("old", {}),
+    ("cp", {}),
+    ("fused", {"DECODE_PDL": False, "DECODE_READY": False}),
+    ("fused", {"DECODE_PDL": True, "DECODE_READY": False}),
+    ("fused", {"DECODE_PDL": True, "DECODE_READY": True}),
+]
+
+
+class _flags:
+    def __init__(self, mod, flags):
+        self.mod, self.flags = mod, flags
+
+    def __enter__(self):
+        self.old = {k: getattr(self.mod, k) for k in self.flags}
+        for k, v in self.flags.items():
+            setattr(self.mod, k, v)
+
+    def __exit__(self, *a):
+        for k, v in self.old.items():
+            setattr(self.mod, k, v)
+
+
+@pytest.mark.parametrize("name,cb,kfun", MIXED[:2] + MIXED[3:], ids=["mul1a", "mul1b", "3inst"])
+def test_decode_paths_are_bit_identical(name, cb, kfun):
+    """Every decode path, per-slot outputs (wts None) and combined rows (with and without add), with non-routed slots
+    (a caller's y) and a row that routes nothing, 1 to 63 rows: the same bits as "old"."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, SLOTS = 40, 512, 256, 8
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=41 + cb)
+    assert ex.aligned16
+    g = torch.Generator().manual_seed(17)
+    scratch = {i: experts.Scratch(ex, 64, SLOTS) for i in range(len(DECODE_FLAGS))}
+    for trial, R in enumerate((1, 2, 3, 5, 8, 13, 16, 17, 31, 63)):
+        x = torch.randn((R, D), generator=g).to(torch.bfloat16).cuda()
+        sel, w = _picks(E, R, SLOTS, g, shared=False)
+        sel = sel.clone()
+        sel[:, -1] = E                                     # a non-routed slot in every row (its y is the caller's)
+        if R > 2:
+            sel[1, :] = E + 3                              # a row that routes nothing
+        add = torch.randn((R, D), generator=g).float().cuda() if trial % 2 else None
+        caller_y = torch.randn((R * SLOTS, D), generator=g).float().cuda()
+        act = experts.ACT_F32 if trial % 3 else experts.ACT_BF16
+        res = []
+        for i, (mode, flags) in enumerate(DECODE_FLAGS):
+            with _flags(experts, flags):
+                s = scratch[i]
+                s.y[:R * SLOTS].copy_(caller_y)
+                out = experts.routed(x, sel, w, ex, s, None, R, limit=7.0, act_mode=act, add=add, decode=mode).clone()
+                s.y[:R * SLOTS].copy_(caller_y)
+                y = experts.routed(x, sel, None, ex, s, None, R, limit=7.0, act_mode=act, decode=mode).clone()
+            res.append((out, y))
+        torch.cuda.synchronize()
+        assert torch.isfinite(res[0][0]).all()
+        for i in range(1, len(DECODE_FLAGS)):
+            assert torch.equal(res[i][0].view(torch.int32), res[0][0].view(torch.int32)), (name, R, DECODE_FLAGS[i])
+            assert torch.equal(res[i][1].view(torch.int32), res[0][1].view(torch.int32)), (name, R, DECODE_FLAGS[i])
+
+
+def test_fused_decode_rows_are_independent_and_graphs_replay_exactly():
+    """The fused path: each row alone against inside windows of 2 to 16 rows from a pool in random order (torch.equal),
+    and graphs captured at 1, 2, 4, 6, 8 and 16 rows on one scratch replayed in turn many times (the counters, launch
+    number and readiness flags they share carry over from replay to replay) equal the eager call."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK, SLOTS = 48, 512, 256, 6, 7
+    _, cb, kfun = MIXED[0]
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=51)
+    g = torch.Generator().manual_seed(23)
+    n = 40
+    x = torch.randn((n, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _picks(E - 1, n, TOPK, g, shared=True)                  # slot 6: expert E - 1 (a shared expert)
+    scratch = experts.Scratch(ex, 64, SLOTS)
+    rnd = random.Random(5)
+
+    def run(idx):
+        return experts.routed(x[idx].contiguous(), sel[idx].contiguous(), w[idx].contiguous(), ex, scratch, None,
+                              len(idx), decode="fused").clone()
+
+    solo = torch.cat([run([i]) for i in range(n)])
+    old = torch.cat([experts.routed(x[i:i + 1], sel[i:i + 1], w[i:i + 1], ex, scratch, None, 1, decode="old").clone()
+                     for i in range(n)])
+    assert torch.equal(solo, old)
+    for t in range(60):
+        idx = rnd.sample(range(n), 2 + t % 15)
+        o = run(idx)
+        for j, i in enumerate(idx):
+            assert torch.equal(o[j], solo[i]), (t, len(idx), j)
+    graphs = {}
+    for R in (1, 2, 4, 6, 8, 16):
+        xb, sb, wb = x[:R].clone(), sel[:R].clone(), w[:R].clone()
+        ob = torch.empty((R, D), dtype=torch.float32, device="cuda")
+        experts.routed(xb, sb, wb, ex, scratch, ob, R)
+        torch.cuda.synchronize()
+        gr = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gr):
+            experts.routed(xb, sb, wb, ex, scratch, ob, R)
+        graphs[R] = (gr, xb, sb, wb, ob)
+    for rep in range(5):
+        for R, (gr, xb, sb, wb, ob) in graphs.items():
+            idx = rnd.sample(range(n), R)
+            xb.copy_(x[idx])
+            sb.copy_(sel[idx])
+            wb.copy_(w[idx])
+            ob.fill_(float("nan"))
+            gr.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(ob, solo[idx]), (rep, R)

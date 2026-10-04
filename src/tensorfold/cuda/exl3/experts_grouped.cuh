@@ -1296,6 +1296,414 @@ __global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict_
     }
 }
 
+// ---- decode windows (fewer than 64 rows): grouped_cp_kernel ------------------------------------------------------
+// grouped_kernel's programs and arithmetic (every row's bits: the same chains over the same k tiles, the same decode,
+// the same mma order, warps added in order), with three changes that leave the bits alone:
+//  - each warp copies its k tiles' trellis words 16 bytes a lane (cp.async) S - 1 steps ahead into its own ring of S
+//    shared-memory stages and reads them back one word a lane, as grouped_kernel's loads hand them to the decode (GB10,
+//    a load-only probe of the same tiles from DRAM: 4-byte lane loads ~195 GB/s, 16-byte copies ~235); the rows' A
+//    fragments come a k tile ahead; the ring is reused for the warps' sums when the k tiles are done;
+//  - the warps' sums go through shared memory 8 rows at a time (rows 8-15 only when the tile has them), so with at
+//    most 128 registers four programs fit an SM (two with the 16-row buffer: GB10 measured 1-8% faster at four);
+//  - programs run expert by expert, the last expert (the shared one, the widest) first, each expert's programs back to
+//    back (its column blocks read neighbouring trellis bytes together);
+//  - EPI 1 (gate/up): the program that completes an (expert, 128-column block) runs the gate/up epilogue for the
+//    expert's rows there (gateup_epilogue_kernel's arithmetic); EPI 2 (down, one split): each program writes its rows'
+//    per-slot outputs (down_combine_kernel's per-slot arithmetic) and the program that completes a (row, 128-column
+//    block) adds the row's slots in slot order (its combine); a counter per block, reset by its last program, and
+//    fences order the partial sums before they are read. Who finishes last never changes what is added or in which
+//    order, so a row's bits stay those of the separate launches, whatever shares the window.
+// The fused launches chain as programmatic dependents (decode_prep -> gate/up -> down): a grid's programs start on the
+// SMs its predecessor frees; down's programs copy their first trellis steps, then wait for their own expert's rows only
+// (ready[u], published by the gate/up program that runs the expert's last epilogue), or for the whole gate/up grid.
+
+constexpr float EPI_HAD = 0.08838834764831845f;      // 1 / sqrt(128)
+
+// programmatic dependent launch (sm_90+): wait for the grid this one depends on (its writes visible), or let the next
+// grid start; both return at once when the launch carries no programmatic dependency
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
+__device__ __forceinline__ void pdl_launch() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
+__device__ __forceinline__ int ld_acquire(const int* p) {
+    int v;
+    asm volatile("ld.acquire.gpu.global.b32 %0, [%1];\n" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
+__device__ __forceinline__ void st_release(int* p, int v) {
+    asm volatile("st.release.gpu.global.b32 [%0], %1;\n" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ uint32_t load_pair_cg(const half* x, bool ok) {
+    return ok ? __ldcg(reinterpret_cast<const unsigned int*>(x)) : 0u;
+}
+
+// experts.cu's fwht128 (the epilogues' Walsh-Hadamard transform), the same butterflies in the same order
+__device__ __forceinline__ void epi_fwht128(float (&v)[4], int lane) {
+    float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
+    v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+#pragma unroll
+    for (int m = 1; m < 32; m <<= 1) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            float o = __shfl_xor_sync(0xffffffffu, v[j], m);
+            v[j] = (lane & m) ? o - v[j] : v[j] + o;
+        }
+    }
+}
+
+__device__ __forceinline__ float epi_bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
+
+struct DecodeEpi {
+    const int* pick = nullptr;    // [P] the window's picks (rows x slots); picks < 0 or >= E are not routed
+    int E = 0;
+    // EPI 1: Xd [P, N] = fp16((SwiGLU(H (gate, up sums) * svh) * suh_d) H) of each member row
+    const half* svh_g = nullptr;
+    const half* svh_u = nullptr;
+    const half* suh_d = nullptr;
+    half* xd = nullptr;
+    float limit = 0.f;
+    int act_mode = 1;
+    // EPI 2: y [P, N] = (H sum) * svh_d of each member row; with wts, out [rows, N] = the slots' wts-weighted y in slot
+    // order (+ add, last); store_y: a non-routed slot adds its y (the caller's), else 0
+    const half* svh_d = nullptr;
+    float* y = nullptr;
+    const float* wts = nullptr;
+    const float* add = nullptr;
+    float* out = nullptr;
+    int store_y = 1;
+    int* cnt = nullptr;           // zeroed: EPI 1 [expert places x N / 128], EPI 2 [rows x N / 128]
+    // with ready: EPI 2 waits for its own expert's Xd (ready[u] == *epoch) instead of the whole gate/up grid; EPI 1's
+    // program that runs an expert's last 128-column epilogue publishes it (ready_cnt counts them, reset by the last)
+    int* ready = nullptr;
+    int* ready_cnt = nullptr;
+    const int* epoch = nullptr;   // this launch's number (decode_prep adds one)
+};
+
+template <int CB, int K2, int NT, int S, int SW, bool WAIT>
+__device__ __forceinline__ void warp_tiles_cp(const uint32_t* __restrict__ T, int NTILES, int kt0, int nkt, int nt0,
+                                              const half* x0, const half* x1, bool ok0, bool ok1, int lane,
+                                              uint32_t* __restrict__ ring, float (&acc)[NT][2][4],
+                                              const int* ready_u, int epoch_v) {
+    constexpr int TW = Fmt<K2>::TW, LW = Fmt<K2>::LW;
+    constexpr int NV = NT * TW / 4;                       // 16-byte chunks of a step's NT tiles (contiguous)
+    constexpr int VPL = (NV + 31) / 32;
+    static_assert(NT * TW <= SW, "a stage holds a step's tiles");
+    const LaneMap<K2> map(lane);
+    const size_t kstride = (size_t)NTILES * TW;
+    const uint32_t* tp = T + ((size_t)kt0 * NTILES + nt0) * TW;
+    auto issue = [&](int it) {
+        uint32_t* dst = ring + (it % S) * SW;
+        const uint32_t* src = tp + (size_t)it * kstride;
+#pragma unroll
+        for (int v = 0; v < VPL; ++v) {
+            const int c = v * 32 + lane;
+            if ((NV % 32) == 0 || c < NV) cp_async16(dst + 4 * c, src + 4 * c, true);
+        }
+    };
+#pragma unroll
+    for (int d = 0; d < S - 1; ++d) {
+        if (d < nkt) issue(d);
+        cp_async_commit();
+    }
+    if constexpr (WAIT) {
+        // the trellis does not depend on the gate/up grid, the rows do
+        if (ready_u != nullptr) {
+            // this expert's rows are complete once its gate/up epilogues have published them (the rest of the gate/up
+            // grid may still run); the rows are then read from L2
+            if (lane == 0)
+                while (ld_acquire(ready_u) != epoch_v) __nanosleep(128);
+            __syncwarp();
+        } else {
+            pdl_wait();
+        }
+    }
+    auto lp = [](const half* p, bool ok) { return WAIT ? load_pair_cg(p, ok) : load_pair(p, ok); };
+    uint32_t an[4] = {lp(x0 + kt0 * 16, ok0), lp(x1 + kt0 * 16, ok1), lp(x0 + kt0 * 16 + 8, ok0),
+                      lp(x1 + kt0 * 16 + 8, ok1)};
+    for (int it = 0; it < nkt; ++it) {
+        if (it + S - 1 < nkt) issue(it + S - 1);
+        cp_async_commit();
+        cp_async_wait<S - 1>();                           // this step's copies (this lane's) are done
+        __syncwarp();                                     // ... and every lane's are visible
+        const uint32_t* st = ring + (it % S) * SW + lane;
+        uint32_t w[NT][LW];
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int l = 0; l < LW; ++l) w[i][l] = ((TW % 32) == 0 || l * 32 + lane < TW) ? st[i * TW + l * 32] : 0u;
+        __syncwarp();                                     // the stage is read before a later step refills it
+        const uint32_t a[4] = {an[0], an[1], an[2], an[3]};
+        if (it + 1 < nkt) {
+            const int k = (kt0 + it + 1) * 16;
+            an[0] = lp(x0 + k, ok0);
+            an[1] = lp(x1 + k, ok1);
+            an[2] = lp(x0 + k + 8, ok0);
+            an[3] = lp(x1 + k + 8, ok1);
+        }
+#pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            uint32_t b0[2], b1[2];
+            decode_tile<CB, K2>(w[i], map, lane, b0, b1);
+            mma16816(acc[i][0], a, b0);
+            mma16816(acc[i][1], a, b1);
+        }
+    }
+}
+
+template <int CB, int NT, int W, int S, int LO, int HI, int EPI>
+__global__ void __launch_bounds__(W * 32, 4) grouped_cp_kernel(
+    const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
+    const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
+    const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, const DecodeEpi ep) {
+    static_assert(EPI == 0 || NT * 16 == 128, "the epilogues work on the 128-column blocks of a program");
+    constexpr int SW = NT * 4 * HI;                       // words a stage: NT tiles of the launch's widest trellis
+    constexpr int RING = W * S * SW;
+    constexpr int RR = 8;                                 // rows a pass of the warps' reduction (two passes)
+    constexpr int RED = W * RR * NT * 16;
+    __shared__ __align__(16) uint32_t smem[RING > RED ? RING : RED];
+    __shared__ int rows_sh[16];
+    __shared__ int last_sh;
+    // expert-major order, the last expert place (the largest id: the shared expert) first
+    const int MT = (maxm + 15) / 16;
+    const int NY = gridDim.y, NZ = gridDim.z;
+    const int lin = blockIdx.x + gridDim.x * (blockIdx.y + NY * blockIdx.z);
+    const int ur = lin / (NY * NZ), rem = lin % (NY * NZ);
+    if constexpr (EPI == 1) {
+        pdl_wait();                                       // the grouping and the rotated rows (decode_prep)
+        pdl_launch();                                     // down's programs may take the SMs this grid frees
+    }
+    const int nu = ucount[0];
+    if (ur >= nu) return;
+    const int u = nu - 1 - ur, by = rem % NY, bz = rem / NY;
+    const int mtile = bz % MT;
+    const int split = (bz / MT) % SK;
+    const int mat = bz / MT / SK;
+    const half* X = mat ? X1 : X0;
+    const int e = uids[u];
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
+    const int k2 = mat ? K2_1[e] : K2_0[e];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int KT = K >> 4, NTILES = N >> 4;
+
+    if (threadIdx.x < 16) {
+        const int m = mtile * 16 + threadIdx.x;
+        const int code = m < maxm ? members[u * maxm + m] : -1;
+        rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
+    }
+    // EPI 1: the expert's member count (members are a prefix; maxm <= the block's threads)
+    int cu = 0;
+    if constexpr (EPI == 1) cu = __syncthreads_count(threadIdx.x < maxm && members[u * maxm + threadIdx.x] >= 0);
+    else __syncthreads();
+    if (rows_sh[0] < 0) return;                           // members come first, so this tile is empty
+    const int r0 = rows_sh[g], r1 = rows_sh[g + 8];
+    const half* x0 = X + (size_t)(r0 < 0 ? 0 : r0) * K + 2 * t;
+    const half* x1 = X + (size_t)(r1 < 0 ? 0 : r1) * K + 2 * t;
+
+    const int per_split = KT / SK, per_warp = per_split / W;
+    const int kt0 = split * per_split + warp * per_warp;
+    const int nt0 = by * NT;
+    uint32_t* ring = smem + warp * S * SW;
+    const int* ready_u = (EPI == 2 && ep.ready != nullptr) ? ep.ready + u : nullptr;
+    const int epoch_v = (EPI == 2 && ep.ready != nullptr) ? *ep.epoch : 0;
+
+    float acc[NT][2][4];
+#pragma unroll
+    for (int i = 0; i < NT; ++i)
+#pragma unroll
+        for (int h = 0; h < 2; ++h)
+#pragma unroll
+            for (int c = 0; c < 4; ++c) acc[i][h][c] = 0.f;
+
+    switch (k2) {
+#define TF_EXL3X_CASE(K2_)                                                                                      \
+    case K2_:                                                                                                   \
+        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
+            warp_tiles_cp<CB, K2_, NT, S, SW, EPI == 2>(T, NTILES, kt0, per_warp, nt0, x0, x1, r0 >= 0, r1 >= 0,  \
+                                                        lane, ring, acc, ready_u, epoch_v);                     \
+        else                                                                                                    \
+            __trap();                                                                                           \
+        break;
+        TF_EXL3X_CASE(2)
+        TF_EXL3X_CASE(3)
+        TF_EXL3X_CASE(4)
+        TF_EXL3X_CASE(5)
+        TF_EXL3X_CASE(6)
+        TF_EXL3X_CASE(7)
+        TF_EXL3X_CASE(8)
+        TF_EXL3X_CASE(9)
+        TF_EXL3X_CASE(10)
+        TF_EXL3X_CASE(11)
+        TF_EXL3X_CASE(12)
+        TF_EXL3X_CASE(13)
+        TF_EXL3X_CASE(14)
+        TF_EXL3X_CASE(15)
+        TF_EXL3X_CASE(16)
+#undef TF_EXL3X_CASE
+        default:
+            __trap();
+    }
+    cp_async_wait<0>();
+    __syncthreads();                                      // every warp is done with its ring: it becomes red
+
+    // warps' partial sums through shared memory, added in warp order (grouped_kernel's reduction): rows 0-7, then rows
+    // 8-15 when the tile has them (half grouped_kernel's shared memory, the same sums)
+    float (*red)[RR][NT * 16] = reinterpret_cast<float (*)[RR][NT * 16]>(smem);
+#pragma unroll
+    for (int hp = 0; hp < 16 / RR; ++hp) {
+        if (hp > 0) {
+            if (rows_sh[8] < 0) break;
+            __syncthreads();                              // the first pass is read before red is overwritten
+        }
+#pragma unroll
+        for (int i = 0; i < NT; ++i)
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const int col = i * 16 + h * 8 + 2 * t;
+                red[warp][g][col] = acc[i][h][2 * hp];         // row g (pass 0) or g + 8 (pass 1)
+                red[warp][g][col + 1] = acc[i][h][2 * hp + 1];
+            }
+        __syncthreads();
+        if constexpr (EPI != 2) {
+            for (int idx = threadIdx.x; idx < RR * NT * 16; idx += W * 32) {
+                const int row = idx / (NT * 16), col = idx % (NT * 16);
+                const int r = rows_sh[row + RR * hp];
+                if (r < 0) continue;
+                float s = red[0][row][col];
+#pragma unroll
+                for (int w = 1; w < W; ++w) s += red[w][row][col];
+                Z[(((size_t)mat * SK + split) * P + r) * N + nt0 * 16 + col] = s;
+            }
+        }
+        if constexpr (EPI == 2) {
+            // each member row's per-slot output for this column block, then the row's combine by the program that
+            // completes the row's routed slots here
+            const int n = by * 128 + 4 * lane;
+            for (int row = warp; row < RR; row += W) {
+                const int p = rows_sh[row + RR * hp];
+                if (p < 0) continue;
+                float v[4];
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int col = 4 * lane + j;
+                    float s = red[0][row][col];
+#pragma unroll
+                    for (int w = 1; w < W; ++w) s += red[w][row][col];
+                    float q = 0.f;                        // down_combine's split sum from 0 (one split)
+                    q += s;
+                    v[j] = q;
+                }
+                epi_fwht128(v, lane);
+                float* yo = ep.y + (size_t)p * N + n;
+#pragma unroll
+                for (int j = 0; j < 4; ++j) yo[j] = v[j] * EPI_HAD * __half2float(ep.svh_d[(size_t)e * N + n + j]);
+                if (ep.wts == nullptr) continue;
+                __threadfence();
+                __syncwarp();
+                const int r = p / slots;
+                int last = 0;
+                if (lane == 0) {
+                    int target = 0;
+                    for (int q = 0; q < slots; ++q) {
+                        const int pe = ep.pick[r * slots + q];
+                        target += pe >= 0 && pe < ep.E;
+                    }
+                    int* c = ep.cnt + r * NY + by;
+                    const int before = atomicAdd(c, 1);
+                    last = before == target - 1;
+                    if (last) *c = 0;
+                }
+                last = __shfl_sync(0xffffffffu, last, 0);
+                if (!last) continue;
+                __threadfence();
+                float a4[4] = {0.f, 0.f, 0.f, 0.f};
+                for (int q = 0; q < slots; ++q) {
+                    const float w = ep.wts[r * slots + q];
+                    const int pq = r * slots + q;
+                    const int pe = ep.pick[pq];
+                    float4 yv = make_float4(0.f, 0.f, 0.f, 0.f);
+                    if ((pe >= 0 && pe < ep.E) || ep.store_y)
+                        yv = __ldcg(reinterpret_cast<const float4*>(ep.y + (size_t)pq * N + n));
+                    a4[0] = fmaf(w, yv.x, a4[0]);
+                    a4[1] = fmaf(w, yv.y, a4[1]);
+                    a4[2] = fmaf(w, yv.z, a4[2]);
+                    a4[3] = fmaf(w, yv.w, a4[3]);
+                }
+#pragma unroll
+                for (int j = 0; j < 4; ++j)
+                    ep.out[(size_t)r * N + n + j] = ep.add ? __fadd_rn(a4[j], ep.add[(size_t)r * N + n + j]) : a4[j];
+            }
+        }
+    }
+    if constexpr (EPI == 1) {
+        // the program completing this (expert, column block) runs the gate/up epilogue for the expert's rows there
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const int target = (NZ / MT) * ((cu + 15) / 16);         // mats x splits programs a live member tile
+            int* c = ep.cnt + u * NY + by;
+            const int before = atomicAdd(c, 1);
+            last_sh = before == target - 1;
+            if (last_sh) *c = 0;
+        }
+        __syncthreads();
+        if (!last_sh) return;
+        __threadfence();
+        const int n = by * 128 + 4 * lane;
+        for (int m = warp; m < cu; m += W) {
+            const int code = members[u * maxm + m];
+            const int p = (code >> 5) * slots + (code & 31);
+            float gv[4], uv[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float sg = 0.f, su = 0.f;
+                for (int s = 0; s < SK; ++s) {
+                    sg += __ldcg(Z + ((size_t)(0 * SK + s) * P + p) * N + n + j);
+                    su += __ldcg(Z + ((size_t)(1 * SK + s) * P + p) * N + n + j);
+                }
+                gv[j] = sg;
+                uv[j] = su;
+            }
+            epi_fwht128(gv, lane);
+            epi_fwht128(uv, lane);
+            float v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                float act;
+                if (ep.act_mode == 0) {
+                    float gg = fminf(epi_bf16r(gv[j] * EPI_HAD * __half2float(ep.svh_g[(size_t)e * N + n + j])),
+                                     ep.limit);
+                    float uu = fminf(fmaxf(epi_bf16r(uv[j] * EPI_HAD * __half2float(ep.svh_u[(size_t)e * N + n + j])),
+                                           -ep.limit), ep.limit);
+                    act = epi_bf16r(epi_bf16r(gg / (1.f + expf(-gg))) * uu);
+                } else {
+                    float gg = fminf(gv[j] * EPI_HAD * __half2float(ep.svh_g[(size_t)e * N + n + j]), ep.limit);
+                    float uu = fminf(fmaxf(uv[j] * EPI_HAD * __half2float(ep.svh_u[(size_t)e * N + n + j]), -ep.limit),
+                                     ep.limit);
+                    act = gg / (1.f + expf(-gg)) * uu;
+                }
+                v[j] = act * __half2float(ep.suh_d[(size_t)e * N + n + j]);
+            }
+            epi_fwht128(v, lane);
+            half* o = ep.xd + (size_t)p * N + n;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * EPI_HAD);
+        }
+        if (ep.ready != nullptr) {
+            // the expert's last column block: publish its rows to down's programs (they wait on ready[u])
+            __threadfence();
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                const int done = atomicAdd(ep.ready_cnt + u, 1);
+                if (done == NY - 1) {
+                    ep.ready_cnt[u] = 0;
+                    __threadfence();
+                    st_release(ep.ready + u, *ep.epoch);
+                }
+            }
+        }
+    }
+}
+
 struct GroupedArgs {
     const half* x0;
     const half* x1;
@@ -1465,6 +1873,41 @@ void grouped_launch(const GroupedArgs& a, cudaStream_t stream) {
     else if (a.nt == 4 && a.warps == 4 && a.pf == 2) { TF_RANGES(4, 4, 2) }
     else TORCH_CHECK(false, "unsupported tile setting nt=", a.nt, " warps=", a.warps, " pf=", a.pf);
 #undef TF_RANGES
+#undef TF_LAUNCH
+}
+
+// grouped_cp_kernel: grouped_launch's grid and settings, pf = the stages of each warp's ring (3), epi as above, pdl:
+// gate/up and down launched as programmatic dependents
+template <int CB>
+void grouped_cp_launch(const GroupedArgs& a, const DecodeEpi& ep, int epi, int pdl, cudaStream_t stream) {
+    const int MT = (a.maxm + 15) / 16;
+    dim3 grid((unsigned)a.nexp_max, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.mats * a.SK * MT));
+    TORCH_CHECK(epi == 0 || (a.nt == 8 && a.maxm <= 32 * a.warps), "decode epilogues: 128-column blocks, maxm <= threads");
+    TORCH_CHECK(epi != 2 || (a.SK == 1 && a.mats == 1), "the fused down combine takes one split");
+    cudaLaunchConfig_t lc = {};
+    lc.gridDim = grid;
+    lc.blockDim = dim3(32 * a.warps);
+    lc.dynamicSmemBytes = 0;
+    lc.stream = stream;
+    cudaLaunchAttribute la[1];
+    la[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    la[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.attrs = la;
+    lc.numAttrs = (pdl && epi != 0) ? 1 : 0;
+#define TF_LAUNCH(NT_, W_, S_, LO_, HI_, EPI_)                                                                  \
+    C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, grouped_cp_kernel<CB, NT_, W_, S_, LO_, HI_, EPI_>, a.x0, a.x1, a.tp0,  \
+                                      a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P,    \
+                                      a.SK, a.maxm, a.slots, ep))
+#define TF_EPI(LO_, HI_)                                                                                        \
+    if (epi == 1) TF_LAUNCH(8, 4, 3, LO_, HI_, 1);                                                              \
+    else if (epi == 2) TF_LAUNCH(8, 4, 3, LO_, HI_, 2);                                                         \
+    else TF_LAUNCH(8, 4, 3, LO_, HI_, 0);
+    TORCH_CHECK(a.nt == 8 && a.warps == 4 && a.pf == 3, "unsupported decode tile setting nt=", a.nt, " warps=",
+                a.warps, " stages=", a.pf);
+    if (a.lo == 8 && a.hi == 8) { TF_EPI(8, 8) }
+    else if (a.lo >= 2 && a.hi <= 10) { TF_EPI(2, 10) }
+    else { TF_EPI(2, 16) }
+#undef TF_EPI
 #undef TF_LAUNCH
 }
 
