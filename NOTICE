@@ -23,7 +23,8 @@ Added:
 
 Modified upstream files:
   pyproject.toml                               package data for the deepseek_v41 CUDA sources
-  src/tensorfold/cuda/exl3/experts_grouped.cuh grouped EXL3 expert kernels extended (multi-row prompt-chunk kernels)
+  src/tensorfold/cuda/exl3/experts_grouped.cuh grouped EXL3 expert kernels extended (multi-row prompt-chunk kernels,
+                                               a fused decode-window path)
   src/tensorfold/cuda/exl3/experts.cu          as above
   src/tensorfold/cuda/exl3/experts.cpp         bindings for the added kernels
   src/tensorfold/cuda/exl3/experts.py          Python entry points for the added kernels
@@ -31,6 +32,11 @@ Modified upstream files:
   src/tensorfold/cuda/exl3/experts_cb1.cu      as above
   src/tensorfold/cuda/exl3/experts_cb2.cu      as above
   src/tensorfold/cuda/exl3/prefill.py          optional tile choice by shape (TF_EXL3_PREFILL_TILES)
+  src/tensorfold/cuda/exl3/linear.cu           shared helpers moved to linear_common.cuh (new); rot_in pinned to the
+                                               same arithmetic; grouped decode linears in linear_grouped.cu (new)
+  src/tensorfold/cuda/exl3/linear.cpp          bindings for the grouped linears
+  src/tensorfold/cuda/exl3/linear.py           Exl3Group and Exl3Linear.grouped(); extension renamed
+  tests/cuda/test_exl3_experts.py              tests for the fused decode path
   src/tensorfold/cuda/http.py                  optional API key (TF_API_KEY / TF_API_KEY_FILE), all routes but /health;
                                                max_model_len in /v1/models
   src/tensorfold/cuda/server.py                a family's own image prompts continue through its vision object
