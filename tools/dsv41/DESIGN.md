@@ -4,7 +4,7 @@ Status: v1, 2026-10-03, written before any engine code. Written independently: c
 and the public jayleaton recipe, which are not read ("the kit": the MiaAI-Lab vLLM kit, commit 6f7d1590ad49,
 AGPL-3.0, only run as a black box for baseline numbers). The model math is re-implemented from DeepSeek's own MIT
 `inference/` (model.py, engram.py, kernel.py) and tech report, read but not copied. Also used: upstream TensorFold
-(Apache-2.0), an earlier, unpublished TensorFold fork of ours for GLM-5.3, and the checkpoint's own file format.
+(Apache-2.0), our TensorFold fork for GLM-5.3 (github.com/bertholomus/TensorFold, branch `glm-dsa-tp4`), and the checkpoint's own file format.
 Upstream vLLM's (Apache-2.0) `deepseek_v41` is a cross-check for math only. Sources and licenses: `ATTRIBUTION.md`
 in this folder.
 
