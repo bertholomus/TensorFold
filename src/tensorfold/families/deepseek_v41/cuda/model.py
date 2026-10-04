@@ -331,7 +331,7 @@ class Engram:
         if any(a[0] == layer and np.array_equal(a[1], flat) for a in self.ahead):
             return
         while len(self.ahead) >= 8:                   # unclaimed reads (a dropped prompt): the oldest goes
-            self.ahead.pop(0)[2].result()
+            self.ahead.pop(0)[2].exception()          # waited for; an unused read's failure is not this step's
         fw, bw, rw = self.files[f"layers.{layer}.engram.embed.weight"]
         fs, bs, rs = self.files[f"layers.{layer}.engram.embed.scale"]
         m = flat.shape[0]

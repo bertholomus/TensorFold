@@ -349,6 +349,9 @@ class MultiDecoder:
         self.drafters: dict[int, object] = {}            # batched drafter graphs by drafting streams
         self.free = list(range(slots))
         self.max_rows = MAX_ROWS
+        if not engine.drafts + 1 <= MAX_ROWS < 64:     # a solo verify window must take the decode kernels, a round too
+            raise ValueError(f"TF_DS_DECODE_ROWS={MAX_ROWS} must hold a verify window ({engine.drafts + 1} rows) "
+                             "and stay under the 64-row prompt kernels")
         self.depth_most = engine.drafts
         graphs = engine.runner is not None
         self.runner = RoundRunner(m, self.pool, graphs=graphs,
@@ -403,7 +406,8 @@ class MultiDecoder:
         N = len(tokens)
         g = self.drafters.get(N)
         if g is None:
-            steps = None if DEPTH_POLICY == "even" else self._depth(N)       # "even" may verify the whole block
+            # as deep as any round with N drafting streams may verify ("even": the whole block)
+            steps = None if DEPTH_POLICY == "even" else max(self._depth(L) for L in range(N, len(self.slots) + 1))
             g = BatchDraftGraph(self.e.drafter, self.m.pool_view(self.pool, 0, 0, self.extents.total), self.dpool, N,
                                 steps=steps)
             g.tokens.copy_(torch.tensor(tokens, dtype=torch.long))
@@ -887,7 +891,7 @@ class MultiDecoder:
                     if even is not None:
                         kk = even[s.sid]
                     elif DEPTH_POLICY in ("conf", "even"):
-                        kk = self._choose_k(cf, kk, len(live))
+                        kk = self._choose_k(cf, min(kk, len(cf)), len(live))
                     if CONF_LOG:
                         self.k_hist.setdefault(len(live), [0] * 8)[kk] += 1
                     proposed[s.sid] = r[:kk]
