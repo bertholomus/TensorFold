@@ -54,6 +54,10 @@ DECODE_PDL = os.environ.get("TF_EXL3_DECODE_PDL", "1") != "0"
 # fused decode with DECODE_PDL: each down program waits only for its own expert's rows (published by the gate/up program
 # that finishes the expert's epilogues) instead of the whole gate/up grid, so down overlaps gate/up's last programs
 DECODE_READY = os.environ.get("TF_EXL3_DECODE_READY", "1") != "0"
+# fused decode: the dead fp32 scratch is dropped from L2 instead of written back to DRAM once read (discard.global.L2):
+# gate/up's partials after the epilogue that sums them, the per-slot outputs after the row's combine (with weights).
+# The layer's experts streaming through L2 would evict them dirty (~2.5 MB a 6-row layer); no output changes.
+DECODE_DISCARD = os.environ.get("TF_EXL3_L2_DISCARD", "1") != "0"
 
 
 @lru_cache(maxsize=1)
@@ -62,7 +66,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v13", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v14", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -378,13 +382,13 @@ def _routed_fused(ext, x, pick, wts, ex, s, out, R, ids, members, limit, act_mod
     ext.grouped_decode(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                        P, s.cfg_gu[2], slots, ex.cb, DECODE_STAGES, ex.k2_gu[0], ex.k2_gu[1], 1, pick, E, ex.svh_g,
                        ex.svh_u, ex.suh_d, s.xd, float(limit), act_mode, s.y, s.no_y, s.no_y, s.no_y, 0, 0, 1,
-                       s.cnt_gu, int(DECODE_PDL), s.ready, s.ready_cnt, s.epoch, ready)
+                       s.cnt_gu, int(DECODE_PDL), s.ready, s.ready_cnt, s.epoch, ready, int(DECODE_DISCARD))
     if before_down is not None:            # the slots computed elsewhere: their y is in s.y before down combines
         torch.cuda.current_stream().wait_event(before_down)
     ext.grouped_decode(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,
                        D, P, 1, slots, ex.cb, DECODE_STAGES, ex.k2_d[0], ex.k2_d[1], 2, pick, E, ex.svh_d, ex.svh_d,
                        ex.svh_d, s.xd, float(limit), act_mode, s.y, w, a, o, int(has_wts), int(has_add), 1, s.cnt_d,
-                       int(DECODE_PDL), s.ready, s.ready_cnt, s.epoch, ready)
+                       int(DECODE_PDL), s.ready, s.ready_cnt, s.epoch, ready, int(DECODE_DISCARD))
     return out if has_wts else s.y[:P]
 
 

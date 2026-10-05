@@ -18,13 +18,20 @@ from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
 from . import model as _model
 from .graph import BUCKET_MIN, bucket_for
-from .model import (KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, attn_in, l2_fork,
-                    l2_join, mm, moe_side, q_proj, store_rows, wo_a_out, wo_a_rot, wo_ab)
+from .model import (KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, attn_in, attn_in_rot,
+                    l2_fork, l2_join, mm, moe_side, q_proj, store_rows, wo_a_out, wo_a_rot, wo_ab)
 
 MAX_ROWS = K.DECODE_ROWS
 # TF_DS_ENGRAM_SPLIT=1 (default): a round is one graph a stretch of layers, cut before each Engram layer, so a layer's
 # Engram rows are read while the layers before it run (the arithmetic is the one-graph round's)
 ENGRAM_SPLIT = os.environ.get("TF_DS_ENGRAM_SPLIT", "1") == "1"
+# TF_DS_ENGRAM_TOUCH=1 (default): a round reads its streams' first rows' Engram rows before the drafts
+# (RoundRunner.engram_touch: the drive awake when the round's read starts; no bit changes)
+ENGRAM_TOUCH = os.environ.get("TF_DS_ENGRAM_TOUCH", "1") == "1"
+# TF_DS_ONE_COPY=1 (default): a round's row inputs (ids, positions, slots, extents) go to the GPU as one pinned
+# non-blocking copy, not five synchronous ones (each waited for the stream: GPU idle between the drafts and the forward);
+# also the drafter's inputs (dspark.py; the absorb's indices stay synchronous: pinned was slower there). 0: as before
+ONE_COPY = os.environ.get("TF_DS_ONE_COPY", "1") == "1"
 
 
 def _candidates_fast(score: torch.Tensor, vis: torch.Tensor, nblocks: int, bsize: int) -> torch.Tensor:
@@ -51,11 +58,10 @@ class RoundDecoder:
         self.m, self.pool, self.R, self.bucket, self.want_taps = model, pool, rows, bucket, taps
         c = model.cfg
         dev = "cuda"
-        self.ids = torch.zeros((rows,), dtype=torch.long, device=dev)
-        self.pos = torch.zeros((rows,), dtype=torch.long, device=dev)
-        self.slot = torch.zeros((rows,), dtype=torch.long, device=dev)
-        self.base = torch.zeros((rows,), dtype=torch.long, device=dev)     # the row's stream's extent, positions
-        self.end = torch.ones((rows,), dtype=torch.long, device=dev)
+        self.inputs = torch.zeros((5, rows), dtype=torch.long, device=dev)  # one buffer, so one copy fills it
+        # ids, positions, slots, and the row's stream's extent (base, end) in positions
+        self.ids, self.pos, self.slot, self.base, self.end = self.inputs.unbind(0)
+        self.end.fill_(1)
         self.table = SeqCache(cap=pool.cap)                                # RoPE tables for any pool position
         self.e_in = {}
         if model.engram is not None:
@@ -119,9 +125,9 @@ class RoundDecoder:
             self._idx[key] = t
         return t
 
-    def _attention(self, lay, x, shared, cos, sin):
-        if any(K.on(k) for k in ("glue", "rot_q", "rot_wob", "rot_attn", "idx", "comp")):
-            return self._attention2(lay, x, shared, cos, sin)
+    def _attention(self, lay, x, shared, cos, sin, xh=None):
+        if xh is not None or any(K.on(k) for k in ("glue", "rot_q", "rot_wob", "rot_attn", "idx", "comp")):
+            return self._attention2(lay, x, shared, cos, sin, xh=xh)
         m, c, pool = self.m, self.m.cfg, self.pool
         n = x.shape[0]
         rd, hd = c.rope_dim, c.head_dim
@@ -193,12 +199,12 @@ class RoundDecoder:
         l2_fork(m, lay, "moe")                                          # the MoE's mHC mix, gate, shared expert
         return out
 
-    def _attention2(self, lay, x, shared, cos, sin):
+    def _attention2(self, lay, x, shared, cos, sin, xh=None):
         """_attention with the small-kernel switches (kernels.SMALL_SWITCHES): "glue" takes the round's index tensors
         from _ix; "rot_q" folds wq_b's input rotation into the q RMSNorm and q's RoPE into wq_b's epilogue, "rot_attn"
         the inverse RoPE and wo_a's input rotation into the attention merge, "rot_wob" wo_b's input rotation into
         wo_a's epilogue; "idx" / "comp" fuse the indexer's and the compressor's glue. The same arithmetic in the same
-        order, so the same bits."""
+        order, so the same bits. ``xh``: attn_in's rotated input rows, written by the mHC finish (switch "hc_rot")."""
 
         m, c, pool = self.m, self.m.cfg, self.pool
         n = x.shape[0]
@@ -208,7 +214,7 @@ class RoundDecoder:
         RS = pool.ring_size
         glue, rot = K.on("glue"), K.on("rot_q")
         ix = self._ix if glue else self._ix_now
-        qa, ykv, ckv, cgate = attn_in(lay, x, comp=bool(ratio))         # wq_a, wkv, the compressor's: one launch
+        qa, ykv, ckv, cgate = attn_in(lay, x, comp=bool(ratio), xh=xh)  # wq_a, wkv, the compressor's: one launch
         iq = None
         has_idx = bool(ratio) and lay.idx_wq_b is not None
         # the indexer's top-k takes every entry it scans (short contexts): its selection needs no scores at all
@@ -429,15 +435,27 @@ class RoundDecoder:
         view = self.table
         spare = torch.empty_like(h)
         pending = None                                   # the last sublayer's gathered partials, not yet posted
+        # (switch "hc_defer") each finish's Sinkhorn half on this side stream, joined before the sublayer's gather
+        # (the next posted mixes read post / comb, the next finish pre; the next mixes write part)
+        sink = None
+        if K.hc_defer_on(c.dim):
+            sink = m.__dict__.get("_tf_hc_sink")
+            if sink is None:
+                sink = m._tf_hc_sink = torch.cuda.Stream()
 
-        def pre_mix(h, params, pre_in, norm, pre_out):
+        def join():
+            if sink is not None:
+                torch.cuda.current_stream().wait_stream(sink)
+
+        def pre_mix(h, params, pre_in, norm, pre_out, rot=None):
             nonlocal spare, pending
             fn, scale, base = params
             if pending is None:
-                K.hc_pre2(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb, part)
+                K.hc_pre2(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb, part,
+                          rot=rot, sink=sink)
                 return h
             out = K.hc_pre2(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb,
-                            part, gathered=pending, h_out=spare)
+                            part, gathered=pending, h_out=spare, rot=rot, sink=sink)
             pending = None
             spare = h
             return out
@@ -451,7 +469,9 @@ class RoundDecoder:
                 kv = m.comm.sum(mm(lay.engram_wkv, self.e_in[lay.idx], F32)).to(BF16)
                 h = K.engram_gate(h, kv.contiguous(), lay.engram_qk, c.eps)
             cos, sin = m._cs(lay.idx, view)
-            h = pre_mix(h, lay.hc_attn, pre, lay.attn_norm, pre_a)
+            # (switch "hc_rot") the finish also writes attn_in's rotated input rows
+            ar = attn_in_rot(lay, h.shape[0], h.device, comp=bool(lay.ratio)) if K.hc_rot_on(c.dim) else None
+            h = pre_mix(h, lay.hc_attn, pre, lay.attn_norm, pre_a, rot=ar[1] if ar else None)
             if self.want_taps and lay.idx in c.dspark_taps:
                 if K.on("glue") and c.dim % 1024 == 0:
                     # one launch a tap, straight into its block of the taps buffer (made at the first tap)
@@ -464,10 +484,13 @@ class RoundDecoder:
                     taps[1] = j + 1
                 else:
                     taps.append(h.to(F32).mean(1).to(BF16))
-            pending = m.comm.gather(self._attention(lay, x, shared, cos, sin))
+            y = self._attention(lay, x, shared, cos, sin, xh=ar[0] if ar else None)
+            join()
+            pending = m.comm.gather(y)
             h = pre_mix(h, lay.hc_ffn, pre_a, lay.ffn_norm, pre_f)
             y = m.moe(lay, x, shared_side=moe_side())               # the gate is in L2 by then
             self._l2_next(li, end)
+            join()
             pending = m.comm.gather(y)
             pre, pre_f = pre_f, pre
         if pending is not None:
@@ -492,6 +515,10 @@ class RoundDecoder:
         self.graph = graphs[0]
 
     def set(self, ids: list[int], pos: list[int], slots: list[int], base: list[int], end: list[int]) -> None:
+        if ONE_COPY:                                    # pinned: the copy runs in stream order, nothing waits for it
+            self.inputs.copy_(torch.tensor([ids, list(pos), slots, base, end], dtype=torch.long).pin_memory(),
+                              non_blocking=True)
+            return
         self.ids.copy_(torch.tensor(ids, dtype=torch.long), non_blocking=False)
         self.pos.copy_(torch.tensor(pos, dtype=torch.long), non_blocking=False)
         self.slot.copy_(torch.tensor(slots, dtype=torch.long), non_blocking=False)
@@ -499,20 +526,38 @@ class RoundDecoder:
         self.end.copy_(torch.tensor(end, dtype=torch.long), non_blocking=False)
 
     def run(self, ids: list[int], pos: list[int], slots: list[int], base: list[int], end: list[int],
-            e_rows) -> torch.Tensor:
+            e_rows, e_start: dict | None = None) -> torch.Tensor:
         """``e_rows``: layer -> its Engram rows on the GPU, or a callable giving them (called just before the stretch
-        that starts at that layer, so the read overlaps the stretches before it)."""
+        that starts at that layer, so the read overlaps the stretches before it). ``e_start``: layer -> a callable that
+        starts that layer's read, called once the stretch before the one that needs the rows is enqueued (before the
+        first stretch for rows it needs)."""
 
+        def start(k: int) -> None:                       # the reads the stretch after stretch k needs
+            if e_start:
+                nxt = self.stretches[k + 1][0] if k + 1 < len(self.stretches) else None
+                for i, fn in e_start.items():
+                    if (k < 0 and i < self.stretches[0][1]) or (k >= 0 and i == nxt):
+                        fn()
+
+        from .multi import _ht
+
+        _ht("fwd prep")
         self.set(ids, pos, slots, base, end)
+        _ht("fwd set")
+        start(-1)
         for k, (first, _) in enumerate(self.stretches):
             for i in self.e_in:
                 if e_rows and (i == first or (k == 0 and i < self.stretches[0][1])):
                     t = e_rows[i]
                     self.e_in[i].copy_(t() if callable(t) else t)
+                    _ht(f"fwd rows {i} in")
             if self.graphs is None:
                 self._stretch(k)
             else:
                 self.graphs[k].replay()
+            _ht(f"fwd stretch {k} launched")
+            start(k)
+            _ht(f"fwd reads after {k} submitted")
         return self.logits
 
 
@@ -527,6 +572,28 @@ class RoundRunner:
 
     def bucket(self, deepest: int) -> int:
         return bucket_for(deepest, self.pool.cap)
+
+    def engram_touch(self, tails: list[list[int]]) -> None:
+        """``tails``: each stream's host ids ending with its pending token, the n-gram's tokens before it included (or
+        from the sequence's start): that row's Engram rows read now on the decode lane (Engram.touch), ahead of the
+        round's own read (ENGRAM_TOUCH). (A row's hash depends only on its n-gram and whether it reaches before
+        position 0, so the tail's last row hashes as the whole sequence's.)"""
+
+        m = self.m
+        if not ENGRAM_TOUCH or m.engram is None or not tails:
+            return
+        import numpy as np
+
+        from .multi import _ht
+
+        _ht("touch start")
+        hs = np.concatenate([m.engram.hashes(t, len(t) - 1, 1) for t in tails], 0)
+        _ht("touch hashed")
+        lo, hi = m.engram.cols
+        for i in m.cfg.engram_layers:
+            if i < len(m.w.layers):
+                m.engram.touch(i, hs[:, m.cfg.engram_layers.index(i), lo:hi])
+                _ht(f"touch {i} submitted")
 
     def forward(self, windows: list[tuple], replay: bool = True) -> tuple[torch.Tensor, torch.Tensor | None]:
         """``windows``: each stream's (slot, extent base, extent size, first position, token ids, host ids so far):
@@ -547,7 +614,7 @@ class RoundRunner:
                 hashes.append(m.engram.hashes(host, p0, n))
         R = len(ids)
         b = self.bucket(max(p + 1 for p in pos))
-        e_rows = None
+        e_rows = e_start = None
         if m.engram is not None and replay:
             import numpy as np
 
@@ -555,8 +622,13 @@ class RoundRunner:
             lo, hi = m.engram.cols
             idx = {i: hs[:, m.cfg.engram_layers.index(i), lo:hi] for i in m.cfg.engram_layers if i < len(m.w.layers)}
             if ENGRAM_SPLIT:
-                for i, ix in idx.items():                     # every layer's read starts now, in layer order
-                    m.engram.prefetch(i, ix, lane=2)
+                if m.engram.decode_aio():
+                    # AIO reads: their submission takes the calling thread ~3 us a row read (O_DIRECT block mapping),
+                    # so each layer's is submitted once the stretch before the one that needs it is enqueued
+                    e_start = {i: (lambda i=i, ix=ix: m.engram.prefetch(i, ix, lane=2)) for i, ix in idx.items()}
+                else:
+                    for i, ix in idx.items():                 # every layer's read starts now, in layer order
+                        m.engram.prefetch(i, ix, lane=2)
                 e_rows = {i: (lambda i=i, ix=ix: m.engram.rows(i, ix)) for i, ix in idx.items()}
             else:
                 e_rows = {i: m.engram.rows(i, ix) for i, ix in idx.items()}
@@ -573,5 +645,5 @@ class RoundRunner:
                 self.captures += 1
         if not replay:
             return None, None
-        out = g.run(ids, pos, slots, base, end, e_rows)
+        out = g.run(ids, pos, slots, base, end, e_rows, e_start)
         return out, g.taps

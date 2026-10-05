@@ -33,6 +33,16 @@ TIMING = os.environ.get("TF_DS_TIMING", "0") == "1"        # per-section wall ti
 ENGRAM_PREFETCH = os.environ.get("TF_DS_ENGRAM_PREFETCH", "1") == "1"
 # TF_DS_ENGRAM_RANDOM=1 (default): the tables' files are read without readahead (a row is 264 bytes at a random offset)
 ENGRAM_RANDOM = os.environ.get("TF_DS_ENGRAM_RANDOM", "1") == "1"
+# TF_DS_ENGRAM_AIO=1 (default): a decode round's Engram reads (the read-ahead lane 2: RoundRunner's prefetch and touch)
+# are Linux AIO on O_DIRECT descriptors, submitted by the calling thread and reaped by it when the rows are needed
+# (engram_io.cpp aio_*), instead of a reader thread handing them to the pool's threads: a thread woken after a round's
+# idle took ~0.6 ms on GB10, two hand-offs made a 6-row window's read ~2 ms (AIO ~0.4-0.8 ms). The same bytes (checked
+# against preads at start; falls back to the pool when the kernel or the filesystem refuses).
+ENGRAM_AIO = os.environ.get("TF_DS_ENGRAM_AIO", "1") == "1"
+ENGRAM_AIO_SLOTS = 1024                                    # reads in flight at most (8 KB bounce slots: 8 MB)
+# TF_DS_ENGRAM_TOUCH_ASYNC=1 (default): a round's touch is submitted by engram_io's touch thread (aio_touch), not by the
+# round's thread (whose io_submit of it took ~0.6 ms on one node and held the round); 0: submitted inline as before
+ENGRAM_TOUCH_ASYNC = os.environ.get("TF_DS_ENGRAM_TOUCH_ASYNC", "1") == "1"
 TIMES: dict = {}
 
 
@@ -129,7 +139,10 @@ L2_PREFETCH = os.environ.get("TF_DS_L2_PREFETCH", "1") != "0"
 # expert's trellises in the "moe" fork, which it replaces.)
 SHARED_OVERLAP = os.environ.get("TF_DS_SHARED_OVERLAP", "0") == "1"
 L2_ATTN_MB = int(os.environ.get("TF_DS_L2_ATTN_MB") or 16)
-L2_MOE_MB = int(os.environ.get("TF_DS_L2_MOE_MB") or 16)
+# (8: the mHC mix, the gate and the shared expert's first ~2 MB; prefetching all of the shared expert (16) left it to be
+# evicted by the routed experts' stream before its programs read it: one-GPU proxy, real routing, 1-6 rows 0.2-0.4 ms
+# slower a forward than 8)
+L2_MOE_MB = int(os.environ.get("TF_DS_L2_MOE_MB") or 8)
 L2_NEXT_MB = int(os.environ.get("TF_DS_L2_NEXT_MB") or 16)
 
 
@@ -238,10 +251,11 @@ def mm(layer, x: torch.Tensor, out_dtype=BF16, ws: exl3_prefill.Workspace | None
 _WS = exl3_prefill.Workspace()
 
 
-def attn_in(lay, x: torch.Tensor, comp: bool = True) -> tuple:
+def attn_in(lay, x: torch.Tensor, comp: bool = True, xh: list | None = None) -> tuple:
     """The projections of an attention block's input rows x: (wq_a bf16, wkv bf16, compressor wkv, compressor wgate),
     the compressor's (``comp`` and the layer has one) in its dtype (bf16 at ratio 1, fp32 else), else None. One grouped
-    launch at decode sizes (``GROUPED``), else one ``mm`` each; the same bits either way."""
+    launch at decode sizes (``GROUPED``), else one ``mm`` each; the same bits either way. ``xh``: the group's input rows
+    already rotated (attn_in_rot's buffers, written by the mHC finish): no rotation launch."""
 
     ck = comp and lay.comp_wkv is not None
     cg = ck and lay.comp_wgate is not None
@@ -249,6 +263,25 @@ def attn_in(lay, x: torch.Tensor, comp: bool = True) -> tuple:
     if not GROUPED or EXACT_MM or x.shape[0] > 128:
         return (mm(lay.wq_a, x), mm(lay.wkv, x), mm(lay.comp_wkv, x, ck_dt) if ck else None,
                 mm(lay.comp_wgate, x, F32) if cg else None)
+    group, dts = _attn_in_group(lay, ck, cg, ck_dt)
+    out = group.rotated(xh, out_dtypes=dts) if xh is not None else group([x] * len(dts), out_dtypes=dts)
+    return tuple(out) + (None,) * (4 - len(out))
+
+
+def attn_in_rot(lay, n: int, device, comp: bool = True) -> tuple:
+    """(rotated-row buffers of attn_in's group for n rows, [(suh, buffer)] a layer): what kernels.hc_pre2(rot=...)
+    writes and attn_in(xh=...) reads; None when attn_in would not take a group launch."""
+
+    if not GROUPED or EXACT_MM or n > 128:
+        return None
+    ck = comp and lay.comp_wkv is not None
+    cg = ck and lay.comp_wgate is not None
+    group, _ = _attn_in_group(lay, ck, cg, BF16 if lay.ratio == 1 else F32)
+    xh = group.buffers(n, device)
+    return xh, list(zip(group.suh, xh))
+
+
+def _attn_in_group(lay, ck: bool, cg: bool, ck_dt) -> tuple:
     key = "_tf_in_c" if ck else "_tf_in"
     spec = getattr(lay, key, None)
     if spec is None:
@@ -263,9 +296,7 @@ def attn_in(lay, x: torch.Tensor, comp: bool = True) -> tuple:
             dts.append(F32)
         spec = (Exl3Group(layers), dts)
         setattr(lay, key, spec)
-    group, dts = spec
-    out = group([x] * len(dts), out_dtypes=dts)
-    return tuple(out) + (None,) * (4 - len(out))
+    return spec
 
 
 def wo_a_out(lay, o: torch.Tensor) -> torch.Tensor:
@@ -397,9 +428,34 @@ def _engram_io():
         here = Path(__file__).parent
         from torch.utils import cpp_extension
 
-        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v4", sources=[str(here / "engram_io.cpp")],
+        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v6", sources=[str(here / "engram_io.cpp")],
                                             extra_cflags=["-O3"], verbose=False)
     return _engram_io.ext
+
+
+class _AioRead:
+    """A lane-2 read submitted as AIO (Engram.prefetch): the future interface Engram uses (result, exception); the
+    rows are in its slot once result() returns."""
+
+    def __init__(self, io, bid: int):
+        self.io, self.bid, self.done, self.exc = io, bid, False, None
+
+    def result(self):
+        if not self.done:
+            self.done = True
+            try:
+                self.io.aio_wait(self.bid)
+            except RuntimeError as exc:
+                self.exc = exc
+        if self.exc is not None:
+            raise self.exc
+
+    def exception(self):
+        try:
+            self.result()
+        except RuntimeError as exc:
+            return exc
+        return None
 
 
 class Engram:
@@ -429,6 +485,7 @@ class Engram:
         self.np_map = np.asarray(token_map, dtype=np.int64)
         self.pad = int(token_map[cfg.engram_pad])
         self.files: dict = {}
+        paths: dict = {}
         for path in sorted(Path(engram_dir).glob("*.safetensors")):
             with open(path, "rb") as f:
                 size = struct.unpack("<Q", f.read(8))[0]
@@ -440,6 +497,7 @@ class Engram:
                 if name.endswith("engram.embed.weight") or name.endswith("engram.embed.scale"):
                     lo, hi = e["data_offsets"]
                     self.files[name] = (fd, 8 + size + lo, int(np.prod(e["shape"][1:])))
+                    paths[fd] = path
         self.io = _engram_io()
         self.threads = int(os.environ.get("TF_DS_ENGRAM_THREADS") or 128)
         self.pinned: dict = {}
@@ -447,6 +505,42 @@ class Engram:
         self.ahead: list = []                         # (layer, flat ids, future, slot)
         self.ring: dict = {}
         self.bg = {1: ThreadPoolExecutor(1), 2: ThreadPoolExecutor(1)} if ENGRAM_PREFETCH else None
+        self.dfiles: dict | None = None               # the same tables on O_DIRECT descriptors (lane 2's AIO reads)
+        if ENGRAM_AIO and self.bg is not None:
+            self.dfiles = self._aio_open(paths)
+
+    def _aio_open(self, paths: dict) -> dict | None:
+        """O_DIRECT descriptors of the tables and the AIO ring, if the kernel and the filesystem take them and a few rows
+        read through them equal the preads' bytes; else None (lane 2 stays on the reader pool)."""
+
+        dfd: dict = {}
+        try:
+            for fd, path in paths.items():
+                dfd[fd] = os.open(str(path), os.O_RDONLY | os.O_DIRECT)
+            if not self.io.aio_init(ENGRAM_AIO_SLOTS):
+                raise OSError("io_setup refused")
+            dfiles = {name: (dfd[fd], off, rb) for name, (fd, off, rb) in self.files.items()}
+            name = next(n for n in self.files if n.endswith("engram.embed.weight"))
+            layer = name[:-len("engram.embed.weight")]
+            fw, bw, rw = self.files[name]
+            fs, bs, rs = self.files[layer + "engram.embed.scale"]
+            dw, _, _ = dfiles[name]
+            ds, _, _ = dfiles[layer + "engram.embed.scale"]
+            idx = torch.tensor([0, 1, 4097, 123457, 7654321], dtype=torch.int64)
+            m = idx.numel()
+            pw, ps = torch.empty((m, rw), dtype=torch.uint8), torch.empty((m, rs), dtype=torch.uint8)
+            aw, as_ = torch.empty_like(pw), torch.empty_like(ps)
+            # (the reader pools are made at their first call, with that call's thread count: the configured one)
+            self.io.gather_rows2(fw, bw, rw, fs, bs, rs, idx, pw, ps, self.threads)
+            self.io.aio_wait(self.io.aio_start(dw, bw, rw, ds, bs, rs, idx, aw, as_, 1))
+            if not (torch.equal(pw, aw) and torch.equal(ps, as_)):
+                raise OSError("AIO rows differ from the preads'")
+            return dfiles
+        except (OSError, RuntimeError, StopIteration) as exc:
+            for d in dfd.values():
+                os.close(d)
+            print(f"[tensorfold] Engram decode reads stay on the reader pool: {exc}", flush=True)
+            return None
 
     def hashes(self, tokens: list[int], start: int, n: int) -> np.ndarray:
         """Row ids [n, L, cols] for positions start .. start + n - 1 of ``tokens`` (the whole sequence so far)."""
@@ -503,9 +597,49 @@ class Engram:
             else:
                 slots.append(slot)
         it = torch.from_numpy(flat)
-        fut = self.bg[lane].submit(self.io.gather_rows2_at, lane, fw, bw, rw, fs, bs, rs, it, slot[0][:m],
-                                   slot[1][:m], self.threads)
+        if lane == 2 and self.dfiles is not None and ENGRAM_AIO:
+            # submitted here, reaped by rows() (the slot, which the rows land in, stays alive in self.ahead)
+            dw, _, _ = self.dfiles[f"layers.{layer}.engram.embed.weight"]
+            ds, _, _ = self.dfiles[f"layers.{layer}.engram.embed.scale"]
+            fut = _AioRead(self.io, self.io.aio_start(dw, bw, rw, ds, bs, rs, it, slot[0][:m], slot[1][:m], 1))
+        else:
+            fut = self.bg[lane].submit(self.io.gather_rows2_at, lane, fw, bw, rw, fs, bs, rs, it, slot[0][:m],
+                                       slot[1][:m], self.threads)
         self.ahead.append((layer, flat, fut, slot))
+
+    def decode_aio(self) -> bool:
+        """Whether lane 2's reads (decode rounds) go as AIO (ENGRAM_AIO and the descriptors opened)."""
+
+        return self.dfiles is not None and ENGRAM_AIO and self.bg is not None
+
+    def touch(self, layer: int, idx: np.ndarray) -> None:
+        """Read idx's rows on the decode lane (an AIO batch nobody waits for, or the reader pool into a throwaway
+        buffer): a round's first rows, known before its drafts, so its Engram read finds the drive awake (GB10's NVMe: a
+        random read takes ~0.3 ms within ~10 ms of the last one, ~1 ms after a round's idle; on the pool path their pages
+        are cached too). Nothing a forward reads changes (rows() reads every row it needs itself)."""
+
+        if self.bg is None:
+            return
+        flat = np.ascontiguousarray(idx.reshape(-1), dtype=np.int64)
+        fw, bw, rw = self.files[f"layers.{layer}.engram.embed.weight"]
+        fs, bs, rs = self.files[f"layers.{layer}.engram.embed.scale"]
+        m = flat.shape[0]
+        if self.dfiles is not None and ENGRAM_AIO:
+            # one row as an AIO batch nobody waits for (nothing copied; reaped by later reads): it wakes the drive (an
+            # O_DIRECT read caches nothing, and each read submitted costs the caller ~3 us)
+            dw, _, _ = self.dfiles[f"layers.{layer}.engram.embed.weight"]
+            ds, _, _ = self.dfiles[f"layers.{layer}.engram.embed.scale"]
+            if ENGRAM_TOUCH_ASYNC:
+                self.io.aio_touch(dw, bw, rw, ds, bs, rs, torch.from_numpy(flat[:1].copy()))
+                return
+            none = torch.empty((0,), dtype=torch.uint8)
+            self.io.aio_start(dw, bw, rw, ds, bs, rs, torch.from_numpy(flat[:1].copy()), none, none, 0)
+            return
+        bw_t = torch.empty((m, rw), dtype=torch.uint8)
+        bs_t = torch.empty((m, rs), dtype=torch.uint8)
+        # (the future keeps its arguments, so the buffers, alive until the read ends; a failed touch is ignored)
+        self.bg[2].submit(self.io.gather_rows2_at, 2, fw, bw, rw, fs, bs, rs, torch.from_numpy(flat), bw_t, bs_t,
+                          self.threads)
 
     def rows(self, layer: int, idx: np.ndarray) -> torch.Tensor:
         """idx [n, cols] (this rank's columns, host) -> bf16 [n, cols * head_dim] on the GPU, no device sync."""
@@ -926,7 +1060,7 @@ class Model:
             # decode / verify windows: the row-invariant matmul; prompt chunks: one cuBLAS GEMM
             pick = torch.empty((n, slots), dtype=torch.int32, device=x.device)
             wts = torch.empty((n, slots), dtype=F32, device=x.device)
-            logits = ((K.rowmm2 if K.on("rowmm") else K.rowmm)(x, lay.gate_w) if n <= K.DECODE_ROWS
+            logits = ((K.rowmm_gate if K.on("rowmm") else K.rowmm)(x, lay.gate_w) if n <= K.DECODE_ROWS
                       else (x.float() @ lay.gate_w.float().t()))
             K.route(logits, lay.gate_b, topk, c.route_scale, shared_id, pick, wts)
             if img is not None:

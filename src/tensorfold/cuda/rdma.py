@@ -5,6 +5,13 @@ write of the same 24 KB takes 6.4 us between two GB10 nodes (ib_write_lat). Here
 pinned host memory and rings a doorbell, a CPU thread RDMA-writes it to every peer followed by a sequence flag on the same
 queue pair, and a collecting kernel waits for the flags and copies the slots out in rank order: the same bytes as
 ``NCCL.all_gather``, the kernel pair captured in graphs like any other.
+
+v5 (rdma_gather.cu's header has the measurements): the rings and their flags in registered malloc memory (GB10 reaches it
+through the GPU's coherent L2 path, cudaHostAlloc memory through an uncached one), one fence a staging block, this
+rank's own slice copied while the writes are on the wire, unrolled ring loads; TF_RDMA_HOST_REG / TF_RDMA_META_REG /
+TF_RDMA_STAGE_FENCE / TF_RDMA_OWN_EARLY / TF_RDMA_COLLECT_UNROLL = 0 each restore c100's way. TF_RDMA_SLOTS (default 4)
+sets the ring slots (2 halves the pinned rings; any count >= 2 is safe: a rank stages gather q + 2 only after its own
+collect of q + 1, which needs the peer's data of q + 1, sent after the peer's collect of q).
 """
 
 from __future__ import annotations
@@ -23,7 +30,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_rdma_gather_v3", sources=[str(here / "rdma_gather.cu")],
+    return load(name="tensorfold_rdma_gather_v5", sources=[str(here / "rdma_gather.cu")],
                 extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
 
 
@@ -54,17 +61,20 @@ def device_names() -> list[str]:
 class RdmaGather:
     """``all_gather(send, recv)`` of fp32 tensors up to ``max_bytes`` a rank; every rank calls in the same order."""
 
-    def __init__(self, store, rank: int, world: int, *, max_bytes: int, slots: int = 4, prefix: str = "tf_rdma",
-                 devices: list[str] | None = None, gid_index: int | None = None) -> None:
+    def __init__(self, store, rank: int, world: int, *, max_bytes: int, slots: int | None = None,
+                 prefix: str = "tf_rdma", devices: list[str] | None = None, gid_index: int | None = None) -> None:
         ext = _ext()
+        slots = int(os.environ.get("TF_RDMA_SLOTS") or 4) if slots is None else int(slots)
         gid = int(os.environ.get("NCCL_IB_GID_INDEX", "5")) if gid_index is None else int(gid_index)
         cpu = int(os.environ.get("TF_RDMA_CPU", "-1"))
         self.ext, self.rank, self.world, self.max_bytes = ext, rank, world, int(max_bytes)
         self.devices = device_names() if devices is None else list(devices)
         error = ""
         try:
+            if slots < 2:
+                raise ValueError(f"TF_RDMA_SLOTS must be at least 2 (got {slots})")
             self.h = ext.create(rank, world, self.max_bytes, slots, self.devices, gid, cpu)
-            info = pickle.dumps(ext.local_info(self.h))
+            info = pickle.dumps((ext.local_info(self.h), slots, self.max_bytes))
         except Exception as exc:           # noqa: BLE001  (published, so every rank refuses together)
             error, info = f"{type(exc).__name__}: {exc}", b""
         store.set(f"{prefix}/info/{rank}", b"E" + error.encode() if error else b"I" + info)
@@ -72,8 +82,13 @@ class RdmaGather:
         bad = [f"rank {r}: {p[1:].decode(errors='replace')}" for r, p in enumerate(peers) if p[:1] != b"I"]
         if bad:
             raise RuntimeError("RDMA gather unavailable (" + "; ".join(bad) + ")")
+        infos = [pickle.loads(peers[r][1:]) for r in range(world)]
         try:
-            ext.connect(self.h, [pickle.loads(peers[r][1:])[rank] for r in range(world)])
+            # the ring layout (slots, slot bytes) addresses every write: the ranks must agree on it
+            shapes = {(i[1], i[2]) for i in infos}
+            if len(shapes) != 1:
+                raise ValueError(f"ranks disagree on the rings (slots, bytes): {sorted(shapes)}")
+            ext.connect(self.h, [infos[r][0][rank] for r in range(world)])
         except Exception as exc:           # noqa: BLE001
             error = f"{type(exc).__name__}: {exc}"
         # every QP is ready to receive before anyone writes, or every rank gives up

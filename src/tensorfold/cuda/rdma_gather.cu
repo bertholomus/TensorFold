@@ -12,6 +12,19 @@
 // (every 1024 spins, so a live gather's latency is unchanged). The proxy sets it when an RDMA completion fails (a write
 // to a dead peer runs out of retries), and so does ``abort`` (a watchdog that lost a peer); after it every gather on this
 // rank, captured ones included, returns at once with garbage and ``failure`` names why.
+//
+// v5 (each part behind a switch; 0 restores c100's path, the bytes moved are the same in every mode):
+// - TF_RDMA_HOST_REG (default 1): the rings and the metadata (flags, doorbell, sizes, sent, abort word) live in malloc'd
+//   memory registered with cudaHostRegister (and mlock'd) instead of one cudaHostAlloc block. On GB10 the GPU reaches
+//   cudaHostAlloc memory over an uncached path whose stores, loads and polls queue behind DRAM traffic (the L2 prefetch
+//   running beside a gather), while registered malloc memory takes the coherent, L2-cached path of cudaMalloc memory (4 MB:
+//   loads 6.3 us against 20.4, stores 6.2 against 20.7). The NIC registers both alike; GPUDirect RDMA and dma-buf
+//   export of cudaMalloc memory are not available on GB10. TF_RDMA_META_REG=0 keeps only the metadata in cudaHostAlloc.
+// - TF_RDMA_STAGE_FENCE (default 1): one system fence a staging block after a barrier (as NCCL publishes its proxy
+//   FIFO) instead of one a thread, the size written before that release, and one fence before the doorbell, not three.
+// - TF_RDMA_OWN_EARLY (default 1): the staging kernel copies this rank's own slice to the output after the doorbell,
+//   while the writes are on the wire, so the collecting kernel copies only the peers' slices after its wait.
+// - TF_RDMA_COLLECT_UNROLL (default 1): the collecting kernel keeps up to four ring loads in flight a thread.
 
 #include <torch/extension.h>
 #include <pybind11/stl.h>
@@ -22,8 +35,10 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sched.h>
+#include <sys/mman.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <atomic>
 #include <cstring>
 #include <memory>
@@ -54,11 +69,21 @@ __device__ __forceinline__ uint64_t now_ns() {
     return t;
 }
 
+__device__ __forceinline__ void store_relaxed_sys(uint64_t* p, uint64_t v) {
+    asm volatile("st.relaxed.sys.global.u64 [%0], %1;" ::"l"(p), "l"(v) : "memory");
+}
+
+int env_int(const char* name, int dflt) {
+    const char* e = std::getenv(name);
+    return e && *e ? std::atoi(e) : dflt;
+}
+
 struct Nic {
     ibv_context* ctx = nullptr;
     ibv_pd* pd = nullptr;
     ibv_cq* cq = nullptr;
-    ibv_mr* mr = nullptr;
+    ibv_mr* mr = nullptr;                 // the send ring's (the whole block's when the rings are cudaHostAlloc memory)
+    ibv_mr* mr_recv = nullptr;            // the receive ring's (== mr in that case)
     ibv_gid gid{};
     std::vector<ibv_qp*> qps;             // per peer
     std::vector<uint32_t> psns;
@@ -73,8 +98,11 @@ struct Peer {
 struct Gather {
     int rank = 0, world = 1, slots = 4, port = 1, gid_index = 5, cpu = -1;
     size_t max_bytes = 0;
-    char* host = nullptr;
+    char* host = nullptr;                 // the metadata's block (host_reg 0: rings + metadata in one cudaHostAlloc)
     size_t host_bytes = 0;
+    int host_reg = 0;                     // TF_RDMA_HOST_REG at create (1: registered malloc memory)
+    size_t send_bytes = 0, recv_bytes = 0;
+    int fence_mode = 0;                   // TF_RDMA_STAGE_FENCE: 1 one fence a block and one publish fence, 0 as c100
     char* send_ring = nullptr;            // [slots][max_bytes]
     char* recv_ring = nullptr;            // [slots][world][max_bytes]
     uint64_t* flags = nullptr;            // [slots][world]: the sequence whose data from a peer is in (slot, peer)
@@ -83,6 +111,7 @@ struct Gather {
     uint64_t* sent = nullptr;             // [slots]: the last sequence whose writes from a slot completed
     uint64_t* abort_word = nullptr;       // nonzero: every wait gives up (a peer is gone)
     uint64_t* seq = nullptr;              // device: gathers so far
+    unsigned* staged = nullptr;           // device: blocks of the current staging launch done copying (reset by the last)
     uint64_t* probe = nullptr;            // device: summed ns (stage, doorbell -> flags, copy-out), count, doorbell time
     bool probing = false;
     std::vector<Nic> nics;
@@ -112,12 +141,18 @@ T* dev(T* host_ptr) {
     return d;
 }
 
-// One block: wait until the slot's last writes are done, copy the partial in, then publish its size and the doorbell.
+// Each block: wait until the slot's last writes are done, copy its share of the partial in; the last block to finish
+// (a counter) publishes the size and the doorbell. (One block took ~6 us for a 6-row window's 120 KB and ~35 us for a
+// 6-row head's 1.5 MB into the pinned ring on GB10; 8-16 blocks 2.5 and 9.) Every block reads the sequence before it
+// counts itself in, and only the last one, after every block has, advances it.
 __global__ void __launch_bounds__(STAGE_THREADS) stage_kernel(const float4* __restrict__ src, int n4, char* send_ring,
                                                                uint64_t* sizes, uint64_t* doorbell, const uint64_t* sent,
                                                                uint64_t* seq, int slots, uint64_t max_bytes,
-                                                               uint64_t* probe, const uint64_t* abort_word) {
+                                                               uint64_t* probe, const uint64_t* abort_word,
+                                                               unsigned* staged, int fence_mode,
+                                                               float4* __restrict__ own_dst) {
     __shared__ uint64_t s_seq;
+    __shared__ int s_last;
     const uint64_t t0 = now_ns();
     if (threadIdx.x == 0) {
         const uint64_t q = *seq + 1;
@@ -126,23 +161,49 @@ __global__ void __launch_bounds__(STAGE_THREADS) stage_kernel(const float4* __re
             for (uint32_t i = 1; load_sys(sent + slot) + slots < q; ++i)
                 if ((i & 1023) == 0 && load_sys(abort_word)) break;
         s_seq = q;
+        // fence_mode 1: the size is written before this block's release below, so the publish needs no second fence
+        if (fence_mode && blockIdx.x == 0) store_relaxed_sys(sizes + slot, (uint64_t)n4 * 16);
     }
     __syncthreads();
     const uint64_t q = s_seq;
     const int slot = (int)(q % slots);
     float4* dst = reinterpret_cast<float4*>(send_ring + (size_t)slot * max_bytes);
-    for (int i = threadIdx.x; i < n4; i += blockDim.x) dst[i] = src[i];
-    __threadfence_system();
-    __syncthreads();
-    if (threadIdx.x == 0) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) dst[i] = src[i];
+    if (fence_mode) {
+        // the barrier orders every thread's stores before thread 0's system fence (a release for the whole block, as
+        // NCCL publishes its proxy FIFO), then the counter
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            __threadfence_system();
+            s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
+        }
+    } else {
         __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) s_last = atomicAdd(staged, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && s_last) {
+        __threadfence_system();
+        *staged = 0;
         *seq = q;
-        store_sys(sizes + slot, (uint64_t)n4 * 16);
-        store_sys(doorbell, q);
+        if (fence_mode) {
+            // the fence above acquired every block's release (data and size) and orders them before this strong store
+            store_relaxed_sys(doorbell, q);
+        } else {
+            store_sys(sizes + slot, (uint64_t)n4 * 16);
+            store_sys(doorbell, q);
+        }
         if (probe) {
             probe[0] += now_ns() - t0;
             probe[4] = now_ns();
         }
+    }
+    if (own_dst) {
+        // TF_RDMA_OWN_EARLY: this rank's own slice of the output, copied after the doorbell (during the RDMA writes and
+        // the peer's) instead of by the collecting kernel after the wait; the same bytes from the same source
+        if (s_last) __syncthreads();             // the publishing block lets its doorbell out first (s_last is uniform)
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) own_dst[i] = src[i];
     }
 }
 
@@ -152,7 +213,8 @@ __global__ void __launch_bounds__(COLLECT_THREADS) collect_kernel(const float4* 
                                                                    const char* recv_ring, const uint64_t* flags,
                                                                    const uint64_t* seq, int rank, int world, int slots,
                                                                    uint64_t max_bytes, uint64_t* probe,
-                                                                   const uint64_t* abort_word) {
+                                                                   const uint64_t* abort_word, int skip_own,
+                                                                   int unroll) {
     const uint64_t q = *seq;
     const int slot = (int)(q % slots);
     if (threadIdx.x < world && threadIdx.x != rank)
@@ -163,11 +225,27 @@ __global__ void __launch_bounds__(COLLECT_THREADS) collect_kernel(const float4* 
     for (int p = 0; p < world; ++p) {
         float4* out = dst + (size_t)p * n4;
         if (p == rank) {
+            if (skip_own) continue;              // the staging kernel wrote it
             for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x) out[i] = own[i];
         } else {
             const float4* in = reinterpret_cast<const float4*>(recv_ring + ((size_t)slot * world + p) * max_bytes);
-            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x)
-                out[i] = __ldcv(in + i);
+            if (unroll) {
+                // TF_RDMA_COLLECT_UNROLL: up to four loads of the ring in flight a thread before its stores (the ring's
+                // first reads after the flag wait out a DRAM queue when a prefetch runs beside)
+                const int stride = gridDim.x * blockDim.x;
+                for (int b = blockIdx.x * blockDim.x + threadIdx.x; b < n4; b += 4 * stride) {
+                    float4 v[4];
+#pragma unroll
+                    for (int u = 0; u < 4; ++u)
+                        if (b + u * stride < n4) v[u] = __ldcv(in + b + u * stride);
+#pragma unroll
+                    for (int u = 0; u < 4; ++u)
+                        if (b + u * stride < n4) out[b + u * stride] = v[u];
+                }
+            } else {
+                for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n4; i += gridDim.x * blockDim.x)
+                    out[i] = __ldcv(in + i);
+            }
         }
     }
     if (probe && blockIdx.x == 0) {
@@ -311,8 +389,17 @@ Nic open_nic(const std::string& name, Gather& g, int world, int rank) {
     TORCH_CHECK(nic.pd, "rdma gather: ibv_alloc_pd failed");
     nic.cq = ibv_create_cq(nic.ctx, 4096, nullptr, nullptr, 0);
     TORCH_CHECK(nic.cq, "rdma gather: ibv_create_cq failed");
-    nic.mr = ibv_reg_mr(nic.pd, g.host, g.host_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
-    TORCH_CHECK(nic.mr, "rdma gather: ibv_reg_mr of ", g.host_bytes, " pinned bytes on ", name, " failed");
+    if (g.host_reg == 0) {
+        nic.mr = ibv_reg_mr(nic.pd, g.host, g.host_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        TORCH_CHECK(nic.mr, "rdma gather: ibv_reg_mr of ", g.host_bytes, " pinned bytes on ", name, " failed");
+        nic.mr_recv = nic.mr;
+    } else {
+        nic.mr = ibv_reg_mr(nic.pd, g.send_ring, g.send_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        TORCH_CHECK(nic.mr, "rdma gather: ibv_reg_mr of the ", g.send_bytes, "-byte send ring on ", name, " failed");
+        nic.mr_recv = ibv_reg_mr(nic.pd, g.recv_ring, g.recv_bytes, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE);
+        TORCH_CHECK(nic.mr_recv, "rdma gather: ibv_reg_mr of the ", g.recv_bytes, "-byte receive ring on ", name,
+                    " failed");
+    }
     TORCH_CHECK(ibv_query_gid(nic.ctx, g.port, g.gid_index, &nic.gid) == 0, "rdma gather: ibv_query_gid failed");
     std::random_device rd;
     nic.qps.assign(world, nullptr);
@@ -358,19 +445,53 @@ int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, co
     g->cpu = (int)cpu;
     const size_t send_b = (size_t)slots * max_bytes, recv_b = (size_t)slots * world * max_bytes;
     const size_t meta_b = ((size_t)slots * world + 1 + 2 * (size_t)slots + 1) * 8;
-    g->host_bytes = send_b + recv_b + ((meta_b + 4095) / 4096) * 4096;
-    C10_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g->host), g->host_bytes,
-                                 cudaHostAllocMapped | cudaHostAllocPortable));
-    std::memset(g->host, 0, g->host_bytes);
-    g->send_ring = g->host;
-    g->recv_ring = g->host + send_b;
-    g->flags = reinterpret_cast<uint64_t*>(g->host + send_b + recv_b);
+    g->host_reg = env_int("TF_RDMA_HOST_REG", 1) ? 1 : 0;
+    g->fence_mode = env_int("TF_RDMA_STAGE_FENCE", 1) ? 1 : 0;
+    g->send_bytes = send_b;
+    g->recv_bytes = recv_b;
+    uint64_t* meta = nullptr;
+    if (g->host_reg == 0) {
+        g->host_bytes = send_b + recv_b + ((meta_b + 4095) / 4096) * 4096;
+        C10_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g->host), g->host_bytes,
+                                     cudaHostAllocMapped | cudaHostAllocPortable));
+        std::memset(g->host, 0, g->host_bytes);
+        g->send_ring = g->host;
+        g->recv_ring = g->host + send_b;
+        meta = reinterpret_cast<uint64_t*>(g->host + send_b + recv_b);
+    } else {
+        // malloc'd pages pinned by cudaHostRegister (mapped; on GB10 the device pointer is the host pointer)
+        auto reg = [](size_t n) {
+            void* p = nullptr;
+            TORCH_CHECK(posix_memalign(&p, 1 << 16, n) == 0 && p, "rdma gather: no memory for ", n, " pinned bytes");
+            std::memset(p, 0, n);
+            // cudaHostRegister does not page-lock on GB10 (the GPU reaches the pages through the host page tables);
+            // the NIC's registration pins the rings, and mlock keeps the metadata (flags, doorbell, abort word)
+            // resident too. Best effort: a refusal (RLIMIT_MEMLOCK) leaves the old behaviour.
+            (void)mlock(p, n);
+            C10_CUDA_CHECK(cudaHostRegister(p, n, cudaHostRegisterMapped | cudaHostRegisterPortable));
+            return reinterpret_cast<char*>(p);
+        };
+        g->send_ring = reg(send_b);
+        g->recv_ring = reg(recv_b);
+        g->host_bytes = ((meta_b + 4095) / 4096) * 4096;
+        if (env_int("TF_RDMA_META_REG", 1)) {
+            g->host = reg(g->host_bytes);
+        } else {
+            C10_CUDA_CHECK(cudaHostAlloc(reinterpret_cast<void**>(&g->host), g->host_bytes,
+                                         cudaHostAllocMapped | cudaHostAllocPortable));
+            std::memset(g->host, 0, g->host_bytes);
+        }
+        meta = reinterpret_cast<uint64_t*>(g->host);
+    }
+    g->flags = meta;
     g->doorbell = g->flags + (size_t)slots * world;
     g->sizes = g->doorbell + 1;
     g->sent = g->sizes + slots;
     g->abort_word = g->sent + slots;
     C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->seq), 8));
     C10_CUDA_CHECK(cudaMemset(g->seq, 0, 8));
+    C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->staged), 8));
+    C10_CUDA_CHECK(cudaMemset(g->staged, 0, 8));
     C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->probe), 8 * 8));
     C10_CUDA_CHECK(cudaMemset(g->probe, 0, 8 * 8));
     for (const auto& name : devices) g->nics.push_back(open_nic(name, *g, (int)world, (int)rank));
@@ -389,7 +510,7 @@ std::vector<py::tuple> local_info(int64_t h) {
         for (auto& nic : g.nics) {
             qpn.push_back(nic.qps[p] ? nic.qps[p]->qp_num : 0);
             psn.push_back(nic.psns[p]);
-            rkey.push_back(nic.mr->rkey);
+            rkey.push_back(nic.mr_recv->rkey);
             gid.push_back(py::bytes(reinterpret_cast<const char*>(nic.gid.raw), 16));
         }
         out.push_back(py::make_tuple(qpn, psn, gid, (uint64_t)(uintptr_t)g.recv_ring, rkey));
@@ -494,14 +615,32 @@ void gather(int64_t h, const at::Tensor& send, at::Tensor recv) {
     const int n4 = (int)(n / 4);
     uint64_t* probe = g.probing ? g.probe : nullptr;
     auto stream = at::cuda::getCurrentCUDAStream();
-    stage_kernel<<<1, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(send.data_ptr()), n4,
-                                                  dev(g.send_ring), dev(g.sizes), dev(g.doorbell), dev(g.sent), g.seq,
-                                                  g.slots, g.max_bytes, probe, dev(g.abort_word));
+    // TF_RDMA_STAGE_BLOCKS (default 16): the most staging blocks, one per 1024 float4 of the partial (1 = one block)
+    static const int stage_max = [] {
+        const char* e = std::getenv("TF_RDMA_STAGE_BLOCKS");
+        return std::max(1, e && *e ? std::atoi(e) : 16);
+    }();
+    static const int collect_max = [] {
+        const char* e = std::getenv("TF_RDMA_COLLECT_BLOCKS");
+        return std::max(1, e && *e ? std::atoi(e) : 48);
+    }();
+    // TF_RDMA_OWN_EARLY (default 1): the staging kernel copies this rank's slice to the output after its doorbell
+    static const bool own_early = env_int("TF_RDMA_OWN_EARLY", 1) != 0;
+    // TF_RDMA_COLLECT_UNROLL (default 1): up to four ring loads in flight a collecting thread
+    static const bool collect_unroll = env_int("TF_RDMA_COLLECT_UNROLL", 1) != 0;
+    const int sblocks = std::max(1, std::min(stage_max, (n4 + 1023) / 1024));
+    float4* own_dst = own_early ? reinterpret_cast<float4*>(recv.data_ptr()) + (size_t)g.rank * n4 : nullptr;
+    stage_kernel<<<sblocks, STAGE_THREADS, 0, stream>>>(reinterpret_cast<const float4*>(send.data_ptr()), n4,
+                                                        dev(g.send_ring), dev(g.sizes), dev(g.doorbell), dev(g.sent),
+                                                        g.seq, g.slots, g.max_bytes, probe, dev(g.abort_word), g.staged,
+                                                        g.fence_mode, own_dst);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    const int blocks = std::max(1, std::min(16, (n4 * g.world + COLLECT_THREADS * 4 - 1) / (COLLECT_THREADS * 4)));
+    // TF_RDMA_COLLECT_BLOCKS (default 48; 16 before): the most collecting blocks, one per 1024 float4 copied out
+    const int blocks = std::max(1, std::min(collect_max, (n4 * g.world + COLLECT_THREADS * 4 - 1) / (COLLECT_THREADS * 4)));
     collect_kernel<<<blocks, COLLECT_THREADS, 0, stream>>>(
         reinterpret_cast<const float4*>(send.data_ptr()), reinterpret_cast<float4*>(recv.data_ptr()), n4,
-        dev(g.recv_ring), dev(g.flags), g.seq, g.rank, g.world, g.slots, g.max_bytes, probe, dev(g.abort_word));
+        dev(g.recv_ring), dev(g.flags), g.seq, g.rank, g.world, g.slots, g.max_bytes, probe, dev(g.abort_word),
+        own_early ? 1 : 0, collect_unroll ? 1 : 0);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

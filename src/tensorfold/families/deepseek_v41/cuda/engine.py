@@ -19,6 +19,10 @@ from typing import Any, Callable
 import torch
 
 PREFILL_CHUNK = int(os.environ.get("TF_DS_PREFILL_CHUNK") or 512)
+# the RDMA gather's slot in MiB (default 4.25; 8 before): fp32 gathers up to it go over RDMA writes, larger ones over
+# NCCL. Decode's largest is a 16-row vocab-split head (4.14 MB); prefill chunks of 218-409 rows send 4.3-8 MB a gather
+# (over NCCL at 4.25). Pinned host memory a rank: slot x TF_RDMA_SLOTS x (1 + world) (4.25 MiB x 4 x 3 = 51 MiB; 96 at 8)
+RDMA_MB = float(os.environ.get("TF_DS_RDMA_MB") or 4.25)
 GRAPHS = os.environ.get("TF_DS_GRAPHS", "1") != "0"
 # decoder SWA bounded replay (CED's prefill, DeepSeek's deployment mode): the decoder runs only over the last 128
 # prompt tokens; off by default (exact prefill) until its agreement and needle recall are measured
@@ -76,7 +80,7 @@ class DsEngine:
             eng = Engram(engram_dir, cfg, tm, rank, world)
         elif rank == 0:
             print("[tensorfold] WARNING: no Engram tables (TF_DS_ENGRAM): output will be degraded", flush=True)
-        self.model = Model(self.w, Comm(nccl, world, rdma_bytes=8 << 20), eng)
+        self.model = Model(self.w, Comm(nccl, world, rdma_bytes=int(RDMA_MB * (1 << 20)) // 64 * 64), eng)
         # images (--vision): the tower runs on rank 0, which shares each image span's rows; every rank routes the span
         # with the gates' VL bias and keeps Engram out of it
         self.vision = None
@@ -128,14 +132,17 @@ class DsEngine:
             self.sc = self.model.pool_view(mu.pool, 0, 0, mu.extents.total)
             self.dc = mu.slots[0].dc
         if nccl is not None:
-            nccl.barrier()
-            mine = torch.tensor([int(self.vcfg is not None), int(parallel)], dtype=torch.int64, device="cuda")
-            every = torch.empty((world * 2,), dtype=torch.int64, device="cuda")
+            from . import markov
+
+            nccl.barrier()                               # the Markov switches set the drafter's gathers (count, size)
+            mine = torch.tensor([int(self.vcfg is not None), int(parallel), int(markov.ON), int(markov.SPLIT)],
+                                dtype=torch.int64, device="cuda")
+            every = torch.empty((world * 4,), dtype=torch.int64, device="cuda")
             nccl.all_gather(mine, every)
-            flags = every.view(world, 2).tolist()
+            flags = every.view(world, 4).tolist()
             if any(f != flags[0] for f in flags):
-                raise ValueError("--vision and --parallel must be the same on every rank (rank 0 and the workers run "
-                                 f"the same steps): {flags}")
+                raise ValueError("--vision, --parallel, TF_DS_MARKOV and TF_DS_MARKOV_SPLIT must be the same on every "
+                                 f"rank (rank 0 and the workers run the same steps): {flags}")
         if WARM:
             self.warm()
         if self.concurrent:

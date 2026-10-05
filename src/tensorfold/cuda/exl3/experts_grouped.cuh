@@ -1375,6 +1375,9 @@ struct DecodeEpi {
     int* ready = nullptr;
     int* ready_cnt = nullptr;
     const int* epoch = nullptr;   // this launch's number (decode_prep adds one)
+    // the dead fp32 scratch leaves L2 unwritten (discard.global.L2): EPI 1 the gate/up partials Z an epilogue has
+    // summed, EPI 2 (with wts) the per-slot outputs y a row's combine has added (nothing reads either afterwards)
+    int discard = 0;
 };
 
 template <int CB, int K2, int NT, int S, int SW, bool WAIT>
@@ -1631,6 +1634,15 @@ __global__ void __launch_bounds__(W * 32, 4) grouped_cp_kernel(
 #pragma unroll
                 for (int j = 0; j < 4; ++j)
                     ep.out[(size_t)r * N + n + j] = ep.add ? __fadd_rn(a4[j], ep.add[(size_t)r * N + n + j]) : a4[j];
+                if (ep.discard) {
+                    // the row's slots' outputs of this column block (512 bytes each, 128-byte aligned: N a multiple
+                    // of 128) are added and read by nothing else: drop their L2 lines (this warp read them all)
+                    __syncwarp();
+                    if (lane < 4 * slots) {
+                        const float* yl = ep.y + (size_t)(r * slots + (lane >> 2)) * N + by * 128 + (lane & 3) * 32;
+                        asm volatile("discard.global.L2 [%0], 128;" ::"l"(yl) : "memory");
+                    }
+                }
             }
         }
     }
@@ -1687,18 +1699,44 @@ __global__ void __launch_bounds__(W * 32, 4) grouped_cp_kernel(
             half* o = ep.xd + (size_t)p * N + n;
 #pragma unroll
             for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * EPI_HAD);
+            if (ep.discard) {
+                // this member's gate/up partials of the column block (2 mats x SK splits x 512 bytes, 128-byte
+                // aligned: N a multiple of 128), summed above by this warp alone, are dead: drop their L2 lines
+                __syncwarp();
+                if (lane < 8 * SK) {
+                    const int ms = lane >> 2, c = (lane & 3) * 32;           // (mat, split) = ms / SK, ms % SK
+                    const float* zl = Z + ((size_t)ms * P + p) * N + by * 128 + c;
+                    asm volatile("discard.global.L2 [%0], 128;" ::"l"(zl) : "memory");
+                }
+            }
         }
         if (ep.ready != nullptr) {
             // the expert's last column block: publish its rows to down's programs (they wait on ready[u])
             __threadfence();
             __syncthreads();
-            if (threadIdx.x == 0) {
-                const int done = atomicAdd(ep.ready_cnt + u, 1);
-                if (done == NY - 1) {
-                    ep.ready_cnt[u] = 0;
-                    __threadfence();
-                    st_release(ep.ready + u, *ep.epoch);
+            if (threadIdx.x == 0) last_sh = atomicAdd(ep.ready_cnt + u, 1) == NY - 1;
+            __syncthreads();
+            if (ep.discard && (K & 63) == 0) {
+                // every gate/up program of this expert has read its members' rotated input rows (each arrived at its
+                // block's counter after its k tiles; every block's epilogue has run): those fp16 rows (decode_prep's,
+                // 128-byte aligned) belong to this expert alone and are dead, so their L2 lines go unwritten (before
+                // the release below, so nothing after it can see them dropped)
+                if (last_sh) {
+                    const int lpm = K >> 6;                  // 128-byte lines of a row
+                    for (int i = threadIdx.x; i < cu * 2 * lpm; i += W * 32) {
+                        const int m = i / (2 * lpm), mat = (i / lpm) & 1, l = i % lpm;
+                        const int code = members[u * maxm + m];
+                        const int p = (code >> 5) * slots + (code & 31);
+                        const half* xl = (mat ? X1 : X0) + (size_t)p * K + l * 64;
+                        asm volatile("discard.global.L2 [%0], 128;" ::"l"(xl) : "memory");
+                    }
                 }
+            }
+            __syncthreads();
+            if (threadIdx.x == 0 && last_sh) {
+                ep.ready_cnt[u] = 0;
+                __threadfence();
+                st_release(ep.ready + u, *ep.epoch);
             }
         }
     }

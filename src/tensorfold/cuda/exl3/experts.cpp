@@ -53,7 +53,8 @@ void exl3x_grouped_decode_cuda(const at::Tensor&, const at::Tensor&, const at::T
                                int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&, int64_t,
                                const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, double, int64_t,
                                at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t,
-                               int64_t, at::Tensor&, int64_t, at::Tensor&, at::Tensor&, at::Tensor&, int64_t);
+                               int64_t, at::Tensor&, int64_t, at::Tensor&, at::Tensor&, at::Tensor&, int64_t,
+                               int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -345,7 +346,7 @@ void grouped_decode(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor
                     const at::Tensor& suh_d, at::Tensor xd, double limit, int64_t act_mode, at::Tensor y,
                     const at::Tensor& wts, const at::Tensor& add, at::Tensor out, int64_t has_wts, int64_t has_add,
                     int64_t store_y, at::Tensor cnt, int64_t pdl, at::Tensor ready, at::Tensor ready_cnt,
-                    at::Tensor epoch, int64_t use_ready) {
+                    at::Tensor epoch, int64_t use_ready, int64_t discard) {
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -389,7 +390,7 @@ void grouped_decode(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_decode_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb,
                               stages, lo, hi, epi, pick, E, svh0, svh1, suh_d, xd, limit, act_mode, y, wts, add, out,
-                              has_wts, has_add, store_y, cnt, pdl, ready, ready_cnt, epoch, use_ready);
+                              has_wts, has_add, store_y, cnt, pdl, ready, ready_cnt, epoch, use_ready, discard);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -405,7 +406,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("svh0"), py::arg("svh1"), py::arg("suh_d"), py::arg("xd"), py::arg("limit"), py::arg("act_mode"),
           py::arg("y"), py::arg("wts"), py::arg("add"), py::arg("out"), py::arg("has_wts"), py::arg("has_add"),
           py::arg("store_y"), py::arg("cnt"), py::arg("pdl"), py::arg("ready"), py::arg("ready_cnt"),
-          py::arg("epoch"), py::arg("use_ready"));
+          py::arg("epoch"), py::arg("use_ready"), py::arg("discard") = 0);
     m.def("decode_prep", &decode_prep);
     m.def("grouped_mma", &grouped_mma);
     m.def("grouped_mma2", &grouped_mma2);

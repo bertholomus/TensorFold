@@ -53,6 +53,7 @@ struct GLayer {
 struct GArgs {
     GLayer l[GMAX];
     int n, M;
+    int discard;                        // the split-K partials leave L2 unwritten once summed (discard.global.L2)
 };
 
 struct RLayer {
@@ -305,6 +306,17 @@ __global__ void __launch_bounds__(WK * 32, WK == 4 ? 3 : 1) glinear_kernel(const
                     store4(y, y_dtype, ((size_t)m0 + r) * ldy + col0 + 4 * lane, v);
                     if (L.rsuh) rot_out(L, v, y_dtype, lane, (size_t)m0 + r, col0);
                 }
+                if (args.discard) {
+                    // the partials of this block's 128 columns (SK splits x R rows x 512 bytes, 128-byte aligned: N
+                    // and the layers' Z offsets are multiples of 128 floats) are dead once summed, and only this
+                    // program reads them: their L2 lines are dropped instead of written back to DRAM
+                    __syncthreads();                         // every warp has read its rows' partials
+                    for (int i = threadIdx.x; i < SK * R * 4; i += WK * 32) {
+                        const int q = i / (R * 4), r = (i >> 2) % R, c = (i & 3) * 32;
+                        const float* zl = Z + ((size_t)q * M + m0 + r) * N + col0 + c;
+                        asm volatile("discard.global.L2 [%0], 128;" ::"l"(zl) : "memory");
+                    }
+                }
                 if (threadIdx.x == 0) counters[pass * NB + nb] = 0;   // every program of the block has arrived
             }
         }
@@ -373,12 +385,13 @@ void exl3_glinear_cuda(const std::vector<at::Tensor>& xhs, const std::vector<at:
                        const std::vector<c10::optional<at::Tensor>>& rxhs, const std::vector<int64_t>& roffs,
                        const std::vector<int64_t>& ropes, const c10::optional<at::Tensor>& rcos,
                        const c10::optional<at::Tensor>& rsin, const c10::optional<at::Tensor>& rpos, int64_t rhd,
-                       int64_t rrd) {
+                       int64_t rrd, int64_t discard) {
     const int n = (int)xhs.size();
     GArgs a;
     std::memset(&a, 0, sizeof(a));
     a.n = n;
     a.M = (int)xhs[0].size(0);
+    a.discard = (int)discard;
     float* zp = Z ? Z->data_ptr<float>() : nullptr;
     size_t zoff = 0;
     int blocks = 0;

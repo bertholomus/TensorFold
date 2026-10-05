@@ -13,7 +13,9 @@ check (each of 64 rows alone against inside windows of 2..16 random other rows i
 Pick modes (each (mode, R) seeded on its own, so --save / --against line up whatever else runs): random (6 of the
 routed experts a row, uniform), disjoint (no expert shared between rows: the most a window can touch), clustered (each
 row's 6 from a pool of 12: verify windows of one stream share most), gate (the layer's own gate and bias on random
-rows: its popularity skew). Every row also takes the shared expert (the layer's last), as the family routes it.
+rows: its popularity skew), real (--real F: the layer's picks of saved served verify windows of R rows, R = 1 the first
+row of a 2-row window: their per-expert row counts). Every row also takes the shared expert (the layer's last), as the
+family routes it. --flush 0 keeps the L2 between replays (default 1: flushed).
 """
 
 import argparse
@@ -26,7 +28,18 @@ import time
 import torch
 
 
+REAL: dict = {}
+
+
 def picks_for(mode, R, E, topk, g, gate=None, x=None):
+    if mode == "real":
+        lst = REAL.get(R) or []
+        if not lst:
+            raise ValueError(f"no saved windows of {R} rows")
+        k = int(torch.randint(len(lst), (1,), generator=torch.Generator().manual_seed(int(g.initial_seed()) +
+                                                                                     len(REAL.get("_n", [])))))
+        REAL.setdefault("_n", []).append(k)
+        return lst[k].to(device="cuda", dtype=torch.int32)
     if mode == "random":
         p = torch.stack([torch.randperm(E, generator=g, device="cuda")[:topk] for _ in range(R)])
     elif mode == "disjoint":
@@ -56,6 +69,8 @@ def main():
                     "launches), cp (grouped_cp_kernel, six launches), fused (three launches); base = the tree's default")
     ap.add_argument("--save", help="save every output (torch.save) for --against")
     ap.add_argument("--against", help="outputs saved by --save (e.g. on the base commit): bit-compare each variant")
+    ap.add_argument("--real", help="saved routed picks (list of (layer, int32 [rows, topk])) for --picks real")
+    ap.add_argument("--flush", type=int, default=1)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     from tensorfold.cuda.exl3 import experts as X
@@ -71,6 +86,11 @@ def main():
     print(f"layer {a.layer} loaded in {time.time() - t0:.1f} s: E={E} D={D} I={ex.width} k2_gu={ex.k2_gu} "
           f"k2_d={ex.k2_d} aligned16={getattr(ex, 'aligned16', None)}", flush=True)
     gate = (lay.gate_w, lay.gate_b)
+    if a.real:
+        for li, t in torch.load(a.real):
+            if int(li) == a.layer:
+                REAL.setdefault(int(t.shape[0]), []).append(t)
+        REAL[1] = [t[:1] for t in REAL.get(2, [])]
     l2 = torch.cuda.get_device_properties(0).L2_cache_size
     flush_buf = torch.empty(max(4 * l2, 128 << 20) // 4, dtype=torch.int32, device="cuda")
     sink = torch.empty((), dtype=torch.int64, device="cuda")
@@ -105,12 +125,14 @@ def main():
                 setattr(X, k, v)
 
     variants = a.variants.split(",")
-    modes = ["random", "disjoint", "clustered", "gate"]
+    modes = ["random", "disjoint", "clustered", "gate", "real"]
     res = {"layer": a.layer, "bench": []}
     saved = {}
     against = torch.load(a.against) if a.against else None
     for mode in a.picks.split(","):
         for R in [int(r) for r in a.rows.split(",")]:
+            if mode == "real" and not REAL.get(R):
+                continue                             # no saved windows of R rows
             # each (picks, R) its own seed: the same sets whichever other modes and rows run (--against)
             g = torch.Generator(device="cuda").manual_seed(1234 + 1000 * modes.index(mode) + R)
             sets = []
@@ -143,7 +165,8 @@ def main():
                 for si in range(len(sets)):
                     for vn in (variants if it % 2 == 0 else variants[::-1]):
                         gr, o, _ = graphs[(vn, si)]
-                        flush()
+                        if a.flush:
+                            flush()
                         e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
                         e0.record()
                         gr.replay()

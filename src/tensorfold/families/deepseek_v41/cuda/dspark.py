@@ -8,14 +8,24 @@ as one window and keeps the matching prefix plus its own next token, so every em
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
 
 from ..ops import BF16, F32, rms_norm
 from . import kernels as K
+from . import markov as _markov
 from . import model as _model
-from .model import KV_QUANT, Model, attn_in, mm, wo_a_out
+from . import rounds as _rounds
+from .model import KV_QUANT, Model, attn_in, l2_fork, l2_join, mm, q_proj, wo_a_out, wo_ab
+
+# TF_DS_DRAFT_FUSED=1 (default): the batched drafter graph's stages take the decode round's fused kernels (each
+# sublayer's hc_post fused into the next hc_pre, q's RMSNorm writing wq_b's rotated rows with q's RoPE in wq_b's
+# epilogue, wo_a's epilogue writing wo_b's rotated rows; each under its kernels.SMALL_SWITCHES switch) and its paced L2
+# prefetch forks (model.L2_PREFETCH: wo_a / wo_b after wq_b, the MoE's mix, gate and shared expert after wo_b, the next
+# stage's first weights or the head's after the experts). The same arithmetic in the same order: the same drafts.
+FUSED = os.environ.get("TF_DS_DRAFT_FUSED", "1") != "0"
 
 
 @dataclass
@@ -35,6 +45,19 @@ class Drafter:
         self.topk = c.dspark_topk
         self.ring_size = c.window + 16
         self._block_idx: dict[int, torch.Tensor] = {}   # per row count: a graph keeps the tensor it captured
+        self._markov: dict = {}
+        self.markov()                                    # the cached bias rows: made at load, before the pools
+
+    def markov(self) -> "_markov.Markov | None":
+        """The Markov loop's kernels and cached rows (markov.py) under the current flags, or None (3b9818d's loop)."""
+
+        if not _markov.ON:
+            return None
+        key = (_markov.SPLIT, _markov.CACHE_ROWS, _markov.SUB)
+        mk = self._markov.get(key)
+        if mk is None:
+            mk = self._markov[key] = _markov.Markov(self.m)
+        return mk
 
     def new_cache(self) -> DraftCache:
         c = self.m.cfg
@@ -74,22 +97,30 @@ class Drafter:
         dc.absorbed = start + n
 
     @torch.inference_mode()
-    def absorb_many(self, dpool: "DraftPool", sc, items: list) -> None:
+    def absorb_many(self, dpool: "DraftPool", sc, items: list, eager: bool = False) -> None:
         """``absorb`` for several streams in one pass over a ring pool: ``items`` (slot, taps [n, 3 d], start) each
-        (fewer than ring rows a stream). The same per-row arithmetic as one absorb a stream."""
+        (fewer than ring rows a stream). The same per-row arithmetic as one absorb a stream. ``eager``: launched on a
+        side stream before the round's tokens are known (multi.EAGER_ABSORB): the indices go as one pinned copy (a
+        pageable one would wait for the forward) and the caller sets each view's ``absorbed``."""
 
         c = self.m.cfg
         taps = torch.cat([t for _, t, _ in items], 0).contiguous()
-        pos = torch.tensor([p for _, t, st in items for p in range(st, st + t.shape[0])], dtype=torch.long,
-                           device=taps.device)
-        slot = torch.tensor([sl for sl, t, _ in items for _ in range(t.shape[0])], dtype=torch.long, device=taps.device)
+        pos_l = [p for _, t, st in items for p in range(st, st + t.shape[0])]
+        slot_l = [sl for sl, t, _ in items for _ in range(t.shape[0])]
+        if eager:
+            idx = torch.tensor([pos_l, slot_l], dtype=torch.long).pin_memory().to(taps.device, non_blocking=True)
+            pos, slot = idx[0], idx[1]
+        else:
+            pos = torch.tensor(pos_l, dtype=torch.long, device=taps.device)
+            slot = torch.tensor(slot_l, dtype=torch.long, device=taps.device)
         main_x = K.rmsnorm(mm(self.dw.main_proj, taps), self.dw.main_norm, c.eps)
         rows = slot * dpool.ring_size + pos % dpool.ring_size
         for lay, ring, y in zip(self.dw.blocks, dpool.rings, self.stage_kv(main_x)):
             cos, sin = self._cs(lay, sc)
             K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, rows, c.eps, KV_QUANT, c.rope_dim)
-        for sl, t, st in items:
-            dpool.views[sl].absorbed = st + t.shape[0]
+        if not eager:
+            for sl, t, st in items:
+                dpool.views[sl].absorbed = st + t.shape[0]
 
     def _attention(self, lay, x, sc, ring, q0, pos=None, wpos=None):
         c = self.m.cfg
@@ -166,6 +197,7 @@ class DraftGraph:
         self.graph = None
         self.out = None
         self.conf = None
+        self.mk = drafter.markov()
 
     def _body(self):
         d, m, c = self.d, self.d.m, self.d.m.cfg
@@ -194,16 +226,21 @@ class DraftGraph:
             pre, pre_f = pre_f, pre
         xc = K.collapse(h, pre)
         local = mm(m.w.head, K.rmsnorm(xc, d.dw.norm, c.eps), F32)
-        logits = m.comm.gather(local).permute(1, 0, 2).reshape(n, -1)
         out = torch.empty((n + 1,), dtype=torch.long, device=dev)
         out[0:1] = self.token
-        head = d.dw.markov_head                                           # [V, rank] fp16
-        embs = []
-        for i in range(n):
-            e = d.dw.markov_embed[out[i:i + 1]][0]
-            embs.append(e)
-            out[i + 1:i + 2] = (logits[i] + (head @ e.to(torch.float16)).float()).argmax().view(1)
-        conf_in = torch.cat([xc.float(), torch.stack(embs).float()], -1)
+        if self.mk is not None:                                           # markov.py: the same drafts
+            self.mk.steps(self.mk.logits_of(local), out.view(1, n + 1), n, n)
+            embs = d.dw.markov_embed[out[:n]]
+        else:
+            logits = m.comm.gather(local).permute(1, 0, 2).reshape(n, -1)
+            head = d.dw.markov_head                                       # [V, rank] fp16
+            embs = []
+            for i in range(n):
+                e = d.dw.markov_embed[out[i:i + 1]][0]
+                embs.append(e)
+                out[i + 1:i + 2] = (logits[i] + (head @ e.to(torch.float16)).float()).argmax().view(1)
+            embs = torch.stack(embs)
+        conf_in = torch.cat([xc.float(), embs.float()], -1)
         self.out = out[1:]
         self.conf = (conf_in @ d.dw.conf.float().t())[:, 0]
         self.packed = torch.cat([self.out.to(F32), self.conf])       # one host read a round (ids < 2^24)
@@ -253,28 +290,73 @@ class BatchDraftGraph:
         self.steps = max(1, min(drafter.size, steps or drafter.size))
         dev = "cuda"
         n = drafter.size
-        self.tokens = torch.zeros((streams,), dtype=torch.long, device=dev)
-        self.q0 = torch.zeros((streams,), dtype=torch.long, device=dev)
-        self.slots = torch.zeros((streams,), dtype=torch.long, device=dev)
+        self.inputs = torch.zeros((3, streams), dtype=torch.long, device=dev)   # one buffer, so one copy fills it
+        self.tokens, self.q0, self.slots = self.inputs.unbind(0)
         self.bidx = (torch.arange(streams, device=dev)[:, None, None] * n +
                      torch.arange(n, device=dev)[None, None, :]).expand(streams, n, n).reshape(streams * n, n).contiguous()
         self.zero = torch.zeros((streams * n,), dtype=torch.long, device=dev)
         self.graph = None
+        self.mk = drafter.markov() if streams <= _markov.NP else None
 
-    def _attention(self, lay, x, ring, pos, wpos, rbase):
-        d, c = self.d, self.d.m.cfg
+    def _attention(self, lay, x, ring, pos, wpos, rbase, fused=False):
+        d, m, c = self.d, self.d.m, self.d.m.cfg
         n = x.shape[0]
         rd, hd = c.rope_dim, c.head_dim
         cos, sin = d._cs(lay, self.sc)
         qa, ykv, _, _ = attn_in(lay, x, comp=False)                       # wq_a and wkv: one launch
-        qr = K.rmsnorm(qa, lay.q_norm, c.eps)
-        q = mm(lay.wq_b, qr).view(n, d.m.Hl, hd)
-        K.rope_heads(q, cos, sin, pos, rd)
-        kvb = K.kv_norm_rope(ykv, lay.kv_norm, cos, sin, pos, ring, d.m._neg(n), c.eps, KV_QUANT, rd)
-        o = K.sparse_attn(q, lay.sink, ring, d.m._zero, True, kvb, self.bidx, wpos, hd ** -0.5, c.window,
+        if fused and K.on("rot_q"):
+            # q's RMSNorm writes wq_b's rotated rows, wq_b's epilogue applies q's RoPE (rounds.py's q path)
+            q = q_proj(lay, qa, c.eps, idx=False, rope=(cos, sin, pos, hd, rd))[1].view(n, m.Hl, hd)
+        else:
+            qr = K.rmsnorm(qa, lay.q_norm, c.eps)
+            q = mm(lay.wq_b, qr).view(n, m.Hl, hd)
+            K.rope_heads(q, cos, sin, pos, rd)
+        if fused:
+            l2_fork(m, lay, "attn")                                       # wo_a, wo_b into L2 after wq_b
+        kvb = K.kv_norm_rope(ykv, lay.kv_norm, cos, sin, pos, ring, m._neg(n), c.eps, KV_QUANT, rd)
+        o = K.sparse_attn(q, lay.sink, ring, m._zero, True, kvb, self.bidx, wpos, hd ** -0.5, c.window,
                           wbase=rbase, cbase=self.zero, ring_rows=self.dp.ring_size)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
-        return mm(lay.wo_b, wo_a_out(lay, o), F32)
+        if fused and K.on("rot_wob"):
+            out = wo_ab(lay, o)                                           # wo_a's epilogue rotates for wo_b
+        else:
+            out = mm(lay.wo_b, wo_a_out(lay, o), F32)
+        if fused:
+            l2_fork(m, lay, "moe")                                        # the MoE's mHC mix, gate, shared expert
+        return out
+
+    def _stages_fused(self, h, pre, x, part, pre_a, pre_f, post, comb, pos, wpos, rbase):
+        """The stages with each sublayer's hc_post fused into the next hc_pre (kernels.hc_pre2, as rounds.py's
+        _layers_fused) and the L2 forks; returns (h, pre)."""
+
+        d, m, c = self.d, self.d.m, self.d.m.cfg
+        spare = torch.empty_like(h)
+        pending = None                                   # the last sublayer's gathered partials, not yet posted
+
+        def pre_mix(h, params, pre_in, norm, pre_out):
+            nonlocal spare, pending
+            fn, scale, base = params
+            if pending is None:
+                K.hc_pre2(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb, part)
+                return h
+            out = K.hc_pre2(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb,
+                            part, gathered=pending, h_out=spare)
+            pending = None
+            spare = h
+            return out
+
+        blocks = d.dw.blocks
+        for j, (lay, ring) in enumerate(zip(blocks, self.dp.rings)):
+            h = pre_mix(h, lay.hc_attn, pre, lay.attn_norm, pre_a)
+            pending = m.comm.gather(self._attention(lay, x, ring, pos, wpos, rbase, fused=True))
+            h = pre_mix(h, lay.hc_ffn, pre_a, lay.ffn_norm, pre_f)
+            y = m.moe(lay, x, topk=d.topk)
+            l2_fork(m, lay, "next", blocks[j + 1] if j + 1 < len(blocks) else m.w.head)
+            pending = m.comm.gather(y)
+            pre, pre_f = pre_f, pre
+        K.hc_post(pending, h, post, comb, h)
+        l2_join(m)
+        return h, pre
 
     def _body(self):
         d, m, c = self.d, self.d.m, self.d.m.cfg
@@ -296,27 +378,39 @@ class BatchDraftGraph:
         pre_f = torch.empty((R, c.hc), dtype=F32, device=dev)
         post = torch.empty((R, c.hc), dtype=F32, device=dev)
         comb = torch.empty((R, c.hc, c.hc), dtype=F32, device=dev)
-        for lay, ring in zip(d.dw.blocks, self.dp.rings):
-            fn, scale, base = lay.hc_attn
-            K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb, part)
-            K.hc_post(m.comm.gather(self._attention(lay, x, ring, pos, wpos, rbase)), h, post, comb, h)
-            fn, scale, base = lay.hc_ffn
-            K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb, part)
-            K.hc_post(m.comm.gather(m.moe(lay, x, topk=d.topk)), h, post, comb, h)
-            pre, pre_f = pre_f, pre
+        if FUSED and K.on("hc"):
+            h, pre = self._stages_fused(h, pre, x, part, pre_a, pre_f, post, comb, pos, wpos, rbase)
+        else:
+            for lay, ring in zip(d.dw.blocks, self.dp.rings):
+                fn, scale, base = lay.hc_attn
+                K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb,
+                         part)
+                K.hc_post(m.comm.gather(self._attention(lay, x, ring, pos, wpos, rbase)), h, post, comb, h)
+                fn, scale, base = lay.hc_ffn
+                K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb,
+                         part)
+                K.hc_post(m.comm.gather(m.moe(lay, x, topk=d.topk)), h, post, comb, h)
+                pre, pre_f = pre_f, pre
         xc = K.collapse(h, pre)
         local = mm(m.w.head, K.rmsnorm(xc, d.dw.norm, c.eps), F32)
-        logits = m.comm.gather(local).permute(1, 0, 2).reshape(R, -1).view(N, n, -1)
         steps = self.steps
         out = torch.empty((N, steps + 1), dtype=torch.long, device=dev)
         out[:, 0] = self.tokens
-        head = d.dw.markov_head                                           # [V, rank] fp16
-        embs = []
-        for i in range(steps):
-            e = d.dw.markov_embed[out[:, i]]                              # [N, rank]
-            embs.append(e)
-            out[:, i + 1] = (logits[:, i] + (e.to(torch.float16) @ head.t()).float()).argmax(-1)
-        conf_in = torch.cat([xc.float().view(N, n, -1)[:, :steps], torch.stack(embs, 1).float()], -1)
+        if self.mk is not None:
+            # markov.py: fixed-order kernels a step (cached bias rows, the vocabulary split over the ranks), every
+            # bias the cuBLAS loop's bits: the same drafts
+            self.mk.steps(self.mk.logits_of(local), out, n, steps)
+            embs = d.dw.markov_embed[out[:, :steps]]                      # [N, steps, rank]: the rows the steps read
+        else:
+            logits = m.comm.gather(local).permute(1, 0, 2).reshape(R, -1).view(N, n, -1)
+            head = d.dw.markov_head                                       # [V, rank] fp16
+            embs = []
+            for i in range(steps):
+                e = d.dw.markov_embed[out[:, i]]                          # [N, rank]
+                embs.append(e)
+                out[:, i + 1] = (logits[:, i] + (e.to(torch.float16) @ head.t()).float()).argmax(-1)
+            embs = torch.stack(embs, 1)
+        conf_in = torch.cat([xc.float().view(N, n, -1)[:, :steps], embs.float()], -1)
         conf = (conf_in @ d.dw.conf.float().t())[..., 0]                 # [N, steps]
         self.packed = torch.cat([out[:, 1:].to(F32), conf], 1)           # [N, 2 steps]: one host read a round
 
@@ -333,9 +427,12 @@ class BatchDraftGraph:
         torch.cuda.synchronize()
 
     def run(self, tokens: list[int], q0: list[int], slots: list[int]) -> list[list[int]]:
-        self.tokens.copy_(torch.tensor(tokens, dtype=torch.long))
-        self.q0.copy_(torch.tensor(q0, dtype=torch.long))
-        self.slots.copy_(torch.tensor(slots, dtype=torch.long))
+        if _rounds.ONE_COPY:
+            self.inputs.copy_(torch.tensor([tokens, q0, slots], dtype=torch.long).pin_memory(), non_blocking=True)
+        else:
+            self.tokens.copy_(torch.tensor(tokens, dtype=torch.long))
+            self.q0.copy_(torch.tensor(q0, dtype=torch.long))
+            self.slots.copy_(torch.tensor(slots, dtype=torch.long))
         if self.graph is None:
             self._body()
         else:

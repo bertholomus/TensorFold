@@ -52,6 +52,20 @@ QUICK_ROWS = int(os.environ.get("TF_DS_QUICK_ROWS") or 1024)
 # TF_DS_ROUND_STATS=1: each round's stages synchronized and timed (drafts, Engram rows + forward, sampling, absorb),
 # their averages printed every 100 rounds by streams decoding (profiling only: the syncs cost a little)
 ROUND_STATS = os.environ.get("TF_DS_ROUND_STATS", "0") == "1"
+# TF_DS_HOST_TRACE=1: host timestamps through each round (no syncs added): every 100 rounds, per rank, the median ms of
+# each step (the follower's wait for rank 0's op included), to find host gaps between and inside rounds
+HOST_TRACE = os.environ.get("TF_DS_HOST_TRACE", "0") == "1"
+# TF_DS_LINK_SPIN_MS (default 3): a follower polls its step link this long before a blocking receive, so the next round's
+# step is picked up without a thread wake-up (~0.1-0.6 ms on GB10 after a short sleep); 0: block at once as before
+LINK_SPIN = float(os.environ.get("TF_DS_LINK_SPIN_MS") or 3.0) / 1000.0
+_HT: dict = {}
+
+
+def _ht(tag: str) -> None:
+    if HOST_TRACE:
+        _HT.setdefault("_marks", []).append((tag, time.perf_counter()))
+
+
 # TF_DS_DEPTH_POLICY=conf (default; "fixed": the table depth): each stream verifies the k (<= its table depth, up to the drafter's block) with the most
 # expected tokens a millisecond: expected tokens from the confidence head's prefix survivals, the round's cost from a
 # fixed table of forward ms by rows (TF_DS_ROUND_MS, a pure function of state every rank holds: no live timers)
@@ -66,7 +80,15 @@ EVEN_COHORT = int(os.environ.get("TF_DS_EVEN_COHORT") or 4)
 ROUND_MS = [float(x) for x in (os.environ.get("TF_DS_ROUND_MS") or
                                "30.0,35.2,39.9,44.9,48.6,52.1,55.6,59.1,62.7,66.3,69.6,72.9,75.5,78.2,81.3,84.4,"
                                "87.5,90.6,93.7,96.8,99.9,103.0,106.1,109.2").split(",")]
-DRAFT_MS = float(os.environ.get("TF_DS_DRAFT_MS") or 5.4)
+# the drafter pass in the depth choice (ms): 3.5 = its measured cost on the pair since the vocabulary-split Markov loop
+# (5.4 before; set-b code at 1 stream over test-server starts: 5.4 -> 99.6, 3.5 -> 100.1-100.7, 7.5 -> 98.9)
+DRAFT_MS = float(os.environ.get("TF_DS_DRAFT_MS") or 3.5)
+# TF_DS_EAGER_ABSORB=1 (default): every drafting stream's window rows go into its drafter rings right after the forward
+# is launched, on a side stream behind the forward (its host launches overlap the forward, not the gap between rounds),
+# instead of the kept rows after sampling. Rows past the kept ones sit at positions the drafter does not read (it reads
+# up to the stream's length) until a later absorb writes them, so no draft changes; the main stream waits for the side
+# stream at the round's end. 0: the kept rows after sampling, as before
+EAGER_ABSORB = os.environ.get("TF_DS_EAGER_ABSORB", "1") == "1"
 # TF_DS_CONF_LOG=1: per draft depth, drafts verified and kept, and kept by confidence (sigmoid tenths), printed every
 # 200 rounds (the DSpark acceptance report)
 CONF_LOG = os.environ.get("TF_DS_CONF_LOG", "0") == "1"
@@ -177,6 +199,12 @@ class Link:
             sock.sendall(len(data).to_bytes(4, "big") + data)
 
     def receive(self) -> list | None:
+        if LINK_SPIN > 0:                            # a follower: poll for rank 0's next step a while before blocking
+            import select
+
+            sock, until = self.socks[0], time.perf_counter() + LINK_SPIN
+            while not select.select([sock], [], [], 0)[0] and time.perf_counter() < until:
+                pass
         head = self._read(self.socks[0], 4)
         body = None if head is None else self._read(self.socks[0], int.from_bytes(head, "big"))
         return None if body is None else json.loads(body)
@@ -418,6 +446,7 @@ class MultiDecoder:
                     self.e.runner.pool = torch.cuda.graph_pool_handle()
                 g.capture(self.e.runner.pool)
             self.drafters[N] = g
+        _ht("drafter run")
         return g.run(tokens, q0, slots)
 
     # -- the scheduler's interface --------------------------------------------------------------------------------
@@ -775,6 +804,24 @@ class MultiDecoder:
         finally:
             self._step(False)
 
+    def _absorb_eager(self, items: list):
+        """absorb_many of ``items`` on the side stream once the forward (on the current stream) has run; returns the
+        event that marks it done."""
+
+        main = torch.cuda.current_stream()
+        side = getattr(self, "_absorb_stream", None)
+        if side is None:
+            side = self._absorb_stream = torch.cuda.Stream()
+        ready = torch.cuda.Event()
+        ready.record(main)
+        side.wait_event(ready)
+        with torch.cuda.stream(side):
+            self.e.drafter.absorb_many(self.dpool, self.m.pool_view(self.pool, 0, 0, self.extents.total) if
+                                       self._table_view is None else self._table_view, items, eager=True)
+            done = torch.cuda.Event()
+            done.record(side)
+        return done
+
     def _choose_k(self, conf: list[float], kmax: int, live: int) -> int:
         """The k in 0 .. kmax with the most expected tokens a millisecond: 1 + the prefix survivals' sum over the
         round's table cost (this stream's rows beside the other streams' at their table depth)."""
@@ -861,7 +908,9 @@ class MultiDecoder:
         self._step(True)
         try:
             ta0 = time.perf_counter()
+            _ht("round start")
             self._agree("round", [self._shape(), k])
+            _ht("agreed")
             if ROUND_STATS:
                 torch.cuda.synchronize()
             t_agree = time.perf_counter() - ta0
@@ -877,7 +926,11 @@ class MultiDecoder:
 
             want = {s.sid: (min(k, s.count - len(s.out)) if s.draft else 0) for s in live}
             drafting = [s for s in live if want[s.sid] > 0]
+            if drafting:                                 # the rows known before the drafts: their Engram rows now
+                self.runner.engram_touch([s.st.sc.host[max(0, s.st.sc.length - 8):s.st.sc.length] + [s.pending]
+                                          for s in live])
             proposed, confs = {}, {}
+            _ht("touched")
             if drafting:
                 rows = self._drafts([s.pending for s in drafting], [s.st.sc.length for s in drafting],
                                     [s.st.index for s in drafting])
@@ -906,7 +959,18 @@ class MultiDecoder:
                 sc.host.extend(int(t) for t in window)
                 windows.append((s.st.index, s.base, s.size, P, window, sc.host))
                 kept.append((s, P, drafts))
+            _ht("drafts back + plan")
             logits, taps = self.runner.forward(windows)
+            _ht("forward launched")
+            absorb_done = None
+            if EAGER_ABSORB and taps is not None:
+                eager, r = [], 0
+                for (s, P, _), (_, _, _, _, window, _) in zip(kept, windows):
+                    if s.draft:
+                        eager.append((s.st.index, taps[r:r + len(window)], P))
+                    r += len(window)
+                if eager:
+                    absorb_done = self._absorb_eager(eager)
             mark()
             done, r0, tokens = [], 0, 0
             t_absorb = 0.0
@@ -931,7 +995,10 @@ class MultiDecoder:
                 new = drafts[:a] + [target[a]]
                 s.st.sc.length = P + a + 1
                 if s.draft and taps is not None:
-                    absorbs.append((s.st.index, taps[r0:r0 + a + 1], P))
+                    if absorb_done is not None:
+                        self.dpool.views[s.st.index].absorbed = P + a + 1
+                    else:
+                        absorbs.append((s.st.index, taps[r0:r0 + a + 1], P))
                 s.counted(n)
                 ends = self._ends(s)
                 for i, t in enumerate(new):
@@ -954,12 +1021,31 @@ class MultiDecoder:
                     ks = [f"{n}:{','.join(str(x) for x in h[:self.depth_most + 1])}" for n, h in sorted(self.k_hist.items())]
                     print(f"[tensorfold] drafts kept by depth {' '.join(dep)}; by confidence {' '.join(bins)}; "
                           f"k chosen by streams {' '.join(ks)}", flush=True)
+            _ht("sampled")
+            if absorb_done is not None:                  # what runs on the main stream next sees the rings written
+                torch.cuda.current_stream().wait_event(absorb_done)
             if absorbs:                                  # every drafting stream's kept rows into its rings, one pass
                 ta = time.perf_counter()
                 e.drafter.absorb_many(self.dpool, self.m.pool_view(self.pool, 0, 0, self.extents.total) if
                                       self._table_view is None else self._table_view, absorbs)
                 t_absorb += time.perf_counter() - ta
             self.rounds += 1
+            if HOST_TRACE:
+                _ht("absorbed")
+                marks = _HT.pop("_marks", [])
+                prev = _HT.get("_end")
+                if prev is not None and marks:
+                    _HT.setdefault("between (op wait incl.)", []).append(marks[0][1] - prev)
+                for (a, ta), (b, tb) in zip(marks, marks[1:]):
+                    _HT.setdefault(f"{a} -> {b}", []).append(tb - ta)
+                _HT["_end"] = time.perf_counter()
+                _HT["_n"] = _HT.get("_n", 0) + 1
+                if _HT["_n"] % 100 == 0:
+                    import statistics
+                    parts = [f"{k} {1000 * statistics.median(v[-100:]):.2f}" for k, v in _HT.items()
+                             if not k.startswith("_")]
+                    print(f"[tensorfold] rank {e.rank} host trace (median ms, {len(live)} streams): " + "; ".join(parts),
+                          flush=True)
             self.round_log.append((len(live), r0, time.perf_counter() - t0, tokens))
             del self.round_log[:-4096]
             if ROUND_STATS:
@@ -1051,6 +1137,7 @@ class MultiDecoder:
 
         while True:
             op = link.receive()
+            _ht("op received")
             if op is None:
                 raise RuntimeError("rank 0's step link closed")
             kind = op[0]

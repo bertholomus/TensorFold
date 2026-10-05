@@ -180,6 +180,44 @@ SMALL_SWITCHES = {
     "pdl": os.environ.get("TF_DS_TRITON_PDL", "1") != "0",       # the decode kernels as programmatic dependent
                                                                  # launches (griddepcontrol): each waits for the one
                                                                  # before it before reading anything it wrote
+    # the verify window's small kernels (2-16 rows; c100 small-kernel patch, each bit-identical to b768469):
+    "hc_split": os.environ.get("TF_DS_HC_SPLIT", "1") != "0",    # the mHC finish as two programs a row side by
+                                                                 # side (the Sinkhorn | the collapse + RMSNorm),
+                                                                 # the collapse's loads issued together up front
+    "hc_rot": os.environ.get("TF_DS_HC_ROT", "0") != "0",        # (default off: level on the proxy; with hc_split) the attention mHC finish also
+                                                                 # writes the input projections' rotated rows (no
+                                                                 # rot_many launch before wq_a / wkv / compressor)
+    "qkv_split": os.environ.get("TF_DS_QKV_SPLIT", "1") != "0",  # q_kv_norm's input rotations each in a program of
+                                                                 # its own (the norm recomputed), beside the others
+    "hc_rb": os.environ.get("TF_DS_HC_RB_ON", "1") != "0",       # the mHC mixes' rows a program by window rows
+    "attn_pf": os.environ.get("TF_DS_ATTN_PF", "1") != "0",      # the decode attention's window keys into L2
+                                                                 # before its PDL wait
+    "hc_xpf": os.environ.get("TF_DS_HC_XPF", "1") != "0",        # the posted mHC mixes prefetch the old streams
+                                                                 # (and post / comb) into L2 before their PDL wait
+    "rowmm_parts": os.environ.get("TF_DS_ROWMM_PARTS_ON", "1") != "0",   # the MoE gate's matmul as chunk sums over
+                                                                 # (outputs, chunks) programs, summed in K order by
+                                                                 # the route kernel
+    # round 2 of the verify window's small kernels (each bit-identical to b0d2fb8):
+    "hc_defer": os.environ.get("TF_DS_HC_DEFER", "1") != "0",    # the mHC finish's Sinkhorn half (pre / post /
+                                                                 # comb, read sublayers later) as its own kernel on a
+                                                                 # side stream beside the collapse + RMSNorm (rounds.py
+                                                                 # joins it before the sublayer's gather), off the
+                                                                 # critical path
+    "merge_reg": os.environ.get("TF_DS_MERGE_REG", "1") != "0",  # the decode attention merge keeps the head's
+                                                                 # output in registers for the inverse RoPE and wo_a's
+                                                                 # input rotation (one store of o, one barrier) instead
+                                                                 # of storing it and reading it back twice
+    "topk_fused": os.environ.get("TF_DS_TOPK_FUSED", "1") != "0",   # the indexer's selection (topk_select) in one
+                                                                 # launch a row: its unique int64 keys sorted, the k
+                                                                 # largest kept, their indices sorted and masked (the
+                                                                 # same set as torch's top-k: a total order), instead
+                                                                 # of torch.topk + _topk_finish
+    "hc_dots": os.environ.get("TF_DS_HC_DOTS", "1") != "0",      # (with "hc_defer") a posted mHC step's main-
+                                                                 # stream kernel is the post alone (the new streams);
+                                                                 # the mixes' partial dots of them (_hc_mix_part on the
+                                                                 # stored streams) run on the side stream before the
+                                                                 # Sinkhorn: the collapse + RMSNorm no longer waits for
+                                                                 # the mixing weights' 2 MB and the dots
 }
 
 
@@ -195,8 +233,10 @@ def on(name: str) -> bool:
 
 def _pdl() -> dict:
     """Launch options of a decode kernel that takes PDL: a programmatic dependent launch (sm_90+) when the "pdl"
-    switch is on. Such a kernel runs griddepcontrol.wait before it reads or writes anything a kernel before it touches
-    (only weights before it), then lets the next kernel launch; launched plainly, both are no-ops."""
+    switch is on. Such a kernel runs griddepcontrol.wait before it reads or writes anything the kernel just before it
+    may still touch (weights, and inputs only kernels further back write, may be read before it: every PDL kernel waits
+    before it lets the next one launch, so only the immediately preceding kernel can be in flight), then lets the next
+    kernel launch; launched plainly, both are no-ops."""
 
     return {"PDL": True, "launch_pdl": True} if SMALL_SWITCHES["pdl"] else {}
 
@@ -282,7 +322,7 @@ def _hc_mix_rows(X, XO, G, RS, POST, COMB, PART, ws, r, b, mg, m, k, WIDE: tl.co
 @triton.jit
 def _hc_mix_part(X, XO, G, RS, POST, COMB, FN, PART, rows, WIDE: tl.constexpr, D: tl.constexpr, NB: tl.constexpr,
                  SUB: tl.constexpr, MB: tl.constexpr, WORLD: tl.constexpr, POSTED: tl.constexpr, RB: tl.constexpr = 1,
-                 PDL: tl.constexpr = False):
+                 PDL: tl.constexpr = False, XPF: tl.constexpr = False):
     r0 = tl.program_id(0) * RB
     b = tl.program_id(1)
     mg = tl.program_id(2)
@@ -292,6 +332,18 @@ def _hc_mix_part(X, XO, G, RS, POST, COMB, FN, PART, rows, WIDE: tl.constexpr, D
     ws = ()                                  # the mixing weights first: they may load while the kernel before runs
     for t in tl.static_range(KB // SUB):
         ws = ws + (tl.load(FN + m[:, None] * WIDE + b * KB + t * SUB + k[None, :]),)
+    if XPF:
+        # (switch "hc_xpf", posted mixes) the old streams' lines this program reads, and its rows' post / comb, into
+        # L2 beside the weights' loads: the kernel before (the gather) writes neither, so their (often DRAM) latency
+        # runs with the weights' instead of after the wait (a prefetch moves no data the kernel reads)
+        xs_ = (b * KB) // D
+        xc0 = b * KB - xs_ * D
+        li = tl.arange(0, 4 * (KB // 64))                    # 4 streams x the block's 128-byte lines
+        for i in tl.static_range(RB):
+            rx = tl.minimum(r0 + i, rows - 1)
+            _prefetch_l2(X + rx * WIDE + (li // (KB // 64)) * D + xc0 + (li % (KB // 64)) * 64)
+            _prefetch_l2(COMB + rx * 16 + tl.arange(0, 1))
+            _prefetch_l2(POST + rx * 4 + tl.arange(0, 1))
     if PDL:
         gdc_wait()
         gdc_launch_dependents()
@@ -309,6 +361,15 @@ def _prefetch_l2(ptrs):
     """prefetch.global.L2 of every address in ptrs (no data moved into registers, nothing computed)."""
 
     return tl.inline_asm_elementwise("prefetch.global.L2 [$1]; mov.b32 $0, 0;", "=r,l", [ptrs], dtype=tl.int32,
+                                     is_pure=False, pack=1)
+
+
+@triton.jit
+def _discard_l2(ptrs):
+    """discard.global.L2 of the 128-byte line at every address in ptrs: the line leaves L2 without a write-back (its
+    data is dead: nothing reads it again before it is rewritten)."""
+
+    return tl.inline_asm_elementwise("discard.global.L2 [$1], 128; mov.b32 $0, 0;", "=r,l", [ptrs], dtype=tl.int32,
                                      is_pure=False, pack=1)
 
 
@@ -383,30 +444,312 @@ def _hc_finish_u(X, PART, BASE, SCALE, PRE_IN, NW, OUT, PRE_OUT, POST, COMB, eps
         tl.store(OUT + r * D + d, (w * (c * rinv)).to(tl.bfloat16))
 
 
+# -- the verify window's mHC finish, faster with the same bits (switch "hc_split") -----------------------------
+# _hc_finish_u's two independent halves as two programs a row (switch "hc_split"): (r, 0) the mixes' sum, the
+# Sinkhorn and pre / post / comb (read by the next sublayers only), (r, 1) the collapse with the carried pre-mix and
+# the RMSNorm (what the sublayer reads next), side by side instead of one after the other. Each half is _hc_finish_u's
+# code with its layouts (8 warps, the same shapes: the same reduction trees); the collapse's 20 loads of the row are
+# issued together up front and its collapsed rows kept for the output pass (_hc_finish_u's second pass reloads the
+# same bits and repeats the same arithmetic), the same expression a column (the compiler contracts it as before).
+@triton.jit
+def _rot_out(OUT, r, cs, rinv, NW, S, H, part, D: tl.constexpr, BLOCK: tl.constexpr, ROT: tl.constexpr,
+             RSPLIT: tl.constexpr = 1):
+    """The finish's output row (w * (c * rinv) -> bf16, BLOCK columns at a time): stored (ROT False), or rotated by
+    rot_many's arithmetic for an EXL3 layer reading it (suh S, rows H [R, D] fp16; ROT True), every block (RSPLIT 1)
+    or block ``part`` alone (RSPLIT = D / BLOCK)."""
+
+    NBK: tl.constexpr = BLOCK // 128
+    for c in tl.static_range(D // BLOCK):
+        if RSPLIT == 1 or c == part:
+            d = c * BLOCK + tl.arange(0, BLOCK)
+            w = tl.load(NW + d).to(tl.float32)
+            y = (w * (cs[c] * rinv)).to(tl.bfloat16)
+            if ROT:
+                v = tl.reshape(y.to(tl.float32), (NBK, 128))
+                dd = tl.reshape(d, (NBK, 128))
+                sv = tl.load(S + dd).to(tl.float32)
+                tl.store(H + r * D + dd, _rot128(v, sv, NBK).to(tl.float16))
+            else:
+                tl.store(OUT + r * D + d, y)
+
+
+@triton.jit
+def _hc_finish_s(X, PART, BASE, SCALE, PRE_IN, NW, OUT, PRE_OUT, POST, COMB, eps, hc_eps, S0, H0, S1, H1, S2, H2,
+                 S3, H3, D: tl.constexpr, NB: tl.constexpr, ITERS: tl.constexpr, BLOCK: tl.constexpr,
+                 NROT: tl.constexpr = 0, RSPLIT: tl.constexpr = 1, PDL: tl.constexpr = False,
+                 SINK: tl.constexpr = True):
+    """(r, 0): the Sinkhorn half; (r, 1): the collapse + RMSNorm half; (r, 2 + j), j < NROT * RSPLIT: the collapse +
+    RMSNorm again (the same code, the same bits) and the output row rotated for EXL3 layer j // RSPLIT (rot_many's
+    bits: what its group launch would make of the stored row; all of it, or with RSPLIT = D / BLOCK its BLOCK columns
+    j % RSPLIT), side by side. SINK False (switch "hc_defer"): no Sinkhorn programs (_hc_sinkhorn runs that half), the
+    grid's programs start at role 1."""
+
+    r = tl.program_id(0)
+    role = tl.program_id(1) if SINK else tl.program_id(1) + 1
+    if role == 0:
+        # the weights (no kernel writes them) before the PDL wait: they load while the mixes run
+        m = tl.arange(0, 32)
+        s0 = tl.load(SCALE + 0)
+        s1 = tl.load(SCALE + 1)
+        s2 = tl.load(SCALE + 2)
+        base = tl.load(BASE + m, mask=m < 24, other=0.0)
+        if PDL:
+            gdc_wait()
+            gdc_launch_dependents()
+        mix = tl.zeros((32,), dtype=tl.float32)
+        ss = 0.0
+        for b in tl.static_range(NB):
+            mix += tl.load(PART + (r * NB + b) * 32 + m)
+            ss += tl.load(PART + (r * NB + b) * 32 + 24)
+        mix = mix * (1.0 / tl.sqrt(ss / (4 * D) + eps))
+        sv = tl.arange(0, 4)
+        pre_l = tl.sum(tl.where(m[None, :] == sv[:, None], (mix * s0 + base)[None, :], 0.0), axis=1)
+        post_l = tl.sum(tl.where(m[None, :] == (sv[:, None] + 4), (mix * s1 + base)[None, :], 0.0), axis=1)
+        pre = 1.0 / (1.0 + tl.exp(-pre_l)) + hc_eps
+        post = 2.0 * (1.0 / (1.0 + tl.exp(-post_l)))
+        ii = tl.arange(0, 4)[:, None]
+        jj = tl.arange(0, 4)[None, :]
+        flat = 8 + ii * 4 + jj
+        cl = tl.sum(tl.where(m[None, None, :] == flat[:, :, None], (mix * s2 + base)[None, None, :], 0.0), axis=2)
+        cmax = tl.max(cl, axis=1)
+        ce = tl.exp(cl - cmax[:, None])
+        comb = ce / tl.sum(ce, axis=1)[:, None] + hc_eps
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+        for _ in range(ITERS - 1):
+            comb = comb / (tl.sum(comb, axis=1)[:, None] + hc_eps)
+            comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+        tl.store(PRE_OUT + r * 4 + sv, pre)
+        tl.store(POST + r * 4 + sv, post)
+        tl.store(COMB + r * 16 + ii * 4 + jj, comb)
+    else:
+        pl = tl.arange(0, BLOCK // 8)                           # one address a 128-byte line of the bf16 weight
+        _prefetch_l2(NW + tl.minimum(pl * 64, D - 1))
+        ti = (role - 2) // RSPLIT                               # a rotation program's layer and block
+        part = (role - 2) % RSPLIT
+        if NROT > 0 and role >= 2:                              # its suh (fp16: 64 a line)
+            sl = tl.minimum(pl * 64, D - 1)
+            if ti == 0:
+                _prefetch_l2(S0 + sl)
+            elif ti == 1:
+                _prefetch_l2(S1 + sl)
+            elif ti == 2:
+                _prefetch_l2(S2 + sl)
+            elif ti == 3:
+                _prefetch_l2(S3 + sl)
+        # the carried pre-mix (written by the previous finish, before the mixes this kernel waits for) before the
+        # PDL wait too: its load (often from DRAM) runs while the mixes do
+        p0 = tl.load(PRE_IN + r * 4 + 0)
+        p1 = tl.load(PRE_IN + r * 4 + 1)
+        p2 = tl.load(PRE_IN + r * 4 + 2)
+        p3 = tl.load(PRE_IN + r * 4 + 3)
+        if PDL:
+            gdc_wait()
+            gdc_launch_dependents()
+        xs = ()
+        for c in tl.static_range(D // BLOCK):
+            d = c * BLOCK + tl.arange(0, BLOCK)
+            xs = xs + (tl.load(X + r * (4 * D) + d), tl.load(X + r * (4 * D) + D + d),
+                       tl.load(X + r * (4 * D) + 2 * D + d), tl.load(X + r * (4 * D) + 3 * D + d))
+        acc = tl.zeros((BLOCK,), dtype=tl.float32)
+        cs = ()
+        for c in tl.static_range(D // BLOCK):
+            x0 = xs[4 * c].to(tl.float32)
+            x1 = xs[4 * c + 1].to(tl.float32)
+            x2 = xs[4 * c + 2].to(tl.float32)
+            x3 = xs[4 * c + 3].to(tl.float32)
+            cc = (((p0 * x0 + p1 * x1) + p2 * x2) + p3 * x3).to(tl.bfloat16).to(tl.float32)
+            acc += cc * cc
+            cs = cs + (cc,)
+        rinv = 1.0 / tl.sqrt(tl.sum(acc, axis=0) / D + eps)
+        if role == 1:
+            _rot_out(OUT, r, cs, rinv, NW, S0, H0, 0, D, BLOCK, False)
+        elif NROT > 0 and ti == 0:
+            _rot_out(OUT, r, cs, rinv, NW, S0, H0, part, D, BLOCK, True, RSPLIT)
+        elif NROT > 1 and ti == 1:
+            _rot_out(OUT, r, cs, rinv, NW, S1, H1, part, D, BLOCK, True, RSPLIT)
+        elif NROT > 2 and ti == 2:
+            _rot_out(OUT, r, cs, rinv, NW, S2, H2, part, D, BLOCK, True, RSPLIT)
+        elif NROT > 3 and ti == 3:
+            _rot_out(OUT, r, cs, rinv, NW, S3, H3, part, D, BLOCK, True, RSPLIT)
+
+
+# (switch "hc_defer") _hc_finish_s's Sinkhorn half (its role 0) as a kernel of its own: the same code with the same
+# layouts (8 warps, the same shapes: the same reduction trees, so the same bits), a program a row, launched on a side
+# stream once the mixes are done (their partial sums), beside the collapse + RMSNorm on the main stream. Its outputs
+# (pre, post, comb) are read sublayers later (the next finish's collapse, the next posted mixes), so the kernels after
+# the finish no longer wait for it; rounds.py joins the side stream before the sublayer's gather.
+@triton.jit
+def _hc_sinkhorn(PART, BASE, SCALE, PRE_OUT, POST, COMB, eps, hc_eps, D: tl.constexpr, NB: tl.constexpr,
+                 ITERS: tl.constexpr):
+    r = tl.program_id(0)
+    m = tl.arange(0, 32)
+    s0 = tl.load(SCALE + 0)
+    s1 = tl.load(SCALE + 1)
+    s2 = tl.load(SCALE + 2)
+    base = tl.load(BASE + m, mask=m < 24, other=0.0)
+    mix = tl.zeros((32,), dtype=tl.float32)
+    ss = 0.0
+    for b in tl.static_range(NB):
+        mix += tl.load(PART + (r * NB + b) * 32 + m)
+        ss += tl.load(PART + (r * NB + b) * 32 + 24)
+    mix = mix * (1.0 / tl.sqrt(ss / (4 * D) + eps))
+    sv = tl.arange(0, 4)
+    pre_l = tl.sum(tl.where(m[None, :] == sv[:, None], (mix * s0 + base)[None, :], 0.0), axis=1)
+    post_l = tl.sum(tl.where(m[None, :] == (sv[:, None] + 4), (mix * s1 + base)[None, :], 0.0), axis=1)
+    pre = 1.0 / (1.0 + tl.exp(-pre_l)) + hc_eps
+    post = 2.0 * (1.0 / (1.0 + tl.exp(-post_l)))
+    ii = tl.arange(0, 4)[:, None]
+    jj = tl.arange(0, 4)[None, :]
+    flat = 8 + ii * 4 + jj
+    cl = tl.sum(tl.where(m[None, None, :] == flat[:, :, None], (mix * s2 + base)[None, None, :], 0.0), axis=2)
+    cmax = tl.max(cl, axis=1)
+    ce = tl.exp(cl - cmax[:, None])
+    comb = ce / tl.sum(ce, axis=1)[:, None] + hc_eps
+    comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+    for _ in range(ITERS - 1):
+        comb = comb / (tl.sum(comb, axis=1)[:, None] + hc_eps)
+        comb = comb / (tl.sum(comb, axis=0)[None, :] + hc_eps)
+    tl.store(PRE_OUT + r * 4 + sv, pre)
+    tl.store(POST + r * 4 + sv, post)
+    tl.store(COMB + r * 16 + ii * 4 + jj, comb)
+
+
+# (switch "hc_dots") _hc_mix_rows' posted streams alone: out_s = post_s y + sum_j comb[j, s] x_j (its fma chain, the
+# same bf16 rounding), a program a (row, K block of one stream), stored; elementwise, so any tiling has the same bits.
+@triton.jit
+def _hc_post_only(X, XO, G, RS, POST, COMB, WIDE: tl.constexpr, D: tl.constexpr, KB: tl.constexpr,
+                  WORLD: tl.constexpr, PDL: tl.constexpr = False):
+    r = tl.program_id(0)
+    b = tl.program_id(1)
+    s = (b * KB) // D
+    d = b * KB - s * D + tl.arange(0, KB)
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    c0 = tl.load(COMB + r * 16 + 0 * 4 + s)
+    c1 = tl.load(COMB + r * 16 + 1 * 4 + s)
+    c2 = tl.load(COMB + r * 16 + 2 * 4 + s)
+    c3 = tl.load(COMB + r * 16 + 3 * 4 + s)
+    ps = tl.load(POST + r * 4 + s)
+    ya = tl.load(G + r * D + d)
+    for q in tl.static_range(1, WORLD):
+        ya = ya + tl.load(G + q * RS + r * D + d)
+    y = ya.to(tl.bfloat16).to(tl.float32)
+    x0 = tl.load(X + r * WIDE + d).to(tl.float32)
+    x1 = tl.load(X + r * WIDE + D + d).to(tl.float32)
+    x2 = tl.load(X + r * WIDE + 2 * D + d).to(tl.float32)
+    x3 = tl.load(X + r * WIDE + 3 * D + d).to(tl.float32)
+    v = tl.fma(ps, y, tl.fma(c3, x3, tl.fma(c2, x2, tl.fma(c0, x0, c1 * x1))))
+    tl.store(XO + r * WIDE + s * D + d, v.to(tl.bfloat16))
+
+
+def hc_defer_on(d: int) -> bool:
+    """Whether hc_pre2 takes ``sink`` (the Sinkhorn half on that side stream: switch "hc_defer", with "hc_split")."""
+
+    return SMALL_SWITCHES["hc_defer"] and SMALL_SWITCHES["hc_split"] and d % 1024 == 0
+
+
+def hc_dots_on(d: int) -> bool:
+    """Whether the decode bodies' posted mHC steps take their mixes' dots off the main stream (switch "hc_dots")."""
+
+    return SMALL_SWITCHES["hc_dots"] and hc_defer_on(d)
+
+
+# rows a program of _hc_mix_part by window rows (switch "hc_rb"; one-GPU sweep: fewer weight-tile reads from L2
+# against rows in series in a program); off: b768469's 1 up to 3 rows, else 2. A row's arithmetic is the same in any.
+HC_RB = {1: 1, 2: 2, 3: 3, 4: 2, 5: 3, 6: 2, 7: 4, 8: 4}
+
+
+def _hc_rb(rows: int) -> int:
+    env = os.environ.get("TF_DS_HC_RB")                      # (benchmarks: one value for every row count)
+    if env:
+        return min(rows, int(env))
+    if not SMALL_SWITCHES["hc_rb"]:
+        return 1 if rows <= 3 else 2
+    return HC_RB.get(rows, 4 if rows <= 12 else 8)
+
+
+HC_ROT_SPLIT_ROWS = int(os.environ.get("TF_DS_HC_ROT_SPLIT_ROWS") or 8)   # rotation programs a 1024 columns up to
+
+
+def hc_rot_on(d: int) -> bool:
+    """Whether hc_pre2 takes ``rot`` (its output rows rotated for the EXL3 layers that read them)."""
+
+    return SMALL_SWITCHES["hc_split"] and SMALL_SWITCHES["hc_rot"] and d % 1024 == 0
+
+
 def hc_pre2(h: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, pre_in: torch.Tensor,
             norm_w: torch.Tensor, eps: float, hc_eps: float, iters: int, out: torch.Tensor, pre_out: torch.Tensor,
             post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor, gathered: torch.Tensor | None = None,
-            h_out: torch.Tensor | None = None) -> torch.Tensor:
+            h_out: torch.Tensor | None = None, rot: list | None = None,
+            sink: torch.cuda.Stream | None = None) -> torch.Tensor:
     """hc_pre's outputs (the same bits), with the previous sublayer's hc_post fused in when ``gathered`` is given: the
     post (reading h, post, comb) is written into ``h_out`` (not h: other programs still read h) and the mixes are those
-    of h_out. Returns the streams the mixes were taken of (h_out, or h)."""
+    of h_out. Returns the streams the mixes were taken of (h_out, or h). ``rot`` (up to four (suh, rows [R, D] fp16)
+    pairs; only when hc_rot_on(D)): ``out``'s rows also written rotated for the EXL3 layers that read them (an
+    Exl3Group's buffers, then its rotated(): rot_many's bits). ``sink`` (a side stream; only when hc_defer_on(D)): the
+    Sinkhorn half (pre_out, post, comb) runs there (_hc_sinkhorn, once the mixes are done), the finish on the current
+    stream is the collapse + RMSNorm alone; the caller makes the current stream wait for ``sink`` before anything reads
+    pre_out, post or comb (or writes post / comb, or the mixes' partial sums ``part``)."""
 
     rows = h.shape[0]
     d = h.shape[-1]
     wide = 4 * d
-    rb = 1 if rows <= 3 else 2                              # rows a program (sharing its weight tiles)
+    rb = _hc_rb(rows)                                       # rows a program (sharing its weight tiles)
     grid = (triton.cdiv(rows, rb), HC_BLOCKS, 3)
+    dots = sink is not None and gathered is not None and hc_dots_on(d)
+    if dots:
+        # (switch "hc_dots") the post alone on this stream; the mixes of the stored new streams (the same partial
+        # sums: _hc_mix_part's non-posted programs read the bf16 values the posted ones keep in registers) and the
+        # Sinkhorn on the side stream, once the post is done (it reads post / comb, which the Sinkhorn rewrites)
+        assert h_out is not None and h_out.data_ptr() != h.data_ptr()
+        rot = rot or []
+        assert not rot or (hc_rot_on(d) and len(rot) <= 4)
+        st = [t for pair in rot for t in pair] + [out, out] * (4 - len(rot))
+        rs = (d // 1024) if rot and rows <= HC_ROT_SPLIT_ROWS else 1
+        _hc_post_only[(rows, HC_BLOCKS)](h, h_out, gathered, rows * d, post, comb, WIDE=wide, D=d,
+                                         KB=wide // HC_BLOCKS, WORLD=gathered.shape[0], num_warps=2, **_pdl())
+        _hc_finish_s[(rows, 1 + len(rot) * rs)](h_out, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps,
+                                                hc_eps, *st, D=d, NB=HC_BLOCKS, ITERS=iters, BLOCK=1024,
+                                                NROT=len(rot), RSPLIT=rs, num_warps=8, SINK=False, **_pdl())
+        sink.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(sink):
+            _hc_mix_part[grid](h_out, h_out, h_out, 0, post, comb, fn, part, rows, WIDE=wide, D=d, NB=HC_BLOCKS,
+                               SUB=128, MB=8, WORLD=1, POSTED=False, RB=rb, num_warps=2)
+            _hc_sinkhorn[(rows,)](part, base, scale, pre_out, post, comb, eps, hc_eps, D=d, NB=HC_BLOCKS,
+                                  ITERS=iters, num_warps=8)
+        return h_out
     if gathered is not None:
         assert h_out is not None and h_out.data_ptr() != h.data_ptr()
+        xpf = {"XPF": True} if SMALL_SWITCHES["hc_xpf"] else {}
         _hc_mix_part[grid](h, h_out, gathered, rows * d, post, comb, fn, part, rows, WIDE=wide, D=d, NB=HC_BLOCKS,
-                           SUB=128, MB=8, WORLD=gathered.shape[0], POSTED=True, RB=rb, num_warps=2, **_pdl())
+                           SUB=128, MB=8, WORLD=gathered.shape[0], POSTED=True, RB=rb, num_warps=2, **xpf, **_pdl())
         src = h_out
     else:
         _hc_mix_part[grid](h, h, h, 0, post, comb, fn, part, rows, WIDE=wide, D=d, NB=HC_BLOCKS, SUB=128, MB=8,
                            WORLD=1, POSTED=False, RB=rb, num_warps=2, **_pdl())
         src = h
-    _hc_finish_u[(rows,)](src, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, D=d,
-                          NB=HC_BLOCKS, ITERS=iters, BLOCK=1024, num_warps=8, **_pdl())
+    if SMALL_SWITCHES["hc_split"] and d % 1024 == 0:
+        rot = rot or []
+        assert not rot or (hc_rot_on(d) and len(rot) <= 4)
+        st = [t for pair in rot for t in pair] + [out, out] * (4 - len(rot))
+        rs = (d // 1024) if rot and rows <= HC_ROT_SPLIT_ROWS else 1     # a rotation program a (layer, 1024 columns)
+        defer = sink is not None
+        if defer:
+            assert hc_defer_on(d)
+            # the Sinkhorn half on the side stream, after the mixes (their partial sums), beside the finish below
+            sink.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(sink):
+                _hc_sinkhorn[(rows,)](part, base, scale, pre_out, post, comb, eps, hc_eps, D=d, NB=HC_BLOCKS,
+                                      ITERS=iters, num_warps=8)
+        _hc_finish_s[(rows, (1 if defer else 2) + len(rot) * rs)](src, part, base, scale, pre_in, norm_w, out,
+                                                                  pre_out, post, comb, eps, hc_eps, *st,
+                                                                  D=d, NB=HC_BLOCKS, ITERS=iters, BLOCK=1024,
+                                                                  NROT=len(rot), RSPLIT=rs, num_warps=8,
+                                                                  SINK=not defer, **_pdl())
+    else:
+        _hc_finish_u[(rows,)](src, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, D=d,
+                              NB=HC_BLOCKS, ITERS=iters, BLOCK=1024, num_warps=8, **_pdl())
     return src
 
 
@@ -437,13 +780,55 @@ def _rowmm2(X, xs, W, OUT, scale, K: tl.constexpr, N: tl.constexpr, BN: tl.const
 
 
 ROWMM2_ROWS = 2          # rowmm2 up to this many rows (beyond, rowmm's tiles share the weights better in L2)
+# TF_DS_ROWMM_RB=n (default 16; 0: rowmm): windows of more than ROWMM2_ROWS rows take _rowmm2r, up to n rows a
+# program sharing the program's weight slice (loaded once, before the PDL wait), each row rowmm2's arithmetic (rowmm's
+# bits: checked on the router's and the indexer's shapes at 1-16 rows)
+ROWMM_RB = int(os.environ.get("TF_DS_ROWMM_RB") or 16)
+
+
+@triton.jit
+def _rowmm2r(X, xs, W, OUT, scale, rows, K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+             RB: tl.constexpr, PDL: tl.constexpr = False, WTS: tl.constexpr = False):
+    """_rowmm2 for RB rows a program: the weight slice loaded once (before the PDL wait), then each row's dot as
+    _rowmm2 makes it (the same K chunks in order, the same per-output reduction), rows past ``rows`` skipped."""
+
+    r0 = tl.program_id(0) * RB
+    nb = tl.program_id(1)
+    nn = nb * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    ws = ()
+    for t in tl.static_range(K // BK):
+        ws = ws + (tl.load(W + nn[:, None] * K + (t * BK + kk)[None, :], mask=(nn < N)[:, None], other=0.0),)
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    for i in tl.static_range(RB):
+        r = r0 + i
+        if r < rows:
+            acc = tl.zeros((BN,), dtype=tl.float32)
+            for t in tl.static_range(K // BK):
+                x = tl.load(X + r * xs + t * BK + kk).to(tl.float32)
+                acc += tl.sum(ws[t].to(tl.float32) * x[None, :], axis=1)
+            if WTS:
+                tl.store(OUT + r * N + nn, (acc.to(tl.bfloat16).to(tl.float32) * scale).to(tl.bfloat16), mask=nn < N)
+            else:
+                tl.store(OUT + r * N + nn, acc, mask=nn < N)
 
 
 def rowmm2(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
-    """rowmm's bits (x [R, K] @ w[N, K]^T -> fp32 [R, N], a row alone), faster at 1-2 rows."""
+    """rowmm's bits (x [R, K] @ w[N, K]^T -> fp32 [R, N], a row alone), faster at 1-2 rows (and with ROWMM_RB, at
+    more: _rowmm2r)."""
 
     rows, k = x.shape
     n = w.shape[0]
+    if rows > ROWMM2_ROWS and ROWMM_RB > 0 and k % 256 == 0 and rows <= DECODE_ROWS:
+        if out is None:
+            out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
+        bn = 4 if n > 64 else 1
+        rb = min(ROWMM_RB, rows)
+        _rowmm2r[(triton.cdiv(rows, rb), triton.cdiv(n, bn))](x, x.stride(0), w, out, 1.0, rows, K=k, N=n, BN=bn,
+                                                             BK=256, RB=rb, num_warps=bn, **_pdl())
+        return out
     if rows > ROWMM2_ROWS or k % 256:
         return rowmm(x, w, out)
     if out is None:
@@ -502,15 +887,16 @@ def _rmsnorm_rot(X, xs, W, OUT, os_, eps, S0, H0, S1, H1, D: tl.constexpr, BLOCK
 @triton.jit
 def _q_kv_norm(X, xs, W, OUT, os_, eps, S0, H0, S1, H1, Y, WK, COS, SIN, POS, KOUT, RING, SLOT_OF, ring_size,
                QUANT: tl.constexpr, D: tl.constexpr, BLOCK: tl.constexpr, NROT: tl.constexpr, DK: tl.constexpr,
-               RD: tl.constexpr, PDL: tl.constexpr = False):
+               RD: tl.constexpr, PDL: tl.constexpr = False, SPLIT: tl.constexpr = False):
     """_rmsnorm_rot (programs (r, 0)) and _kv_norm_rope (programs (r, 1)) of the same rows in one launch: the two
     independent norms after attn_in, each program the code of the kernel it replaces."""
 
-    if tl.program_id(1) == 0:
+    role = tl.program_id(1)
+    if role != 1:
         pl = tl.minimum(tl.arange(0, BLOCK // 64) * 64, D - 1)   # the suh lines (read after the row's stores)
-        if NROT > 0:
+        if NROT > 0 and (role == 0 or role == 2):
             _prefetch_l2(S0 + pl)
-        if NROT > 1:
+        if NROT > 1 and (role == 0 or role == 3):
             _prefetch_l2(S1 + pl)
         _prefetch_l2(W + pl)                                     # and the norm weights (weights: before the wait)
     else:
@@ -519,22 +905,25 @@ def _q_kv_norm(X, xs, W, OUT, os_, eps, S0, H0, S1, H1, Y, WK, COS, SIN, POS, KO
         gdc_wait()
         gdc_launch_dependents()
     r = tl.program_id(0)
-    if tl.program_id(1) == 0:
+    if role != 1:
+        # programs (r, 0): the norm, its rows and (SPLIT False) the rotations; (r, 2 + i) with SPLIT: the norm again
+        # (the same code, the same bits) and rotation i alone, beside the others
         d = tl.arange(0, BLOCK)
         ok = d < D
         x = tl.load(X + r * xs + d, mask=ok, other=0.0).to(tl.float32)
         rinv = 1.0 / tl.sqrt(tl.sum(x * x, axis=0) / D + eps)
         w = tl.load(W + d, mask=ok, other=0.0).to(tl.float32)
         y = (w * (x * rinv)).to(tl.bfloat16)
-        tl.store(OUT + r * os_ + d, y, mask=ok)
+        if role == 0:
+            tl.store(OUT + r * os_ + d, y, mask=ok)
         NBK: tl.constexpr = BLOCK // 128
         v = tl.reshape(y.to(tl.float32), (NBK, 128))
         dd = tl.reshape(d, (NBK, 128))
         okk = dd < D
-        if NROT > 0:
+        if NROT > 0 and ((not SPLIT and role == 0) or role == 2):
             sv = tl.load(S0 + dd, mask=okk, other=0.0).to(tl.float32)
             tl.store(H0 + r * D + dd, _rot128(v, sv, NBK).to(tl.float16), mask=okk)
-        if NROT > 1:
+        if NROT > 1 and ((not SPLIT and role == 0) or role == 3):
             sv = tl.load(S1 + dd, mask=okk, other=0.0).to(tl.float32)
             tl.store(H1 + r * D + dd, _rot128(v, sv, NBK).to(tl.float16), mask=okk)
     else:
@@ -583,9 +972,11 @@ def q_kv_norm(x: torch.Tensor, w: torch.Tensor, eps: float, rot: list, y: torch.
     out = torch.empty((rows, d), dtype=torch.bfloat16, device=x.device)
     kout = torch.empty_like(y)
     st = [t for pair in rot for t in pair] + [out, out] * (2 - len(rot))
-    _q_kv_norm[(rows, 2)](x, x.stride(0), w, out, out.stride(0), eps, *st, y, wk, cos, sin, pos, kout, ring, slots,
-                          ring.shape[0], QUANT=quant, D=d, BLOCK=triton.next_power_of_2(d), NROT=len(rot), DK=dk, RD=rd,
-                          num_warps=4, **_pdl())
+    split = SMALL_SWITCHES["qkv_split"] and len(rot) > 0
+    _q_kv_norm[(rows, 2 + (len(rot) if split else 0))](x, x.stride(0), w, out, out.stride(0), eps, *st, y, wk, cos,
+                                                       sin, pos, kout, ring, slots, ring.shape[0], QUANT=quant, D=d,
+                                                       BLOCK=triton.next_power_of_2(d), NROT=len(rot), DK=dk, RD=rd,
+                                                       num_warps=4, SPLIT=split, **_pdl())
     return out
 
 
@@ -768,7 +1159,21 @@ def _comp_keys(COMP, CSC, row, ok, hc, HD: tl.constexpr, BN: tl.constexpr, PACKE
 def _sparse_attn_part(Q, WSRC, WLO, COMP, CSC, IDX, POS, PM, PL, PO, SINK, OUT, scale, ring_size, n_idx, RBASE, CBASE,
                       H: tl.constexpr, HD: tl.constexpr, HB: tl.constexpr, WIN: tl.constexpr, BN: tl.constexpr,
                       RING: tl.constexpr, HAS_COMP: tl.constexpr, PACKED: tl.constexpr, SPLITS: tl.constexpr,
-                      NBLK: tl.constexpr, FINAL: tl.constexpr, HAS_BASE: tl.constexpr, PDL: tl.constexpr = False):
+                      NBLK: tl.constexpr, FINAL: tl.constexpr, HAS_BASE: tl.constexpr, PDL: tl.constexpr = False,
+                      WPF: tl.constexpr = False):
+    if WPF:
+        # (switch "attn_pf") the split's window block into L2 before the PDL wait: ring rows written kernels ago (the
+        # window KV norm), at slots of round inputs (positions, ring bases); a prefetch moves no data a kernel reads
+        spw = tl.program_id(2)
+        if spw < WIN // BN:
+            nw = tl.arange(0, BN)
+            pw = tl.load(POS + tl.program_id(0))
+            wpw = pw - (WIN - 1) + spw * BN + nw
+            okw = wpw >= 0
+            sw = tl.where(okw, wpw % ring_size, 0)
+            if HAS_BASE:
+                sw = sw + tl.load(RBASE + tl.program_id(0))
+            _prefetch_l2(WSRC + sw[:, None] * HD + (tl.arange(0, HD // 64) * 64)[None, :])
     if PDL:
         gdc_wait()
         gdc_launch_dependents()
@@ -857,7 +1262,7 @@ def _sparse_attn_merge(PM, PL, PO, SINK, OUT, H: tl.constexpr, HD: tl.constexpr,
 @triton.jit
 def _sparse_attn_merge_rot(PM, PL, PO, SINK, OUT, COS, SIN, POS, SUH, XH, rows, H: tl.constexpr, HD: tl.constexpr,
                            HB: tl.constexpr, SPLITS: tl.constexpr, RD: tl.constexpr, GH: tl.constexpr,
-                           PDL: tl.constexpr = False):
+                           PDL: tl.constexpr = False, DISCARD: tl.constexpr = False):
     """_sparse_attn_merge for one head a program (its arithmetic is per head: the same bits as the HB-head program),
     then, through OUT, rope_heads' inverse RoPE of the head and wo_a's input rotation of it (GH heads a slice, the
     slices' suh concatenated in SUH, their rotated rows in XH: slice g's [rows, GH * HD] block at
@@ -890,6 +1295,11 @@ def _sparse_attn_merge_rot(PM, PL, PO, SINK, OUT, COS, SIN, POS, SUH, XH, rows, 
     ob = OUT + r * (H * HD) + h * HD
     tl.store(ob + d, (acc / l).to(tl.bfloat16))
     tl.debug_barrier()
+    if DISCARD:
+        # this head's split outputs (SPLITS x HD fp32, 128-byte aligned rows of 2 KB) are read by this program alone
+        # and dead now: their L2 lines go without a write-back (~3 MB a 6-row layer otherwise reaches DRAM)
+        q = tl.arange(0, SPLITS * (HD // 32))
+        _discard_l2(PO + (base0 + q // (HD // 32)) * HB * HD + hi * HD + (q % (HD // 32)) * 32)
     # inverse RoPE on the last RD dims (rope_heads, INV), its compiled contraction spelled out: re = fma(xe, cs,
     # -(xo sn)), im = fma(xe, sn, xo cs) (checked against rope_heads on 16M random pairs: no other order matches)
     j = tl.arange(0, RD // 2)
@@ -915,7 +1325,79 @@ def _sparse_attn_merge_rot(PM, PL, PO, SINK, OUT, COS, SIN, POS, SUH, XH, rows, 
     tl.store(XH + g * (rows * GH * HD) + r * (GH * HD) + col[:, None] + c[None, :], y.to(tl.float16))
 
 
+# (switch "merge_reg") _sparse_attn_merge_rot with the head's row kept in registers: the merge's bf16 row, the inverse
+# RoPE of its last RD values (pairs split out of the row: the same fma pattern on the same bf16 inputs, rounded to bf16)
+# and wo_a's rotation of the roped bf16 row (_rot128, defined element by element), then one store of o (its final,
+# roped content: what the two stores of _sparse_attn_merge_rot leave) and of the rotated rows. The same bits.
+@triton.jit
+def _sparse_attn_merge_rot2(PM, PL, PO, SINK, OUT, COS, SIN, POS, SUH, XH, rows, H: tl.constexpr, HD: tl.constexpr,
+                            HB: tl.constexpr, SPLITS: tl.constexpr, RD: tl.constexpr, GH: tl.constexpr,
+                            PDL: tl.constexpr = False, DISCARD: tl.constexpr = False):
+    h = tl.program_id(1)
+    _prefetch_l2(SUH + h * HD + tl.arange(0, HD // 64) * 64)    # wo_a's suh of this head
+    _prefetch_l2(SINK + h + tl.arange(0, 1))
+    pp = tl.load(POS + tl.program_id(0))                       # (positions: a round input, no kernel writes them)
+    _prefetch_l2(COS + pp * (RD // 2) + tl.arange(0, 1))
+    _prefetch_l2(SIN + pp * (RD // 2) + tl.arange(0, 1))
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    d = tl.arange(0, HD)
+    base0 = (r * (H // HB) + h // HB) * SPLITS
+    hi = h % HB
+    m = -1e30
+    for sp in range(SPLITS):
+        m = tl.maximum(m, tl.load(PM + (base0 + sp) * HB + hi))
+    l = 0.0
+    acc = tl.zeros((HD,), dtype=tl.float32)
+    for sp in range(SPLITS):
+        ms = tl.load(PM + (base0 + sp) * HB + hi)
+        a = tl.exp(ms - m)
+        l += tl.load(PL + (base0 + sp) * HB + hi) * a
+        acc += tl.load(PO + (base0 + sp) * HB * HD + hi * HD + d) * a
+    l += tl.exp(tl.load(SINK + h) - m)
+    y = (acc / l).to(tl.bfloat16).to(tl.float32)               # the merge's bf16 row
+    if DISCARD:
+        tl.debug_barrier()                                     # every thread's split loads are consumed
+        q = tl.arange(0, SPLITS * (HD // 32))
+        _discard_l2(PO + (base0 + q // (HD // 32)) * HB * HD + hi * HD + (q % (HD // 32)) * 32)
+    # inverse RoPE on the last RD values (pairs j = HD / 2 - RD / 2 ..): rope_heads' contraction as in
+    # _sparse_attn_merge_rot, on the same bf16 values
+    ye, yo = tl.split(tl.reshape(y, (HD // 2, 2)))
+    jj = tl.arange(0, HD // 2)
+    J0: tl.constexpr = (HD - RD) // 2
+    rot = jj >= J0
+    jr = tl.maximum(jj - J0, 0)
+    p = tl.load(POS + r)
+    cs = tl.load(COS + p * (RD // 2) + jr)
+    sn = tl.load(SIN + p * (RD // 2) + jr)
+    sn = -sn
+    re = tl.where(rot, tl.fma(ye, cs, -(yo * sn)).to(tl.bfloat16).to(tl.float32), ye)
+    im = tl.where(rot, tl.fma(ye, sn, yo * cs).to(tl.bfloat16).to(tl.float32), yo)
+    o = tl.reshape(tl.join(re, im), (HD,))                     # the roped bf16 row (as fp32)
+    tl.store(OUT + r * (H * HD) + h * HD + d, o.to(tl.bfloat16))
+    # wo_a's input rotation of the head: its HD / 128 blocks (slice g = h // GH, columns (h % GH) * HD ..)
+    NBK: tl.constexpr = HD // 128
+    bi = tl.arange(0, NBK)
+    c = tl.arange(0, 128)
+    v = tl.reshape(o, (NBK, 128))
+    sv = tl.load(SUH + h * HD + bi[:, None] * 128 + c[None, :]).to(tl.float32)
+    yr = _rot128(v, sv, NBK)
+    g = h // GH
+    col = (h % GH) * HD + bi * 128
+    tl.store(XH + g * (rows * GH * HD) + r * (GH * HD) + col[:, None] + c[None, :], yr.to(tl.float16))
+
+
 ATTN_SPLITS = 8
+
+
+def _pow2(n: int) -> bool:
+    return n > 0 and n & (n - 1) == 0
+
+# TF_EXL3_L2_DISCARD=1 (default): the decode attention merge drops the split outputs it has read from L2 (no
+# write-back to DRAM of the dead fp32 partials; the same bits)
+L2_DISCARD = os.environ.get("TF_EXL3_L2_DISCARD", "1") != "0"
 
 
 def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: torch.Tensor, ring: bool,
@@ -965,13 +1447,15 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
                                           wbase if based else pos, (cbase if cbase is not None else wbase) if based else pos,
                                           H=h, HD=hd, HB=hb, WIN=window, BN=bn, RING=ring, HAS_COMP=has, PACKED=packed,
                                           SPLITS=sp, NBLK=nblk, FINAL=final, HAS_BASE=based, num_warps=4, num_stages=1,
-                                          **_pdl())
+                                          WPF=SMALL_SWITCHES["attn_pf"] and ring and not final, **_pdl())
     if not final and rot is not None:
         # rot = (cos, sin, rope dim, wo_a's suh concatenated, its rotated rows' buffer, heads a slice): the merge, the
         # inverse RoPE and wo_a's input rotation in one launch (o is still written, roped)
         cos, sin, rd, suh, xh, gh = rot
-        _sparse_attn_merge_rot[(rows, h)](pm, pl, po, sink, out, cos, sin, pos, suh, xh, rows, H=h, HD=hd, HB=hb,
-                                          SPLITS=sp, RD=rd, GH=gh, num_warps=4, **_pdl())
+        merge = _sparse_attn_merge_rot2 if SMALL_SWITCHES["merge_reg"] and _pow2(hd) else _sparse_attn_merge_rot
+        merge[(rows, h)](pm, pl, po, sink, out, cos, sin, pos, suh, xh, rows, H=h, HD=hd, HB=hb,
+                         SPLITS=sp, RD=rd, GH=gh, num_warps=4,
+                         DISCARD=L2_DISCARD and hd % 32 == 0 and _pow2(sp * (hd // 32)), **_pdl())
     elif not final:
         _sparse_attn_merge[(rows, groups)](pm, pl, po, sink, out, H=h, HD=hd, HB=hb, SPLITS=sp, num_warps=8,
                                            **_pdl())
@@ -1131,13 +1615,39 @@ def _topk_finish(TOP, VIS, OUT, KK: tl.constexpr, PDL: tl.constexpr = False):
     tl.store(OUT + r * KK + j, tl.where(idx < vis, idx, -1))
 
 
+# (switch "topk_fused") topk_select in one launch a row: the row's n keys (unique: the score's ordered bits above, the
+# inverted index below) sorted ascending, the k largest (the last k) kept, then _topk_finish's tail (their indices sorted
+# ascending, -1 at or past vis[r]). The keys are a total order, so the k largest are the set torch's top-k returns.
+@triton.jit
+def _topk_sel(KEYS, VIS, OUT, N: tl.constexpr, KK: tl.constexpr, PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    key = tl.load(KEYS + r * N + tl.arange(0, N))
+    srt = tl.reshape(tl.sort(key), (N // KK, KK))
+    last = tl.arange(0, N // KK)[:, None] == (N // KK - 1)
+    top = tl.sum(tl.where(last, srt, 0), axis=0)                 # the k largest keys (one term a column: exact)
+    idx = 0xFFFFFFFF - (top & 0xFFFFFFFF)
+    idx = tl.sort(idx)
+    vis = tl.load(VIS + r)
+    tl.store(OUT + r * KK + tl.arange(0, KK), tl.where(idx < vis, idx, -1))
+
+
+TOPK_FUSED_MAX = int(os.environ.get("TF_DS_TOPK_FUSED_MAX") or 4096)   # keys a row the fused selection takes at most
+
+
 def topk_select(keys: torch.Tensor, k: int, vis: torch.Tensor) -> torch.Tensor:
     """torch.where(topk_indices(score, k) < vis[:, None], ..., -1) from index_keys' keys: torch's top-k of the keys,
     then one launch for the indices, their sort and the mask (k a power of two). The same int64 [R, k]."""
 
-    top = keys.topk(k, dim=-1, sorted=False).values.contiguous()
-    rows = keys.shape[0]
+    rows, n = keys.shape
     out = torch.empty((rows, k), dtype=torch.int64, device=keys.device)
+    if (SMALL_SWITCHES["topk_fused"] and _pow2(n) and _pow2(k) and k <= n <= TOPK_FUSED_MAX and keys.is_contiguous()
+            and keys.dtype == torch.int64):
+        _topk_sel[(rows,)](keys, vis, out, N=n, KK=k, num_warps=8 if n > 1024 else 4, **_pdl())
+        return out
+    top = keys.topk(k, dim=-1, sorted=False).values.contiguous()
     _topk_finish[(rows,)](top, vis, out, KK=k, num_warps=4, **_pdl())
     return out
 
@@ -1356,8 +1866,117 @@ def _route(L, BIAS, PICK, WTS, scale, shared_id, NE: tl.constexpr, NB: tl.conste
     _route_row(L + r * NE, BIAS, PICK + r * SLOTS, WTS + r * SLOTS, scale, shared_id, NE, NB, TOPK, SLOTS, SP, False)
 
 
+# the router matmul as chunk sums (switch "rowmm_parts"): S[r, t, n] = the dot of chunk t (BK columns) of x[r] and
+# w[n], a tile [BN, BK] over NW warps (BN / NW outputs a warp, each output's chunk 8 columns a lane and the same
+# butterfly as in rowmm2, so each chunk's sum has the bits it has inside rowmm2; x's chunk loaded as a tile of that
+# layout, no layout conversion), programs over (output blocks, groups of CPG chunks), every row of the window in a
+# program (RB == rows: its weight chunks loaded once, before the PDL wait; every store after every load); the route
+# kernel adds a row's chunk sums in K order from zero (rowmm2's acc: the same adds in the same order, so the same
+# logits) before routing
+@triton.jit
+def _rowmm_parts(X, xs, W, S, rows, K: tl.constexpr, N: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+                 CPG: tl.constexpr, RB: tl.constexpr, PDL: tl.constexpr = False):
+    nb = tl.program_id(0)
+    g = tl.program_id(1)
+    nn = nb * BN + tl.arange(0, BN)
+    kk = tl.arange(0, BK)
+    KC: tl.constexpr = K // BK
+    ws = ()
+    for c in tl.static_range(CPG):
+        ws = ws + (tl.load(W + nn[:, None] * K + ((g * CPG + c) * BK + kk)[None, :], mask=(nn < N)[:, None],
+                           other=0.0),)
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    out = ()
+    for i in tl.static_range(RB):                      # RB == rows (a variant a row count)
+        for c in tl.static_range(CPG):
+            # x's chunk as a [BN, BK] tile (every warp the same row: the tile's own layout, no conversion)
+            x = tl.load(X + i * xs + ((g * CPG + c) * BK + kk)[None, :] + 0 * nn[:, None]).to(tl.float32)
+            out = out + (tl.sum(ws[c].to(tl.float32) * x, axis=1),)
+    for i in tl.static_range(RB):
+        for c in tl.static_range(CPG):
+            tl.store(S + (i * KC + g * CPG + c) * N + nn, out[i * CPG + c], mask=nn < N)
+
+
+@triton.jit
+def _route_parts(S, BIAS, PICK, WTS, scale, shared_id, NE: tl.constexpr, NB: tl.constexpr, TOPK: tl.constexpr,
+                 SLOTS: tl.constexpr, SP: tl.constexpr, KC: tl.constexpr, PDL: tl.constexpr = False):
+    """_route of a row whose logits are rowmm_parts' chunk sums: the logits are summed first (from zero, chunk 0
+    first: rowmm2's accumulation), then _route_row's code."""
+
+    if PDL:
+        _prefetch_l2(BIAS + tl.minimum(tl.arange(0, NB // 32) * 32, NE - 1))   # the bias (a weight) while waiting
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    e = tl.arange(0, NB)
+    ok = e < NE
+    lg = tl.zeros((NB,), dtype=tl.float32)
+    for t in tl.static_range(KC):
+        lg += tl.load(S + (r * KC + t) * NE + e, mask=ok, other=0.0)
+    PICK = PICK + r * SLOTS
+    WTS = WTS + r * SLOTS
+    sp = tl.where(lg > 20.0, lg, tl.log(1.0 + tl.exp(lg)))
+    sc = tl.sqrt(sp)
+    b = tl.load(BIAS + e, mask=ok, other=0.0)
+    sel = tl.where(ok, sc + b, float("-inf"))
+    tot = 0.0
+    s = tl.arange(0, SP)
+    picks = tl.full((SP,), shared_id, dtype=tl.int32)
+    ws = tl.zeros((SP,), dtype=tl.float32)
+    for k in tl.static_range(TOPK):
+        best = tl.max(sel, axis=0)
+        idx = tl.min(tl.where(sel == best, e, NB), axis=0)          # lowest index among ties
+        v = tl.sum(tl.where(e == idx, sc, 0.0), axis=0)
+        picks = tl.where(s == k, idx, picks)
+        ws = tl.where(s == k, v, ws)
+        tot += v
+        sel = tl.where(e == idx, float("-inf"), sel)
+    ws = tl.where(s < TOPK, ws / (tot + 1e-20) * scale, 1.0)
+    tl.store(PICK + s, picks, mask=s < SLOTS)
+    tl.store(WTS + s, ws, mask=s < SLOTS)
+
+
+# rowmm_parts' (outputs, chunks, warps) a program by rows (a one-GPU sweep of tilings at 1-16 rows);
+# TF_DS_ROWMM_PARTS="BN,CPG,NW" sets one for every row count (benchmarks)
+_RP_ENV = os.environ.get("TF_DS_ROWMM_PARTS")
+_RP = [int(v) for v in _RP_ENV.split(",")] if _RP_ENV else None
+# rowmm_parts serves windows of ROWMM_PARTS_MIN rows or more (TF_DS_ROWMM_PARTS_MIN, default 1)
+ROWMM_PARTS_MIN = int(os.environ.get("TF_DS_ROWMM_PARTS_MIN") or 1)
+
+
+def _rp_tile(rows: int) -> tuple:
+    if _RP is not None:
+        return tuple(_RP)
+    return (16, 1, 2) if rows <= 6 else (8, 1, 2)
+
+
+def rowmm_gate(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """The MoE gate's logits for route(): rowmm2(x, w) [R, N], or (switch "rowmm_parts", decode windows) its chunk
+    sums [R, K / 256, N] (route() adds them in K order: the same logits)."""
+
+    rows, k = x.shape
+    n = w.shape[0]
+    bn, cpg, nw = _rp_tile(rows)
+    kc = k // 256
+    if (SMALL_SWITCHES["rowmm_parts"] and ROWMM_PARTS_MIN <= rows <= DECODE_ROWS and k % 256 == 0 and kc % cpg == 0
+            and n >= 32 and x.dtype == torch.bfloat16 and w.dtype == torch.float16):
+        out = torch.empty((rows, kc, n), dtype=torch.float32, device=x.device)
+        _rowmm_parts[(triton.cdiv(n, bn), kc // cpg)](x, x.stride(0), w, out, rows, K=k, N=n, BN=bn, BK=256, CPG=cpg,
+                                                      RB=rows, num_warps=nw, **_pdl())
+        return out
+    return rowmm2(x, w)
+
+
 def route(logits: torch.Tensor, bias: torch.Tensor, topk: int, scale: float, shared_id: int,
           pick: torch.Tensor, wts: torch.Tensor) -> None:
+    if logits.dim() == 3:                                   # rowmm_gate's chunk sums
+        rows, kc, ne = logits.shape
+        _route_parts[(rows,)](logits, bias, pick, wts, scale, shared_id, NE=ne, NB=triton.next_power_of_2(ne),
+                              TOPK=topk, SLOTS=pick.shape[1], SP=triton.next_power_of_2(pick.shape[1]), KC=kc,
+                              num_warps=1, **_pdl())
+        return
     rows, ne = logits.shape
     # one warp a row (switch "rowmm"): its reductions are a max, a min index and a one-element sum, exact in any
     # layout, so the picks and weights are the 4-warp launch's; no cross-warp barriers in its six rounds

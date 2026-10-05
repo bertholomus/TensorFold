@@ -90,6 +90,11 @@ tokens; workspace and graphs ~3–4 GiB. The kit allocates ~99.5 GiB weights a r
   through main_proj + main_norm into each draft block's window ring (positions of those tokens).
 - Draft: block [last token, noise x 4] -> 5 base logits in one pass; the Markov head adds its bias row by row
   (greedy argmax, or keyed sampling at T>0) -> d1..d5 and confidences.
+- The Markov steps (`markov.py`): each bias element is one fixed-order tensor-core dot (the bits of the cuBLAS GEMM
+  it replaces, checked over the whole vocabulary), each rank scores its vocabulary half against its half of the
+  drafter heads logits and the ranks (value, index) bests meet in one small gather a step (ties to the lower
+  index); the bias rows of the 4096 most frequent tokens (a code + English sample) are made at load by the same
+  kernel and read instead of the head. The same drafts on every rank, the same drafts as the plain loop.
 - Verify k of them (start fixed k=3, then pick k from the confidence head's survival estimate and our measured
   throughput curve) in one target pass of k+1 rows; accept the matching prefix plus the target's next token.
 - The drafter only proposes; the target's serial arithmetic decides every token.

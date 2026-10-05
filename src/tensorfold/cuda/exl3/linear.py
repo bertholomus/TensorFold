@@ -19,7 +19,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_exl3_linear_v5",
+    return load(name="tensorfold_exl3_linear_v6",
                 sources=[str(here / "linear.cpp"), str(here / "linear.cu"), str(here / "linear_grouped.cu")],
                 extra_include_paths=[str(here)], extra_cuda_cflags=["-O3", "--expt-relaxed-constexpr"],
                 verbose=False)
@@ -217,6 +217,11 @@ def _rows(x: torch.Tensor) -> torch.Tensor:
 # grouped launches as programmatic dependent launches (sm_90+): each may start while the kernel before it finishes,
 # reading only weights until that kernel is done (TF_EXL3_PDL=0: plain launches); the bits are the same either way
 PDL = os.environ.get("TF_EXL3_PDL", "1") != "0"
+# TF_EXL3_L2_DISCARD=1 (default): a grouped launch's split-K partials (fp32 Z) are dropped from L2 once the block that
+# sums them has read them (discard.global.L2), so they are never written back to DRAM: the partials are dead then, and
+# on a decode step the layer's weights streaming through L2 would evict them dirty (~2 MB a 6-row layer). No output
+# changes (only DRAM write traffic).
+DISCARD = os.environ.get("TF_EXL3_L2_DISCARD", "1") != "0"
 
 
 class Exl3Group:
@@ -297,20 +302,21 @@ class Exl3Group:
         for part, k2, cb, wk, words, s_k, s_nb, svh, bias, counters, sks, ns in self.launches:
             zn = sum(sk * m * n for sk, n in zip(sks, ns) if sk > 1)
             z = torch.empty((zn,), dtype=torch.float32, device=dev) if zn else None
+            dc = int(DISCARD and z is not None)
             if rope is not None and any(rope[5][i] for i in part):
                 rs = [rot[i] for i in part] if rot is not None else [None] * len(part)
                 ext.glinear([xh[i] for i in part], words, s_k, s_nb, svh, bias, [outs[i] for i in part], z, counters,
                             sks, k2, cb, wk, PDL, [r[0] if r else None for r in rs], [r[1] if r else None for r in rs],
                             [r[2] if r else 0 for r in rs], [int(bool(rope[5][i])) for i in part], rope[0], rope[1],
-                            rope[2], rope[3], rope[4])
+                            rope[2], rope[3], rope[4], discard=dc)
             elif rot is not None and any(rot[i] is not None for i in part):
                 rs = [rot[i] for i in part]
                 ext.glinear([xh[i] for i in part], words, s_k, s_nb, svh, bias, [outs[i] for i in part], z, counters,
                             sks, k2, cb, wk, PDL, [r[0] if r else None for r in rs], [r[1] if r else None for r in rs],
-                            [r[2] if r else 0 for r in rs])
+                            [r[2] if r else 0 for r in rs], discard=dc)
             else:
                 ext.glinear([xh[i] for i in part], words, s_k, s_nb, svh, bias, [outs[i] for i in part], z, counters,
-                            sks, k2, cb, wk, PDL)
+                            sks, k2, cb, wk, PDL, discard=dc)
         return outs
 
 

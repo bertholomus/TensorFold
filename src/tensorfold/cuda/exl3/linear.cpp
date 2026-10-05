@@ -16,7 +16,7 @@ void exl3_glinear_cuda(const std::vector<at::Tensor>&, const std::vector<at::Ten
                        int64_t, int64_t, int64_t, bool, const std::vector<c10::optional<at::Tensor>>&,
                        const std::vector<c10::optional<at::Tensor>>&, const std::vector<int64_t>&,
                        const std::vector<int64_t>&, const c10::optional<at::Tensor>&, const c10::optional<at::Tensor>&,
-                       const c10::optional<at::Tensor>&, int64_t, int64_t);
+                       const c10::optional<at::Tensor>&, int64_t, int64_t, int64_t);
 
 static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t && x.is_contiguous(), name,
@@ -105,7 +105,7 @@ void rot_many(const std::vector<at::Tensor>& xs, const std::vector<at::Tensor>& 
 // bias_i, xhs the rotated rows (rot_many), each layer with its own SK as linear() runs it (the same bits); ys may be
 // row-strided views. Z fp32 holds SK_i * M * N_i floats of every layer with SK_i > 1, in order; counters as for
 // linear(), one per layer, distinct. pdl as for rot_many (it reads only its first weights before the kernel before it
-// is done).
+// is done). discard: each block's split-K partials are dropped from L2 once summed (not written back; no bit changes).
 void glinear(const std::vector<at::Tensor>& xhs, const std::vector<at::Tensor>& Ts,
              const std::vector<int64_t>& stride_k, const std::vector<int64_t>& stride_nb,
              const std::vector<at::Tensor>& svhs,
@@ -116,7 +116,7 @@ void glinear(const std::vector<at::Tensor>& xhs, const std::vector<at::Tensor>& 
              const std::vector<c10::optional<at::Tensor>>& rxhs = {}, const std::vector<int64_t>& roffs = {},
              const std::vector<int64_t>& ropes = {}, const c10::optional<at::Tensor>& rcos = c10::nullopt,
              const c10::optional<at::Tensor>& rsin = c10::nullopt, const c10::optional<at::Tensor>& rpos = c10::nullopt,
-             int64_t rhd = 0, int64_t rrd = 0) {
+             int64_t rhd = 0, int64_t rrd = 0, int64_t discard = 0) {
     const size_t n = xhs.size();
     TORCH_CHECK(n >= 1 && (int)n <= exl3_glinear_max(), "1 to ", exl3_glinear_max(), " layers a launch");
     TORCH_CHECK(Ts.size() == n && stride_k.size() == n && stride_nb.size() == n && svhs.size() == n &&
@@ -183,7 +183,7 @@ void glinear(const std::vector<at::Tensor>& xhs, const std::vector<at::Tensor>& 
     }
     c10::cuda::CUDAGuard guard(xhs[0].device());
     exl3_glinear_cuda(xhs, Ts, stride_k, stride_nb, svhs, biases, ys, Z, counters, SK, K2, cb, WK, pdl, rsuhs, rxhs,
-                      roffs, ropes, rcos, rsin, rpos, rhd, rrd);
+                      roffs, ropes, rcos, rsin, rpos, rhd, rrd, discard);
 }
 
 // W [K, N] fp16 = W_q, the trellis tiles decoded; tile (kt, nt) at kt * stride_k + (nt / 8) * stride_nb words.
@@ -206,7 +206,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           py::arg("rsuhs") = std::vector<c10::optional<at::Tensor>>{},
           py::arg("rxhs") = std::vector<c10::optional<at::Tensor>>{}, py::arg("roffs") = std::vector<int64_t>{},
           py::arg("ropes") = std::vector<int64_t>{}, py::arg("rcos") = c10::nullopt, py::arg("rsin") = c10::nullopt,
-          py::arg("rpos") = c10::nullopt, py::arg("rhd") = 0, py::arg("rrd") = 0);
+          py::arg("rpos") = c10::nullopt, py::arg("rhd") = 0, py::arg("rrd") = 0, py::arg("discard") = 0);
     m.def("glinear_max", &exl3_glinear_max);
     m.def("rot_many", &rot_many);
 }

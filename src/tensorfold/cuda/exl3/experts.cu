@@ -826,7 +826,7 @@ void exl3x_grouped_decode_cuda(const at::Tensor& X0, const at::Tensor& X1, const
                                at::Tensor& xd, double limit, int64_t act_mode, at::Tensor& y, const at::Tensor& wts,
                                const at::Tensor& add, at::Tensor& out, int64_t has_wts, int64_t has_add,
                                int64_t store_y, at::Tensor& cnt, int64_t pdl, at::Tensor& ready,
-                               at::Tensor& ready_cnt, at::Tensor& epoch, int64_t use_ready) {
+                               at::Tensor& ready_cnt, at::Tensor& epoch, int64_t use_ready, int64_t discard) {
     TORCH_CHECK(K % (16 * SK * 4) == 0 && N % 128 == 0, "K and N must split evenly");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(X0.data_ptr());
@@ -852,6 +852,8 @@ void exl3x_grouped_decode_cuda(const at::Tensor& X0, const at::Tensor& X1, const
     ep.pick = pick.data_ptr<int>();
     ep.E = (int)E;
     ep.cnt = cnt.data_ptr<int>();
+    // EPI 1: 2 * SK (mat, split) partial rows a member (<= 32 lanes); EPI 2: only with the combine (y dead after it)
+    ep.discard = (int)(discard && ((epi == 1 && 8 * SK <= 32) || (epi == 2 && has_wts && 4 * slots <= 32)));
     if (epi == 1) {
         ep.svh_g = reinterpret_cast<const half*>(svh0.data_ptr());
         ep.svh_u = reinterpret_cast<const half*>(svh1.data_ptr());
