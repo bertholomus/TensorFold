@@ -648,9 +648,12 @@ class Engram:
         fs, bs, rs = self.files[f"layers.{layer}.engram.embed.scale"]
         flat = np.ascontiguousarray(idx.reshape(-1), dtype=np.int64)
         m = flat.shape[0]
-        hit = next((a for a in self.ahead if a[0] == layer and np.array_equal(a[1], flat)), None)
+        at = next((j for j, a in enumerate(self.ahead) if a[0] == layer and np.array_equal(a[1], flat)), None)
+        hit = self.ahead[at] if at is not None else None
         if hit is not None:                           # read ahead: the same bytes, from its slot
-            self.ahead.remove(hit)
+            # by index, not list.remove(): remove() compares the tuples with ==, which raises on an earlier entry
+            # whose id array has another length ("operands could not be broadcast")
+            del self.ahead[at]
             hit[2].result()
             gw = hit[3][0][:m].cuda(non_blocking=True)
             gs = hit[3][1][:m].cuda(non_blocking=True)
