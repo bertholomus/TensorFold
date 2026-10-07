@@ -9,6 +9,11 @@ TF_ZREC_DIR=<dir> turns it on (sitecustomize.py). It writes there when <dir>/DUM
 exit: launches.json (Triton kernels, phases, grids, sites, and up to TF_ZREC_KEEP detailed launches a distinct shape;
 extension calls are in its phases and log too), modules.json (the extension modules and their .so files), aten.json
 (ATen ops by phase and signature, with call sites) and meta.json (versions, device, environment).
+
+With CUDA_INJECTION64_PATH=.../ztrace.so the phases also go to that launch tracer. With TF_ZREC_LAYERS set (a list of
+layer numbers, possibly empty), while <dir>/LAYERS exists every call of the LAYER_POINTS methods writes a line a tensor
+it takes or returns to layers.jsonl (digest, shape, dtype, first and last row's first bytes), and the listed layers'
+tensors (and Model.forward's) are saved whole under <dir>/layers/: the Zig port's layer gate (M3).
 """
 
 from __future__ import annotations
@@ -31,10 +36,16 @@ OPS_ON = os.environ.get("TF_ZREC_ATEN", "1") != "0"
 FAMILY = "tensorfold.families.deepseek_v41"
 
 _tls = threading.local()
+_ztrace = None      # ztrace.so (CUDA_INJECTION64_PATH) when it traces this process: phases go to it too
 _lock = threading.Lock()
 _rec = None
 _ops = None
 _modules: dict[str, str | None] = {}
+
+
+def _trace_phase(p: str) -> None:
+    if _ztrace is not None:
+        _ztrace.ztrace_phase(p.encode())
 
 
 def phase() -> str:
@@ -152,6 +163,7 @@ def scoped(name, f):
             p = getattr(name, "__name__", "phase")
         st = _tls.__dict__.setdefault("stack", [])
         st.append(p)
+        _trace_phase(p)
         mode = None
         if len(st) == 1 and OPS_ON and _OpLog is not None:
             mode = _OpLog()
@@ -162,6 +174,7 @@ def scoped(name, f):
             if mode is not None:
                 mode.__exit__(None, None, None)
             st.pop()
+            _trace_phase(st[-1] if st else "other")
 
     w._zrec = True
     return w
@@ -226,6 +239,125 @@ PHASES = [
 ]
 
 
+# -- per-layer fixtures -------------------------------------------------------------------------------------------
+
+LAYER_POINTS = [
+    # (module under FAMILY, class, method): the prompt path's layer steps and the gather between them
+    ("cuda.model", "Model", "forward"),
+    ("cuda.model", "Model", "attention_k"),
+    ("cuda.model", "Model", "moe"),
+    ("cuda.model", "Comm", "gather"),
+]
+LAYERS_ON = "TF_ZREC_LAYERS" in os.environ
+LAYERS_FULL = {int(x) for x in os.environ.get("TF_ZREC_LAYERS", "").split(",") if x.strip().isdigit()}
+FULL_MAX = 256 << 20     # bytes: a bigger tensor is never saved whole
+DIGEST_MAX = 2 << 30     # bytes: a bigger one gets no digest either
+_lay_lines: list[dict] = []
+_lay = {"armed": False, "at": 0.0, "call": 0}
+
+
+def _armed() -> bool:
+    now = time.monotonic()
+    if now - _lay["at"] > 0.2:
+        _lay["at"] = now
+        _lay["armed"] = (OUT / "LAYERS").exists()
+    return _lay["armed"]
+
+
+def _tensors(x, path: str):
+    """(path, tensor) for x when it is a tensor, or for each tensor in x when it is a list or tuple."""
+
+    import torch
+
+    if isinstance(x, torch.Tensor):
+        yield path, x
+    elif isinstance(x, (list, tuple)):
+        for i, y in enumerate(x):
+            if isinstance(y, torch.Tensor):
+                yield f"{path}.{i}", y
+
+
+def _layer_of(a) -> int | None:
+    for v in a[1:3]:
+        i = getattr(v, "idx", None)
+        if isinstance(i, int):
+            return i
+    return None
+
+
+def _put_layer(call: int, where: str, layer: int | None, path: str, t) -> None:
+    import hashlib
+
+    import torch
+
+    line = {"phase": "/".join(getattr(_tls, "stack", None) or ["other"]), "call": call, "where": where, "layer": layer,
+            "arg": path, "shape": list(t.shape), "dtype": str(t.dtype).replace("torch.", ""), "stride": list(t.stride())}
+    n = t.numel() * t.element_size()
+    if n > DIGEST_MAX:
+        line["skipped"] = n
+    else:
+        c = t.detach()
+        if c.is_complex():
+            c = torch.view_as_real(c)
+        raw = c.contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+        row = len(raw) // t.shape[0] if t.dim() > 0 and t.shape[0] > 0 else len(raw)
+        line.update(sha256=hashlib.sha256(raw).hexdigest(), head=raw[:64].hex(), tail=raw[len(raw) - row:][:64].hex())
+        if n <= FULL_MAX and (layer in LAYERS_FULL or where == "Model.forward"):
+            f = OUT / "layers" / f"{call:05d}.{where}.{path}.bin"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_bytes(raw)
+            line["file"] = f.name
+    with _lock:
+        _lay_lines.append(line)
+
+
+def _layer_point(where: str, f):
+    """f, writing its tensors in and out while the LAYERS flag is up (synchronized first; never in a graph capture)."""
+
+    @functools.wraps(f)
+    def w(*a, **k):
+        import torch
+
+        if not _armed() or torch.cuda.is_current_stream_capturing():
+            return f(*a, **k)
+        with _lock:
+            _lay["call"] += 1
+            call = _lay["call"]
+        layer = _layer_of(a)
+        ins = [(f"in{i}", v) for i, v in enumerate(a[1:], 1)] + [(f"in.{kk}", v) for kk, v in k.items()]
+
+        def put(items, tag):
+            try:
+                torch.cuda.synchronize()
+                for name, v in items:
+                    for path, t in _tensors(v, tag + name):
+                        _put_layer(call, where, layer, path, t)
+            except Exception as e:  # never break the forward
+                print(f"zrec: layer point {where} {tag} not taken ({e!r})", file=sys.stderr, flush=True)
+
+        put(ins, "")
+        out = f(*a, **k)
+        put([("out", out)], "")
+        put(ins, "post.")
+        return out
+
+    w._zrec_layer = True
+    return w
+
+
+def _patch_layers() -> None:
+    import importlib
+
+    for mod, owner, attr in LAYER_POINTS:
+        try:
+            target = getattr(importlib.import_module(f"{FAMILY}.{mod}"), owner)
+            f = getattr(target, attr)
+            if not getattr(f, "_zrec_layer", False):
+                setattr(target, attr, _layer_point(f"{owner}.{attr}", f))
+        except Exception as e:
+            print(f"zrec: no layer point {mod}.{owner}.{attr} ({e!r})", file=sys.stderr, flush=True)
+
+
 def _wrap_module(mod, label: str) -> None:
     names = tuple(n for n in dir(mod) if not n.startswith("_") and callable(getattr(mod, n, None)))
     _rec.wrap(mod, names, label)
@@ -286,6 +418,8 @@ def meta() -> dict:
 
 def dump() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
+    if _ztrace is not None:
+        _ztrace.ztrace_flush()
     _rec.dump(OUT / "launches.json.tmp")
     os.replace(OUT / "launches.json.tmp", OUT / "launches.json")
     with _lock:
@@ -294,6 +428,10 @@ def dump() -> None:
     if _ops is not None:
         (OUT / "aten.json").write_text(json.dumps(_ops.dump(), indent=0, default=str) + "\n")
     (OUT / "meta.json").write_text(json.dumps(meta(), indent=1, default=str) + "\n")
+    if LAYERS_ON:
+        with _lock:
+            lines = list(_lay_lines)
+        (OUT / "layers.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
     (OUT / "DUMPED").write_text(time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) + "\n")
 
 
@@ -313,14 +451,22 @@ def _watch() -> None:
 def install() -> None:
     """Patch Triton, the extension loaders, sampling and the engine's phases; start the dump watcher."""
 
-    global _rec, _ops, _OpLog
+    global _rec, _ops, _OpLog, _ztrace
     OUT.mkdir(parents=True, exist_ok=True)
+    inj = os.environ.get("CUDA_INJECTION64_PATH")
+    if inj and inj.endswith("ztrace.so"):
+        import ctypes
+
+        _ztrace = ctypes.CDLL(inj)
+        _ztrace.ztrace_phase.argtypes = [ctypes.c_char_p]
     _rec = _recorder_class()().install()
     _ops = Ops()
     if OPS_ON:
         _OpLog = _mode_class()
     _patch_loaders()
     _patch_sampling()
+    if LAYERS_ON:
+        _patch_layers()
     for mod, owner, attr, name in PHASES:
         _patch(f"{FAMILY}.{mod}", owner, attr, name)
     threading.Thread(target=_watch, name="zrec-dump", daemon=True).start()
