@@ -451,6 +451,11 @@ fn ints(run: *Run, p: ?*const Point) ![]const i64 {
     return std.mem.bytesAsSlice(i64, bytes);
 }
 
+/// The logits' width: the ranks' vocabulary parts (a 2D rank's part is both pairs' quarters).
+fn vocabOf(eng: *const prompt.Engine) usize {
+    return eng.world * (if (eng.two) |t| t.hw[0] + t.hw[1] else eng.w.head.n);
+}
+
 /// The index of the first largest of n fp32 values on the device (torch.argmax's choice).
 fn argmax(run: *Run, dev: u64, n: usize) !usize {
     try run.s.synchronize();
@@ -469,7 +474,7 @@ fn argmax(run: *Run, dev: u64, n: usize) !usize {
 fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []i32, prompt_len: usize, rounds: usize, a: std.mem.Allocator, arena: *prompt.Arena) !bool {
     const fx = run.fx;
     const w_out = run.out;
-    const vocab = eng.world * (if (eng.two) |t| t.hw[0] + t.hw[1] else eng.w.head.n); // 2D: a rank's half is both pairs' quarters
+    const vocab = vocabOf(eng);
     var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
     var next = try argmax(run, ch.head_g, vocab); // greedy from the prompt's logits
     var have = prompt_len;
@@ -635,7 +640,7 @@ fn runLight(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
     const w_out = run.out;
     const c = eng.c;
     const pts = fx.points;
-    const vocab = eng.world * eng.w.head.n;
+    const vocab = vocabOf(eng);
     var rd = try round_mod.Round.init(eng, arena, a, tokens);
     const seq = try a.alloc(i32, tokens + 16);
     const host_pos = try a.alloc(i64, chunk_rows);
