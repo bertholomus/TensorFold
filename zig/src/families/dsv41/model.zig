@@ -89,6 +89,10 @@ pub const Model = struct {
     // the stream a fill is running: its slot and its view of the caches (its extent from base)
     fill_slot: usize = 0,
     view: prompt.Caches = undefined,
+    // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
+    prof: bool = false,
+    t_forward: u64 = 0,
+    t_absorb: u64 = 0,
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -107,6 +111,9 @@ pub const Model = struct {
         m.world = o.world;
         m.pool_cap = o.pool;
         m.fill_slot = 0;
+        m.prof = false;
+        m.t_forward = 0;
+        m.t_absorb = 0;
         m.dpool = null;
         m.dr = null;
         m.tables = null;
@@ -320,7 +327,13 @@ pub const Model = struct {
     /// overwrites them). absorb[i]: window i's stream drafts.
     pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool) !void {
         const e = &m.eng;
+        const t0 = m.now();
         try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null);
+        if (m.prof) {
+            try m.stream.synchronize();
+            m.t_forward = m.now() - t0;
+        }
+        const t1 = m.now();
         if (m.dr) |*dr| {
             const wins = rows.windows orelse return error.BadRound;
             var items: [max_streams]draft.Item = undefined;
@@ -333,6 +346,12 @@ pub const Model = struct {
             if (n > 0) try dr.absorbMany(e, &m.ch, &m.dpool.?, items[0..n]);
         }
         try m.stream.synchronize();
+        if (m.prof) m.t_absorb = m.now() - t1;
+    }
+
+    /// The monotonic clock (ns).
+    pub fn now(m: *const Model) u64 {
+        return @intCast(std.Io.Timestamp.now(m.io, .awake).nanoseconds);
     }
 
     /// The round's logits, R rows of the vocabulary, on the host (after verify).
