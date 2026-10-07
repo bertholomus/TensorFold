@@ -13,6 +13,8 @@ pub const comm = @import("comm.zig");
 pub const tri = @import("tri.zig");
 pub const tri_basic = @import("tri_basic.zig");
 pub const cublas = @import("cublas.zig");
+pub const elf = @import("elf.zig");
+pub const exl3_linear = @import("exl3_linear.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -30,4 +32,6 @@ test {
     refAll(tri);
     refAll(tri_basic);
     refAll(cublas);
+    refAll(elf);
+    refAll(exl3_linear);
 }
