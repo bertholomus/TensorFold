@@ -202,7 +202,7 @@ PHASES = [
     ("cuda.graph", "StaticDecoder", "run", "static_run"),
     ("cuda.rounds", "RoundDecoder", "capture", _rows_bucket("round")),
     ("cuda.rounds", "RoundDecoder", "run", "round_run"),
-    ("cuda.rounds", "RoundRunner", "_forward", "round_forward"),
+    ("cuda.rounds", "RoundRunner", "forward", "round_forward"),
     ("cuda.dspark", "Drafter", "absorb", "absorb"),
     ("cuda.dspark", "Drafter", "absorb_many", "absorb"),
     ("cuda.dspark", "Drafter", "draft", "draft_eager"),
@@ -221,7 +221,8 @@ PHASES = [
     ("cuda.multi", "MultiDecoder", "follow", "follow"),
     ("cuda.model", "Model", "forward", "forward"),
     ("cuda.model", "Engram", "rows", "engram_rows"),
-    ("cuda.vision", "DsVision", "__call__", "vision"),
+    ("cuda.vision", "Tower", "encode", "vision"),
+    ("cuda.vision", "Tower", "span_rows", "vision"),
 ]
 
 

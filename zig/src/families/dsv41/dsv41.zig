@@ -10,6 +10,8 @@ pub const weights = @import("weights.zig");
 pub const engram_io = @import("engram_io.zig");
 pub const link = @import("link.zig");
 pub const comm = @import("comm.zig");
+pub const tri = @import("tri.zig");
+pub const tri_basic = @import("tri_basic.zig");
 
 test {
     _ = @import("config.zig");
@@ -22,4 +24,6 @@ test {
     _ = engram_io;
     _ = link;
     _ = comm;
+    _ = tri;
+    _ = tri_basic;
 }
