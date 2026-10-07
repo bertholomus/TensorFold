@@ -8,7 +8,8 @@
 //! FFN mixes, the MoE and its gather; a stretch's last post alone; the head on every row. The served side streams (the
 //! Sinkhorn half, the L2 prefetches) run in this stream's order here, the RDMA gathers are NCCL all-gathers (the same
 //! bytes), and the round's index arithmetic (rounds.py _ix: integer ops on the positions and the stream's extent) is
-//! made on the host.
+//! made on the host. A node of the four-node 2D split takes its column parts and their exchanges through round2d.zig's
+//! hooks (Engine.two).
 const std = @import("std");
 const cuda = @import("cuda");
 const prompt = @import("prompt.zig");
@@ -21,6 +22,8 @@ const tri_attn = @import("tri_attn.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
+const exl3_experts2d = @import("exl3_experts2d.zig");
+const round2d = @import("round2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 
@@ -151,7 +154,7 @@ pub const Round = struct {
         const d = c.hidden;
         const hc = c.hc;
         const hd = c.head_dim;
-        const hl = c.heads / e.world;
+        const hl = e.heads();
         const l0 = w.layers[0];
         const nb_max = bucketFor(pool_cap, pool_cap);
         var rd: Round = undefined;
@@ -226,15 +229,17 @@ pub const Round = struct {
         for (w.layers) |lay| {
             const ew = lay.engram_wkv orelse continue;
             rd.e_in = try a.take(R * ew.k * 2);
+            const en = if (e.two) |tw| tw.engramWidth() else ew.n; // the summed projection's width (2D: both pairs')
             rd.ek = try a.take(R * ew.n * 4);
-            rd.ekg = try a.take(e.world * R * ew.n * 4);
-            rd.ekv = try a.take(R * ew.n * 2);
+            rd.ekg = try a.take(e.world * R * en * 4);
+            rd.ekv = try a.take(R * en * 2);
             break;
         }
         rd.xc = try a.take(R * d * 2);
+        const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else w.head.n; // a rank's vocabulary half (2D: both pairs' parts)
         rd.hl = try a.take(R * w.head.n * 4);
-        rd.hg = try a.take(e.world * R * w.head.n * 4);
-        rd.logits = try a.take(R * e.world * w.head.n * 4);
+        rd.hg = try a.take(e.world * R * hh * 4);
+        rd.logits = try a.take(R * e.world * hh * 4);
         rd.taps = try a.take(R * @max(c.dspark_taps.slice().len, 1) * d * 2);
         // wo_a_rot's suh: the slices' suh one after another (torch.cat's bytes)
         rd.wo_suh = try gpa.alloc(u64, w.layers.len);
@@ -325,7 +330,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     const R = rd.r;
     const hd = c.head_dim;
     const rd_dim = c.rope_dim;
-    const hl = c.heads / e.world;
+    const hl = e.heads();
     const ratio: usize = lay.ratio;
     const rope = ropeOf(e, lay);
     const ring = rings[li];
@@ -513,12 +518,14 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     var col: usize = 0;
     var off: usize = 0;
     for (lay.wo_a[0..lay.groups], 0..) |wo, gi| {
-        calls[gi] = .{ .layer = wo, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xhwo + off * 2, .y = rd.u + col * 2, .ldy = @intCast(uw), .y_dtype = .bf16, .counters = 0, .rot = .{ .suh = lay.wo_b.suh, .xh = rd.xb, .ldr = @intCast(lay.wo_b.k), .off = @intCast(col) } };
+        const rot: exl3_linear.RotOut = if (e.two) |tw| round2d.woRot(tw, lay, col) else .{ .suh = lay.wo_b.suh, .xh = rd.xb, .ldr = @intCast(lay.wo_b.k), .off = @intCast(col) };
+        calls[gi] = .{ .layer = wo, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xhwo + off * 2, .y = rd.u + col * 2, .ldy = @intCast(uw), .y_dtype = .bf16, .counters = 0, .rot = rot };
         col += wo.n;
         off += R * wo.k;
     }
     try prompt.groupedRotated(e, ch, R, calls[0..lay.groups]);
-    var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(c.hidden), .y_dtype = .f32, .counters = 0 }};
+    if (e.two) |tw| try round2d.woExchange(tw, e, rd.xb, R); // 2D: the column partner's half of wo_b's input rows
+    var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
     try prompt.groupedRotated(e, ch, R, &cb_call);
 }
 
@@ -531,6 +538,7 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const sl = e.slots();
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
+    if (e.two) |tw| return round2d.experts(tw, e, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit); // 2D: around the intermediate's exchange
     try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
 }
 
@@ -543,7 +551,6 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     const t = e.t;
     const R = rows.ids.len;
     if (R == 0 or R > max_rows or rows.pos.len != R) return error.BadRound;
-    if (e.two != null) return error.NotPortedYet; // the four-node split's rounds (its exchanges and column parts)
     rd.r = R;
     var deepest: usize = 0;
     for (rows.pos) |p| deepest = @max(deepest, @as(usize, @intCast(p)) + 1);
@@ -575,10 +582,11 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
                 try engramRows(e, rd, ehost, l, seq, rows);
                 try prompt.grouped(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
                 try Probe.check(probe, .engram_proj, l, rd.ek);
-                try e.comm.allGather(rd.ek, rd.ekg, R * ew.n, .f32, e.s);
+                const en = if (e.two) |tw| tw.engramWidth() else ew.n;
+                if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.comm.allGather(rd.ek, rd.ekg, R * ew.n, .f32, e.s);
                 try Probe.check(probe, .engram_gather, l, rd.ekg);
                 if (e.world != 2) return error.NotPortedYet;
-                try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * ew.n * 4, rd.ekv, R * ew.n);
+                try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * en * 4, rd.ekv, R * en);
                 try tri_basic.engramGate(t, h, rd.ekv, lay.engram_qk, spare, c.eps, R, d);
                 std.mem.swap(u64, &h, &spare);
             }
@@ -592,14 +600,14 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
             try Probe.check(probe, .attn_in, l, rd.x);
             try attention(e, rd, ch, cs, rings, &sh, l);
             try Probe.check(probe, .attn_out, l, rd.pa);
-            try e.comm.allGather(rd.pa, rd.ga, R * d, .f32, e.s);
+            if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else try e.comm.allGather(rd.pa, rd.ga, R * d, .f32, e.s);
             try Probe.check(probe, .attn_gather, l, rd.ga);
             pending = rd.ga;
             h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
             try Probe.check(probe, .moe_in, l, rd.x);
             try moe(e, rd, ch, l);
             try Probe.check(probe, .moe_out, l, rd.pm);
-            try e.comm.allGather(rd.pm, rd.gm, R * d, .f32, e.s);
+            if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.comm.allGather(rd.pm, rd.gm, R * d, .f32, e.s);
             try Probe.check(probe, .moe_gather, l, rd.gm);
             pending = rd.gm;
             std.mem.swap(u64, &pre, &pre_f);
@@ -612,9 +620,10 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     const hn: usize = w.head.n;
     try prompt.grouped(e, ch, R, &.{w.head}, &.{rd.xc}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});
     try Probe.check(probe, .head_cols, w.layers.len, rd.hl);
-    try e.comm.allGather(rd.hl, rd.hg, R * hn, .f32, e.s);
+    const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else hn; // a rank's vocabulary half (2D: both pairs' quarters)
+    if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.comm.allGather(rd.hl, rd.hg, R * hn, .f32, e.s);
     try Probe.check(probe, .head_gather, w.layers.len, rd.hg);
-    for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hn * 4, hn * 4, rd.logits + k * hn * 4, e.world * hn * 4, hn * 4, R);
+    for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hh * 4, hh * 4, rd.logits + k * hh * 4, e.world * hh * 4, hh * 4, R);
     try Probe.check(probe, .logits, w.layers.len, rd.logits);
     if (ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
     // keep the round's streams where the next round's buffers expect nothing: every buffer is rewritten a round

@@ -449,7 +449,7 @@ fn argmax(run: *Run, dev: u64, n: usize) !usize {
 fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []i32, prompt_len: usize, rounds: usize, a: std.mem.Allocator, arena: *prompt.Arena) !bool {
     const fx = run.fx;
     const w_out = run.out;
-    const vocab = eng.world * eng.w.head.n;
+    const vocab = eng.world * (if (eng.two) |t| t.hw[0] + t.hw[1] else eng.w.head.n); // 2D: a rank's half is both pairs' quarters
     var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
     var next = try argmax(run, ch.head_g, vocab); // greedy from the prompt's logits
     var have = prompt_len;
