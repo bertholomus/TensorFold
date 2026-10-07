@@ -274,7 +274,7 @@ pub fn checkShapes(c: Config, why: *Why) !void {
 }
 
 /// The fields our checkpoint's config.json has (DeepSeek-V4.1-Flash, EXL3 2.9 bpw mul1), trimmed to what parse reads.
-const flash =
+pub const test_config =
     \\{"model_type": "deepseek_v41", "bos_token_id": 0, "eos_token_id": 1, "image_token_id": 129264,
     \\ "quantization_config": {"quant_method": "exl3", "codebook": "mul1"},
     \\ "text_config": {"vocab_size": 129280, "hidden_size": 5120, "moe_intermediate_size": 2304,
@@ -299,7 +299,7 @@ const flash =
 
 test "parse our checkpoint's config and accept its shapes" {
     var why: Why = .{};
-    const c = try parse(std.testing.allocator, flash, &why);
+    const c = try parse(std.testing.allocator, test_config, &why);
     try checkShapes(c, &why);
     try std.testing.expectEqual(@as(u8, 2), c.ratios[2]);
     try std.testing.expectEqual(@as(u8, 1), c.ratios[39]);
@@ -314,16 +314,16 @@ test "parse our checkpoint's config and accept its shapes" {
 test "refuse other model types, other quantization and other shapes" {
     const a = std.testing.allocator;
     var why: Why = .{};
-    const other = try std.mem.replaceOwned(u8, a, flash, "\"deepseek_v41\"", "\"deepseek_v4\"");
+    const other = try std.mem.replaceOwned(u8, a, test_config, "\"deepseek_v41\"", "\"deepseek_v4\"");
     defer a.free(other);
     try std.testing.expectError(error.NotDeepSeekV41, parse(a, other, &why));
-    const fp8 = try std.mem.replaceOwned(u8, a, flash, "\"quant_method\": \"exl3\"", "\"quant_method\": \"fp8\"");
+    const fp8 = try std.mem.replaceOwned(u8, a, test_config, "\"quant_method\": \"exl3\"", "\"quant_method\": \"fp8\"");
     defer a.free(fp8);
     try std.testing.expectError(error.UnsupportedQuantization, parse(a, fp8, &why));
-    const mcg = try std.mem.replaceOwned(u8, a, flash, "\"mul1\"", "\"mcg\"");
+    const mcg = try std.mem.replaceOwned(u8, a, test_config, "\"mul1\"", "\"mcg\"");
     defer a.free(mcg);
     try std.testing.expectError(error.UnsupportedQuantization, parse(a, mcg, &why));
-    const wide = try std.mem.replaceOwned(u8, a, flash, "\"num_experts_per_tok\": 6", "\"num_experts_per_tok\": 8");
+    const wide = try std.mem.replaceOwned(u8, a, test_config, "\"num_experts_per_tok\": 6", "\"num_experts_per_tok\": 8");
     defer a.free(wide);
     try std.testing.expectError(error.UnsupportedShapes, checkShapes(try parse(a, wide, &why), &why));
 }
