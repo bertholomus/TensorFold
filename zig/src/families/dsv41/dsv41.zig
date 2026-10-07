@@ -40,6 +40,8 @@ pub const draft2d = @import("draft2d.zig");
 pub const markov_tokens = @import("markov_tokens.zig");
 pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
+pub const model = @import("model.zig");
+pub const lanes = @import("lanes.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -84,4 +86,6 @@ test {
     refAll(markov_tokens);
     refAll(draft);
     refAll(sampling);
+    refAll(model);
+    refAll(lanes);
 }
