@@ -1,5 +1,6 @@
 //! tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F]
 //!   [--engram DIR --token-map FILE] [--dump DIR]: the Zig port's layer gate (M3).
+//! WORLD 4: the four nodes of the exact 2D split (prompt2d.zig), RANK the node, the links on PORT .. PORT + 2.
 //! Both ranks run the recorded prompt's first C chunks (each Model.forward of the layer fixtures, in order; the
 //! compressed caches and the window rings carried from chunk to chunk) through the port's prompt forward (prompt.zig)
 //! on their GPUs, at most N layers a chunk, with the recording's bounded replay (replay = the prompt's length - the
@@ -223,13 +224,14 @@ pub fn main(init: std.process.Init) !u8 {
     defer ix.deinit();
     var cache_file = try cache_dir.openFile(io, cache_name, .{});
     defer cache_file.close(io);
-    var w = try dsv41.weights.load(gpa, &driver, .{ .cache = .{ .file = cache_file, .index = &ix, .io = io } }, cfg, .{ .rank = rank, .world = world }, false);
+    const sp = try dsv41.prompt2d.split(rank, world); // world 4: the 2D split (prompt2d.zig)
+    var w = try dsv41.weights.load(gpa, &driver, .{ .cache = .{ .file = cache_file, .index = &ix, .io = io } }, cfg, sp, false);
     defer w.deinit();
     const load_s = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
 
-    var link = if (rank == 0) try dsv41.link.Link.listen(ip, port) else try dsv41.link.Link.connect(io, ip, port, 300);
-    defer link.close();
-    var comm = try dsv41.comm.Comm.init(link, rank, world);
+    var fan = try dsv41.prompt2d.Fan.open(io, ip, port, rank, world);
+    defer fan.close();
+    var comm = try fan.comm(rank, world);
     defer comm.deinit();
 
     // kernels: the recording's Triton set, the served extension cubins, the torch-op images
@@ -268,7 +270,8 @@ pub fn main(init: std.process.Init) !u8 {
     var arena = try prompt.Arena.init(&driver, 3 << 30);
     defer arena.deinit();
     var blas_ws_ptr: u64 = undefined;
-    var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = world, .plain = rope, .compressed = rope_c };
+    var two: ?dsv41.prompt2d.Two = if (sp.pair != null) try dsv41.prompt2d.Two.init(&cfg, &w, &arena, sp, chunk_rows) else null;
+    var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
     var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, cache_tokens);
     const caches = try prompt.Caches.init(&eng, &arena, cache_tokens);
     blas_ws_ptr = ch.blas_ws;
@@ -304,7 +307,7 @@ pub fn main(init: std.process.Init) !u8 {
         };
         tables = try dsv41.engram_io.Tables.open(gpa, io, edir);
         pool = try dsv41.engram_io.Pool.init(gpa, io, 64);
-        eh = try prompt.EngramHost.init(a, &cfg, dsv41.engram.Hasher.init(cfg, map, mult), &tables, pool.?, rank, world, chunk_rows);
+        eh = try prompt.EngramHost.init(a, &cfg, dsv41.engram.Hasher.init(cfg, map, mult), &tables, pool.?, sp.rank, sp.world, chunk_rows);
     }
     // the whole sequence's ids (Engram hashes n-grams across chunk boundaries)
     const seq = try a.alloc(i32, total);

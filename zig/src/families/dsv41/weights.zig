@@ -11,7 +11,9 @@ const checkpoint = @import("checkpoint.zig");
 /// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
 pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32 };
 
-/// A layer's routed experts and its shared expert (the last entry), as exl3_experts.prepare lays them out.
+/// A layer's routed experts and its shared expert (the last entry), as exl3_experts.prepare lays them out. On a 2D node
+/// (exl3/experts2d.py prepare) gate / up hold its intermediate blocks (width of the half's down_k) and down its
+/// output columns (down_n of dims) over the half's whole intermediate.
 pub const Experts = struct {
     trellis: u64, // gate trellises of every expert, then up, then down (pack_trellises)
     gate_ptr: u64, // int64 [E]
@@ -24,13 +26,15 @@ pub const Experts = struct {
     suh_u: u64,
     svh_g: u64, // fp16 [E, I]
     svh_u: u64,
-    suh_d: u64, // fp16 [E, I]
-    svh_d: u64, // fp16 [E, D]
+    suh_d: u64, // fp16 [E, I]: down's input signs on the gate / up blocks here
+    svh_d: u64, // fp16 [E, down_n]
     count: u32,
     dims: u32,
     width: u32,
     k2_gu: [2]u32,
     k2_d: [2]u32,
+    down_k: u32, // down's K: the rank's whole intermediate (width but on a 2D node)
+    down_n: u32, // down's output columns here (dims but on a 2D node)
 };
 
 pub const Layer = struct {
@@ -47,7 +51,8 @@ pub const Layer = struct {
     kv_norm: u64 = 0,
     sink: u64 = 0, // this rank's heads, f32
     wo_a: [4]Linear = undefined, // this rank's groups
-    wo_b: Linear = undefined, // this rank's groups' input rows
+    groups: u32 = 4, // wo_a's entries loaded: the rank's groups, its pair's half of them on a 2D node
+    wo_b: Linear = undefined, // this rank's groups' input rows (a 2D node: its pair's output columns of them)
     comp_wkv: ?Linear = null,
     comp_wgate: ?Linear = null,
     comp_norm: u64 = 0,
@@ -191,10 +196,13 @@ const Loader = struct {
     }
 
     /// load_block's experts: exl3_parts of w1 / w3 by output columns and w2 by input rows for every expert and the
-    /// shared one, packed as pack_trellises packs them, with prepare's tables.
-    fn experts(L: *Loader, p: []const u8, n: usize, cols: [2]usize, d: usize) !Experts {
+    /// shared one, packed as pack_trellises packs them, with prepare's tables. `half`: the rank's intermediate; `gu`:
+    /// gate / up's columns of it here (the half, or a 2D node's blocks); `dcols`: down's output columns (null: all).
+    fn experts(L: *Loader, p: []const u8, n: usize, half: [2]usize, gu: [2]usize, dcols: ?[2]usize, d: usize) !Experts {
         const e_count = n + 1;
-        const width = cols[1] - cols[0];
+        const width = gu[1] - gu[0];
+        const down_k = half[1] - half[0];
+        const down_n = if (dcols) |dc| dc[1] - dc[0] else d;
         var kb: [256]u8 = undefined;
         var nb: [256]u8 = undefined;
         const prefixes = try L.gpa.alloc([3][]u8, e_count);
@@ -206,12 +214,26 @@ const Loader = struct {
             const ep = if (e < n) try std.fmt.bufPrint(&nb, "{s}.ffn.experts.{d}", .{ p, e }) else try std.fmt.bufPrint(&nb, "{s}.ffn.shared_experts", .{p});
             for ([_][]const u8{ "w1", "w3", "w2" }, 0..) |proj, j| prefixes[e][j] = try std.fmt.allocPrint(L.gpa, "{s}.{s}", .{ ep, proj });
         }
+        // exl3_parts' (cols, rows) of projection j: gate / up by output columns, down by input rows (and on a 2D
+        // node by its output columns too)
+        const Parts = struct {
+            gu: [2]usize,
+            half: [2]usize,
+            dcols: ?[2]usize,
+            fn cols(q: @This(), j: usize) ?[2]usize {
+                return if (j < 2) q.gu else q.dcols;
+            }
+            fn rows(q: @This(), j: usize) ?[2]usize {
+                return if (j == 2) q.half else null;
+            }
+        };
+        const pq: Parts = .{ .gu = gu, .half = half, .dcols = dcols };
         // sizes first: one buffer, gate trellises of every expert, then up, then down
         const sizes = try L.gpa.alloc(usize, 3 * e_count);
         defer L.gpa.free(sizes);
         var total: usize = 0;
         for (0..3) |j| for (0..e_count) |e| {
-            const key = try plan.partKey(&kb, prefixes[e][j], if (j < 2) cols else null, if (j == 2) cols else null, "tr");
+            const key = try plan.partKey(&kb, prefixes[e][j], pq.cols(j), pq.rows(j), "tr");
             sizes[j * e_count + e] = try L.src.size(key);
             total += sizes[j * e_count + e];
         };
@@ -223,7 +245,7 @@ const Loader = struct {
         defer L.gpa.free(k2s);
         var at: usize = 0;
         for (0..3) |j| for (0..e_count) |e| {
-            const key = try plan.partKey(&kb, prefixes[e][j], if (j < 2) cols else null, if (j == 2) cols else null, "tr");
+            const key = try plan.partKey(&kb, prefixes[e][j], pq.cols(j), pq.rows(j), "tr");
             const tr = try L.entry(key);
             try buf.upload(at, tr);
             const t = try L.shape(key);
@@ -239,6 +261,8 @@ const Loader = struct {
         x.count = @intCast(e_count);
         x.dims = @intCast(d);
         x.width = @intCast(width);
+        x.down_k = @intCast(down_k);
+        x.down_n = @intCast(down_n);
         const tables = [_]*u64{ &x.gate_ptr, &x.up_ptr, &x.down_ptr };
         const k2t = [_]*u64{ &x.gate_k2, &x.up_k2, &x.down_k2 };
         for (0..3) |j| {
@@ -249,22 +273,24 @@ const Loader = struct {
         x.k2_d = .{ std.math.maxInt(u32), 0 };
         for (k2s[0 .. 2 * e_count]) |v| x.k2_gu = .{ @min(x.k2_gu[0], @as(u32, @intCast(v))), @max(x.k2_gu[1], @as(u32, @intCast(v))) };
         for (k2s[2 * e_count ..]) |v| x.k2_d = .{ @min(x.k2_d[0], @as(u32, @intCast(v))), @max(x.k2_d[1], @as(u32, @intCast(v))) };
-        // stack(mats, j, n): every expert's scale row in order
-        const stacks = [_]struct { dst: *u64, proj: usize, part: []const u8, len: usize, name: []const u8 }{
-            .{ .dst = &x.suh_g, .proj = 0, .part = "suh", .len = d, .name = "suh_g" },
-            .{ .dst = &x.suh_u, .proj = 1, .part = "suh", .len = d, .name = "suh_u" },
-            .{ .dst = &x.svh_g, .proj = 0, .part = "svh", .len = width, .name = "svh_g" },
-            .{ .dst = &x.svh_u, .proj = 1, .part = "svh", .len = width, .name = "svh_u" },
-            .{ .dst = &x.suh_d, .proj = 2, .part = "suh", .len = width, .name = "suh_d" },
-            .{ .dst = &x.svh_d, .proj = 2, .part = "svh", .len = d, .name = "svh_d" },
+        // stack(mats, j, n): every expert's scale row in order; suh_d is down's input signs on gate / up's blocks
+        // (experts2d.prepare: the half's [gu - half), all of it but on a 2D node)
+        const off = gu[0] - half[0];
+        const stacks = [_]struct { dst: *u64, proj: usize, part: []const u8, len: usize, src_len: usize, off: usize, name: []const u8 }{
+            .{ .dst = &x.suh_g, .proj = 0, .part = "suh", .len = d, .src_len = d, .off = 0, .name = "suh_g" },
+            .{ .dst = &x.suh_u, .proj = 1, .part = "suh", .len = d, .src_len = d, .off = 0, .name = "suh_u" },
+            .{ .dst = &x.svh_g, .proj = 0, .part = "svh", .len = width, .src_len = width, .off = 0, .name = "svh_g" },
+            .{ .dst = &x.svh_u, .proj = 1, .part = "svh", .len = width, .src_len = width, .off = 0, .name = "svh_u" },
+            .{ .dst = &x.suh_d, .proj = 2, .part = "suh", .len = width, .src_len = down_k, .off = off, .name = "suh_d" },
+            .{ .dst = &x.svh_d, .proj = 2, .part = "svh", .len = down_n, .src_len = down_n, .off = 0, .name = "svh_d" },
         };
         for (stacks) |s| {
             try L.aux.resize(L.gpa, e_count * s.len * 2);
             for (0..e_count) |e| {
                 const j = s.proj;
-                const row = try L.entry(try plan.partKey(&kb, prefixes[e][j], if (j < 2) cols else null, if (j == 2) cols else null, s.part));
-                if (row.len != s.len * 2) return error.UnexpectedTensor;
-                @memcpy(L.aux.items[e * s.len * 2 ..][0 .. s.len * 2], row);
+                const row = try L.entry(try plan.partKey(&kb, prefixes[e][j], pq.cols(j), pq.rows(j), s.part));
+                if (row.len != s.src_len * 2) return error.UnexpectedTensor;
+                @memcpy(L.aux.items[e * s.len * 2 ..][0 .. s.len * 2], row[s.off * 2 ..][0 .. s.len * 2]);
             }
             s.dst.* = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.{s}", .{ p, s.name }), L.aux.items);
         }
@@ -273,7 +299,6 @@ const Loader = struct {
 
     fn block(L: *Loader, c: Config, s: plan.Split, p: []const u8, i: usize, n_experts: usize) !Layer {
         var nb: [256]u8 = undefined;
-        const hl = s.heads(c);
         const gl = s.groups(c);
         var lay: Layer = .{ .idx = @intCast(i), .ratio = c.ratios[i] };
         for ([_][]const u8{ "fn", "scale", "base" }, 0..) |part, k| {
@@ -284,17 +309,20 @@ const Loader = struct {
         lay.ffn_norm = try L.plain(try std.fmt.bufPrint(&nb, "{s}.ffn_norm.weight", .{p}), null);
         lay.wq_a = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wq_a", .{p}), null, null);
         lay.q_norm = try L.plain(try std.fmt.bufPrint(&nb, "{s}.attn.q_norm.weight", .{p}), null);
-        lay.wq_b = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wq_b", .{p}), s.range(hl * c.head_dim), null);
+        lay.wq_b = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wq_b", .{p}), s.wqB(c), null);
         lay.wkv = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wkv", .{p}), null, null);
         lay.kv_norm = try L.plain(try std.fmt.bufPrint(&nb, "{s}.attn.kv_norm.weight", .{p}), null);
         {
             var kb: [256]u8 = undefined;
             const name = try std.fmt.bufPrint(&nb, "{s}.attn.attn_sink", .{p});
             const all = try L.entry(try plan.plainKey(&kb, name, .f32));
-            lay.sink = try L.upload(name, all[s.rank * hl * 4 ..][0 .. hl * 4]);
+            const hs = s.headSpan(c);
+            lay.sink = try L.upload(name, all[hs[0] * 4 ..][0 .. hs[1] * 4]);
         }
-        for (0..gl) |g| lay.wo_a[g] = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wo_a.slice.{d}", .{ p, s.rank * gl + g }), null, null);
-        lay.wo_b = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wo_b", .{p}), null, s.range(gl * c.o_lora));
+        const ga = s.woAGroups(c);
+        for (0..ga[1]) |g| lay.wo_a[g] = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wo_a.slice.{d}", .{ p, ga[0] + g }), null, null);
+        lay.groups = @intCast(ga[1]);
+        lay.wo_b = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wo_b", .{p}), s.woBCols(c), s.range(gl * c.o_lora));
         if (c.kv_sources.has(i)) {
             lay.comp_wkv = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.compressor.wkv", .{p}), null, null);
             lay.comp_norm = try L.plain(try std.fmt.bufPrint(&nb, "{s}.attn.compressor.norm.weight", .{p}), null);
@@ -320,9 +348,10 @@ const Loader = struct {
         }
         lay.gate_w = try L.plain(try std.fmt.bufPrint(&nb, "{s}.ffn.gate.weight", .{p}), .f16);
         lay.gate_b = try L.plain(try std.fmt.bufPrint(&nb, "{s}.ffn.gate.bias", .{p}), .f32);
-        lay.experts = try L.experts(p, n_experts, s.range(s.inter(c)), c.hidden);
+        const xp = s.expertParts(c);
+        lay.experts = try L.experts(p, n_experts, xp.half, xp.gu, xp.dcols, c.hidden);
         if (c.engram_layers.has(i)) {
-            lay.engram_wkv = try L.linear(try std.fmt.bufPrint(&nb, "{s}.engram.wkv", .{p}), null, s.range(s.engramRows(c)));
+            lay.engram_wkv = try L.linear(try std.fmt.bufPrint(&nb, "{s}.engram.wkv", .{p}), s.engramCols(c), s.range(s.engramRows(c)));
             var kb: [256]u8 = undefined;
             const q = try L.gpa.dupe(u8, try L.entry(try plan.plainKey(&kb, try std.fmt.bufPrint(&nb, "{s}.engram.q_weight", .{p}), .f32)));
             defer L.gpa.free(q);
@@ -351,7 +380,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
     }
     w.embed = try L.plain("embed.weight", null);
     w.norm = try L.plain("norm.weight", null);
-    const vr = s.range(s.vocab(c));
+    const vr = s.headCols(c);
     w.head = try L.linear("head", vr, null);
     w.vocab_lo = vr[0];
     w.vocab_hi = vr[1];
@@ -361,7 +390,9 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
     if (dspark and c.dspark_block > 0) {
         const blocks = try gpa.alloc(Layer, c.draft_layers);
         errdefer gpa.free(blocks);
-        for (0..c.draft_layers) |j| blocks[j] = try L.block(c, s, try std.fmt.bufPrint(&nb, "mtp.{d}", .{j}), c.layers + j, c.draft_experts);
+        // DSpark stays TP2 inside the pair on a 2D node (weights.py _load_2d)
+        const tp2: plan.Split = .{ .rank = s.rank, .world = s.world };
+        for (0..c.draft_layers) |j| blocks[j] = try L.block(c, tp2, try std.fmt.bufPrint(&nb, "mtp.{d}", .{j}), c.layers + j, c.draft_experts);
         var lb: [64]u8 = undefined;
         const last = try std.fmt.bufPrint(&lb, "mtp.{d}", .{c.draft_layers - 1});
         var tb: [128]u8 = undefined;

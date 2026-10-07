@@ -30,6 +30,7 @@ const engram_io = @import("engram_io.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
+const prompt2d = @import("prompt2d.zig");
 
 /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
 pub const ring_extra = 16;
@@ -77,8 +78,10 @@ pub const Engine = struct {
     world: usize,
     plain: Rope,
     compressed: Rope,
+    two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
 
     fn heads(e: *const Engine) usize {
+        if (e.two) |t| return t.heads;
         return e.c.heads / e.world;
     }
 
@@ -179,7 +182,7 @@ pub const Chunk = struct {
         const l0 = e.w.layers[0];
         const hl = e.heads();
         const hd = c.head_dim;
-        const groups = l0.wo_a.len;
+        const groups = l0.groups;
         const o_lora = l0.wo_a[0].n;
         const ex = l0.experts;
         const sl = e.slots();
@@ -248,10 +251,11 @@ pub const Chunk = struct {
         }
         for (e.w.layers) |lay| {
             const ew = lay.engram_wkv orelse continue;
+            const en = if (e.two) |t| t.engramWidth() else ew.n; // the summed projection's width (2D: both pairs')
             ch.eb = try a.take(cap * ew.k * 2);
             ch.ek = try a.take(cap * ew.n * 4);
-            ch.ekg = try a.take(e.world * cap * ew.n * 4);
-            ch.kv = try a.take(cap * ew.n * 2);
+            ch.ekg = try a.take(e.world * cap * en * 4);
+            ch.kv = try a.take(cap * en * 2);
             break;
         }
         const sz = exl3_experts.Scratch.sizes(cap, sl, ex.dims, ex.width, ex.count);
@@ -271,7 +275,7 @@ pub const Chunk = struct {
             ls[1] = lay.wkv;
             ls[2] = lay.wq_b;
             ls[3] = lay.wo_b;
-            for (lay.wo_a, 0..) |wo, g| ls[4 + g] = wo;
+            for (lay.wo_a[0..lay.groups], 0..) |wo, g| ls[4 + g] = wo;
             ls[8] = lay.comp_wkv;
             ls[9] = lay.comp_wgate;
             ls[10] = lay.idx_wq_b;
@@ -480,7 +484,7 @@ fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u6
 }
 
 /// mm of the chunk's rows.
-fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
+pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
     try mmRows(e, ch, ch.n, l, x, ldx, out, out_type, os);
 }
 
@@ -570,12 +574,12 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     try upload(e, ch.ring_idx, &idx, keep * 8);
     try e.ops.scatterRows(e.s, kv + (n - keep) * hd * 2, hd * 2, ch.ring_idx, ring, hd * 2, hd * 2, keep);
     // wo_a: each group's column block of o read in place, written into its column block of u; then wo_b to fp32
-    const groups = lay.wo_a.len;
+    const groups = lay.groups;
     const gk = hl * hd / groups;
     const uw = groups * lay.wo_a[0].n;
     var col: usize = 0;
     if (n > 128) {
-        for (lay.wo_a, 0..) |wo, g| {
+        for (lay.wo_a[0..groups], 0..) |wo, g| {
             try mm(e, ch, wo, ch.o + g * gk * 2, hl * hd, ch.u + col * 2, .bf16, uw);
             col += wo.n;
         }
@@ -583,13 +587,17 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         // one group: the column blocks of o read in place, written into u's column blocks
         var xs: [4]u64 = undefined;
         var outs: [4]u64 = undefined;
-        for (lay.wo_a, 0..) |wo, g| {
+        for (lay.wo_a[0..groups], 0..) |wo, g| {
             xs[g] = ch.o + g * gk * 2;
             outs[g] = ch.u + col * 2;
             col += wo.n;
         }
-        try grouped(e, ch, n, &lay.wo_a, &xs, &.{ hl * hd, hl * hd, hl * hd, hl * hd }, &outs, &.{ uw, uw, uw, uw }, &.{ .bf16, .bf16, .bf16, .bf16 });
+        const lds = [_]usize{ hl * hd, hl * hd, hl * hd, hl * hd };
+        const oss = [_]usize{ uw, uw, uw, uw };
+        const dts = [_]exl3_linear.DType{ .bf16, .bf16, .bf16, .bf16 };
+        try grouped(e, ch, n, lay.wo_a[0..groups], xs[0..groups], lds[0..groups], outs[0..groups], oss[0..groups], dts[0..groups]);
     }
+    if (e.two) |t| return t.woB(e, ch, lay); // 2D: the column partner's groups first, then this pair's columns
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
 }
 
@@ -709,6 +717,7 @@ pub fn scale(hd: usize) f32 {
 
 /// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order.
 pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
+    if (e.two) |t| return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
     try e.comm.allGather(src, dst, ch.n * e.c.hidden, .f32, e.s);
 }
 
@@ -734,6 +743,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     try e.blas.xwT(ch.xf, ch.gate_f, ch.logits, n, d, c.experts);
     const shared_id = lay.experts.count - 1;
     try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
+    if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
 }
 
@@ -800,9 +810,11 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     if (m * t.row_w != n * ew.k) return error.EngramShape;
     try upload(e, ch.eb, eh.rows.ptr, m * t.row_w * 2);
     try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
-    try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
+    // 2D (model.py esum): this node's columns of its rank's projection; the quarters give both ranks' whole ones
+    const en = if (e.two) |two| two.engramWidth() else ew.n;
+    if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
     if (e.world != 2) return error.NotPortedYet; // Comm.sum of more ranks: acc += g[r]
-    try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * ew.n * 4, ch.kv, n * ew.n);
+    try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
     try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
     swapStreams(ch, ch.h_alt);
 }
