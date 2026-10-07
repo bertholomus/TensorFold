@@ -364,9 +364,20 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     });
     errdefer gpa.free(h.startup);
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F) }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
+}
+
+/// A family's reasoning efforts as numbers its chat template takes (F.efforts: name and value), else none.
+fn familyEfforts(comptime F: type) []const api.Effort {
+    if (!@hasDecl(F, "efforts")) return &.{};
+    const table = comptime blk: {
+        var out: [F.efforts.len]api.Effort = undefined;
+        for (F.efforts, &out) |e, *o| o.* = .{ .name = e.name, .value = e.value };
+        break :blk out;
+    };
+    return &table;
 }
 
 fn toGib(bytes: u64) f64 {
