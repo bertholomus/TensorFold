@@ -22,6 +22,7 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
         .add_generation_prompt = generation,
         .enable_thinking = thinking,
         .reasoning_effort = if (thinking) effort else null,
+        .reasoning_effort_value = if (thinking) srv.effortValue(effort) else null,
     };
     var ids = srv.text.renderIds(cx.a, normalized, options, &problem) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,

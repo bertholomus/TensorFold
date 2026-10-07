@@ -65,6 +65,8 @@ pub const Server = struct {
     markers: reply_text.Markers = reply_text.think_markers,
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
+    /// The engine's numbers for its efforts (Info.efforts); empty: the template hears the names.
+    effort_values: []const api.Effort = &.{},
     eos: []const u32 = &.{},
     think_close: []const u32 = &.{},
     think_close_end: ?u32 = null,
@@ -91,7 +93,13 @@ pub const Server = struct {
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
-        srv.effort_levels = try fields.effortLevels(a, text.templateSource());
+        if (srv.info.efforts.len > 0) {
+            // a family whose template takes numbers: every name it gives one passes as asked, rendered as that number
+            const names = try a.alloc([]const u8, srv.info.efforts.len);
+            for (srv.info.efforts, names) |e, *n| n.* = e.name;
+            srv.effort_levels = names;
+            srv.effort_values = srv.info.efforts;
+        } else srv.effort_levels = try fields.effortLevels(a, text.templateSource());
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(text.templateSource());
         if (text.tokenId("</think>")) |end| {
@@ -118,6 +126,13 @@ pub const Server = struct {
     pub fn effortFor(srv: *const Server, explicit: ?[]const u8) ?[]const u8 {
         const e = explicit orelse srv.config.reasoning_effort orelse return null;
         return fields.coerceEffort(e, srv.effort_levels);
+    }
+
+    /// The number the engine's family gives an effort name (Info.efforts), else null: the template hears the name.
+    pub fn effortValue(srv: *const Server, effort: ?[]const u8) ?i64 {
+        const e = effort orelse return null;
+        for (srv.effort_values) |v| if (std.mem.eql(u8, v.name, e)) return v.value;
+        return null;
     }
 
     /// ``_resolve_sampling``: omitted or null fields keep the defaults; an omitted seed is keyed to the prompt.

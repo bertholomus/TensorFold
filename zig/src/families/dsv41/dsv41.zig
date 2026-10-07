@@ -29,6 +29,7 @@ pub const rdma_seq = @import("rdma_seq.zig");
 pub const rdma = @import("rdma.zig");
 pub const exl3_experts2d = @import("exl3_experts2d.zig");
 pub const prompt2d = @import("prompt2d.zig");
+pub const text = @import("text.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -62,4 +63,5 @@ test {
     refAll(rdma);
     refAll(exl3_experts2d);
     refAll(prompt2d);
+    refAll(text);
 }

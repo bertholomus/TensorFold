@@ -260,7 +260,9 @@ pub const HfText = struct {
         }
         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
         try context.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
-        if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
+        if (options.reasoning_effort_value) |v| {
+            try context.put(a, "reasoning_effort", .{ .integer = v });
+        } else if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
         var diag: template.Diag = .{};
         const tools: std.json.Value = if (options.tools) |tl| try toStd(a, tl) else .null;
         const out = template.render(a, compiled, try toStd(a, messages), tools, .{ .object = context }, options.add_generation_prompt, &diag) catch |e| {
