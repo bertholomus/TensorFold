@@ -27,14 +27,14 @@ pub const Kernels = struct {
         while (names.next()) |name| {
             var buf: [256]u8 = undefined;
             if (std.mem.indexOf(u8, name, "rot_in_kernel") != null) {
-                k.rot_in = try k.module.function(try std.fmt.bufPrintZ(&buf, "{s}", .{name}));
+                k.rot_in = try k.module.function(try std.mem.printSentinel(&buf, "{s}", .{name}, 0));
                 found = true;
                 continue;
             }
             const at = std.mem.indexOf(u8, name, "unpack_kernelILi") orelse continue;
             const t = template2(name[at + "unpack_kernel".len ..]) orelse continue;
             if (t[0] > 16 or t[1] > 2) continue;
-            k.unpack[t[0]][t[1]] = try k.module.function(try std.fmt.bufPrintZ(&buf, "{s}", .{name}));
+            k.unpack[t[0]][t[1]] = try k.module.function(try std.mem.printSentinel(&buf, "{s}", .{name}, 0));
         }
         if (!found) return error.MissingKernel;
         return k;

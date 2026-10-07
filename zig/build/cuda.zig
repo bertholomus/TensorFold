@@ -116,6 +116,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_comm.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_comm.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-comm", .root_module = ds_comm }));
+    const ds_layer = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/layer_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_layer.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_layer.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-layer", .root_module = ds_layer }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.core, mods.tokenizer, build_options, true);
 }
 

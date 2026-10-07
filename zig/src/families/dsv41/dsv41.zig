@@ -23,6 +23,7 @@ pub const tri_hc = @import("tri_hc.zig");
 pub const exl3_prefill = @import("exl3_prefill.zig");
 pub const ops = @import("ops.zig");
 pub const exl3_experts = @import("exl3_experts.zig");
+pub const prompt = @import("prompt.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -50,4 +51,5 @@ test {
     refAll(exl3_prefill);
     refAll(ops);
     refAll(exl3_experts);
+    refAll(prompt);
 }

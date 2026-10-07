@@ -110,7 +110,7 @@ pub const Kernels = struct {
 
 fn fnByName(m: cuda.Module, name: []const u8) !cuda.Function {
     var buf: [512]u8 = undefined;
-    return m.function(try std.fmt.bufPrintZ(&buf, "{s}", .{name}));
+    return m.function(try std.mem.printSentinel(&buf, "{s}", .{name}, 0));
 }
 
 /// The integer and bool template arguments of a mangled kernel name's "I...E" list ("ILi2ELi8ELb1ELi4EE" -> 2, 8, 1,
@@ -156,7 +156,7 @@ pub const Scratch = struct {
     }
 
     /// Bytes of each buffer, in the field order above (xg .. work_d).
-    pub fn sizes(rows: usize, slots: usize, d: usize, i: usize, e: usize) [12]usize {
+    pub fn sizes(rows: usize, slots: usize, d: usize, i: usize, e: usize) [11]usize {
         const p = rows * slots;
         const maxu = @min(p, e);
         return .{ 2 * p * d, 2 * p * d, 2 * p * i, 4 * promptZ(d, i) * p, 4, 4 * maxu, 4, 4 * e, 4 * maxu * ((rows + 127) / 128 * 128), 8 * listLen(p, maxu, mma_rows_gu), 8 * listLen(p, maxu, rows_rows_d) };

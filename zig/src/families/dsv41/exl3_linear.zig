@@ -97,14 +97,14 @@ pub const Kernels = struct {
         while (names.next()) |name| {
             var buf: [256]u8 = undefined;
             if (std.mem.indexOf(u8, name, "rot_many_kernel") != null) {
-                k.rot_many = try k.module.function(try std.fmt.bufPrintZ(&buf, "{s}", .{name}));
+                k.rot_many = try k.module.function(try std.mem.printSentinel(&buf, "{s}", .{name}, 0));
                 found_rot = true;
                 continue;
             }
             const at = std.mem.indexOf(u8, name, "glinear_kernelILi") orelse continue;
             const t = template3(name[at + "glinear_kernel".len ..]) orelse continue;
             if (t[0] > 16 or t[1] > 2 or (t[2] != 4 and t[2] != 8)) continue;
-            k.glinear[t[0]][t[1]][if (t[2] == 8) 1 else 0] = try k.module.function(try std.fmt.bufPrintZ(&buf, "{s}", .{name}));
+            k.glinear[t[0]][t[1]][if (t[2] == 8) 1 else 0] = try k.module.function(try std.mem.printSentinel(&buf, "{s}", .{name}, 0));
         }
         if (!found_rot) return error.MissingKernel;
         return k;
