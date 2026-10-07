@@ -35,6 +35,9 @@ const prompt2d = @import("prompt2d.zig");
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
+/// A row block's rows at most where the layers before the candidate source prune (prunes: n_comp > 32,768, so rb =
+/// 2^26 / (4 n_comp) < 512).
+const pruned_rows: usize = 512;
 
 /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
 pub const ring_extra = 16;
@@ -153,6 +156,16 @@ pub const Chunk = struct {
     tmax: u64 = 0, // int64 [rows of a block, cdiv(n_comp, 64)]
     cidx: u64 = 0, // int64 [cap, index_topk]: the selected latents
     max_comp: usize = 0,
+    // the candidate pool past candidate_blocks blocks (model.py _candidates, apply_candidates): the chunk's block mask
+    // (u8 [cap, pool_ms]), a row block's block maxima (fp32) and their top blocks (int64 [rows, candidate_blocks]), a
+    // row's every_vis (no mask); the layers before the candidate source's pruned selection (tpos, cand: up to
+    // pruned_rows rows)
+    pool: u64 = 0,
+    pool_ms: usize = 0,
+    bmax: u64 = 0,
+    pidx: u64 = 0,
+    every: u64 = 0,
+    pbufs: tri_index.PrunedBufs = .{ .tpos = 0, .cand = 0, .every = 0 },
     // MoE
     xf: u64, // fp32 [cap, D]
     gate_f: u64, // fp32 [experts, D]
@@ -270,6 +283,25 @@ pub const Chunk = struct {
             ch.cidx = try a.take(cap * c.index_topk * 8);
             ch.ktop = try a.take(cap * c.index_topk * 8);
             ch.cidxp = try a.take(cap * (c.index_topk + 16) * 8);
+            // the pool: only past candidate_blocks blocks, so a row block holds at most key_elems / 2048 rows there
+            const cb = c.candidate_block;
+            ch.pool_ms = (ch.max_comp + cb - 1) / cb;
+            if (ch.pool_ms > c.candidate_blocks) {
+                ch.pool = try a.take(cap * ch.pool_ms);
+                ch.bmax = try a.take(@max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
+                ch.pidx = try a.take(cap * c.candidate_blocks * 8);
+            }
+            ch.every = try a.take(cap * 8);
+            {
+                const ev = try std.heap.page_allocator.alloc(i64, cap);
+                defer std.heap.page_allocator.free(ev);
+                @memset(ev, tri_index.every_vis);
+                try upload(e, ch.every, ev.ptr, cap * 8);
+                try e.s.synchronize(); // (the host copy is freed next)
+            }
+            if (tri_index.prunes(ch.max_comp, c.index_topk)) {
+                ch.pbufs = .{ .tpos = try a.take(pruned_rows * c.index_topk * 8), .cand = try a.take(pruned_rows * c.index_topk * tri_index.tile * 8), .every = ch.every };
+            }
         }
         for (e.w.layers) |lay| {
             const ew = lay.engram_wkv orelse continue;
@@ -548,7 +580,7 @@ pub const Caches = struct {
 
 /// What one forward carries from layer to layer (model.py _forward_k's `shared`): the latest kv-source layer, and the
 /// latest indexer's selection (in the chunk's cidx, kk a row).
-pub const Shared = struct { kv_layer: ?usize = null, kk: ?usize = null };
+pub const Shared = struct { kv_layer: ?usize = null, kk: ?usize = null, pool: bool = false };
 
 /// The chunk's rows: token ids at positions start .., their streams h [n, hc, D] (every stream the token's embedding
 /// row) and pre [n, hc] = (1, 0, 0, 0): embed_init, the bytes of forward()'s embedding rows expanded over the streams.
@@ -820,12 +852,18 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
     const torch_topk: tri_index.TopK = .{ .top = ch.ktop, .ctx = @ptrCast(@constCast(e)), .run = torchTopk };
-    if (keyed and tri_index.prunes(n_comp_end, kk)) return error.NotPortedYet; // the pruned search's buffers
+    if (keyed and tri_index.prunes(n_comp_end, kk) and (rb > pruned_rows or ch.pbufs.cand == 0)) return error.ChunkTooLong;
     // the candidate source and the layers after it: fp32 scores, the pool (_candidates at the source, apply_candidates
     // after it), topk_indices and -1 past vis. While every block of the scores fits in the pool (cand_blocks of them)
     // the pool keeps each block with a finite score (the newest pinned: it holds the row's last visible key) and
-    // apply_candidates rewrites only scores already -inf: no launch changes a byte.
-    if (!keyed and (n_comp_end + c.candidate_block - 1) / c.candidate_block > c.candidate_blocks) return error.NotPortedYet; // a pool that leaves blocks out
+    // apply_candidates rewrites only scores already -inf: no launch changes a byte. Past it the source's block maxima
+    // (the newest block pinned to +inf) pick the pool's cand_blocks blocks (topk_indices: ties to the lower block), the
+    // picked blocks with a finite maximum make the chunk's mask, and the later layers' scores outside it become -inf.
+    const cb = c.candidate_block;
+    const nbk = (n_comp_end + cb - 1) / cb;
+    const pooled = !keyed and nbk > c.candidate_blocks;
+    if (pooled and (ch.pool == 0 or nbk > ch.pool_ms)) return error.ChunkTooLong;
+    const pk = @min(c.candidate_blocks, nbk);
     var r0: usize = 0;
     while (r0 < n) : (r0 += rb) {
         // the block's rows: iq[r0:r1], wts[r0:r1] and vis[r0:r1] as views (their offsets the served pointers'), its
@@ -837,12 +875,22 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         const out = ch.cidx + r0 * kk * 8;
         if (keyed) {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
-            try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, vr, out, .{ .tpos = 0, .cand = 0, .every = 0 }, torch_topk, m, n_comp_end);
+            try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, vr, out, ch.pbufs, torch_topk, m, n_comp_end);
         } else {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.score, null, false, null, false, m, ih, id);
+            const mrows = ch.pool + r0 * ch.pool_ms;
+            if (pooled and li == c.candidate_source) {
+                try e.ops.blockMax(e.s, ch.score, n_comp_end, n_comp_end, cb, vr, ch.bmax, nbk, m);
+                try e.ops.topkIndices(e.s, ch.bmax, nbk, m, nbk, pk, ch.every, ch.pidx);
+                try e.ops.poolPick(e.s, ch.bmax, nbk, nbk, ch.pidx, pk, mrows, ch.pool_ms, 0, m);
+            } else if (pooled and c.candidate_source < li) {
+                if (!sh.pool) return error.NoCandidatePool;
+                try e.ops.applyPool(e.s, ch.score, n_comp_end, n_comp_end, cb, mrows, ch.pool_ms, m);
+            }
             try e.ops.topkIndices(e.s, ch.score, n_comp_end, m, n_comp_end, kk, vr, out);
         }
     }
+    if (pooled and li == c.candidate_source) sh.pool = true;
     sh.kk = kk;
 }
 

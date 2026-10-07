@@ -1,6 +1,7 @@
 """The token recording's requests (Zig port M4 Token gate): a fixed set of chat prompts, greedy, one at a time (so each
 decode round is one stream's one row), to the served endpoint. Code, prose and structured asks with 256 tokens, and two
-long word lists (about 3,000 and 8,000 tokens) with 128. The words come from zrec_req's fixed generator.
+long word lists (about 3,000 and 8,000 tokens) with 128; on request (--only) word lists of about 40,000 and 150,000
+tokens with 32 (long contexts: the indexer's candidate pool). The words come from zrec_req's fixed generator.
 
   python3 zrec_tok.py --base URL --model NAME --key-file FILE [--only NAME,...] [--max-tokens N] --out OUT.json
 
@@ -24,8 +25,10 @@ PROMPTS = [
      256),
     ("words3k", None, 128),
     ("words8k", None, 128),
+    ("words40k", None, 32),
+    ("words150k", None, 32),
 ]
-WORDS = {"words3k": 2300, "words8k": 6100}
+WORDS = {"words3k": 2300, "words8k": 6100, "words40k": 34500, "words150k": 129000}
 
 
 def main() -> None:

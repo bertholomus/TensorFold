@@ -107,14 +107,15 @@ __device__ __forceinline__ unsigned long long tf_ds_score_key(float x, int j) {
 // layers), a row a block (1024 threads): each score's int64 key (its bits, -0 as +0 (score + 0.0), ordered as signed
 // integers, above the inverted column: a total order, ties to the lower column), the k largest keys by a radix select
 // (eight 8-bit digits from the top), their columns ascending (a bitonic sort), a column at or past vis[r] as -1.
-// score [rows, n] fp32 (row stride ss), vis [rows] int64, out [rows, k] int64; k <= 1024 and k <= n.
+// score [rows, n] fp32 (row stride ss), vis [rows] int64, out [rows, k] int64; k <= 2048 and k <= n (the candidate
+// pool's top blocks: k = 2048).
 extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_indices_kernel(const float* score, long long ss, int n,
                                                                               int k, const long long* vis,
                                                                               long long* out) {
     __shared__ unsigned int hist[256];
     __shared__ unsigned long long prefix_s, mask_s;
     __shared__ int want_s, count_s;
-    __shared__ long long cols[1024];
+    __shared__ long long cols[2048];
     const float* row = score + (long long)blockIdx.x * ss;
     if (threadIdx.x == 0) {
         prefix_s = 0;
@@ -158,14 +159,15 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_indices_kernel(con
     for (int size = 2; size <= p; size <<= 1) {
         for (int stride = size >> 1; stride > 0; stride >>= 1) {
             __syncthreads();
-            const int i = threadIdx.x;
-            const int j = i ^ stride;
-            if (i < p && j > i) {
-                const bool up = (i & size) == 0;
-                const long long a = cols[i], b = cols[j];
-                if ((a > b) == up) {
-                    cols[i] = b;
-                    cols[j] = a;
+            for (int i = threadIdx.x; i < p; i += blockDim.x) {   // (p up to 2048: two elements a thread)
+                const int j = i ^ stride;
+                if (j > i) {
+                    const bool up = (i & size) == 0;
+                    const long long a = cols[i], b = cols[j];
+                    if ((a > b) == up) {
+                        cols[i] = b;
+                        cols[j] = a;
+                    }
                 }
             }
         }
@@ -194,5 +196,61 @@ extern "C" __global__ void tf_ds_cand_fast_kernel(const float* score, long long 
             else if (x > -__int_as_float(0x7f800000)) above = true;
         }
         out[(long long)r * os + b] = (uint8_t)((!nan && above) || b == last);
+    }
+}
+
+// model.py _candidates / rounds.py _candidate_blocks, their first step: a row's block maxima of the scores (amax over
+// blocks of bsize, the last block padded with -inf, a NaN wins), its newest block, (vis - 1) // bsize (floor
+// division), pinned to +inf. score [rows, width] fp32 (row stride ss), vis [rows] int64, out [rows, nb] fp32 (row
+// stride os), nb = ceil(width / bsize); grid (blocks, rows).
+extern "C" __global__ void tf_ds_block_max_kernel(const float* score, long long ss, int width, int bsize,
+                                                  const long long* vis, float* out, long long os, int nb) {
+    const int r = blockIdx.y;
+    const long long t = vis[r] - 1;
+    const long long last = t >= 0 ? t / bsize : -((-t + bsize - 1) / bsize);
+    const float ninf = -__int_as_float(0x7f800000);
+    for (int b = blockIdx.x * blockDim.x + threadIdx.x; b < nb; b += gridDim.x * blockDim.x) {
+        const float* s = score + (long long)r * ss + (long long)b * bsize;
+        float m = ninf;
+        bool nan = false;
+        for (int j = 0; j < bsize && b * bsize + j < width; ++j) {
+            const float x = s[j];
+            if (x != x) nan = true;
+            else if (x > m) m = x;
+        }
+        float v = nan ? __int_as_float(0x7fc00000) : m;
+        if (b == last) v = __int_as_float(0x7f800000);
+        out[(long long)r * os + b] = v;
+    }
+}
+
+// The pool from a row's top blocks idx [rows, k] (kernels.topk_indices of the block maxima bmax [rows, nb], row stride
+// bs): model.py _candidates' mask (u8 [rows, nb], row stride ms: zeros, then each picked block whose maximum is above
+// -inf) and/or rounds.py _candidate_blocks' list (int32 [rows, k]: the block, or -1 when its maximum is not above -inf).
+// A row a block of threads.
+extern "C" __global__ void tf_ds_pool_pick_kernel(const float* bmax, long long bs, int nb, const long long* idx, int k,
+                                                  uint8_t* mask, long long ms, int* cblk) {
+    const int r = blockIdx.x;
+    const float ninf = -__int_as_float(0x7f800000);
+    if (mask != nullptr) {
+        for (int b = threadIdx.x; b < nb; b += blockDim.x) mask[(long long)r * ms + b] = 0;
+        __syncthreads();
+    }
+    for (int j = threadIdx.x; j < k; j += blockDim.x) {
+        const long long c = idx[(long long)r * k + j];
+        const bool ok = bmax[(long long)r * bs + c] > ninf;
+        if (mask != nullptr && ok) mask[(long long)r * ms + c] = 1;
+        if (cblk != nullptr) cblk[(long long)r * k + j] = ok ? (int)c : -1;
+    }
+}
+
+// model.py apply_candidates: -inf at every position whose block the row's pool leaves out (mask u8 [rows, >= ceil(width
+// / bsize)], row stride ms), in place. score [rows, width] fp32 (row stride ss); grid (blocks, rows).
+extern "C" __global__ void tf_ds_apply_pool_kernel(float* score, long long ss, int width, int bsize, const uint8_t* mask,
+                                                   long long ms) {
+    const int r = blockIdx.y;
+    const float ninf = -__int_as_float(0x7f800000);
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < width; j += gridDim.x * blockDim.x) {
+        if (!mask[(long long)r * ms + j / bsize]) score[(long long)r * ss + j] = ninf;
     }
 }

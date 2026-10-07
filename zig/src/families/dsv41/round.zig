@@ -128,6 +128,12 @@ pub const Round = struct {
     score: u64, // fp32 [R, nb]
     cand: u64, // u8 [R, nb / candidate_block]
     has_cand: bool = false,
+    // past candidate_blocks blocks (TF_DS_CAND_ONLY, served on): the candidate source's block maxima, their top blocks
+    // and the pool as block ids (int32 [R, candidate_blocks], -1 none) the later layers score alone
+    bmax: u64, // fp32 [R, nb / candidate_block]
+    pidx: u64, // int64 [R, candidate_blocks]
+    cblk: u64, // int32 [R, candidate_blocks]
+    has_cblk: bool = false,
     cidx: u64, // int64 [R, index_topk]
     kk: usize = 0,
     ktop: u64, // int64 [R, index_topk]: torch's top-k values
@@ -213,6 +219,10 @@ pub const Round = struct {
         rd.keys = try a.take(R * nb_max * 8);
         rd.score = try a.take(R * nb_max * 4);
         rd.cand = try a.take(R * (nb_max / c.candidate_block + 1));
+        rd.bmax = try a.take(R * (nb_max / c.candidate_block + 1) * 4);
+        rd.pidx = try a.take(R * c.candidate_blocks * 8);
+        rd.cblk = try a.take(R * c.candidate_blocks * 4);
+        rd.has_cblk = false;
         rd.cidx = try a.take(R * c.index_topk * 8);
         rd.ktop = try a.take(R * c.index_topk * 8);
         rd.tmax = try a.take(R * (nb_max / tri_index.tile + 1) * 8);
@@ -480,9 +490,15 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
             const pow2 = kk & (kk - 1) == 0;
             const after_src = c.candidate_source < li;
             const top: tri_index.TopK = .{ .top = rd.ktop, .ctx = @ptrCast(@constCast(e)), .run = prompt.torchTopk };
-            if (pow2 and li != c.candidate_source) {
+            if (pow2 and after_src and rd.has_cblk) {
+                // past the pool's width: the pool's blocks scored alone (the same keys there; the -inf keys elsewhere
+                // left out: the same top-k), then the selection
+                const nblk = c.candidate_blocks;
+                try tri_index.indexKeysCand(t, rd.iq4, k, rd.iw, vis, nb, rd.cblk, nblk, nblk, c.candidate_block, cbase, rd.keys, R, ih, id);
+                try tri_index.topkSelect(t, rd.keys, nblk * c.candidate_block, kk, vis, rd.cidx, top, R, nblk * c.candidate_block);
+            } else if (pow2 and li != c.candidate_source) {
                 // scores -> (the pool's mask) -> top-k keys in one launch, then the selection
-                if (after_src and nb > c.candidate_blocks * c.candidate_block) return error.NotPortedYet; // index_keys_cand
+                if (after_src and nb > c.candidate_blocks * c.candidate_block) return error.NoCandidatePool;
                 const cand: ?tri_index.Cand = if (after_src) (if (rd.has_cand) .{ .mask = rd.cand, .stride = nb / c.candidate_block } else return error.NoCandidatePool) else null;
                 if (nb > tri_index.topk_fused_max) {
                     // long buckets: each 64-key tile's maximum too; topk_select_pruned (the k best tiles, or torch's
@@ -494,12 +510,22 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
                     try tri_index.topkSelect(t, rd.keys, nb, kk, vis, rd.cidx, top, R, nb);
                 }
             } else if (pow2 and li == c.candidate_source) {
-                // the candidate source: the scores, the pool's mask from them, then their keys' top-k
-                if (nb > c.candidate_blocks * c.candidate_block) return error.NotPortedYet; // _candidate_blocks
-                if (nb % c.candidate_block != 0) return error.NotPortedYet; // _candidates' padded path
+                // the candidate source: the scores, the pool from them, then their keys' top-k
                 try tri_index.indexScore(t, rd.iq4, k, rd.iw, vis, nb, rd.score, cbase, false, null, false, R, ih, id);
-                try e.ops.candFast(e.s, rd.score, nb, nb / c.candidate_block, c.candidate_block, vis, rd.cand, nb / c.candidate_block, R);
-                rd.has_cand = true;
+                const cb = c.candidate_block;
+                if (nb > c.candidate_blocks * cb) {
+                    // _candidate_blocks: the block maxima (the newest pinned), their candidate_blocks best (ties to the
+                    // lower block, ascending), those with a finite maximum as block ids, the rest -1
+                    const nbk = (nb + cb - 1) / cb;
+                    try e.ops.blockMax(e.s, rd.score, nb, nb, cb, vis, rd.bmax, nbk, R);
+                    try e.ops.topkIndices(e.s, rd.bmax, nbk, R, nbk, c.candidate_blocks, rd.pbufs.every, rd.pidx);
+                    try e.ops.poolPick(e.s, rd.bmax, nbk, nbk, rd.pidx, c.candidate_blocks, 0, 0, rd.cblk, R);
+                    rd.has_cblk = true;
+                } else {
+                    if (nb % cb != 0) return error.NotPortedYet; // _candidates' padded path (buckets are whole blocks)
+                    try e.ops.candFast(e.s, rd.score, nb, nb / cb, cb, vis, rd.cand, nb / cb, R);
+                    rd.has_cand = true;
+                }
                 if (nb > tri_index.topk_fused_max) {
                     try tri_index.scoreKeys(t, rd.score, rd.tmax, rd.keys, R, nb);
                     try tri_index.topkSelectPruned(t, rd.keys, nb, rd.tmax, kk, vis, rd.cidx, rd.pbufs, top, R, nb);
@@ -580,6 +606,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     for (rows.pos) |p| deepest = @max(deepest, @as(usize, @intCast(p)) + 1);
     rd.bucket = bucketFor(deepest, pool_cap);
     rd.has_cand = false;
+    rd.has_cblk = false;
     try setGlue(e, rd, rows);
     const d = c.hidden;
     try tri_basic.embedInit(t, w.embed, rd.ids, rd.h, rd.pre, R, d, c.hc);
