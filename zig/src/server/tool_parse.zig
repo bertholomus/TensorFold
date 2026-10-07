@@ -26,6 +26,14 @@ const invoke_open = "<\u{ff5c}DSML\u{ff5c}invoke name=\"";
 const invoke_close = "</\u{ff5c}DSML\u{ff5c}invoke>";
 const param_open = "<\u{ff5c}DSML\u{ff5c}parameter name=\"";
 const param_close = "</\u{ff5c}DSML\u{ff5c}parameter>";
+// DeepSeek-V4.1's spelling (its chat template's, and the served Python lane's reply_text.py): a space after the marker,
+// the block named "calls"; read as the lane reads it (dsml41Calls)
+const dsml41_open = "<\u{ff5c}DSML\u{ff5c} calls>";
+const dsml41_close = "</\u{ff5c}DSML\u{ff5c} calls>";
+const invoke41_open = "<\u{ff5c}DSML\u{ff5c} invoke name=\"";
+const invoke41_close = "</\u{ff5c}DSML\u{ff5c} invoke>";
+const param41_open = "<\u{ff5c}DSML\u{ff5c} parameter name=\"";
+const param41_close = "</\u{ff5c}DSML\u{ff5c} parameter>";
 
 fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;
@@ -82,6 +90,12 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
         try found.append(a, .{ .start = s, .end = e + dsml_close.len, .payload = text[s .. e + dsml_close.len] });
         pos = e + dsml_close.len;
     }
+    pos = 0;
+    while (find(text, dsml41_open, pos)) |s| {
+        const e = find(text, dsml41_close, s + dsml41_open.len) orelse break;
+        try found.append(a, .{ .start = s, .end = e + dsml41_close.len, .payload = text[s .. e + dsml41_close.len] });
+        pos = e + dsml41_close.len;
+    }
     std.mem.sort(Envelope, found.items, {}, struct {
         fn less(_: void, x: Envelope, y: Envelope) bool {
             if (x.start != y.start) return x.start < y.start;
@@ -114,6 +128,10 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     for (envs) |env| {
         try residue.appendSlice(a, text[cursor..env.start]);
         cursor = env.end;
+        if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
+            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
+            continue;
+        }
         if (max_calls) |m| if (calls.items.len >= m) continue;
         const parsed: ?[]Call = blk: {
             if (std.mem.startsWith(u8, env.payload, dsml_open)) {
@@ -450,6 +468,66 @@ fn gemmaCall(a: Allocator, block: []const u8) Error!?Call {
         text = try std.mem.replaceOwned(u8, a, text, mark, try json.quote(a, value, .{ .ascii = false }));
     }
     return .{ .name = name, .arguments = try jsonObject(a, .{ .string = text }) };
+}
+
+/// DeepSeek-V4.1's calls block as the served lane reads it (reply_text.py: dsml_to_tool_calls, then parse_tool_calls on
+/// each invoke's ``<tool_call>{"name": .., "arguments": ..}</tool_call>``): every ``invoke name="N"`` up to its closer is a
+/// call of its own, text between them is dropped; its ``parameter name="K"`` values are strings, or JSON with
+/// ``string="false"`` (a string when that JSON does not parse). An offered name is a call (past ``max_calls`` it is
+/// dropped; with a limit its arguments must be finite); another name stays as the lane leaves it, its rewritten block.
+fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value), residue: *std.ArrayList(u8)) Allocator.Error!void {
+    var pos: usize = 0;
+    while (find(block, invoke41_open, pos)) |s| {
+        pos = s + 1;
+        const name_start = s + invoke41_open.len;
+        const q = std.mem.indexOfScalarPos(u8, block, name_start, '"') orelse continue;
+        if (q == name_start or !std.mem.startsWith(u8, block[q..], "\">")) continue;
+        const e = find(block, invoke41_close, q + 2) orelse continue;
+        pos = e + invoke41_close.len;
+        const name = block[name_start..q];
+        const body = block[q + 2 .. e];
+        const arguments = try json.newObject(a);
+        var p: usize = 0;
+        while (find(body, param41_open, p)) |ps| {
+            p = ps + 1;
+            const ns = ps + param41_open.len;
+            const nq = std.mem.indexOfScalarPos(u8, body, ns, '"') orelse continue;
+            if (nq == ns) continue;
+            var v_start = nq + 1;
+            var json_value = false;
+            if (std.mem.startsWith(u8, body[v_start..], " string=\"true\"")) {
+                v_start += " string=\"true\"".len;
+            } else if (std.mem.startsWith(u8, body[v_start..], " string=\"false\"")) {
+                v_start += " string=\"false\"".len;
+                json_value = true;
+            }
+            if (v_start >= body.len or body[v_start] != '>') continue;
+            v_start += 1;
+            const pe = find(body, param41_close, v_start) orelse continue;
+            p = pe + param41_close.len;
+            const value = body[v_start..pe];
+            const v: Value = if (json_value) switch (try json.parseText(a, value)) {
+                .ok => |parsed| parsed,
+                .err => .{ .string = value },
+            } else .{ .string = value };
+            try arguments.put(a, body[ns..nq], v);
+        }
+        if (max_calls) |m| if (calls.items.len >= m) continue;
+        const offered = known.get(try std.ascii.allocLowerString(a, name));
+        if (offered == null or (max_calls != null and !tool_params.finite(.{ .object = arguments }))) {
+            if (max_calls == null) {
+                // the lane's rewrite: <tool_call> + json.dumps({"name": N, "arguments": args}, ensure_ascii=False) + </tool_call>
+                const doc = try json.newObject(a);
+                try doc.put(a, "name", .{ .string = name });
+                try doc.put(a, "arguments", .{ .object = arguments });
+                try residue.appendSlice(a, "<tool_call>");
+                try residue.appendSlice(a, try json.stringify(a, .{ .object = doc }, .{ .ascii = false }));
+                try residue.appendSlice(a, "</tool_call>");
+            }
+            continue;
+        }
+        try calls.append(a, try openaiCall(a, offered.?, .{ .object = arguments }));
+    }
 }
 
 /// Every invoke of a DSML block, or Invalid when anything in it is not a well-formed invoke.
