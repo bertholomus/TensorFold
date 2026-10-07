@@ -147,6 +147,23 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
     return @intCast(t);
 }
 
+/// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
+/// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
+pub const Profile = struct {
+    send: u64 = 0,
+    forward: u64 = 0,
+    absorb: u64 = 0,
+    logits: u64 = 0,
+    sample: u64 = 0,
+    pass: u64 = 0,
+    prefill: u64 = 0,
+    rounds: u64 = 0,
+    rows: u64 = 0,
+    passes: u64 = 0,
+    pass_streams: u64 = 0,
+    prefills: u64 = 0,
+};
+
 /// A stream's place in the pool and the drafts it holds.
 const Lane = struct {
     slot: usize,
@@ -173,6 +190,7 @@ pub const Lanes = struct {
     used: [max_streams]bool = @splat(false),
     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
     built: Built = .{},
+    prof: ?Profile = null,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
 
@@ -279,6 +297,11 @@ pub const Lanes = struct {
         const self = of(ptr);
         const m = self.m;
         const gpa = self.gpa;
+        const t0 = m.now();
+        defer if (self.prof) |*p| {
+            p.prefill += m.now() - t0;
+            p.prefills += 1;
+        };
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
@@ -373,6 +396,7 @@ pub const Lanes = struct {
             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
             wins[k] = .{ .slot = l.slot, .base = l.base, .end = l.end, .start = start, .absorb = m.drafting() and w.stream.drafts, .ids = ids[k][0..rows] };
         }
+        const t0 = m.now();
         if (try self.begin(.verify)) {
             try self.wire.int(gpa, u32, @intCast(windows.len));
             for (wins[0..windows.len]) |w| {
@@ -385,9 +409,21 @@ pub const Lanes = struct {
             }
             try self.flush();
         }
+        const t1 = m.now();
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
+        const t2 = m.now();
         const logits = try m.roundLogits(rows.ids.len);
+        const t3 = m.now();
+        defer if (self.prof) |*p| {
+            p.send += t1 - t0;
+            p.forward += m.t_forward;
+            p.absorb += m.t_absorb;
+            p.logits += t3 - t2;
+            p.sample += m.now() - t3;
+            p.rounds += 1;
+            p.rows += rows.ids.len;
+        };
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
@@ -449,7 +485,13 @@ pub const Lanes = struct {
             }
             try self.flush();
         }
+        const t0 = m.now();
         try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
+        if (self.prof) |*p| {
+            p.pass += m.now() - t0;
+            p.passes += 1;
+            p.pass_streams += n;
+        }
         const d = &m.dr.?;
         for (asked[0..n], depths[0..n], 0..) |l, k, i| {
             for (0..k) |j| {

@@ -54,6 +54,7 @@ pub fn main(init: std.process.Init) !u8 {
     var requests_file: ?[]const u8 = null;
     var parallel: usize = dsv41.model.max_streams;
     var arena_gib: ?usize = null;
+    var profile = false;
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -68,6 +69,8 @@ pub fn main(init: std.process.Init) !u8 {
             o.drafts = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--arena-gib")) {
             arena_gib = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--profile")) {
+            profile = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--engram")) {
             o.engram_dir = val;
         } else if (std.mem.eql(u8, key, "--token-map")) {
@@ -108,6 +111,11 @@ pub fn main(init: std.process.Init) !u8 {
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
+    if (profile) {
+        ln.prof = .{};
+        m.prof = true;
+    }
+    var step_ns: u64 = 0;
     const rows: u32 = dsv41.round.max_rows;
     var cfg = try lanes.Config.init(gpa, ln.facts(), rows, rows - 1);
     defer cfg.deinit(gpa);
@@ -146,11 +154,13 @@ pub fn main(init: std.process.Init) !u8 {
             try w.print("{{\"rank\": 0, \"request\": {d}, \"name\": \"{s}\", \"prompt_tokens\": {d}, \"prefill_s\": {d:.2}}}\n", .{ j.index, r.name, r.prompt.len, seconds(j.began, io) });
             try w.flush();
         }
+        const s0 = m.now();
         if (core.live.items.len > 0) core.step() catch |err| {
             try w.print("{{\"rank\": 0, \"step\": {d}, \"error\": \"{s}\"}}\n", .{ core.steps, @errorName(err) });
             try w.flush();
             return 1;
         };
+        step_ns += m.now() - s0;
         // the finished streams' replies
         for (jobs[0..admitted]) |*j| {
             if (j.done or !j.stream.finished) continue;
@@ -170,6 +180,15 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     const total_s = seconds(started, io);
+    if (ln.prof) |p| {
+        const ms = struct {
+            fn f(ns: u64, n: u64) f64 {
+                return if (n == 0) 0 else @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
+            }
+        }.f;
+        try w.print("{{\"rank\": 0, \"profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"step_ms\": {d:.2}, \"send_ms\": {d:.3}, \"forward_ms\": {d:.2}, \"absorb_ms\": {d:.2}, \"logits_ms\": {d:.2}, \"sample_ms\": {d:.2}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.2}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{ p.rounds, ms(p.rows * 1000000, p.rounds), ms(step_ns, core.steps), ms(p.send, p.rounds), ms(p.forward, p.rounds), ms(p.absorb, p.rounds), ms(p.logits, p.rounds), ms(p.sample, p.rounds), p.passes, ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes), p.prefills, ms(p.prefill, p.prefills) });
+        try w.flush();
+    }
     try w.print("{{\"rank\": 0, \"requests\": {d}, \"tokens\": {d}, \"steps\": {d}, \"shared_rounds\": {d}, \"drafted\": {d}, \"accepted\": {d}, \"seconds\": {d:.2}, \"all_equal\": {}}}\n", .{ reqs.len, tokens_out, core.steps, core.shared_rounds, core.drafted, core.accepted, total_s, all_equal });
     try w.flush();
     return if (all_equal) 0 else 1;
