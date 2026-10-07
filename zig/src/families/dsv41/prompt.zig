@@ -461,10 +461,11 @@ pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl
     try exl3_linear.glinear(e.lin, e.s, calls, m, ch.gz, true, true);
 }
 
-/// One sequence's compressed-attention caches (model.py SeqCache: comp, index_k, comp_raw), by kv-source layer: the
+/// The pool's compressed-attention caches (model.py PoolCache: comp, index_k, comp_raw), by kv-source layer: the
 /// compressed latents as packed FP4 (codes [rows, head_dim / 2], E8M0 scales [rows, head_dim / 16]), the index keys
-/// (codes [rows, index_head_dim / 2], scales [rows, index_head_dim / 32], 127 when unwritten) and, at ratio 2, the
-/// positional store of the compressor's raw kv and scores (fp32 [RAW, head_dim] each). rows = cap / ratio + 2.
+/// (codes [rows, index_head_dim / 2], scales [rows, index_head_dim / 32], 127 when unwritten) over `cap` positions of
+/// streams' extents (rows = cap / ratio + 2), and, at ratio 2, each slot's positional store of the compressor's raw kv
+/// and scores (fp32 [RAW, head_dim] each, `slots` of them). One stream's caches (SeqCache) are a view.
 pub const Caches = struct {
     comp_codes: [64]u64 = @splat(0),
     comp_scales: [64]u64 = @splat(0),
@@ -473,10 +474,11 @@ pub const Caches = struct {
     raw_kv: [64]u64 = @splat(0),
     raw_score: [64]u64 = @splat(0),
     cap: usize = 0, // positions
+    slots: usize = 1, // the positional stores' slots
 
-    pub fn init(e: *const Engine, a: *Arena, cap: usize) !Caches {
+    pub fn init(e: *const Engine, a: *Arena, cap: usize, slots: usize) !Caches {
         const c = e.c;
-        var cs: Caches = .{ .cap = cap };
+        var cs: Caches = .{ .cap = cap, .slots = slots };
         for (e.w.layers, 0..) |lay, i| {
             if (lay.comp_wkv == null) continue;
             const r: usize = lay.ratio;
@@ -488,15 +490,15 @@ pub const Caches = struct {
                 cs.idx_scales[i] = try a.take(rows * c.index_head_dim / 32);
             }
             if (r > 1) {
-                cs.raw_kv[i] = try a.take(raw_rows * c.head_dim * 4);
-                cs.raw_score[i] = try a.take(raw_rows * c.head_dim * 4);
+                cs.raw_kv[i] = try a.take(slots * raw_rows * c.head_dim * 4);
+                cs.raw_score[i] = try a.take(slots * raw_rows * c.head_dim * 4);
             }
         }
         try cs.clear(e);
         return cs;
     }
 
-    /// A new sequence's caches, as SeqCache makes them: zeros, the index keys' E8M0 scales 127 (1.0).
+    /// A new pool's caches, as PoolCache makes them: zeros, the index keys' E8M0 scales 127 (1.0).
     pub fn clear(cs: *const Caches, e: *const Engine) !void {
         const c = e.c;
         for (e.w.layers, 0..) |lay, i| {
@@ -510,10 +512,37 @@ pub const Caches = struct {
                 try fill(e, cs.idx_scales[i], 127, rows * c.index_head_dim / 32);
             }
             if (r > 1) {
-                try fill(e, cs.raw_kv[i], 0, raw_rows * c.head_dim * 4);
-                try fill(e, cs.raw_score[i], 0, raw_rows * c.head_dim * 4);
+                try fill(e, cs.raw_kv[i], 0, cs.slots * raw_rows * c.head_dim * 4);
+                try fill(e, cs.raw_score[i], 0, cs.slots * raw_rows * c.head_dim * 4);
             }
         }
+    }
+
+    /// The stream in pool slot `slot` with its extent from position `base` (MultiDecoder: pool_view): its compressed
+    /// rows from base / ratio, its slot's positional stores (one slot's view: its prompt chunks read positions from 0).
+    pub fn view(cs: *const Caches, e: *const Engine, slot: usize, base: usize) !Caches {
+        const c = e.c;
+        if (slot >= cs.slots or base >= cs.cap) return error.BadView;
+        var v = cs.*;
+        v.slots = 1;
+        v.cap = cs.cap - base;
+        for (e.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            if (base % r != 0) return error.BadView;
+            const g = base / r;
+            v.comp_codes[i] += g * c.head_dim / 2;
+            v.comp_scales[i] += g * c.head_dim / 16;
+            if (lay.idx_wk != null) {
+                v.idx_codes[i] += g * c.index_head_dim / 2;
+                v.idx_scales[i] += g * c.index_head_dim / 32;
+            }
+            if (r > 1) {
+                v.raw_kv[i] += slot * raw_rows * c.head_dim * 4;
+                v.raw_score[i] += slot * raw_rows * c.head_dim * 4;
+            }
+        }
+        return v;
     }
 };
 

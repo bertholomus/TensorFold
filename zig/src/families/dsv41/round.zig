@@ -1,4 +1,4 @@
-//! A decode round on one TP rank: the served build's RoundDecoder (rounds.py) for one stream's rows in pool slot 0,
+//! A decode round on one TP rank: the served build's RoundDecoder (rounds.py) for the rows of one or more streams' windows,
 //! with the served switches (hc fused with the Sinkhorn half deferred and the posted mixes' dots on it; glue, rot_q,
 //! rot_attn, rot_wob, idx, comp, rowmm on; hc_rot and SHARED_OVERLAP off): the rows' streams from their token ids
 //! (embed_init), then a stretch at a time (cut before each Engram layer) every layer's attention mixes with the last
@@ -60,9 +60,32 @@ pub const Probe = struct {
     }
 };
 
-/// A round's rows of one stream: token ids at positions pos (consecutive), the stream in pool slot 0 with its extent
-/// [base, end) of positions.
-pub const Rows = struct { ids: []const i64, pos: []const i64, base: i64 = 0, end: i64 };
+/// A round's rows: token ids at positions pos. One stream's (consecutive positions) in pool slot 0 with its extent [base,
+/// end) of positions; or a concurrent round's (MultiDecoder: several streams' windows, each window's rows contiguous):
+/// each row's pool slot and its stream's extent, and each window's first row with its stream's ids through the window.
+pub const Rows = struct {
+    ids: []const i64,
+    pos: []const i64,
+    base: i64 = 0,
+    end: i64 = 0,
+    slots: ?[]const i64 = null,
+    bases: ?[]const i64 = null,
+    ends: ?[]const i64 = null,
+    windows: ?[]const Window = null,
+
+    fn slotOf(r: Rows, i: usize) i64 {
+        return if (r.slots) |v| v[i] else 0;
+    }
+    fn baseOf(r: Rows, i: usize) i64 {
+        return if (r.bases) |v| v[i] else r.base;
+    }
+    fn endOf(r: Rows, i: usize) i64 {
+        return if (r.ends) |v| v[i] else r.end;
+    }
+};
+
+/// A window of a concurrent round: its first row, its rows, its stream's ids through the window (Engram's n-grams).
+pub const Window = struct { row: usize, n: usize, seq: []const i32 };
 
 /// The index tensors rounds.py's _ix makes from a round's inputs, by row (int64 [R] each, gi [R, 2]).
 const Glue = enum(u8) { wslot, wbase, cbase1, ctarget1, gpos1, vis1, cbase2, ctarget2, gpos2, vis2, rslot, gi };
@@ -265,7 +288,7 @@ pub const Round = struct {
     }
 };
 
-/// rounds.py _ix's tensors for these rows (one stream in slot 0), made on the host and uploaded in one copy.
+/// rounds.py _ix's tensors for these rows (each row's slot and extent), made on the host and uploaded in one copy.
 fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
     const R = rows.ids.len;
     var hg: [glue_n * max_rows]i64 = @splat(0);
@@ -278,27 +301,29 @@ fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
                 return &buf[@as(usize, @intFromEnum(k)) * max_rows + r];
             }
         }.f;
-        // wbase = slot * RS (slot 0), wslot = wbase + pos % RS
-        at(&hg, .wbase, i).* = 0;
-        at(&hg, .wslot, i).* = @mod(p, rs);
+        const slot = rows.slotOf(i);
+        const base = rows.baseOf(i);
+        // wbase = slot * RS, wslot = wbase + pos % RS
+        at(&hg, .wbase, i).* = slot * rs;
+        at(&hg, .wslot, i).* = slot * rs + @mod(p, rs);
         // ratio 1: cbase = base, ctarget = cbase + pos, gpos = pos, vis = pos + 1
-        at(&hg, .cbase1, i).* = rows.base;
-        at(&hg, .ctarget1, i).* = rows.base + p;
+        at(&hg, .cbase1, i).* = base;
+        at(&hg, .ctarget1, i).* = base + p;
         at(&hg, .gpos1, i).* = p;
         at(&hg, .vis1, i).* = p + 1;
         // ratio 2: groups = pos // 2, target = groups if the group is complete else the extent's last row (scratch)
-        const cb2 = @divFloor(rows.base, 2);
+        const cb2 = @divFloor(base, 2);
         const groups = @divFloor(p, 2);
-        const scratch = @divFloor(rows.end, 2) - 1 - cb2;
+        const scratch = @divFloor(rows.endOf(i), 2) - 1 - cb2;
         at(&hg, .cbase2, i).* = cb2;
         at(&hg, .ctarget2, i).* = cb2 + (if (@mod(p + 1, 2) == 0) groups else scratch);
         at(&hg, .gpos2, i).* = groups * 2;
         at(&hg, .vis2, i).* = @divFloor(p + 1, 2);
-        // rslot = slot * RAW + pos % RAW; gi = rbase + (groups * 2 + [0, 1]) % RAW
-        at(&hg, .rslot, i).* = @mod(p, raw);
+        // rslot = slot * RAW + pos % RAW; gi = rbase + (groups * 2 + [0, 1]) % RAW, rbase = slot * RAW
+        at(&hg, .rslot, i).* = slot * raw + @mod(p, raw);
         const gi0 = @as(usize, @intFromEnum(Glue.gi)) * max_rows;
-        hg[gi0 + 2 * i] = @mod(groups * 2, raw);
-        hg[gi0 + 2 * i + 1] = @mod(groups * 2 + 1, raw);
+        hg[gi0 + 2 * i] = slot * raw + @mod(groups * 2, raw);
+        hg[gi0 + 2 * i + 1] = slot * raw + @mod(groups * 2 + 1, raw);
     }
     try prompt.upload(e, rd.glue, &hg, hg.len * 8);
     // RoundDecoder.set: [ids, pos, slots, base, end] in one [5, R] copy
@@ -306,9 +331,9 @@ fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
     for (0..R) |i| {
         in[i] = rows.ids[i];
         in[R + i] = rows.pos[i];
-        in[2 * R + i] = 0;
-        in[3 * R + i] = rows.base;
-        in[4 * R + i] = rows.end;
+        in[2 * R + i] = rows.slotOf(i);
+        in[3 * R + i] = rows.baseOf(i);
+        in[4 * R + i] = rows.endOf(i);
     }
     try prompt.upload(e, rd.inputs, &in, 5 * R * 8);
     rd.ids = rd.inputs;
@@ -411,8 +436,8 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
                 try e.ops.scatterRows(e.s, rd.ckv, hd * 4, rd.g(.rslot), cs.raw_kv[li], hd * 4, hd * 4, R);
                 try e.ops.scatterRows(e.s, rd.cgate, hd * 4, rd.g(.rslot), cs.raw_score[li], hd * 4, hd * 4, R);
                 try e.d.check(e.d.api.cuMemsetD8Async(ch.invalid, 0, 4, e.s.handle), "cuMemsetD8Async");
-                try e.ops.gatherRows(e.s, cs.raw_kv[li], raw_rows, rd.g(.gi), rd.kvg, hd * 4, 2 * R, ch.invalid);
-                try e.ops.gatherRows(e.s, cs.raw_score[li], raw_rows, rd.g(.gi), rd.sg, hd * 4, 2 * R, ch.invalid);
+                try e.ops.gatherRows(e.s, cs.raw_kv[li], cs.slots * raw_rows, rd.g(.gi), rd.kvg, hd * 4, 2 * R, ch.invalid);
+                try e.ops.gatherRows(e.s, cs.raw_score[li], cs.slots * raw_rows, rd.g(.gi), rd.sg, hd * 4, 2 * R, ch.invalid);
                 try e.exact.compress2(e.s, rd.kvg, rd.sg, rd.lat2, R, hd);
                 try tri_basic.rmsnorm(t, rd.lat2, hd, lay.comp_norm, rd.lat, hd, c.eps, R, hd);
             } else return error.NotPortedYet;
@@ -645,7 +670,7 @@ fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params
     return tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, null, rd.sink, R, c.hidden);
 }
 
-/// Layer li's Engram rows of the round's rows (Engram.hashes of the stream's ids through each row, this rank's
+/// Layer li's Engram rows of the round's rows (Engram.hashes of each row's stream's ids through the row, this rank's
 /// columns, the tables' FP8 rows decoded to bf16 as Engram._decode does) into rd.e_in.
 fn engramRows(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, li: usize, seq: []const i32, rows: Rows) !void {
     const c = e.c;
@@ -655,9 +680,14 @@ fn engramRows(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, li: usize, s
     const tbl = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
     const cols = eh.hasher.cols();
     const k = eh.hi - eh.lo;
-    const start: usize = @intCast(rows.pos[0]);
-    if (seq.len < start + R) return error.ShortSequence;
-    eh.hasher.hashes(seq, start, R, eh.hashes[0 .. R * eh.hasher.layers * cols]);
+    const one = [_]Window{.{ .row = 0, .n = R, .seq = seq }};
+    const windows = rows.windows orelse &one;
+    for (windows) |w| {
+        const start: usize = @intCast(rows.pos[w.row]);
+        if (w.row + w.n > R or w.seq.len < start + w.n) return error.ShortSequence;
+        const per = eh.hasher.layers * cols;
+        eh.hasher.hashes(w.seq, start, w.n, eh.hashes[w.row * per .. (w.row + w.n) * per]);
+    }
     for (0..R) |r| {
         for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
     }
