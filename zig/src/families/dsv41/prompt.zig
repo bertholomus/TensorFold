@@ -32,6 +32,9 @@ const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const prompt2d = @import("prompt2d.zig");
 
+/// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
+const key_elems: usize = 1 << 24;
+
 /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
 pub const ring_extra = 16;
 /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
@@ -101,7 +104,8 @@ pub const Chunk = struct {
     n: usize = 0,
     start: usize = 0,
     ids: u64, // int64 [cap]
-    pos: u64, // int64 [cap]: start .. start + n
+    pos: u64, // int64 [n]: start .. start + n (after a replay cut a view into pos0, pos[first:])
+    pos0: u64, // int64 [cap]: the chunk's positions as begin() wrote them
     h: u64, // bf16 [cap, hc, D]: the streams
     h_alt: u64, // their second buffer (hc_pre_pf writes the posted streams there)
     x: u64, // bf16 [cap, D]: a block's input rows
@@ -124,6 +128,10 @@ pub const Chunk = struct {
     ga: u64, // fp32 [world, cap, D]: its gather
     neg: u64, // int64 [cap], -1: no ring slot (model.py _neg)
     ring_idx: u64, // int64 [ring]
+    rslot: u64 = 0, // int64 [RING_EXTRA]: ring mode's slots, pos % R
+    pm_: u64 = 0, // fp32 [16, heads, 8]: the split attention's partials (ring mode's rows)
+    pl_: u64 = 0,
+    po_: u64 = 0, // fp32 [16, heads, 8, head_dim]
     invalid: u64, // uint32 [1]
     // compressed layers
     kvc: u64 = 0, // fp32 [cap, head_dim]: the compressor's kv projection
@@ -139,9 +147,9 @@ pub const Chunk = struct {
     wl: u64 = 0, // fp32 [cap, index_heads]
     iw: u64 = 0, // bf16 [cap, index_heads]: the heads' weights
     vis: u64 = 0, // int64 [cap]: compressed entries a row sees
-    keys: u64 = 0, // int64 [cap, max_comp]
-    score: u64 = 0, // fp32 [cap, max_comp]: the candidate pool's layers' index scores
-    tmax: u64 = 0, // int64 [cap, cdiv(max_comp, 64)]
+    keys: u64 = 0, // int64 [rows of a block, n_comp]: at most key_elems
+    score: u64 = 0, // fp32 [rows of a block, n_comp]: the candidate pool's layers' index scores
+    tmax: u64 = 0, // int64 [rows of a block, cdiv(n_comp, 64)]
     cidx: u64 = 0, // int64 [cap, index_topk]: the selected latents
     max_comp: usize = 0,
     // MoE
@@ -153,6 +161,11 @@ pub const Chunk = struct {
     pm: u64, // fp32 [cap, D]: the MoE partial
     gm: u64, // fp32 [world, cap, D]: its gather (the pending post)
     xs: exl3_experts.Scratch,
+    // Model._moe_scratch's decode scratch: windows under 64 rows (a prompt's small chunk, every decode round), one for
+    // every layer of the same slots and experts, its epoch carried from call to call
+    xsd: exl3_experts.DecodeScratch,
+    gl: u64, // fp32 [16, D / 256, experts]: rowmm_gate's chunk sums (chunks of up to 16 rows)
+    cidxp: u64 = 0, // int64 [cap, index_topk + 16]: the selection padded with -1 to whole 16-column tiles
     // Engram (zero when no layer has it)
     eb: u64 = 0, // bf16 [cap, cols * engram_head_dim]: the rows read
     ek: u64 = 0, // fp32 [cap, hc * D + D]: their projection, this rank's columns
@@ -192,7 +205,8 @@ pub const Chunk = struct {
         ch.start = 0;
         ch.pending = false;
         ch.ids = try a.take(cap * 8);
-        ch.pos = try a.take(cap * 8);
+        ch.pos0 = try a.take(cap * 8);
+        ch.pos = ch.pos0;
         ch.h = try a.take(cap * hc * d * 2);
         ch.h_alt = try a.take(cap * hc * d * 2);
         ch.x = try a.take(cap * d * 2);
@@ -214,6 +228,10 @@ pub const Chunk = struct {
         ch.ga = try a.take(e.world * cap * d * 4);
         ch.neg = try a.take(cap * 8);
         ch.ring_idx = try a.take((c.window + ring_extra) * 8);
+        ch.rslot = try a.take(ring_extra * 8);
+        ch.pm_ = try a.take(ring_extra * hl * tri_attn.attn_splits * 4);
+        ch.pl_ = try a.take(ring_extra * hl * tri_attn.attn_splits * 4);
+        ch.po_ = try a.take(ring_extra * hl * tri_attn.attn_splits * hd * 4);
         ch.invalid = try a.take(4);
         ch.xf = try a.take(cap * d * 4);
         ch.gate_f = try a.take(c.experts * d * 4);
@@ -243,11 +261,14 @@ pub const Chunk = struct {
             ch.wl = try a.take(cap * c.index_heads * 4);
             ch.iw = try a.take(cap * c.index_heads * 2);
             ch.vis = try a.take(cap * 8);
-            ch.keys = try a.take(cap * ch.max_comp * 8);
-            ch.score = try a.take(cap * ch.max_comp * 4);
-            ch.tmax = try a.take(cap * ((ch.max_comp + tri_index.tile - 1) / tri_index.tile) * 8);
+            // the indexer's row blocks keep rows * n_comp under 2^24 (model.py rb), so their keys under key_elems
+            const ke: usize = @min(cap * ch.max_comp, key_elems); // (typed: @min with a comptime bound narrows)
+            ch.keys = try a.take(ke * 8);
+            ch.score = try a.take(ke * 4);
+            ch.tmax = try a.take((ke / tri_index.tile + cap) * 8);
             ch.cidx = try a.take(cap * c.index_topk * 8);
             ch.ktop = try a.take(cap * c.index_topk * 8);
+            ch.cidxp = try a.take(cap * (c.index_topk + 16) * 8);
         }
         for (e.w.layers) |lay| {
             const ew = lay.engram_wkv orelse continue;
@@ -266,6 +287,8 @@ pub const Chunk = struct {
             @field(xs, f) = try a.take(sz[j]);
         }
         ch.xs = xs;
+        ch.xsd = try decodeScratch(e, a, ex, sl);
+        ch.gl = try a.take(16 * (d / 256) * c.experts * 4);
         // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard
         var max_xk: usize = 0;
         var max_kn: usize = 0;
@@ -355,6 +378,22 @@ pub const Chunk = struct {
     }
 };
 
+/// Model._moe_scratch's decode scratch: experts.py Scratch(rows=max(n, 64), prompt=False), zeros but its member lists'
+/// -1 (made at the first window under 64 rows and never replaced).
+pub fn decodeScratch(e: *const Engine, a: *Arena, ex: weights.Experts, slots: usize) !exl3_experts.DecodeScratch {
+    const rows = exl3_experts.exact_rows;
+    const sz = try exl3_experts.DecodeScratch.sizes(rows, slots, ex.dims, ex.width, ex.count);
+    var sc: exl3_experts.DecodeScratch = undefined;
+    sc.rows = rows;
+    sc.slots = slots;
+    inline for (.{ "xg", "xu", "xd", "z", "y", "cnt_gu", "cnt_d", "epoch", "ready", "ready_cnt", "ids", "count", "members" }, 0..) |f, j| {
+        const ptr = try a.take(sz[j]);
+        @field(sc, f) = ptr;
+        if (j == 12) try fill32(e, ptr, 0xffffffff, sz[j] / 4) else try fill(e, ptr, 0, sz[j]);
+    }
+    return sc;
+}
+
 /// Host bytes to the device in the stream's order (the stream is non-blocking: the legacy stream's synchronous copies
 /// would not wait for its kernels). Pageable host memory is staged before the call returns.
 pub fn upload(e: *const Engine, dst: u64, src: *const anyopaque, bytes: usize) !void {
@@ -414,32 +453,48 @@ pub const Caches = struct {
     idx_scales: [64]u64 = @splat(0),
     raw_kv: [64]u64 = @splat(0),
     raw_score: [64]u64 = @splat(0),
+    cap: usize = 0, // positions
 
     pub fn init(e: *const Engine, a: *Arena, cap: usize) !Caches {
         const c = e.c;
-        var cs: Caches = .{};
+        var cs: Caches = .{ .cap = cap };
         for (e.w.layers, 0..) |lay, i| {
             if (lay.comp_wkv == null) continue;
             const r: usize = lay.ratio;
             const rows = cap / r + 2;
             cs.comp_codes[i] = try a.take(rows * c.head_dim / 2);
             cs.comp_scales[i] = try a.take(rows * c.head_dim / 16);
-            try fill(e, cs.comp_codes[i], 0, rows * c.head_dim / 2);
-            try fill(e, cs.comp_scales[i], 0, rows * c.head_dim / 16);
             if (lay.idx_wk != null) {
                 cs.idx_codes[i] = try a.take(rows * c.index_head_dim / 2);
                 cs.idx_scales[i] = try a.take(rows * c.index_head_dim / 32);
-                try fill(e, cs.idx_codes[i], 0, rows * c.index_head_dim / 2);
-                try fill(e, cs.idx_scales[i], 127, rows * c.index_head_dim / 32);
             }
             if (r > 1) {
                 cs.raw_kv[i] = try a.take(raw_rows * c.head_dim * 4);
                 cs.raw_score[i] = try a.take(raw_rows * c.head_dim * 4);
+            }
+        }
+        try cs.clear(e);
+        return cs;
+    }
+
+    /// A new sequence's caches, as SeqCache makes them: zeros, the index keys' E8M0 scales 127 (1.0).
+    pub fn clear(cs: *const Caches, e: *const Engine) !void {
+        const c = e.c;
+        for (e.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            const rows = cs.cap / r + 2;
+            try fill(e, cs.comp_codes[i], 0, rows * c.head_dim / 2);
+            try fill(e, cs.comp_scales[i], 0, rows * c.head_dim / 16);
+            if (lay.idx_wk != null) {
+                try fill(e, cs.idx_codes[i], 0, rows * c.index_head_dim / 2);
+                try fill(e, cs.idx_scales[i], 127, rows * c.index_head_dim / 32);
+            }
+            if (r > 1) {
                 try fill(e, cs.raw_kv[i], 0, raw_rows * c.head_dim * 4);
                 try fill(e, cs.raw_score[i], 0, raw_rows * c.head_dim * 4);
             }
         }
-        return cs;
     }
 };
 
@@ -457,6 +512,7 @@ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_
     ch.pending = false;
     for (host_pos[0..n], 0..) |*p, i| p.* = @intCast(start + i);
     try upload(e, ch.ids, ids.ptr, n * 8);
+    ch.pos = ch.pos0;
     try upload(e, ch.pos, host_pos.ptr, n * 8);
     try tri_basic.embedInit(e.t, e.w.embed, ch.ids, ch.h, ch.pre, n, e.c.hidden, e.c.hc);
 }
@@ -511,7 +567,8 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     // _cs: the layer's RoPE kind (compressed layers rotate by the compressed table) for every rotation it makes
     const rope = if (lay.ratio != 0) e.compressed else e.plain;
     const ring_rows = c.window + ring_extra;
-    if (n <= ring_extra) return error.NotPortedYet; // ring mode (verify windows)
+    // ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring
+    const ring_mode = n <= ring_extra;
     // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
     if (n > 128) {
         try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
@@ -524,8 +581,14 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     try tri_norm.ropeHeads(e.t, ch.q, rope.cos, rope.sin, ch.pos, rd, false, n, hl, hd);
     // the window keys: the ring's last window - 1 positions before start, then this chunk's rows
     const lo = @max(floor, start -| (c.window - 1));
-    const wsrc_rows = start - lo + n;
-    if (start > lo) {
+    const wsrc_rows = if (ring_mode) ring_rows else start - lo + n;
+    if (ring_mode) {
+        // kv_norm_rope into ring rows pos % R (and its rows out), the attention's window keys the ring, WLO zero
+        var slots: [ring_extra]i64 = undefined;
+        for (0..n) |j| slots[j] = @intCast((start + j) % ring_rows);
+        try upload(e, ch.rslot, &slots, n * 8);
+        try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.rslot, c.eps, true, rd, ch.wsrc, n, hd);
+    } else if (start > lo) {
         // wsrc[:start - lo] = ring[arange(lo, start) % R]
         var ridx: [256]i64 = undefined;
         if (start - lo > ridx.len) return error.WindowTooLong;
@@ -534,13 +597,14 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         try fill(e, ch.invalid, 0, 4);
         try e.ops.gatherRows(e.s, ring, ring_rows, ch.ring_idx, ch.wsrc, hd * 2, start - lo, ch.invalid);
     }
-    var lo64: i64 = @intCast(lo);
+    var lo64: i64 = if (ring_mode) 0 else @intCast(lo);
     try upload(e, ch.wlo, &lo64, 8);
     const kv = ch.wsrc + (start - lo) * hd * 2;
     // slots -1: the keys go to wsrc only (ring_mode is off); the ring is written after the attention
-    try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.neg, c.eps, true, rd, kv, n, hd);
+    if (!ring_mode) try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.neg, c.eps, true, rd, kv, n, hd);
     var comp: tri_attn.Comp = .none;
     var n_idx: usize = 0;
+    var padded = false;
     if (lay.ratio != 0) {
         const r: usize = lay.ratio;
         if (lay.comp_wkv != null and !kv_done) try kvSourceUpdate(e, ch, cs, sh, li);
@@ -555,7 +619,13 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const kk = sh.kk orelse return error.NoIndexerSelection;
         comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
         n_idx = kk;
-        if (kk % 16 != 0) return error.NotPortedYet; // a prompt chunk's idx padded to whole 16-column tiles
+        if (kk % 16 != 0 and n > tri_attn.decode_rows) {
+            // sparse_attn: a prompt chunk's pick list padded with -1 to whole 16-column tiles (F.pad), read from there
+            const kp = (kk + 15) / 16 * 16;
+            try fill(e, ch.cidxp, 0xff, n * kp * 8);
+            try e.ops.copyRows(e.s, ch.cidx, kk * 8, ch.cidxp, kp * 8, kk * 8, n);
+            padded = true;
+        }
     }
     try tri_attn.sparseAttn(e.t, .{
         .q = ch.q,
@@ -564,24 +634,27 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         .h = hl,
         .hd = hd,
         .sink = lay.sink,
-        .wsrc = ch.wsrc,
+        .wsrc = if (ring_mode) ring else ch.wsrc,
         .wsrc_rows = wsrc_rows,
         .wlo = ch.wlo,
-        .ring = false,
+        .ring = ring_mode,
+        .parts = .{ .pm = ch.pm_, .pl = ch.pl_, .po = ch.po_ },
         .comp = comp,
-        .idx = if (n_idx > 0) ch.cidx else 0,
+        .idx = if (n_idx > 0) (if (padded) ch.cidxp else ch.cidx) else 0,
         .n_idx = n_idx,
         .pos = ch.pos,
         .scale = scale(hd),
         .window = c.window,
     });
     try tri_norm.ropeHeads(e.t, ch.o, rope.cos, rope.sin, ch.pos, rd, true, n, hl, hd);
-    // ring[pos[-keep:] % R] = kv[-keep:]
-    const keep = @min(n, ring_rows);
-    var idx: [256]i64 = undefined;
-    for (0..keep) |j| idx[j] = @intCast((start + n - keep + j) % ring_rows);
-    try upload(e, ch.ring_idx, &idx, keep * 8);
-    try e.ops.scatterRows(e.s, kv + (n - keep) * hd * 2, hd * 2, ch.ring_idx, ring, hd * 2, hd * 2, keep);
+    // ring[pos[-keep:] % R] = kv[-keep:] (ring mode wrote them before the attention)
+    const keep: usize = if (ring_mode) 0 else @min(n, ring_rows);
+    if (keep > 0) {
+        var idx: [256]i64 = undefined;
+        for (0..keep) |j| idx[j] = @intCast((start + n - keep + j) % ring_rows);
+        try upload(e, ch.ring_idx, &idx, keep * 8);
+        try e.ops.scatterRows(e.s, kv + (n - keep) * hd * 2, hd * 2, ch.ring_idx, ring, hd * 2, hd * 2, keep);
+    }
     // wo_a: each group's column block of o read in place, written into its column block of u; then wo_b to fp32
     const groups = lay.groups;
     const gk = hl * hd / groups;
@@ -684,32 +757,44 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
     // switch "idx": fp4_qd's bytes in one launch
     try tri_attn.fp4QdP2(e.t, ch.iq, ch.iq4, n * ih * id);
-    if (n <= tri_index.decode_rows) return error.NotPortedYet; // rowmm2 of the fp16 projection
-    try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
-    try e.blas.xwT(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
+    if (n <= tri_index.decode_rows) {
+        // a decode-sized chunk: the row-invariant matmul of the fp16 projection (rowmm2)
+        try tri_norm.rowmm2(e.t, ch.x, c.hidden, lay.idx_proj_h, ch.wl, n, c.hidden, ih);
+    } else {
+        try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
+        try e.blas.xwT(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
+    }
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
     const kk = @min(c.index_topk, n_comp_end);
     // rows in blocks so the [rows, n_comp] keys stay bounded at long contexts
     const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1))));
-    if (rb < n) return error.NotPortedYet; // more than one row block
+    if (rb * n_comp_end > key_elems) return error.ChunkTooLong;
     const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
-    if (!keyed) {
-        // the candidate source and the layers after it: fp32 scores, the pool (_candidates at the source,
-        // apply_candidates after it), topk_indices and -1 past vis. While every block of the scores fits in the pool
-        // (cand_blocks of them) the pool keeps each block with a finite score (the newest pinned: it holds the row's
-        // last visible key) and apply_candidates rewrites only scores already -inf: no launch changes a byte.
-        const nb = (n_comp_end + c.candidate_block - 1) / c.candidate_block;
-        if (nb > c.candidate_blocks) return error.NotPortedYet; // a pool that leaves blocks out
-        try tri_index.indexScore(e.t, ch.iq4, k, ch.iw, ch.vis, n_comp_end, ch.score, null, false, null, false, n, ih, id);
-        try e.ops.topkIndices(e.s, ch.score, n_comp_end, n, n_comp_end, kk, ch.vis, ch.cidx);
-        sh.kk = kk;
-        return;
-    }
-    try tri_index.indexScore(e.t, ch.iq4, k, ch.iw, ch.vis, n_comp_end, ch.keys, null, true, ch.tmax, false, n, ih, id);
     const torch_topk: tri_index.TopK = .{ .top = ch.ktop, .ctx = @ptrCast(@constCast(e)), .run = torchTopk };
-    if (tri_index.prunes(n_comp_end, kk)) return error.NotPortedYet; // the pruned search's buffers
-    try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, ch.vis, ch.cidx, .{ .tpos = 0, .cand = 0, .every = 0 }, torch_topk, n, n_comp_end);
+    if (keyed and tri_index.prunes(n_comp_end, kk)) return error.NotPortedYet; // the pruned search's buffers
+    // the candidate source and the layers after it: fp32 scores, the pool (_candidates at the source, apply_candidates
+    // after it), topk_indices and -1 past vis. While every block of the scores fits in the pool (cand_blocks of them)
+    // the pool keeps each block with a finite score (the newest pinned: it holds the row's last visible key) and
+    // apply_candidates rewrites only scores already -inf: no launch changes a byte.
+    if (!keyed and (n_comp_end + c.candidate_block - 1) / c.candidate_block > c.candidate_blocks) return error.NotPortedYet; // a pool that leaves blocks out
+    var r0: usize = 0;
+    while (r0 < n) : (r0 += rb) {
+        // the block's rows: iq[r0:r1], wts[r0:r1] and vis[r0:r1] as views (their offsets the served pointers'), its
+        // selection into cidx[r0:r1]
+        const m = @min(n, r0 + rb) - r0;
+        const q = ch.iq4 + r0 * ih * id * 2;
+        const wb = ch.iw + r0 * ih * 2;
+        const vr = ch.vis + r0 * 8;
+        const out = ch.cidx + r0 * kk * 8;
+        if (keyed) {
+            try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
+            try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, vr, out, .{ .tpos = 0, .cand = 0, .every = 0 }, torch_topk, m, n_comp_end);
+        } else {
+            try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.score, null, false, null, false, m, ih, id);
+            try e.ops.topkIndices(e.s, ch.score, n_comp_end, m, n_comp_end, kk, vr, out);
+        }
+    }
     sh.kk = kk;
 }
 
@@ -747,12 +832,20 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     const n = ch.n;
     const d = c.hidden;
     const sl = e.slots();
-    try e.ops.toF32(e.s, ch.x, ch.xf, n * d);
-    try e.ops.f16ToF32(e.s, lay.gate_w, ch.gate_f, c.experts * d);
-    try e.blas.xwT(ch.xf, ch.gate_f, ch.logits, n, d, c.experts);
     const shared_id = lay.experts.count - 1;
-    try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
+    if (n <= tri_norm.decode_rows) {
+        // a decode-sized chunk: the row-invariant gate (rowmm_gate's chunk sums) and its routing
+        const kc = try tri_norm.rowmmGate(e.t, ch.x, d, lay.gate_w, ch.gl, n, d, c.experts);
+        try tri_norm.route(e.t, ch.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
+    } else {
+        try e.ops.toF32(e.s, ch.x, ch.xf, n * d);
+        try e.ops.f16ToF32(e.s, lay.gate_w, ch.gate_f, c.experts * d);
+        try e.blas.xwT(ch.xf, ch.gate_f, ch.logits, n, d, c.experts);
+        try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
+    }
     if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
+    // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
+    if (n < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
 }
 
@@ -850,8 +943,9 @@ pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     std.mem.swap(u64, &ch.pre, &ch.pre_f);
     ch.start += first;
     ch.n = n;
-    for (host_pos[0..n], 0..) |*q, i| q.* = @intCast(ch.start + i);
-    try upload(e, ch.pos, host_pos.ptr, n * 8);
+    // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for)
+    _ = host_pos;
+    ch.pos += first * 8;
     return true;
 }
 
