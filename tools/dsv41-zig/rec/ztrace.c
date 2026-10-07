@@ -7,8 +7,7 @@
 // kernels that are not Triton's (the extensions' and torch's).
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-#include <cupti.h>
-#include <generated_cuda_runtime_api_meta.h>
+#include <cupti.h>      // with generated_cuda_runtime_api_meta.h (the runtime launch parameters)
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -47,10 +46,10 @@ static int first_time(uint64_t h) {
     return 0;
 }
 
-// A CUDA address: only values in the 48-bit user range are asked about (GB10 device memory is 0xf... there), and the
-// driver's answer is kept by value. Called under mu.
+// A CUDA address (the driver's answer, kept by value; device memory sits both low, 0x3..., and high, 0xf8..., in the
+// 48-bit user range). Called under mu.
 static int is_ptr(uint64_t v) {
-    if ((v >> 40) == 0 || (v >> 48) != 0) return 0;
+    if (v < 0x10000ull || (v >> 48) != 0) return 0;
     size_t i = (size_t)((v * 0x9E3779B97F4A7C15ull) >> 48);
     if (ptr_v[i] == v) return ptr_p[i];
     unsigned int mt = 0;
@@ -67,12 +66,30 @@ static void put_json_str(FILE* f, const char* s) {
     }
 }
 
+// The CUfunction that answers name and parameter queries: a runtime launch hands the driver a CUkernel (a library's
+// kernel, for any context) where a CUfunction goes, and its function in the current context is the one to ask.
+static CUfunction resolve(CUfunction f, const char** name) {
+    const char* n = NULL;
+    if (!f) return NULL;
+    if (cuFuncGetName(&n, f) == CUDA_SUCCESS) {
+        if (!*name) *name = n;
+        return f;
+    }
+    CUfunction g = NULL;
+    if (cuKernelGetFunction(&g, (CUkernel)f) == CUDA_SUCCESS && g && cuFuncGetName(&n, g) == CUDA_SUCCESS) {
+        if (!*name) *name = n;
+        return g;
+    }
+    if (!*name && cuKernelGetName(&n, (CUkernel)f) == CUDA_SUCCESS) *name = n;
+    return NULL;
+}
+
 static void record(const char* name, CUfunction f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
                    unsigned bz, unsigned smem, int pdl, void** params, const char* via) {
     pthread_mutex_lock(&mu);
     ++launches;
     if (via[0] == 'r') ++by_rt;
-    if (!name && f) cuFuncGetName(&name, f);
+    f = resolve(f, &name);
     if (!name) name = "?";
     static char hex[16384];
     size_t hp = 0;
@@ -142,7 +159,7 @@ static void CUPTIAPI callback(void* ud, CUpti_CallbackDomain dom, CUpti_Callback
         if (rt_in) rt_seen = 1;
         if (id == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel || id == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel_ptsz) {
             const cuLaunchKernel_params* p = (const cuLaunchKernel_params*)d->functionParams;
-            record(NULL, p->f, p->gridDimX, p->gridDimY, p->gridDimZ, p->blockDimX, p->blockDimY, p->blockDimZ,
+            record(d->symbolName, p->f, p->gridDimX, p->gridDimY, p->gridDimZ, p->blockDimX, p->blockDimY, p->blockDimZ,
                    p->sharedMemBytes, 0, p->kernelParams, "drv");
         } else {
             const cuLaunchKernelEx_params* p = (const cuLaunchKernelEx_params*)d->functionParams;
@@ -151,7 +168,7 @@ static void CUPTIAPI callback(void* ud, CUpti_CallbackDomain dom, CUpti_Callback
             for (unsigned i = 0; i < c->numAttrs; ++i)
                 if (c->attrs[i].id == CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION)
                     pdl = c->attrs[i].value.programmaticStreamSerializationAllowed;
-            record(NULL, p->f, c->gridDimX, c->gridDimY, c->gridDimZ, c->blockDimX, c->blockDimY, c->blockDimZ,
+            record(d->symbolName, p->f, c->gridDimX, c->gridDimY, c->gridDimZ, c->blockDimX, c->blockDimY, c->blockDimZ,
                    c->sharedMemBytes, pdl, p->kernelParams, "drv");
         }
         return;

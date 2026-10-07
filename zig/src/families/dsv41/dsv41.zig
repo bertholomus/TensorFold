@@ -20,6 +20,9 @@ pub const tri_index = @import("tri_index.zig");
 pub const tri_attn = @import("tri_attn.zig");
 pub const tri_markov = @import("tri_markov.zig");
 pub const tri_hc = @import("tri_hc.zig");
+pub const exl3_prefill = @import("exl3_prefill.zig");
+pub const ops = @import("ops.zig");
+pub const exl3_experts = @import("exl3_experts.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -44,4 +47,7 @@ test {
     refAll(tri_attn);
     refAll(tri_markov);
     refAll(tri_hc);
+    refAll(exl3_prefill);
+    refAll(ops);
+    refAll(exl3_experts);
 }
