@@ -299,15 +299,15 @@ pub const Chunk = struct {
             max_gk = @max(max_gk, lay.wq_a.k + lay.wkv.k);
             max_gz = @max(max_gz, exl3_linear.zFloats(&in_group, 128));
             var wo_k: usize = 0;
-            for (lay.wo_a) |wo| wo_k += wo.k;
+            for (lay.wo_a[0..lay.groups]) |wo| wo_k += wo.k;
             max_gk = @max(max_gk, wo_k);
-            max_gz = @max(max_gz, exl3_linear.zFloats(&lay.wo_a, 128));
+            max_gz = @max(max_gz, exl3_linear.zFloats(lay.wo_a[0..lay.groups], 128));
             var ls: [16]?weights.Linear = @splat(null);
             ls[0] = lay.wq_a;
             ls[1] = lay.wkv;
             ls[2] = lay.wq_b;
             ls[3] = lay.wo_b;
-            for (lay.wo_a, 0..) |wo, g| ls[4 + g] = wo;
+            for (lay.wo_a[0..lay.groups], 0..) |wo, g| ls[4 + g] = wo;
             ls[8] = lay.comp_wkv;
             ls[9] = lay.comp_wgate;
             ls[10] = lay.idx_wq_b;
@@ -338,7 +338,8 @@ pub const Chunk = struct {
             ch.n_counters += 1;
             ch.head_x = try a.take(d * 2);
             ch.head_l = try a.take(l.n * 4);
-            ch.head_g = try a.take(e.world * l.n * 4);
+            const hn = if (e.two) |t| t.hw[0] + t.hw[1] else l.n; // a rank's vocabulary half (2D: both pairs' parts)
+            ch.head_g = try a.take(e.world * hn * 4);
         }
         ch.taps = try a.take(@max(c.dspark_taps.slice().len, 1) * cap * d * 2);
         ch.gxh = try a.take(128 * max_gk * 2);
@@ -877,6 +878,7 @@ pub fn head(e: *const Engine, ch: *Chunk) !void {
     try tri_basic.collapseNorm(e.t, last_h, last_pre, e.w.norm, ch.head_x, c.eps, 1, c.hidden);
     const hl = e.w.head;
     try mmRows(e, ch, 1, hl, ch.head_x, c.hidden, ch.head_l, .fp32, hl.n);
+    if (e.two) |t| return t.quarters(e, ch.head_l, ch.head_g, 1, t.hw, 4); // 2D: the vocabulary quarters, TP2's layout
     try e.comm.allGather(ch.head_l, ch.head_g, hl.n, .f32, e.s);
 }
 

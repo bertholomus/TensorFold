@@ -92,6 +92,7 @@ pub const Two = struct {
     gu: [2]usize, // gate / up's columns a pair
     dw: [2]usize, // down's output columns a pair
     ew: [2]usize, // Engram wkv's output columns a pair (0 without an Engram layer)
+    hw: [2]usize, // the head's vocabulary columns a pair (253 / 252 blocks of a TP2 half)
     parts: u64, // [4, rows, widest] where the all-gathers land
     pad: u64, // this node's part at the wider pair's width (when the pairs' widths differ)
     part_bytes: usize, // the largest part a node sends
@@ -116,6 +117,7 @@ pub const Two = struct {
         var engram = false;
         for (w.layers) |lay| engram = engram or lay.engram_wkv != null;
         t.ew = if (engram) .{ len(s0.engramCols(c.*)), len(s1.engramCols(c.*)) } else .{ 0, 0 };
+        t.hw = .{ len(s0.headCols(c.*)), len(s1.headCols(c.*)) };
         // the weights loaded here are this split's
         const l0 = w.layers[0];
         if (l0.wq_b.n != t.heads * c.head_dim or l0.groups * c.o_lora != t.uw[pp] or l0.wo_b.n != t.ow[pp] or
@@ -123,7 +125,7 @@ pub const Two = struct {
         // prompt.gather assembles either sublayer's partials: both splits must give the same widths
         if (t.ow[0] != t.dw[0] or t.ow[1] != t.dw[1]) return error.UnequalPartialSplits;
         const slots = c.top_k + 1;
-        const biggest = @max(@max(cap * @max(t.ow[0], t.ow[1]) * 4, cap * @max(t.ew[0], t.ew[1]) * 4), @max(cap * @max(t.uw[0], t.uw[1]) * 2, cap * slots * @max(t.gu[0], t.gu[1]) * 2));
+        const biggest = @max(@max(@max(cap * @max(t.ow[0], t.ow[1]) * 4, cap * @max(t.ew[0], t.ew[1]) * 4), @max(cap * @max(t.uw[0], t.uw[1]) * 2, cap * slots * @max(t.gu[0], t.gu[1]) * 2)), @max(t.hw[0], t.hw[1]) * 4);
         t.part_bytes = biggest;
         t.parts = try a.take(4 * biggest);
         t.pad = try a.take(biggest);
