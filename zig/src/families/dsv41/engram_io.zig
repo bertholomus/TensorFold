@@ -1,8 +1,6 @@
 //! Engram rows from the original FP8 tables on local NVMe: a weight row and its scale row a row id, read by offset with
 //! one pread each on a pool of threads (engram_io.cpp's gather_rows2), so a step's random rows cost about one latency.
 const std = @import("std");
-const core = @import("core");
-const st = core.safetensors;
 
 /// One layer's table: [rows, row_w] FP8 weights and [rows, row_s] E8M0 scales, by file and offset.
 pub const Table = struct { fd_w: std.c.fd_t, base_w: u64, row_w: usize, fd_s: std.c.fd_t, base_s: u64, row_s: usize, rows: u64 };
@@ -34,24 +32,25 @@ pub const Tables = struct {
             const n: usize = @intCast(std.mem.readInt(u64, &head, .little));
             const json = try a.alloc(u8, n);
             if (try file.readPositionalAll(io, json, 8) != n) return error.BadSafetensors;
-            const len = try file.length(io);
-            const h = try st.parseHeader(a, json, len - 8 - n);
+            // the header read here (not core.safetensors: the tables are F8_E4M3 values and F8_E8M0 scales)
+            const h = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
+            if (h != .object) return error.BadSafetensors;
             var opened: ?std.c.fd_t = null;
-            var names = h.iterator();
+            var names = h.object.iterator();
             while (names.next()) |kv| {
                 const name = kv.key_ptr.*;
                 const which: usize = if (std.mem.endsWith(u8, name, "engram.embed.weight")) 0 else if (std.mem.endsWith(u8, name, "engram.embed.scale")) 1 else continue;
                 const layer = try layerOf(name);
+                const en = try entry(kv.value_ptr.*);
                 if (opened == null) {
                     const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
                     if (fd < 0) return error.FileNotFound;
                     try t.fds.append(gpa, fd);
                     opened = fd;
                 }
-                const en = kv.value_ptr.*;
                 const gop = try halves.getOrPut(a, layer);
                 if (!gop.found_existing) gop.value_ptr.* = .{ null, null };
-                gop.value_ptr[which] = .{ .fd = opened.?, .base = 8 + n + en.begin, .row = en.dim(1) * en.dtype.size(), .rows = en.dim(0) };
+                gop.value_ptr[which] = .{ .fd = opened.?, .base = 8 + n + en.begin, .row = en.cols * en.size, .rows = en.rows };
             }
         }
         var hv = halves.iterator();
@@ -71,6 +70,28 @@ pub const Tables = struct {
         t.* = undefined;
     }
 };
+
+/// A 2-d header entry's rows, columns, element size and data begin (from the data region's start).
+fn entry(v: std.json.Value) !struct { rows: u64, cols: usize, size: usize, begin: u64 } {
+    if (v != .object) return error.BadSafetensors;
+    const dt = v.object.get("dtype") orelse return error.BadSafetensors;
+    const shape = v.object.get("shape") orelse return error.BadSafetensors;
+    const offs = v.object.get("data_offsets") orelse return error.BadSafetensors;
+    if (dt != .string or shape != .array or shape.array.items.len != 2 or offs != .array or offs.array.items.len != 2) return error.BadSafetensors;
+    const one = [_][]const u8{ "F8_E4M3", "F8_E5M2", "F8_E8M0", "U8", "I8" };
+    const two = [_][]const u8{ "BF16", "F16" };
+    var size: usize = 0;
+    for (one) |x| if (std.mem.eql(u8, dt.string, x)) {
+        size = 1;
+    };
+    for (two) |x| if (std.mem.eql(u8, dt.string, x)) {
+        size = 2;
+    };
+    if (std.mem.eql(u8, dt.string, "F32")) size = 4;
+    if (size == 0) return error.UnsupportedDType;
+    for ([_]std.json.Value{ shape.array.items[0], shape.array.items[1], offs.array.items[0] }) |x| if (x != .integer or x.integer < 0) return error.BadSafetensors;
+    return .{ .rows = @intCast(shape.array.items[0].integer), .cols = @intCast(shape.array.items[1].integer), .size = size, .begin = @intCast(offs.array.items[0].integer) };
+}
 
 fn layerOf(name: []const u8) !u32 {
     // "layers.<id>.engram.embed.weight" (a "model." prefix allowed)
@@ -103,6 +124,8 @@ pub const Pool = struct {
     gen: u64 = 0,
     stop: bool = false,
     job: ?*Job = null,
+    /// Worker threads inside work() on the current job: gather() returns (and its job goes) only once they are out.
+    active: usize = 0,
 
     const Job = struct {
         t: Table,
@@ -155,8 +178,15 @@ pub const Pool = struct {
             }
             seen = p.gen;
             const job = p.job;
+            if (job != null) p.active += 1;
             p.mutex.unlock(p.io);
-            if (job) |j| p.work(j);
+            if (job) |j| {
+                p.work(j);
+                p.mutex.lockUncancelable(p.io);
+                p.active -= 1;
+                p.done_cond.broadcast(p.io);
+                p.mutex.unlock(p.io);
+            }
         }
     }
 
@@ -190,7 +220,7 @@ pub const Pool = struct {
         p.mutex.unlock(p.io);
         p.work(&job);
         p.mutex.lockUncancelable(p.io);
-        while (job.finished.load(.acquire) < ids.len) p.done_cond.waitUncancelable(p.io, &p.mutex);
+        while (job.finished.load(.acquire) < ids.len or p.active > 0) p.done_cond.waitUncancelable(p.io, &p.mutex);
         p.job = null;
         p.mutex.unlock(p.io);
         if (job.failed.load(.monotonic)) return error.ReadFailed;

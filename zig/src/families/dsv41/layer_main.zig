@@ -1,16 +1,19 @@
-//! tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N]: the Zig port's layer gate (M3).
+//! tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--engram DIR --token-map FILE]:
+//! the Zig port's layer gate (M3).
 //! Both ranks run the first 2,048-row prompt chunk the recording's layer fixtures hold through the port's prompt
 //! forward (prompt.zig) on their GPUs and compare every point a layer exchanges with the served build's bytes: the
-//! attention's input rows and partial, its gather, the MoE's input rows and partial, its gather. One JSON line a point;
+//! attention's input rows and partial, its gather, the MoE's input rows and partial, its gather, and on an Engram layer
+//! its rows' projection and their gather. One JSON line a point;
 //! the first difference stops the run (its first differing element and how many differ).
 //! REC_DIR: aot/ (the recording's Triton set), cubins/ (linear.cubin, experts.cubin, experts_cb.cubin: the served
-//! extension cubins), rope-plain-{cos,sin}.f32 and rope.json (zrec_fixtures.py), rank<R>/layers.jsonl and layers/.
+//! extension cubins), rope-plain-{cos,sin}.f32, rope.json and engram.json (zrec_fixtures.py), rank<R>/layers.jsonl and
+//! layers/. Engram layers need the original Engram tables (DIR) and the compressed token map (the lane's JSON cache).
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const prompt = dsv41.prompt;
 
-const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N]\n";
+const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--engram DIR --token-map FILE] [--dump DIR]\n";
 const rope_rows = 8192; // the plain table's first rows (chunk 0's positions and more)
 const chunk_rows = 2048;
 
@@ -74,7 +77,7 @@ const Run = struct {
         };
         try r.s.synchronize();
         const bytes = numel(pt.shape) * dtypeBytes(pt.dtype);
-        if (bytes > r.host.len) return error.PointTooBig;
+        if (bytes > r.host.len) r.host = try r.a.alloc(u8, bytes); // the arena: no free
         try r.d.check(r.d.api.cuMemcpyDtoH_v2(r.host.ptr, dev, bytes), "cuMemcpyDtoH");
         var h: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(r.host[0..bytes], &h, .{});
@@ -136,7 +139,23 @@ pub fn main(init: std.process.Init) !u8 {
     const port = try std.fmt.parseInt(u16, args[6], 10);
     const rec = args[7];
     var layers: usize = 1;
-    if (args.len >= 10 and std.mem.eql(u8, args[8], "--layers")) layers = try std.fmt.parseInt(usize, args[9], 10);
+    var engram_dir: ?[]const u8 = null;
+    var token_map: ?[]const u8 = null;
+    var dump: ?[]const u8 = null;
+    var ai: usize = 8;
+    while (ai + 1 < args.len) : (ai += 2) {
+        const key = args[ai];
+        const val = args[ai + 1];
+        if (std.mem.eql(u8, key, "--layers")) {
+            layers = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--engram")) {
+            engram_dir = val;
+        } else if (std.mem.eql(u8, key, "--token-map")) {
+            token_map = val;
+        } else if (std.mem.eql(u8, key, "--dump")) {
+            dump = val;
+        } else return error.BadArgument;
+    }
 
     var out_buf: [1 << 14]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);
@@ -235,15 +254,50 @@ pub fn main(init: std.process.Init) !u8 {
     try w_out.print("{{\"rank\": {d}, \"loaded_s\": {d:.1}, \"weights_bytes\": {d}, \"chunk_call\": {d}, \"rows\": {d}, \"arena_bytes\": {d}}}\n", .{ rank, load_s, w.bytes, start_call, ids.len, arena.used });
     try w_out.flush();
 
+    // Engram on the host: the compressed token map, the recording's multipliers, the tables and 64 readers
+    var eh: ?prompt.EngramHost = null;
+    var tables: dsv41.engram_io.Tables = undefined;
+    var pool: ?*dsv41.engram_io.Pool = null;
+    defer if (pool) |p| p.deinit(gpa);
+    defer if (eh != null) tables.close();
+    if (engram_dir) |edir| {
+        const map_text = try std.Io.Dir.cwd().readFileAlloc(io, token_map orelse return error.NoTokenMap, a, .limited(1 << 26));
+        const map = try std.json.parseFromSliceLeaky([]i32, a, map_text, .{});
+        const EngramJson = struct { multipliers: [][]i64 };
+        const ej_text = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ rec, "engram.json" }), a, .limited(1 << 26));
+        const ej = try std.json.parseFromSliceLeaky(EngramJson, a, ej_text, .{ .ignore_unknown_fields = true });
+        var mult: [dsv41.engram.max_layers][dsv41.engram.max_ngram]i64 = @splat(@splat(0));
+        for (ej.multipliers, 0..) |row, l| for (row, 0..) |v, k| {
+            mult[l][k] = v;
+        };
+        tables = try dsv41.engram_io.Tables.open(gpa, io, edir);
+        pool = try dsv41.engram_io.Pool.init(gpa, io, 64);
+        eh = try prompt.EngramHost.init(a, &cfg, dsv41.engram.Hasher.init(cfg, map, mult), &tables, pool.?, rank, world, chunk_rows);
+    }
+    const seq = try a.alloc(i32, ids.len);
+    for (seq, ids) |*q, id| q.* = @intCast(id);
+
     var run: Run = .{ .a = a, .io = io, .d = &driver, .s = stream, .fx = &fx, .rank = rank, .out = w_out, .host = try a.alloc(u8, 2 * chunk_rows * cfg.hidden * 4) };
     const host_pos = try a.alloc(i64, chunk_rows);
     try prompt.begin(&eng, &ch, ids, 0, host_pos);
     var after = start_call;
     for (0..layers) |li| {
         const l: i64 = @intCast(li);
+        var label_buf: [64]u8 = undefined;
+        if (w.layers[li].engram_wkv != null) {
+            const e_h = if (eh) |*x| x else return report(w_out, rank, li, "engram", error.NoEngramTables);
+            prompt.engramApply(&eng, &ch, e_h, li, seq) catch |err| return report(w_out, rank, li, "engram", err);
+            if (dump) |dir| dumpEngram(a, io, dir, li, rank, e_h, ch.n) catch |err| {
+                try w_out.print("{{\"rank\": {d}, \"dump\": \"{s}\"}}\n", .{ rank, @errorName(err) });
+                try w_out.flush();
+            };
+            const eg = fx.find(after, "Comm.gather", null, "in1");
+            if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} engram projection", .{li}), eg, ch.ek)) break;
+            if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} engram gather", .{li}), fx.find(after, "Comm.gather", null, "out"), ch.ekg)) break;
+            after = eg.?.call;
+        }
         const att = fx.find(after, "Model.attention_k", l, "in2") orelse return error.NoLayerFixture;
         prompt.attnMixes(&eng, &ch, li) catch |err| return report(w_out, rank, li, "attention mixes", err);
-        var label_buf: [64]u8 = undefined;
         if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention in", .{li}), att, ch.x)) break;
         prompt.attention(&eng, &ch, li, rings[li], 0) catch |err| return report(w_out, rank, li, "attention", err);
         if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention partial", .{li}), fx.find(after, "Model.attention_k", l, "out"), ch.pa)) break;
@@ -255,13 +309,26 @@ pub fn main(init: std.process.Init) !u8 {
         prompt.moe(&eng, &ch, li) catch |err| return report(w_out, rank, li, "moe", err);
         if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe partial", .{li}), fx.find(att.call, "Model.moe", l, "out"), ch.pm)) break;
         try prompt.gather(&eng, &ch, ch.pm, ch.gm);
-        if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe gather", .{li}), fx.find(mo.?.call, "Comm.gather", null, "out"), ch.gm)) break;
+        const mg = fx.find(mo.?.call, "Comm.gather", null, "out");
+        if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe gather", .{li}), mg, ch.gm)) break;
         prompt.endLayer(&ch);
-        after = mo.?.call;
+        after = mg.?.call;
     }
     try w_out.print("{{\"rank\": {d}, \"layers\": {d}, \"all_equal\": {}}}\n", .{ rank, layers, run.ok });
     try w_out.flush();
     return if (run.ok) 0 else 1;
+}
+
+/// The Engram rows' ids and their bf16 rows of layer li, for the served Engram.rows (zrec_engram_ref.py).
+fn dumpEngram(a: std.mem.Allocator, io: std.Io, dir: []const u8, li: usize, rank: u32, eh: *const prompt.EngramHost, n: usize) !void {
+    const m = n * (eh.hi - eh.lo);
+    const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    for ([_][]const u8{ "ids.i64", "rows.bf16" }, [_][]const u8{ std.mem.sliceAsBytes(eh.flat[0..m]), std.mem.sliceAsBytes(eh.rows[0 .. m * t.row_w]) }) |ext, bytes| {
+        const path = try std.fmt.allocPrint(a, "{s}/engram-L{d}-r{d}.{s}", .{ dir, li, rank, ext });
+        var f = try std.Io.Dir.cwd().createFile(io, path, .{});
+        defer f.close(io);
+        try f.writePositionalAll(io, bytes, 0);
+    }
 }
 
 fn report(w: *std.Io.Writer, rank: u32, li: usize, step: []const u8, err: anyerror) !u8 {
