@@ -1,6 +1,6 @@
 // The device half of DeepSeek-V4.1's one-hop RDMA all-gather (the Python family's cuda/rdma_gather.cu v7). The staging
 // kernel copies this rank's fp32 slice into a pinned host ring slot and rings a doorbell; the host's proxy thread
-// (rdma_ring.zig) RDMA-writes the slot to every peer with an immediate and publishes a peer's flag once all its parts
+// (rdma.zig) RDMA-writes the slot to every peer with an immediate and publishes a peer's flag once all its parts
 // are in; the collecting kernels wait for the flags and copy the slots out in rank order, or straight into the caller's
 // views (gather_into). The kernel bodies are the served build's; only their names are the family's.
 // v7: a nonzero `pdl` makes each kernel wait for the one before it and let the next one launch (programmatic dependent

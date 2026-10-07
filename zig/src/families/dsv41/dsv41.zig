@@ -26,7 +26,7 @@ pub const exl3_experts = @import("exl3_experts.zig");
 pub const prompt = @import("prompt.zig");
 pub const exact = @import("exact.zig");
 pub const rdma_seq = @import("rdma_seq.zig");
-pub const rdma_ring = @import("rdma_ring.zig");
+pub const rdma = @import("rdma.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -57,5 +57,5 @@ test {
     refAll(prompt);
     refAll(exact);
     refAll(rdma_seq);
-    refAll(rdma_ring);
+    refAll(rdma);
 }

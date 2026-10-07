@@ -1,4 +1,4 @@
-//! The RDMA ring's sequence bookkeeping (rdma_ring.zig's proxy thread), apart from the verbs so it can be tested: a
+//! The RDMA ring's sequence bookkeeping (rdma.zig's proxy thread), apart from the verbs so it can be tested: a
 //! slot's parts over the devices, a peer's parts back to whole sequences, and when a slot's writes have all been sent.
 const std = @import("std");
 

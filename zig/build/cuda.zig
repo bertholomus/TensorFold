@@ -122,6 +122,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_layer.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-layer", .root_module = ds_layer }));
     // the RDMA ring across real nodes (rdma_ring.zig): rendezvous, gathers at each row count, every float checked
+    // the RDMA ring across real nodes (rdma.zig): rendezvous, gathers at each row count, every float checked
     const ds_rdma = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/rdma_bench_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_rdma.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_rdma.addImport("cuda", cuda);
@@ -136,7 +137,7 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     dsv41.addImport("cuda", cuda);
     dsv41.addImport("lanes", lanes);
     dsv41.addImport("core", core);
-    // the RDMA ring's verbs (rdma_ring.zig)
+    // the RDMA ring's verbs (rdma.zig)
     dsv41.addImport("fabric", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/fabric.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
