@@ -26,6 +26,7 @@ const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
+const exl3_linear = @import("exl3_linear.zig");
 
 /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
 pub const ring_extra = 16;
@@ -64,6 +65,7 @@ pub const Engine = struct {
     blas: *const cublas.Blas,
     comm: *const comm.Comm,
     pf: *const exl3_prefill.Kernels,
+    lin: *const exl3_linear.Kernels,
     ex: *const exl3_experts.Kernels,
     ops: *const ops.Ops,
     exact: *const exact.Exact,
@@ -151,6 +153,12 @@ pub const Chunk = struct {
     kv: u64 = 0, // bf16 [cap, hc * D + D]: the ranks' sum
     ws: exl3_prefill.Workspace,
     blas_ws: u64, // cuBLAS workspace
+    // the grouped EXL3 linears of decode-sized rows (1..128): rotated rows, split-K partials, each layer's counters
+    gxh: u64 = 0, // fp16 [128, the largest group's sum of K]
+    gz: u64 = 0, // fp32 [the largest group's split-K partials at 128 rows]
+    counters: [640]Counter = undefined,
+    n_counters: usize = 0,
+    ktop: u64 = 0, // int64 [cap, index_topk]: torch's top-k values for _topk_finish
     pending: bool = false, // gm holds a MoE gather whose post is not in h yet
 
     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
@@ -226,6 +234,7 @@ pub const Chunk = struct {
             ch.keys = try a.take(cap * ch.max_comp * 8);
             ch.tmax = try a.take(cap * ((ch.max_comp + tri_index.tile - 1) / tri_index.tile) * 8);
             ch.cidx = try a.take(cap * c.index_topk * 8);
+            ch.ktop = try a.take(cap * c.index_topk * 8);
         }
         for (e.w.layers) |lay| {
             const ew = lay.engram_wkv orelse continue;
@@ -266,16 +275,94 @@ pub const Chunk = struct {
         }
         ch.ws = .{ .xh = try a.take(cap * max_xk * 2), .w = try a.take(max_kn * 2), .h = try a.take(128 * 128 * 2) };
         ch.blas_ws = try a.take(cublas.Blas.workspace_bytes);
+        // grouped linears: every layer's counters (int32 [8 N / 128], zeros, left zero by each launch), the largest
+        // group's rotated rows and partials at 128 rows
+        var max_gk: usize = 0;
+        var max_gz: usize = 0;
+        ch.n_counters = 0;
+        for (e.w.layers) |lay| {
+            const in_group = [_]weights.Linear{ lay.wq_a, lay.wkv };
+            max_gk = @max(max_gk, lay.wq_a.k + lay.wkv.k);
+            max_gz = @max(max_gz, exl3_linear.zFloats(&in_group, 128));
+            var wo_k: usize = 0;
+            for (lay.wo_a) |wo| wo_k += wo.k;
+            max_gk = @max(max_gk, wo_k);
+            max_gz = @max(max_gz, exl3_linear.zFloats(&lay.wo_a, 128));
+            var ls: [16]?weights.Linear = @splat(null);
+            ls[0] = lay.wq_a;
+            ls[1] = lay.wkv;
+            ls[2] = lay.wq_b;
+            ls[3] = lay.wo_b;
+            for (lay.wo_a, 0..) |wo, g| ls[4 + g] = wo;
+            ls[8] = lay.comp_wkv;
+            ls[9] = lay.comp_wgate;
+            ls[10] = lay.idx_wq_b;
+            ls[11] = lay.idx_wk;
+            ls[12] = lay.engram_wkv;
+            for (ls) |ol| {
+                const l = ol orelse continue;
+                max_gk = @max(max_gk, l.k);
+                max_gz = @max(max_gz, exl3_linear.zFloats(&[_]weights.Linear{l}, 128));
+                if (ch.n_counters == ch.counters.len) return error.TooManyLinears;
+                const bytes = 8 * (l.n / 128) * 4;
+                const ptr = try a.take(bytes);
+                try fill(e, ptr, 0, bytes);
+                ch.counters[ch.n_counters] = .{ .words = l.words, .ptr = ptr };
+                ch.n_counters += 1;
+            }
+        }
+        ch.gxh = try a.take(128 * max_gk * 2);
+        ch.gz = try a.take(@max(max_gz, 1) * 4);
         // the scratch as experts.py makes it: zeros, the member lists -1
-        for ([_]u64{ xs.xg, xs.xu, xs.xd, xs.z, xs.no_y, xs.ids, xs.count, xs.counts }, [_]usize{ sz[0], sz[1], sz[2], sz[3], sz[4], sz[5], sz[6], sz[7] }) |p, n| try e.d.check(e.d.api.cuMemsetD8_v2(p, 0, n), "cuMemsetD8");
-        try e.d.check(e.d.api.cuMemsetD32_v2(xs.members, 0xffffffff, sz[8] / 4), "cuMemsetD32");
-        try e.d.check(e.d.api.cuMemsetD8_v2(ch.neg, 0xff, cap * 8), "cuMemsetD8");
+        for ([_]u64{ xs.xg, xs.xu, xs.xd, xs.z, xs.no_y, xs.ids, xs.count, xs.counts }, [_]usize{ sz[0], sz[1], sz[2], sz[3], sz[4], sz[5], sz[6], sz[7] }) |p, n| try fill(e, p, 0, n);
+        try fill32(e, xs.members, 0xffffffff, sz[8] / 4);
+        try fill(e, ch.neg, 0xff, cap * 8);
         var had: [128 * 128]u16 = undefined;
         exl3_prefill.hadamard(&had);
-        try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.ws.h, &had, had.len * 2), "cuMemcpyHtoD");
+        try upload(e, ch.ws.h, &had, had.len * 2);
         return ch;
     }
 };
+
+/// Host bytes to the device in the stream's order (the stream is non-blocking: the legacy stream's synchronous copies
+/// would not wait for its kernels). Pageable host memory is staged before the call returns.
+fn upload(e: *const Engine, dst: u64, src: *const anyopaque, bytes: usize) !void {
+    try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(dst, src, bytes, e.s.handle), "cuMemcpyHtoDAsync");
+}
+
+/// cuMemsetD8 in the stream's order.
+fn fill(e: *const Engine, dst: u64, value: u8, bytes: usize) !void {
+    try e.d.check(e.d.api.cuMemsetD8Async(dst, value, bytes, e.s.handle), "cuMemsetD8Async");
+}
+
+/// cuMemsetD32 in the stream's order.
+fn fill32(e: *const Engine, dst: u64, value: u32, words: usize) !void {
+    try e.d.check(e.d.api.cuMemsetD32Async(dst, value, words, e.s.handle), "cuMemsetD32Async");
+}
+
+/// A layer's split-K counters (Exl3Linear.counters) by its trellis words.
+pub const Counter = struct { words: u64, ptr: u64 };
+
+fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
+    for (ch.counters[0..ch.n_counters]) |c| if (c.words == l.words) return c.ptr;
+    return error.NoCounters;
+}
+
+/// Exl3Group(ls) on m (1..128) rows (linear.py): one rot_many launch rotating every layer's input rows xs[i] (bf16,
+/// row stride ldxs[i]) into the group's buffer, then a glinear launch for each (bits, warps) set, outputs into outs[i]
+/// (row stride ldos[i], dtype types[i]); programmatic dependent launches, split-K partials dropped from L2 (the served
+/// TF_EXL3_PDL and TF_EXL3_L2_DISCARD).
+fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
+    if (m == 0 or m > 128 or ls.len > 8) return error.NotADecodeWindow;
+    var calls: [8]exl3_linear.Call = undefined;
+    var off: usize = 0;
+    for (ls, 0..) |l, i| {
+        calls[i] = .{ .layer = l, .x = xs[i], .ldx = @intCast(ldxs[i]), .x_dtype = .bf16, .xh = ch.gxh + off * 2, .y = outs[i], .ldy = @intCast(ldos[i]), .y_dtype = types[i], .counters = try counterOf(ch, l) };
+        off += m * l.k;
+    }
+    try exl3_linear.rotMany(e.lin, e.s, calls[0..ls.len], m, true);
+    try exl3_linear.glinear(e.lin, e.s, calls[0..ls.len], m, ch.gz, true, true);
+}
 
 /// One sequence's compressed-attention caches (model.py SeqCache: comp, index_k, comp_raw), by kv-source layer: the
 /// compressed latents as packed FP4 (codes [rows, head_dim / 2], E8M0 scales [rows, head_dim / 16]), the index keys
@@ -298,19 +385,19 @@ pub const Caches = struct {
             const rows = cap / r + 2;
             cs.comp_codes[i] = try a.take(rows * c.head_dim / 2);
             cs.comp_scales[i] = try a.take(rows * c.head_dim / 16);
-            try e.d.check(e.d.api.cuMemsetD8_v2(cs.comp_codes[i], 0, rows * c.head_dim / 2), "cuMemsetD8");
-            try e.d.check(e.d.api.cuMemsetD8_v2(cs.comp_scales[i], 0, rows * c.head_dim / 16), "cuMemsetD8");
+            try fill(e, cs.comp_codes[i], 0, rows * c.head_dim / 2);
+            try fill(e, cs.comp_scales[i], 0, rows * c.head_dim / 16);
             if (lay.idx_wk != null) {
                 cs.idx_codes[i] = try a.take(rows * c.index_head_dim / 2);
                 cs.idx_scales[i] = try a.take(rows * c.index_head_dim / 32);
-                try e.d.check(e.d.api.cuMemsetD8_v2(cs.idx_codes[i], 0, rows * c.index_head_dim / 2), "cuMemsetD8");
-                try e.d.check(e.d.api.cuMemsetD8_v2(cs.idx_scales[i], 127, rows * c.index_head_dim / 32), "cuMemsetD8");
+                try fill(e, cs.idx_codes[i], 0, rows * c.index_head_dim / 2);
+                try fill(e, cs.idx_scales[i], 127, rows * c.index_head_dim / 32);
             }
             if (r > 1) {
                 cs.raw_kv[i] = try a.take(raw_rows * c.head_dim * 4);
                 cs.raw_score[i] = try a.take(raw_rows * c.head_dim * 4);
-                try e.d.check(e.d.api.cuMemsetD8_v2(cs.raw_kv[i], 0, raw_rows * c.head_dim * 4), "cuMemsetD8");
-                try e.d.check(e.d.api.cuMemsetD8_v2(cs.raw_score[i], 0, raw_rows * c.head_dim * 4), "cuMemsetD8");
+                try fill(e, cs.raw_kv[i], 0, raw_rows * c.head_dim * 4);
+                try fill(e, cs.raw_score[i], 0, raw_rows * c.head_dim * 4);
             }
         }
         return cs;
@@ -330,8 +417,8 @@ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_
     ch.start = start;
     ch.pending = false;
     for (host_pos[0..n], 0..) |*p, i| p.* = @intCast(start + i);
-    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.ids, ids.ptr, n * 8), "cuMemcpyHtoD");
-    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.pos, host_pos.ptr, n * 8), "cuMemcpyHtoD");
+    try upload(e, ch.ids, ids.ptr, n * 8);
+    try upload(e, ch.pos, host_pos.ptr, n * 8);
     try tri_basic.embedInit(e.t, e.w.embed, ch.ids, ch.h, ch.pre, n, e.c.hidden, e.c.hc);
 }
 
@@ -356,10 +443,19 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     }
 }
 
-/// mm(layer, x, out_dtype) of a prompt chunk (more than 128 rows): the prompt GEMM.
+/// mm(layer, x, out_dtype) of m rows: the prompt GEMM beyond 128 rows, the layer's own group (GROUPED) up to 128.
+fn mmRows(e: *const Engine, ch: *const Chunk, m: usize, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
+    if (m > 128) return exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, m);
+    const dt: exl3_linear.DType = switch (out_type) {
+        .bf16 => .bf16,
+        .fp32 => .f32,
+    };
+    try grouped(e, ch, m, &.{l}, &.{x}, &.{ldx}, &.{out}, &.{os}, &.{dt});
+}
+
+/// mm of the chunk's rows.
 fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: usize, out: u64, out_type: tri_markov.OutType, os: usize) !void {
-    if (ch.n <= 128) return error.NotPortedYet; // decode-sized rows take the grouped EXL3 linears
-    try exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, ch.n);
+    try mmRows(e, ch, ch.n, l, x, ldx, out, out_type, os);
 }
 
 /// attention_k: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the layer's window ring
@@ -377,18 +473,30 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     const rope = if (lay.ratio != 0) e.compressed else e.plain;
     const ring_rows = c.window + ring_extra;
     if (n <= ring_extra) return error.NotPortedYet; // ring mode (verify windows)
-    // attn_in: wq_a and wkv of x, one prompt GEMM each
-    try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
-    try mm(e, ch, lay.wkv, ch.x, c.hidden, ch.y, .bf16, hd);
+    // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
+    if (n > 128) {
+        try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
+        try mm(e, ch, lay.wkv, ch.x, c.hidden, ch.y, .bf16, hd);
+    } else {
+        try grouped(e, ch, n, &.{ lay.wq_a, lay.wkv }, &.{ ch.x, ch.x }, &.{ c.hidden, c.hidden }, &.{ ch.qa, ch.y }, &.{ lay.wq_a.n, hd }, &.{ .bf16, .bf16 });
+    }
     try tri_basic.rmsnorm(e.t, ch.qa, lay.wq_a.n, lay.q_norm, ch.qr, lay.wq_a.n, c.eps, n, lay.wq_a.n);
     try mm(e, ch, lay.wq_b, ch.qr, lay.wq_a.n, ch.q, .bf16, hl * hd);
     try tri_norm.ropeHeads(e.t, ch.q, rope.cos, rope.sin, ch.pos, rd, false, n, hl, hd);
     // the window keys: the ring's last window - 1 positions before start, then this chunk's rows
     const lo = @max(floor, start -| (c.window - 1));
-    if (start > lo) return error.NotPortedYet; // a later chunk: the ring rows before it (row gather)
     const wsrc_rows = start - lo + n;
+    if (start > lo) {
+        // wsrc[:start - lo] = ring[arange(lo, start) % R]
+        var ridx: [256]i64 = undefined;
+        if (start - lo > ridx.len) return error.WindowTooLong;
+        for (0..start - lo) |j| ridx[j] = @intCast((lo + j) % ring_rows);
+        try upload(e, ch.ring_idx, &ridx, (start - lo) * 8);
+        try fill(e, ch.invalid, 0, 4);
+        try e.ops.gatherRows(e.s, ring, ring_rows, ch.ring_idx, ch.wsrc, hd * 2, start - lo, ch.invalid);
+    }
     var lo64: i64 = @intCast(lo);
-    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.wlo, &lo64, 8), "cuMemcpyHtoD");
+    try upload(e, ch.wlo, &lo64, 8);
     const kv = ch.wsrc + (start - lo) * hd * 2;
     // slots -1: the keys go to wsrc only (ring_mode is off); the ring is written after the attention
     try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.neg, c.eps, true, rd, kv, n, hd);
@@ -403,7 +511,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         var vis_host: [4096]i64 = undefined;
         if (n > vis_host.len) return error.ChunkTooLong;
         for (0..n) |i| vis_host[i] = @intCast((start + i + 1) / r);
-        try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.vis, &vis_host, n * 8), "cuMemcpyHtoD");
+        try upload(e, ch.vis, &vis_host, n * 8);
         if (lay.idx_wq_b) |wqb| try indexer(e, ch, cs, sh, li, wqb, src, n_comp_end, rope);
         const kk = sh.kk orelse return error.NoIndexerSelection;
         comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
@@ -437,17 +545,29 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const p = start + n - keep + j;
         idx[p % ring_rows] = @intCast(n - keep + j);
     }
-    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.ring_idx, &idx, keep * 8), "cuMemcpyHtoD");
-    try e.d.check(e.d.api.cuMemsetD8_v2(ch.invalid, 0, 4), "cuMemsetD8");
+    try upload(e, ch.ring_idx, &idx, keep * 8);
+    try fill(e, ch.invalid, 0, 4);
     try e.ops.gatherRows(e.s, kv, n, ch.ring_idx, ring, hd * 2, keep, ch.invalid);
     // wo_a: each group's column block of o read in place, written into its column block of u; then wo_b to fp32
     const groups = lay.wo_a.len;
     const gk = hl * hd / groups;
     const uw = groups * lay.wo_a[0].n;
     var col: usize = 0;
-    for (lay.wo_a, 0..) |wo, g| {
-        try mm(e, ch, wo, ch.o + g * gk * 2, hl * hd, ch.u + col * 2, .bf16, uw);
-        col += wo.n;
+    if (n > 128) {
+        for (lay.wo_a, 0..) |wo, g| {
+            try mm(e, ch, wo, ch.o + g * gk * 2, hl * hd, ch.u + col * 2, .bf16, uw);
+            col += wo.n;
+        }
+    } else {
+        // one group: the column blocks of o read in place, written into u's column blocks
+        var xs: [4]u64 = undefined;
+        var outs: [4]u64 = undefined;
+        for (lay.wo_a, 0..) |wo, g| {
+            xs[g] = ch.o + g * gk * 2;
+            outs[g] = ch.u + col * 2;
+            col += wo.n;
+        }
+        try grouped(e, ch, n, &lay.wo_a, &xs, &.{ hl * hd, hl * hd, hl * hd, hl * hd }, &outs, &.{ uw, uw, uw, uw }, &.{ .bf16, .bf16, .bf16, .bf16 });
     }
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
 }
@@ -482,8 +602,8 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
             const row = n - keep + j;
             idx[(start + row) % raw_rows] = @intCast(row);
         }
-        try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.raw_idx, &idx, keep * 8), "cuMemcpyHtoD");
-        try e.d.check(e.d.api.cuMemsetD8_v2(ch.invalid, 0, 4), "cuMemsetD8");
+        try upload(e, ch.raw_idx, &idx, keep * 8);
+        try fill(e, ch.invalid, 0, 4);
         try e.ops.gatherRows(e.s, ch.kvc, n, ch.raw_idx, cs.raw_kv[li], hd * 4, keep, ch.invalid);
         try e.ops.gatherRows(e.s, ch.scc, n, ch.raw_idx, cs.raw_score[li], hd * 4, keep, ch.invalid);
         if (full == 0) return error.NotPortedYet;
@@ -499,13 +619,12 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
         g_host[j] = @intCast(start / r + j);
         p_host[j] = @intCast((start / r + j) * r);
     }
-    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.groups, &g_host, full * 8), "cuMemcpyHtoD");
-    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.gpos, &p_host, full * 8), "cuMemcpyHtoD");
+    try upload(e, ch.groups, &g_host, full * 8);
+    try upload(e, ch.gpos, &p_host, full * 8);
     const rot = e.compressed;
     if (lay.idx_wk) |iwk| {
         const id = c.index_head_dim;
-        if (full <= 128) return error.NotPortedYet; // decode-sized: the grouped EXL3 linear
-        try exl3_prefill.matmul(e.pf, e.t, ch.ws, iwk, ch.lat, .bf16, hd, ch.lat2, .bf16, id, full);
+        try mmRows(e, ch, full, iwk, ch.lat, hd, ch.lat2, .bf16, id);
         try e.exact.rmsNorm(e.s, ch.lat2, id, lay.idx_k_norm, ch.ik, id, full, id, c.eps);
         try e.exact.rope(e.s, ch.ik, id, id - rd, rot.cos, rot.sin, ch.gpos, full, rd / 2, false);
         // switch "comp": the packed cache's rows in one launch (fp4_store: store_rows' bytes)
@@ -544,14 +663,16 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     if (!keyed) return error.NotPortedYet; // the candidate pool's layers
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
     try tri_index.indexScore(e.t, ch.iq4, k, ch.iw, ch.vis, n_comp_end, ch.keys, null, true, ch.tmax, false, n, ih, id);
-    const no_topk: tri_index.TopK = .{ .top = 0, .run = noTorchTopk };
+    const torch_topk: tri_index.TopK = .{ .top = ch.ktop, .ctx = @ptrCast(@constCast(e)), .run = torchTopk };
     if (tri_index.prunes(n_comp_end, kk)) return error.NotPortedYet; // the pruned search's buffers
-    try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, ch.vis, ch.cidx, .{ .tpos = 0, .cand = 0, .every = 0 }, no_topk, n, n_comp_end);
+    try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, ch.vis, ch.cidx, .{ .tpos = 0, .cand = 0, .every = 0 }, torch_topk, n, n_comp_end);
     sh.kk = kk;
 }
 
-fn noTorchTopk(_: ?*anyopaque, _: tri.Tri, _: u64, _: usize, _: usize, _: usize, _: usize, _: u64) anyerror!void {
-    return error.NotPortedYet; // torch.topk of more keys than the fused selection takes
+/// topk_select's torch step, keys.topk(k).values: the top-k set of the unique int64 keys (ops.topkI64).
+fn torchTopk(ctx: ?*anyopaque, _: tri.Tri, keys: u64, ks: usize, rows: usize, n: usize, k: usize, top: u64) anyerror!void {
+    const e: *const Engine = @ptrCast(@alignCast(ctx.?));
+    try e.ops.topkI64(e.s, keys, ks, rows, n, k, top);
 }
 
 /// hd ** -0.5 as Triton passes the Python float: rounded to fp32.
@@ -650,7 +771,7 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
     for (0..m) |i| engram.decodeRow(eh.w[i * t.row_w ..][0..t.row_w], eh.s[i * t.row_s ..][0..t.row_s], eh.rows[i * t.row_w ..][0..t.row_w]);
     if (m * t.row_w != n * ew.k) return error.EngramShape;
-    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.eb, eh.rows.ptr, m * t.row_w * 2), "cuMemcpyHtoD");
+    try upload(e, ch.eb, eh.rows.ptr, m * t.row_w * 2);
     try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
     try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
     if (e.world != 2) return error.NotPortedYet; // Comm.sum of more ranks: acc += g[r]
