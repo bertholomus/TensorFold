@@ -131,6 +131,8 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     dsv41.addImport("cuda", cuda);
     dsv41.addImport("lanes", lanes);
     dsv41.addImport("core", core);
+    // the RDMA ring's verbs (rdma_ring.zig)
+    dsv41.addImport("fabric", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/fabric.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
