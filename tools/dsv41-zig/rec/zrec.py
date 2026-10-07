@@ -262,11 +262,13 @@ LAYER_POINTS = [
     ("cuda.dspark", "Drafter", "absorb", (1, 2)),                # dc, sc: caches
     ("cuda.dspark", "Drafter", "absorb_many", (1, 2)),           # dpool, sc
     ("cuda.dspark", "Drafter", "draft", (1, 2)),                 # dc, sc
+    # the target's sampler (M5b): each call's logits rows, positions and tokens (the sampling object is no tensor)
+    ("cuda.engine", "DsEngine", "_sample"),
 ]
 # saved whole whatever the layer (TF_ZREC_WHOLE=<where>,... overrides: a token recording keeps only the prompts)
 WHOLE = tuple(x for x in os.environ["TF_ZREC_WHOLE"].split(",") if x) if "TF_ZREC_WHOLE" in os.environ else (
     "Model.forward", "RoundRunner.forward", "RoundDecoder.run", "BatchDraftGraph.run", "BatchDraftGraph._stages_fused",
-    "Markov.steps", "Drafter.absorb", "Drafter.absorb_many", "Drafter.draft")
+    "Markov.steps", "Drafter.absorb", "Drafter.absorb_many", "Drafter.draft", "DsEngine._sample")
 # TF_ZREC_ONLY=<where>,...: only these points are written (a token recording: the prompts ids and the rounds inputs)
 ONLY = {x for x in os.environ.get("TF_ZREC_ONLY", "").split(",") if x}
 LAYERS_ON = "TF_ZREC_LAYERS" in os.environ
