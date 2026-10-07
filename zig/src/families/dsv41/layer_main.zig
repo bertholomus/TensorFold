@@ -164,6 +164,8 @@ pub fn main(init: std.process.Init) !u8 {
     var engram_dir: ?[]const u8 = null;
     var token_map: ?[]const u8 = null;
     var dump: ?[]const u8 = null;
+    var rdma_devices: ?[]const u8 = null; // 2D: the decode-size exchanges over RDMA rings (ring2d.zig) on these devices
+    var rdma_kernels: ?[]const u8 = null; // their kernels' image (rdma_gather.cu's fatbin)
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -184,6 +186,10 @@ pub fn main(init: std.process.Init) !u8 {
             token_map = val;
         } else if (std.mem.eql(u8, key, "--dump")) {
             dump = val;
+        } else if (std.mem.eql(u8, key, "--rdma")) {
+            rdma_devices = val;
+        } else if (std.mem.eql(u8, key, "--rdma-kernels")) {
+            rdma_kernels = val;
         } else return error.BadArgument;
     }
 
@@ -289,6 +295,20 @@ pub fn main(init: std.process.Init) !u8 {
     defer arena.deinit();
     var blas_ws_ptr: u64 = undefined;
     var two: ?dsv41.prompt2d.Two = if (sp.pair != null) try dsv41.prompt2d.Two.init(&cfg, &w, &arena, sp, chunk_rows) else null;
+    // 2D with --rdma: the rings (their infos go round over NCCL world 4)
+    var rdma_mod: ?cuda.Module = null;
+    defer if (rdma_mod) |*m| m.unload();
+    var rdma_rings: ?dsv41.ring2d.Rings = null;
+    defer if (rdma_rings) |*r| r.close(gpa);
+    if (two != null and rdma_devices != null) {
+        const image = try std.Io.Dir.cwd().readFileAllocOptions(io, rdma_kernels orelse return error.NoRdmaKernels, a, .limited(1 << 26), .@"16", null);
+        rdma_mod = try cuda.Module.load(&driver, image);
+        var devices: std.ArrayList([]const u8) = .empty;
+        var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
+        while (dit.next()) |d| try devices.append(a, d);
+        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 5 }, &comm, stream);
+        two.?.rings = &rdma_rings.?;
+    }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
     // the caches' positions: the deepest round's bucket and the widest extent the recording reaches
     var tokens: usize = cache_tokens;
