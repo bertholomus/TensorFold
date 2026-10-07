@@ -334,7 +334,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         return null;
     };
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
-    const weights = weightBytes(io, o.dir);
+    // a family that splits the checkpoint over several GPUs reports its own share
+    const weights = if (@hasDecl(F, "weightBytes")) F.weightBytes(io, o.dir) else weightBytes(io, o.dir);
     const held0 = cuda.usage(false).device;
     if (weights > before.room(held0)) {
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
