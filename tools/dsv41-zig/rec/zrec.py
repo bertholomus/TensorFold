@@ -186,7 +186,10 @@ def _rows_bucket(prefix: str):
 
 
 PHASES = [
-    # (module under FAMILY, class, method, phase)
+    # (module under FAMILY, class or None for a module function, method, phase)
+    ("cuda.engine", "DsEngine", "__init__", "init"),
+    ("cuda.weights", None, "load", "load"),
+    ("cuda.weights", None, "attach_vl_bias", "load"),
     ("cuda.engine", "DsEngine", "warm", "warm"),
     ("cuda.engine", "DsEngine", "vision_warm", "vision_warm"),
     ("cuda.engine", "DsEngine", "prefill_steps", "prompt"),

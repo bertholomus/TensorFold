@@ -13,7 +13,7 @@ bad = []
 for mod, owner, attr, _ in zrec.PHASES:
     try:
         m = importlib.import_module(f"{zrec.FAMILY}.{mod}")
-        if not getattr(getattr(getattr(m, owner), attr), "_zrec", False):
+        if not getattr(getattr(getattr(m, owner) if owner else m, attr), "_zrec", False):
             bad.append(f"{mod}.{owner}.{attr}")
     except Exception as e:
         bad.append(f"{mod}.{owner}.{attr} ({e!r})")
