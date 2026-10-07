@@ -18,6 +18,7 @@ pub const Ops = struct {
     to_f32: cuda.Function,
     f16_to_f32: cuda.Function,
     add2_bf16: cuda.Function,
+    topk_i64: cuda.Function,
     to_bf16: cuda.Function,
     strided: cuda.Function,
     gather: cuda.Function,
@@ -37,6 +38,7 @@ pub const Ops = struct {
             .to_f32 = try pw.function("tf_bf16_to_f32_kernel"),
             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
             .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
+            .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
             .to_bf16 = try pw.function("tf_f32_to_bf16_kernel"),
             .strided = try mv.function("tf_strided_copy_kernel"),
             .gather = try mv.function("tf_gather_rows_kernel"),
@@ -83,6 +85,20 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(u64, count));
         try go(o.add2_bf16, s, blocks(count, 256), 256, &a);
+    }
+
+    /// keys.topk(k, sorted=False).values of unique int64 keys [rows, n] (row stride ks) into top [rows, k], the set in no
+    /// particular order (_topk_finish sorts the indices).
+    pub fn topkI64(o: *const Ops, s: cuda.Stream, keys: u64, ks: usize, rows: usize, n: usize, k: usize, top: u64) !void {
+        if (rows == 0) return;
+        if (k > n) return error.BadTopK;
+        var a: cuda.Args = .{};
+        a.add(keys);
+        a.add(@as(c_longlong, @intCast(ks)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(k)));
+        a.add(top);
+        try cuda.launch.launch(o.topk_i64, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a);
     }
 
     /// `.to(torch.bfloat16)` of `count` fp32 values (round to nearest even).

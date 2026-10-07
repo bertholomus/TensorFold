@@ -1,8 +1,9 @@
 """The Zig port's torch-op kernels (zig/kernels/cuda/dsv41_torch.cu) against the served build's own torch code on this
 GPU, byte for byte: ops.rms_norm (128 and 512 wide, 1 to 2,048 rows), _compress's ratio-2 softmax with the weighted
-sum, and ops.rope_ (forward and inverse). One JSON line a test and a summary.
+sum, and ops.rope_ (forward and inverse); with OPS_FATBIN (dsv41_ops.cu), tf_ds_topk_i64 against torch.topk's values
+(as a set: _topk_finish sorts them). One JSON line a test and a summary.
 
-  python zrec_torchlab.py FATBIN MODEL_DIR
+  python zrec_torchlab.py FATBIN MODEL_DIR [OPS_FATBIN]
 """
 
 import ctypes
@@ -23,13 +24,13 @@ def ok(r: int, what: str) -> None:
         raise RuntimeError(f"{what}: CUresult {r}")
 
 
-def load(path: str):
+def load(path: str, names=("tf_ds_rms_norm_kernel", "tf_ds_compress2_kernel", "tf_ds_rope_kernel")):
     torch.zeros(1, device="cuda")            # torch's primary context, current on this thread
     mod = ctypes.c_void_p()
     img = open(path, "rb").read()
     ok(cu.cuModuleLoadData(ctypes.byref(mod), ctypes.c_char_p(img)), "cuModuleLoadData")
     out = {}
-    for name in ("tf_ds_rms_norm_kernel", "tf_ds_compress2_kernel", "tf_ds_rope_kernel"):
+    for name in names:
         f = ctypes.c_void_p()
         ok(cu.cuModuleGetFunction(ctypes.byref(f), mod, name.encode()), name)
         out[name] = f
@@ -148,6 +149,31 @@ def main() -> None:
                         ptr(pos), ctypes.c_int(rows), ctypes.c_int(half), ctypes.c_int(int(inverse))])
                 torch.cuda.synchronize()
                 report(op="rope", width=width, rows=rows, inverse=inverse, differ=differ(out, ref))
+    # torch's keys.topk(k).values of unique int64 keys (the indexer's: score bits above, an index below), as a set
+    if len(sys.argv) > 3:
+        t = load(sys.argv[3], ("tf_ds_topk_i64_kernel",))["tf_ds_topk_i64_kernel"]
+        for rows, n, k, ks, case in ((1, 1114, 512, 1114, "unique"), (181, 1114, 512, 1114, "unique"),
+                                     (181, 1025, 512, 1025, "unique"), (64, 4097, 512, 4097, "unique"),
+                                     (3, 600, 7, 640, "unique"), (2, 513, 512, 513, "unique"), (5, 2000, 1, 2000, "unique"),
+                                     (181, 1114, 512, 1114, "ties"), (181, 1114, 512, 1114, "dups"),
+                                     (16, 1114, 512, 1114, "masked")):
+            hi = torch.randint(-2**31, 2**31 - 1, (rows, ks), device="cuda", generator=g, dtype=torch.int64)
+            if case in ("ties", "dups"):
+                hi = hi % 5 - 2                                # a few high words: long runs of equal leading digits
+            lo = torch.randperm(2**20, device="cuda", generator=g)[:ks].to(torch.int64).expand(rows, ks)
+            keys = (hi << 32) | (2**31 - 1 - lo)
+            if case == "dups":
+                keys[:, 1::3] = keys[:, 0:ks - 1:3][:, :keys[:, 1::3].shape[1]]   # repeated values (a multiset)
+            if case == "masked":
+                keys[:, n // 3:] = torch.iinfo(torch.int64).min + torch.arange(ks - n // 3, device="cuda")
+            view = keys[:, :n]
+            ref = view.topk(k, dim=1, sorted=False).values.sort(dim=1).values
+            out = torch.full((rows, k), 7, dtype=torch.int64, device="cuda")
+            launch(t, (rows, 1, 1), (1024, 1, 1), 0,
+                   [ptr(keys), ctypes.c_longlong(ks), ctypes.c_int(n), ctypes.c_int(k), ptr(out)])
+            torch.cuda.synchronize()
+            got = out.sort(dim=1).values
+            report(op="topk_i64", rows=rows, n=n, k=k, ks=ks, case=case, differ=int((got != ref).sum()))
     print(json.dumps({"summary": {"tests": len(lines), "failed": bad, "eps": eps}}), flush=True)
 
 

@@ -1,22 +1,24 @@
-//! tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--engram DIR --token-map FILE]:
-//! the Zig port's layer gate (M3).
-//! Both ranks run the first 2,048-row prompt chunk the recording's layer fixtures hold through the port's prompt
-//! forward (prompt.zig) on their GPUs and compare every point a layer exchanges with the served build's bytes: the
-//! attention's input rows and partial, its gather, the MoE's input rows and partial, its gather, and on an Engram layer
-//! its rows' projection and their gather. One JSON line a point;
+//! tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F]
+//!   [--engram DIR --token-map FILE] [--dump DIR]: the Zig port's layer gate (M3).
+//! Both ranks run the recorded prompt's first C chunks (each Model.forward of the layer fixtures, in order; the
+//! compressed caches and the window rings carried from chunk to chunk) through the port's prompt forward (prompt.zig)
+//! on their GPUs, at most N layers a chunk, and from chunk F on compare every point a layer exchanges with the served
+//! build's bytes: the attention's input rows and partial, its gather, the MoE's input rows and partial, its gather, and
+//! on an Engram layer its rows' projection and their gather. One JSON line a point;
 //! the first difference stops the run (its first differing element and how many differ).
-//! REC_DIR: aot/ (the recording's Triton set), cubins/ (linear.cubin, experts.cubin, experts_cb.cubin: the served
-//! extension cubins), rope-{plain,compressed}-{cos,sin}.f32, rope.json and engram.json (zrec_fixtures.py), rank<R>/layers.jsonl and
+//! REC_DIR: aot/ (the recording's Triton set), cubins/ (linear.cubin, linear_grouped.cubin, experts.cubin,
+//! experts_cb.cubin: the served extension cubins), rope-{plain,compressed}-{cos,sin}.f32, rope.json and engram.json (zrec_fixtures.py), rank<R>/layers.jsonl and
 //! layers/. Engram layers need the original Engram tables (DIR) and the compressed token map (the lane's JSON cache).
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const prompt = dsv41.prompt;
 
-const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--engram DIR --token-map FILE] [--dump DIR]\n";
+const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--engram DIR --token-map FILE] [--dump DIR]\n";
 const rope_rows = 8192; // the plain table's first rows (chunk 0's positions and more)
 const chunk_rows = 2048;
 const cache_tokens = 4096; // the compressed caches' positions (the recorded prompt's)
+const max_chunks = 8;
 
 /// One fixture line of layers.jsonl.
 const Point = struct {
@@ -140,6 +142,8 @@ pub fn main(init: std.process.Init) !u8 {
     const port = try std.fmt.parseInt(u16, args[6], 10);
     const rec = args[7];
     var layers: usize = 1;
+    var chunks: usize = 1;
+    var check_from: usize = 0;
     var engram_dir: ?[]const u8 = null;
     var token_map: ?[]const u8 = null;
     var dump: ?[]const u8 = null;
@@ -149,6 +153,10 @@ pub fn main(init: std.process.Init) !u8 {
         const val = args[ai + 1];
         if (std.mem.eql(u8, key, "--layers")) {
             layers = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--chunks")) {
+            chunks = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--check-from")) {
+            check_from = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--engram")) {
             engram_dir = val;
         } else if (std.mem.eql(u8, key, "--token-map")) {
@@ -180,18 +188,23 @@ pub fn main(init: std.process.Init) !u8 {
         try points.append(a, p);
     }
     const fx: Fixtures = .{ .points = points.items, .dir = rank_dir };
-    // the first 2,048-row chunk: Model.forward's ids
-    var start_call: u64 = 0;
-    var ids_file: ?[]const u8 = null;
+    // the prompt's chunks: each Model.forward's ids, and the layers the recording ran on it
+    var chunk_call: [max_chunks + 1]u64 = undefined;
+    var chunk_ids: [max_chunks][]const i64 = undefined;
+    var n_chunks: usize = 0;
     for (fx.points) |p| {
-        if (std.mem.eql(u8, p.where, "Model.forward") and std.mem.eql(u8, p.arg, "in2") and p.shape.len == 1 and p.shape[0] == chunk_rows) {
-            start_call = p.call;
-            ids_file = p.file;
-            break;
-        }
+        if (n_chunks == chunks or n_chunks == max_chunks) break;
+        if (!std.mem.eql(u8, p.where, "Model.forward") or !std.mem.eql(u8, p.arg, "in2") or p.shape.len != 1) continue;
+        const ids_bytes = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rank_dir, "layers", p.file orelse return error.NoChunkFixture }), a, .limited(1 << 20), .@"8", null);
+        chunk_call[n_chunks] = p.call;
+        chunk_ids[n_chunks] = std.mem.bytesAsSlice(i64, ids_bytes);
+        if (chunk_ids[n_chunks].len > chunk_rows) return error.ChunkTooLong;
+        n_chunks += 1;
     }
-    const ids_bytes = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rank_dir, "layers", ids_file orelse return error.NoChunkFixture }), a, .limited(1 << 20), .@"8", null);
-    const ids = std.mem.bytesAsSlice(i64, ids_bytes);
+    if (n_chunks < chunks) return error.NoChunkFixture;
+    chunk_call[n_chunks] = std.math.maxInt(u64);
+    var total: usize = 0;
+    for (chunk_ids[0..n_chunks]) |ids| total += ids.len;
 
     // the weights (no DSpark blocks) from the lane's rank cache
     const t0 = std.Io.Timestamp.now(io, .awake);
@@ -217,6 +230,9 @@ pub fn main(init: std.process.Init) !u8 {
     const lin = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rec, "cubins", "linear.cubin" }), a, .limited(1 << 28), .@"16", null);
     var pf = try dsv41.exl3_prefill.Kernels.load(&driver, lin);
     defer pf.unload();
+    const lgc = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rec, "cubins", "linear_grouped.cubin" }), a, .limited(1 << 28), .@"16", null);
+    var lg = try dsv41.exl3_linear.Kernels.load(&driver, lgc);
+    defer lg.unload();
     const exb = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rec, "cubins", "experts.cubin" }), a, .limited(1 << 28), .@"16", null);
     const exc = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rec, "cubins", "experts_cb.cubin" }), a, .limited(1 << 28), .@"16", null);
     var exk = try dsv41.exl3_experts.Kernels.load(&driver, exb, exc, dsv41.exl3_linear.codebook_mul1);
@@ -244,10 +260,9 @@ pub fn main(init: std.process.Init) !u8 {
     var arena = try prompt.Arena.init(&driver, 3 << 30);
     defer arena.deinit();
     var blas_ws_ptr: u64 = undefined;
-    var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = world, .plain = rope, .compressed = rope_c };
+    var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = world, .plain = rope, .compressed = rope_c };
     var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, cache_tokens);
     const caches = try prompt.Caches.init(&eng, &arena, cache_tokens);
-    var shared: prompt.Shared = .{};
     blas_ws_ptr = ch.blas_ws;
     var blas = try dsv41.cublas.Blas.open(stream, blas_ws_ptr);
     defer blas.close();
@@ -255,10 +270,12 @@ pub fn main(init: std.process.Init) !u8 {
     const rings = try a.alloc(u64, cfg.layers);
     for (rings) |*r| {
         r.* = try arena.take(eng.ringBytes());
-        try driver.check(driver.api.cuMemsetD8_v2(r.*, 0, eng.ringBytes()), "cuMemsetD8");
+        try driver.check(driver.api.cuMemsetD8Async(r.*, 0, eng.ringBytes(), stream.handle), "cuMemsetD8Async");
     }
+    try stream.synchronize();
+    try driver.check(driver.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
 
-    try w_out.print("{{\"rank\": {d}, \"loaded_s\": {d:.1}, \"weights_bytes\": {d}, \"chunk_call\": {d}, \"rows\": {d}, \"arena_bytes\": {d}}}\n", .{ rank, load_s, w.bytes, start_call, ids.len, arena.used });
+    try w_out.print("{{\"rank\": {d}, \"loaded_s\": {d:.1}, \"weights_bytes\": {d}, \"chunks\": {d}, \"rows\": {d}, \"arena_bytes\": {d}}}\n", .{ rank, load_s, w.bytes, n_chunks, total, arena.used });
     try w_out.flush();
 
     // Engram on the host: the compressed token map, the recording's multipliers, the tables and 64 readers
@@ -281,49 +298,88 @@ pub fn main(init: std.process.Init) !u8 {
         pool = try dsv41.engram_io.Pool.init(gpa, io, 64);
         eh = try prompt.EngramHost.init(a, &cfg, dsv41.engram.Hasher.init(cfg, map, mult), &tables, pool.?, rank, world, chunk_rows);
     }
-    const seq = try a.alloc(i32, ids.len);
-    for (seq, ids) |*q, id| q.* = @intCast(id);
+    // the whole sequence's ids (Engram hashes n-grams across chunk boundaries)
+    const seq = try a.alloc(i32, total);
+    {
+        var at: usize = 0;
+        for (chunk_ids[0..n_chunks]) |ids| for (ids) |id| {
+            seq[at] = @intCast(id);
+            at += 1;
+        };
+    }
 
     var run: Run = .{ .a = a, .io = io, .d = &driver, .s = stream, .fx = &fx, .rank = rank, .out = w_out, .host = try a.alloc(u8, 2 * chunk_rows * cfg.hidden * 4) };
     const host_pos = try a.alloc(i64, chunk_rows);
-    try prompt.begin(&eng, &ch, ids, 0, host_pos);
-    var after = start_call;
+    var start: usize = 0;
+    var ran: usize = 0;
+    for (chunk_ids[0..n_chunks], 0..) |ids, ci| {
+        // the layers the recording ran on this chunk (its attention points before the next chunk)
+        var rec_layers: usize = 0;
+        for (fx.points) |p| {
+            if (p.call <= chunk_call[ci] or p.call >= chunk_call[ci + 1] or !std.mem.eql(u8, p.where, "Model.attention_k")) continue;
+            if (p.layer) |l| rec_layers = @max(rec_layers, @as(usize, @intCast(l)) + 1);
+        }
+        const n_layers = @min(layers, rec_layers);
+        try w_out.print("{{\"rank\": {d}, \"chunk\": {d}, \"call\": {d}, \"start\": {d}, \"rows\": {d}, \"layers\": {d}, \"recorded_layers\": {d}, \"checked\": {}}}\n", .{ rank, ci, chunk_call[ci], start, ids.len, n_layers, rec_layers, ci >= check_from });
+        try w_out.flush();
+        var shared: prompt.Shared = .{};
+        try prompt.begin(&eng, &ch, ids, start, host_pos);
+        if (!try runChunk(&run, &eng, &ch, &caches, &shared, rings, if (eh) |*x| x else null, seq[0 .. start + ids.len], chunk_call[ci], n_layers, ci >= check_from, dump)) {
+            run.ok = false;
+            break;
+        }
+        start += ids.len;
+        ran += 1;
+    }
+    try w_out.print("{{\"rank\": {d}, \"chunks\": {d}, \"layers\": {d}, \"all_equal\": {}}}\n", .{ rank, ran, layers, run.ok });
+    try w_out.flush();
+    return if (run.ok) 0 else 1;
+}
+
+/// One chunk's layers through the prompt forward, each exchange checked against the fixtures after the chunk's call
+/// when `check` (else only run). False on the first difference or a step's error (reported).
+fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, shared: *prompt.Shared, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, call: u64, layers: usize, checked: bool, dump: ?[]const u8) !bool {
+    const fx = run.fx;
+    const w_out = run.out;
+    const rank = run.rank;
+    var after = call;
     for (0..layers) |li| {
         const l: i64 = @intCast(li);
         var label_buf: [64]u8 = undefined;
-        if (w.layers[li].engram_wkv != null) {
-            const e_h = if (eh) |*x| x else return report(w_out, rank, li, "engram", error.NoEngramTables);
-            prompt.engramApply(&eng, &ch, e_h, li, seq) catch |err| return report(w_out, rank, li, "engram", err);
-            if (dump) |dir| dumpEngram(a, io, dir, li, rank, e_h, ch.n) catch |err| {
+        if (eng.w.layers[li].engram_wkv != null) {
+            const e_h = eh orelse return report(w_out, rank, li, "engram", error.NoEngramTables);
+            prompt.engramApply(eng, ch, e_h, li, seq) catch |err| return report(w_out, rank, li, "engram", err);
+            if (dump) |dir| dumpEngram(run.a, run.io, dir, li, rank, e_h, ch.n) catch |err| {
                 try w_out.print("{{\"rank\": {d}, \"dump\": \"{s}\"}}\n", .{ rank, @errorName(err) });
                 try w_out.flush();
             };
-            const eg = fx.find(after, "Comm.gather", null, "in1");
-            if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} engram projection", .{li}), eg, ch.ek)) break;
-            if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} engram gather", .{li}), fx.find(after, "Comm.gather", null, "out"), ch.ekg)) break;
-            after = eg.?.call;
+            const eg = fx.find(after, "Comm.gather", null, "in1") orelse return report(w_out, rank, li, "engram fixture", error.NoLayerFixture);
+            if (checked) {
+                if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} engram projection", .{li}), eg, ch.ek)) return false;
+                if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} engram gather", .{li}), fx.find(after, "Comm.gather", null, "out"), ch.ekg)) return false;
+            }
+            after = eg.call;
         }
-        const att = fx.find(after, "Model.attention_k", l, "in2") orelse return error.NoLayerFixture;
-        prompt.attnMixes(&eng, &ch, li) catch |err| return report(w_out, rank, li, "attention mixes", err);
-        if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention in", .{li}), att, ch.x)) break;
-        prompt.attention(&eng, &ch, &caches, &shared, li, rings[li], 0) catch |err| return report(w_out, rank, li, "attention", err);
-        if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention partial", .{li}), fx.find(after, "Model.attention_k", l, "out"), ch.pa)) break;
-        try prompt.gather(&eng, &ch, ch.pa, ch.ga);
-        if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention gather", .{li}), fx.find(att.call, "Comm.gather", null, "out"), ch.ga)) break;
-        prompt.ffnMixes(&eng, &ch, li) catch |err| return report(w_out, rank, li, "ffn mixes", err);
-        const mo = fx.find(att.call, "Model.moe", l, "in2");
-        if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe in", .{li}), mo, ch.x)) break;
-        prompt.moe(&eng, &ch, li) catch |err| return report(w_out, rank, li, "moe", err);
-        if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe partial", .{li}), fx.find(att.call, "Model.moe", l, "out"), ch.pm)) break;
-        try prompt.gather(&eng, &ch, ch.pm, ch.gm);
-        const mg = fx.find(mo.?.call, "Comm.gather", null, "out");
-        if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe gather", .{li}), mg, ch.gm)) break;
-        prompt.endLayer(&ch);
-        after = mg.?.call;
+        const att = fx.find(after, "Model.attention_k", l, "in2") orelse return report(w_out, rank, li, "attention fixture", error.NoLayerFixture);
+        prompt.attnMixes(eng, ch, li) catch |err| return report(w_out, rank, li, "attention mixes", err);
+        if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention in", .{li}), att, ch.x)) return false;
+        prompt.attention(eng, ch, caches, shared, li, rings[li], 0) catch |err| return report(w_out, rank, li, "attention", err);
+        if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention partial", .{li}), fx.find(after, "Model.attention_k", l, "out"), ch.pa)) return false;
+        try prompt.gather(eng, ch, ch.pa, ch.ga);
+        if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention gather", .{li}), fx.find(att.call, "Comm.gather", null, "out"), ch.ga)) return false;
+        prompt.ffnMixes(eng, ch, li) catch |err| return report(w_out, rank, li, "ffn mixes", err);
+        const mo = fx.find(att.call, "Model.moe", l, "in2") orelse return report(w_out, rank, li, "moe fixture", error.NoLayerFixture);
+        if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe in", .{li}), mo, ch.x)) return false;
+        prompt.moe(eng, ch, li) catch |err| return report(w_out, rank, li, "moe", err);
+        if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe partial", .{li}), fx.find(att.call, "Model.moe", l, "out"), ch.pm)) return false;
+        try prompt.gather(eng, ch, ch.pm, ch.gm);
+        const mg = fx.find(mo.call, "Comm.gather", null, "out") orelse return report(w_out, rank, li, "moe gather fixture", error.NoLayerFixture);
+        if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe gather", .{li}), mg, ch.gm)) return false;
+        prompt.endLayer(ch);
+        after = mg.call;
     }
-    try w_out.print("{{\"rank\": {d}, \"layers\": {d}, \"all_equal\": {}}}\n", .{ rank, layers, run.ok });
-    try w_out.flush();
-    return if (run.ok) 0 else 1;
+    try run.s.synchronize();
+    return true;
 }
 
 /// The Engram rows' ids and their bf16 rows of layer li, for the served Engram.rows (zrec_engram_ref.py).
@@ -338,8 +394,8 @@ fn dumpEngram(a: std.mem.Allocator, io: std.Io, dir: []const u8, li: usize, rank
     }
 }
 
-fn report(w: *std.Io.Writer, rank: u32, li: usize, step: []const u8, err: anyerror) !u8 {
+fn report(w: *std.Io.Writer, rank: u32, li: usize, step: []const u8, err: anyerror) !bool {
     try w.print("{{\"rank\": {d}, \"layer\": {d}, \"step\": \"{s}\", \"error\": \"{s}\"}}\n", .{ rank, li, step, @errorName(err) });
     try w.flush();
-    return 1;
+    return false;
 }
