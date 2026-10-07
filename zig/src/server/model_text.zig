@@ -10,6 +10,8 @@ pub const RenderOptions = struct {
     /// Also ``thinking_mode`` ("thinking" or "chat") for templates that read that switch.
     enable_thinking: bool = false,
     reasoning_effort: ?[]const u8 = null,
+    /// The family's number for that effort (Info.efforts): the template hears the number instead of the name.
+    reasoning_effort_value: ?i64 = null,
 };
 
 pub const Error = error{ Template, OutOfMemory };

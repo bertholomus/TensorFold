@@ -103,6 +103,9 @@ pub const Sink = struct {
     event: *const fn (ctx: *anyopaque, id: Id, event: *const Event) void,
 };
 
+/// A reasoning effort name and the number a family's chat template takes for it (DeepSeek-V4.1's: "medium" -> 62).
+pub const Effort = struct { name: []const u8, value: i64 };
+
 /// What the engine serves, fixed once it has loaded.
 pub const Info = struct {
     name: []const u8 = "lanes",
@@ -119,6 +122,9 @@ pub const Info = struct {
     prefill_step: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
     startup: []const u8 = "",
+    /// The reasoning efforts the family's template takes as numbers: each name passes as asked and the template hears
+    /// its number. Empty: the names the template quotes, as text (the nearest one for any other name).
+    efforts: []const Effort = &.{},
 };
 
 /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.

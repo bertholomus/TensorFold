@@ -37,6 +37,7 @@ test {
     _ = @import("messages.zig");
     _ = @import("stream_preflight_test.zig");
     _ = @import("late_system_test.zig");
+    _ = @import("effort_values_test.zig");
     _ = @import("compact_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
