@@ -4,9 +4,12 @@
 //! partials, the FFN mixes with that post fused in (hc_pre_pf), the MoE and its gather, whose post goes into the next
 //! layer's mixes (switch "hc_pf2"); before an Engram layer's mixes, its Engram (engram_apply). Compressed layers
 //! (ratio 1, 2): a kv source's compressor and index keys into the caches (kv_source_update), the indexer's top-k
-//! (prompt_keys: scored keys and the selection), and the sparse attention over the window and the selected latents.
-//! Not yet: the candidate pool's layers (the candidate source and after), later chunks' carried rows (the ring, the
-//! positional store); those return error.NotPortedYet.
+//! (prompt_keys: scored keys and the selection; from the candidate source on: fp32 scores and topk_indices), and the
+//! sparse attention over the window (a later chunk's first keys from the ring) and the selected latents. Decode-sized
+//! rows (1..128) take the grouped EXL3 linears. With replay (bounded replay prefill) the decoder's first layer cuts the
+//! chunk to its rows at or past replay (replayCut); DSpark taps (tap) and the head on the last row (head) end it.
+//! Not yet: ring mode (verify windows), a pool that leaves blocks out, a chunk starting inside a compressor group;
+//! those return error.NotPortedYet.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -134,6 +137,7 @@ pub const Chunk = struct {
     iw: u64 = 0, // bf16 [cap, index_heads]: the heads' weights
     vis: u64 = 0, // int64 [cap]: compressed entries a row sees
     keys: u64 = 0, // int64 [cap, max_comp]
+    score: u64 = 0, // fp32 [cap, max_comp]: the candidate pool's layers' index scores
     tmax: u64 = 0, // int64 [cap, cdiv(max_comp, 64)]
     cidx: u64 = 0, // int64 [cap, index_topk]: the selected latents
     max_comp: usize = 0,
@@ -159,6 +163,11 @@ pub const Chunk = struct {
     counters: [640]Counter = undefined,
     n_counters: usize = 0,
     ktop: u64 = 0, // int64 [cap, index_topk]: torch's top-k values for _topk_finish
+    // the DSpark taps and the head
+    taps: u64 = 0, // bf16 [taps, cap, D]: each tap layer's mean of the streams (Model.forward's taps)
+    head_x: u64 = 0, // bf16 [1, D]: collapse_norm of the last row
+    head_l: u64 = 0, // fp32 [1, this rank's vocabulary columns]: its logits
+    head_g: u64 = 0, // fp32 [world, 1, columns]: their gather (the prompt's logits, rank after rank)
     pending: bool = false, // gm holds a MoE gather whose post is not in h yet
 
     /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
@@ -232,6 +241,7 @@ pub const Chunk = struct {
             ch.iw = try a.take(cap * c.index_heads * 2);
             ch.vis = try a.take(cap * 8);
             ch.keys = try a.take(cap * ch.max_comp * 8);
+            ch.score = try a.take(cap * ch.max_comp * 4);
             ch.tmax = try a.take(cap * ((ch.max_comp + tri_index.tile - 1) / tri_index.tile) * 8);
             ch.cidx = try a.take(cap * c.index_topk * 8);
             ch.ktop = try a.take(cap * c.index_topk * 8);
@@ -311,6 +321,22 @@ pub const Chunk = struct {
                 ch.n_counters += 1;
             }
         }
+        {
+            // the head: one row through its own group
+            const l = e.w.head;
+            max_gk = @max(max_gk, l.k);
+            max_gz = @max(max_gz, exl3_linear.zFloats(&[_]weights.Linear{l}, 128));
+            if (ch.n_counters == ch.counters.len) return error.TooManyLinears;
+            const bytes = 8 * (l.n / 128) * 4;
+            const ptr = try a.take(bytes);
+            try fill(e, ptr, 0, bytes);
+            ch.counters[ch.n_counters] = .{ .words = l.words, .ptr = ptr };
+            ch.n_counters += 1;
+            ch.head_x = try a.take(d * 2);
+            ch.head_l = try a.take(l.n * 4);
+            ch.head_g = try a.take(e.world * l.n * 4);
+        }
+        ch.taps = try a.take(@max(c.dspark_taps.slice().len, 1) * cap * d * 2);
         ch.gxh = try a.take(128 * max_gk * 2);
         ch.gz = try a.take(@max(max_gz, 1) * 4);
         // the scratch as experts.py makes it: zeros, the member lists -1
@@ -461,7 +487,7 @@ fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: usize,
 /// attention_k: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the layer's window ring
 /// (bf16 [window + RING_EXTRA, head_dim]). A compressed layer also attends to its kv source's latents the indexer picks
 /// (a kv source first compresses the chunk into them). `floor`: no window key before this position.
-pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, ring: u64, floor: usize) !void {
+pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, ring: u64, floor: usize, kv_done: bool) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const n = ch.n;
@@ -504,7 +530,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     var n_idx: usize = 0;
     if (lay.ratio != 0) {
         const r: usize = lay.ratio;
-        if (lay.comp_wkv != null) try kvSourceUpdate(e, ch, cs, sh, li);
+        if (lay.comp_wkv != null and !kv_done) try kvSourceUpdate(e, ch, cs, sh, li);
         const src = sh.kv_layer orelse return error.NoKvSource;
         const n_comp_end = (start + n) / r;
         // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
@@ -539,15 +565,10 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     try tri_norm.ropeHeads(e.t, ch.o, rope.cos, rope.sin, ch.pos, rd, true, n, hl, hd);
     // ring[pos[-keep:] % R] = kv[-keep:]
     const keep = @min(n, ring_rows);
-    if (keep != ring_rows) return error.NotPortedYet; // fewer rows than the ring: a scatter of some slots
     var idx: [256]i64 = undefined;
-    for (0..keep) |j| {
-        const p = start + n - keep + j;
-        idx[p % ring_rows] = @intCast(n - keep + j);
-    }
+    for (0..keep) |j| idx[j] = @intCast((start + n - keep + j) % ring_rows);
     try upload(e, ch.ring_idx, &idx, keep * 8);
-    try fill(e, ch.invalid, 0, 4);
-    try e.ops.gatherRows(e.s, kv, n, ch.ring_idx, ring, hd * 2, keep, ch.invalid);
+    try e.ops.scatterRows(e.s, kv + (n - keep) * hd * 2, hd * 2, ch.ring_idx, ring, hd * 2, hd * 2, keep);
     // wo_a: each group's column block of o read in place, written into its column block of u; then wo_b to fp32
     const groups = lay.wo_a.len;
     const gk = hl * hd / groups;
@@ -595,17 +616,12 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
         try mm(e, ch, cwkv, ch.x, c.hidden, ch.kvc, .fp32, hd);
         try mm(e, ch, lay.comp_wgate.?, ch.x, c.hidden, ch.scc, .fp32, hd);
         // rk[pw] = kv[-keep:], rs[pw] = score[-keep:]: pw = positions start + n - keep .. % RAW
-        if (n < raw_rows) return error.NotPortedYet; // fewer rows than the store: a scatter of some slots
-        const keep: usize = raw_rows;
+        const keep: usize = @min(n, raw_rows);
         var idx: [raw_rows]i64 = undefined;
-        for (0..keep) |j| {
-            const row = n - keep + j;
-            idx[(start + row) % raw_rows] = @intCast(row);
-        }
+        for (0..keep) |j| idx[j] = @intCast((start + n - keep + j) % raw_rows);
         try upload(e, ch.raw_idx, &idx, keep * 8);
-        try fill(e, ch.invalid, 0, 4);
-        try e.ops.gatherRows(e.s, ch.kvc, n, ch.raw_idx, cs.raw_kv[li], hd * 4, keep, ch.invalid);
-        try e.ops.gatherRows(e.s, ch.scc, n, ch.raw_idx, cs.raw_score[li], hd * 4, keep, ch.invalid);
+        try e.ops.scatterRows(e.s, ch.kvc + (n - keep) * hd * 4, hd * 4, ch.raw_idx, cs.raw_kv[li], hd * 4, hd * 4, keep);
+        try e.ops.scatterRows(e.s, ch.scc + (n - keep) * hd * 4, hd * 4, ch.raw_idx, cs.raw_score[li], hd * 4, hd * 4, keep);
         if (full == 0) return error.NotPortedYet;
         try e.exact.compress2(e.s, ch.kvc, ch.scc, ch.lat2, full, hd);
         try e.exact.rmsNorm(e.s, ch.lat2, hd, lay.comp_norm, ch.lat, hd, full, hd, c.eps);
@@ -660,8 +676,19 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1))));
     if (rb < n) return error.NotPortedYet; // more than one row block
     const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
-    if (!keyed) return error.NotPortedYet; // the candidate pool's layers
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
+    if (!keyed) {
+        // the candidate source and the layers after it: fp32 scores, the pool (_candidates at the source,
+        // apply_candidates after it), topk_indices and -1 past vis. While every block of the scores fits in the pool
+        // (cand_blocks of them) the pool keeps each block with a finite score (the newest pinned: it holds the row's
+        // last visible key) and apply_candidates rewrites only scores already -inf: no launch changes a byte.
+        const nb = (n_comp_end + c.candidate_block - 1) / c.candidate_block;
+        if (nb > c.candidate_blocks) return error.NotPortedYet; // a pool that leaves blocks out
+        try tri_index.indexScore(e.t, ch.iq4, k, ch.iw, ch.vis, n_comp_end, ch.score, null, false, null, false, n, ih, id);
+        try e.ops.topkIndices(e.s, ch.score, n_comp_end, n, n_comp_end, kk, ch.vis, ch.cidx);
+        sh.kk = kk;
+        return;
+    }
     try tri_index.indexScore(e.t, ch.iq4, k, ch.iw, ch.vis, n_comp_end, ch.keys, null, true, ch.tmax, false, n, ih, id);
     const torch_topk: tri_index.TopK = .{ .top = ch.ktop, .ctx = @ptrCast(@constCast(e)), .run = torchTopk };
     if (tri_index.prunes(n_comp_end, kk)) return error.NotPortedYet; // the pruned search's buffers
@@ -778,6 +805,67 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * ew.n * 4, ch.kv, n * ew.n);
     try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
     swapStreams(ch, ch.h_alt);
+}
+
+/// The decoder's bounded replay at its first layer (_forward_k's `replay`, CED's prefill): the layer's attention mixes
+/// (the pending MoE post fused in) and its kv-source update over every row of the chunk, then the chunk cut to its rows
+/// at positions >= replay, the streams and their pre copied down (h[first:], pre[first:]). The decoder layers then run
+/// on those rows with no window key before replay and this layer's update done. False: an encoder-only chunk (no
+/// row at or past replay), which ends here.
+pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, replay: usize, host_pos: []i64) !bool {
+    try attnMixes(e, ch, li);
+    if (e.w.layers[li].comp_wkv == null) return error.NoKvSource;
+    try kvSourceUpdate(e, ch, cs, sh, li);
+    const first = @max(ch.start, replay) - ch.start;
+    if (first >= ch.n) return false;
+    if (first == 0) return true;
+    const c = e.c;
+    const n = ch.n - first;
+    const row_h = c.hc * c.hidden * 2;
+    try e.ops.copyRows(e.s, ch.h + first * row_h, row_h, ch.h_alt, row_h, row_h, n);
+    std.mem.swap(u64, &ch.h, &ch.h_alt);
+    const row_p = c.hc * 4;
+    try e.ops.copyRows(e.s, ch.pre + first * row_p, row_p, ch.pre_f, row_p, row_p, n);
+    std.mem.swap(u64, &ch.pre, &ch.pre_f);
+    ch.start += first;
+    ch.n = n;
+    for (host_pos[0..n], 0..) |*q, i| q.* = @intCast(ch.start + i);
+    try upload(e, ch.pos, host_pos.ptr, n * 8);
+    return true;
+}
+
+/// DSpark tap j (_forward_k at a tap layer): a pending MoE gather posted into the streams first (hc_post, not fused),
+/// then h.to(fp32).mean(1).to(bf16) into tap j's rows.
+pub fn tap(e: *const Engine, ch: *Chunk, j: usize) !void {
+    const c = e.c;
+    if (ch.pending) {
+        try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, ch.n, c.hidden);
+        ch.pending = false;
+    }
+    try e.exact.hcMean4(e.s, ch.h, ch.taps + j * ch.cap * c.hidden * 2, c.hidden, ch.n, c.hidden);
+}
+
+/// Tap j's rows (bf16 [n, D]).
+pub fn tapRows(e: *const Engine, ch: *const Chunk, j: usize) u64 {
+    return ch.taps + j * ch.cap * e.c.hidden * 2;
+}
+
+/// The head on the chunk's last row (_forward_k without all_logits): the pending MoE post, collapse_norm of the row with
+/// its pre, the head's columns (one row through the head's own group, fp32) and their gather: head_g holds the
+/// prompt's logits, the ranks' columns in rank order.
+pub fn head(e: *const Engine, ch: *Chunk) !void {
+    const c = e.c;
+    const n = ch.n;
+    if (ch.pending) {
+        try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
+        ch.pending = false;
+    }
+    const last_h = ch.h + (n - 1) * c.hc * c.hidden * 2;
+    const last_pre = ch.pre + (n - 1) * c.hc * 4;
+    try tri_basic.collapseNorm(e.t, last_h, last_pre, e.w.norm, ch.head_x, c.eps, 1, c.hidden);
+    const hl = e.w.head;
+    try mmRows(e, ch, 1, hl, ch.head_x, c.hidden, ch.head_l, .fp32, hl.n);
+    try e.comm.allGather(ch.head_l, ch.head_g, hl.n, .f32, e.s);
 }
 
 /// A layer's end: the MoE's gather is pending (the next layer's attention mixes post it) and the FFN's pre_out is the

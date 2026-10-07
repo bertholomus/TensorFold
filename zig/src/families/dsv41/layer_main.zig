@@ -2,10 +2,12 @@
 //!   [--engram DIR --token-map FILE] [--dump DIR]: the Zig port's layer gate (M3).
 //! Both ranks run the recorded prompt's first C chunks (each Model.forward of the layer fixtures, in order; the
 //! compressed caches and the window rings carried from chunk to chunk) through the port's prompt forward (prompt.zig)
-//! on their GPUs, at most N layers a chunk, and from chunk F on compare every point a layer exchanges with the served
-//! build's bytes: the attention's input rows and partial, its gather, the MoE's input rows and partial, its gather, and
-//! on an Engram layer its rows' projection and their gather. One JSON line a point;
-//! the first difference stops the run (its first differing element and how many differ).
+//! on their GPUs, at most N layers a chunk, with the recording's bounded replay (replay = the prompt's length - the
+//! window: the decoder's first layer cuts a chunk to its rows from there, an encoder-only chunk ends at it), and from
+//! chunk F on compare every point a layer exchanges with the served build's bytes: the attention's input rows and
+//! partial, its gather, the MoE's input rows and partial, its gather, on an Engram layer its rows' projection and their
+//! gather; after a chunk's last layer the DSpark taps, the head's columns, their gather and the prompt's logits.
+//! One JSON line a point; the first difference stops the run (its first differing element and how many differ).
 //! REC_DIR: aot/ (the recording's Triton set), cubins/ (linear.cubin, linear_grouped.cubin, experts.cubin,
 //! experts_cb.cubin: the served extension cubins), rope-{plain,compressed}-{cos,sin}.f32, rope.json and engram.json (zrec_fixtures.py), rank<R>/layers.jsonl and
 //! layers/. Engram layers need the original Engram tables (DIR) and the compressed token map (the lane's JSON cache).
@@ -205,6 +207,12 @@ pub fn main(init: std.process.Init) !u8 {
     chunk_call[n_chunks] = std.math.maxInt(u64);
     var total: usize = 0;
     for (chunk_ids[0..n_chunks]) |ids| total += ids.len;
+    // the recorded prompt's length (every chunk's rows): the bounded replay starts a window before its end
+    var prompt_len: usize = 0;
+    for (fx.points) |p| {
+        if (std.mem.eql(u8, p.where, "Model.forward") and std.mem.eql(u8, p.arg, "in2") and p.shape.len == 1) prompt_len += @intCast(p.shape[0]);
+    }
+    const replay: usize = prompt_len -| cfg.window;
 
     // the weights (no DSpark blocks) from the lane's rank cache
     const t0 = std.Io.Timestamp.now(io, .awake);
@@ -319,12 +327,12 @@ pub fn main(init: std.process.Init) !u8 {
             if (p.call <= chunk_call[ci] or p.call >= chunk_call[ci + 1] or !std.mem.eql(u8, p.where, "Model.attention_k")) continue;
             if (p.layer) |l| rec_layers = @max(rec_layers, @as(usize, @intCast(l)) + 1);
         }
-        const n_layers = @min(layers, rec_layers);
-        try w_out.print("{{\"rank\": {d}, \"chunk\": {d}, \"call\": {d}, \"start\": {d}, \"rows\": {d}, \"layers\": {d}, \"recorded_layers\": {d}, \"checked\": {}}}\n", .{ rank, ci, chunk_call[ci], start, ids.len, n_layers, rec_layers, ci >= check_from });
+        const n_layers = @min(layers, cfg.layers);
+        try w_out.print("{{\"rank\": {d}, \"chunk\": {d}, \"call\": {d}, \"start\": {d}, \"rows\": {d}, \"replay\": {d}, \"layers\": {d}, \"recorded_layers\": {d}, \"checked\": {}}}\n", .{ rank, ci, chunk_call[ci], start, ids.len, replay, n_layers, rec_layers, ci >= check_from });
         try w_out.flush();
         var shared: prompt.Shared = .{};
         try prompt.begin(&eng, &ch, ids, start, host_pos);
-        if (!try runChunk(&run, &eng, &ch, &caches, &shared, rings, if (eh) |*x| x else null, seq[0 .. start + ids.len], chunk_call[ci], n_layers, ci >= check_from, dump)) {
+        if (!try runChunk(&run, &eng, &ch, &caches, &shared, rings, if (eh) |*x| x else null, seq[0 .. start + ids.len], chunk_call[ci], n_layers, ci >= check_from, dump, replay, host_pos)) {
             run.ok = false;
             break;
         }
@@ -337,15 +345,28 @@ pub fn main(init: std.process.Init) !u8 {
 }
 
 /// One chunk's layers through the prompt forward, each exchange checked against the fixtures after the chunk's call
-/// when `check` (else only run). False on the first difference or a step's error (reported).
-fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, shared: *prompt.Shared, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, call: u64, layers: usize, checked: bool, dump: ?[]const u8) !bool {
+/// when `checked` (else only run); at the decoder's first layer the replay cut (an encoder-only chunk ends there); a
+/// chunk through every layer ends with its taps and the head, checked too. False on the first difference or a step's
+/// error (reported).
+fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, shared: *prompt.Shared, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, call: u64, layers: usize, checked: bool, dump: ?[]const u8, replay: usize, host_pos: []i64) !bool {
     const fx = run.fx;
     const w_out = run.out;
     const rank = run.rank;
+    const c = eng.c;
     var after = call;
+    var floor: usize = 0;
+    var kv_done: ?usize = null;
+    var label_buf: [64]u8 = undefined;
     for (0..layers) |li| {
         const l: i64 = @intCast(li);
-        var label_buf: [64]u8 = undefined;
+        if (li == c.layers / 2) {
+            const go_on = prompt.replayCut(eng, ch, caches, shared, li, replay, host_pos) catch |err| return report(w_out, rank, li, "replay cut", err);
+            try w_out.print("{{\"rank\": {d}, \"layer\": {d}, \"replay\": {d}, \"rows\": {d}, \"start\": {d}, \"encoder_only\": {}}}\n", .{ rank, li, replay, ch.n, ch.start, !go_on });
+            try w_out.flush();
+            if (!go_on) break;
+            floor = replay;
+            kv_done = li;
+        }
         if (eng.w.layers[li].engram_wkv != null) {
             const e_h = eh orelse return report(w_out, rank, li, "engram", error.NoEngramTables);
             prompt.engramApply(eng, ch, e_h, li, seq) catch |err| return report(w_out, rank, li, "engram", err);
@@ -360,10 +381,14 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
             }
             after = eg.call;
         }
+        // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
+        if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| {
+            prompt.tap(eng, ch, j) catch |err| return report(w_out, rank, li, "tap", err);
+        }
         const att = fx.find(after, "Model.attention_k", l, "in2") orelse return report(w_out, rank, li, "attention fixture", error.NoLayerFixture);
         prompt.attnMixes(eng, ch, li) catch |err| return report(w_out, rank, li, "attention mixes", err);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention in", .{li}), att, ch.x)) return false;
-        prompt.attention(eng, ch, caches, shared, li, rings[li], 0) catch |err| return report(w_out, rank, li, "attention", err);
+        prompt.attention(eng, ch, caches, shared, li, rings[li], floor, kv_done != null and kv_done.? == li) catch |err| return report(w_out, rank, li, "attention", err);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention partial", .{li}), fx.find(after, "Model.attention_k", l, "out"), ch.pa)) return false;
         try prompt.gather(eng, ch, ch.pa, ch.ga);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention gather", .{li}), fx.find(att.call, "Comm.gather", null, "out"), ch.ga)) return false;
@@ -377,6 +402,20 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe gather", .{li}), mg, ch.gm)) return false;
         prompt.endLayer(ch);
         after = mg.call;
+        if (li + 1 < c.layers) continue;
+        // the chunk's end: the taps (Model.forward's list), the head on the last row, the prompt's logits
+        for (0..c.dspark_taps.slice().len) |j| {
+            var arg_buf: [32]u8 = undefined;
+            const arg = try std.fmt.bufPrint(&arg_buf, "post.in.taps.{d}", .{j});
+            if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "tap {d}", .{j}), fx.find(call - 1, "Model.forward", null, arg), prompt.tapRows(eng, ch, j))) return false;
+        }
+        prompt.head(eng, ch) catch |err| return report(w_out, rank, li, "head", err);
+        const hg = fx.find(after, "Comm.gather", null, "in1") orelse return report(w_out, rank, li, "head fixture", error.NoLayerFixture);
+        if (checked) {
+            if (!try run.check("head columns", hg, ch.head_l)) return false;
+            if (!try run.check("head gather", fx.find(after, "Comm.gather", null, "out"), ch.head_g)) return false;
+            if (!try run.check("prompt logits", fx.find(call - 1, "Model.forward", null, "out"), ch.head_g)) return false;
+        }
     }
     try run.s.synchronize();
     return true;

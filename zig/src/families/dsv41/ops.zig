@@ -1,8 +1,9 @@
 //! The torch operations of the served forward that only move or widen bytes, on TensorFold's own torch-op kernels
 //! (zig/kernels/cuda/torch_ops: pointwise.cu, movement.cu; ours in dsv41_ops.cu) with their development launchers'
 //! geometry: `.float()` of bf16 and fp16 (exact), `.to(bf16)` of fp32 (round to nearest even), `.contiguous()` and row
-//! copies, and row gathers by index (`t[idx]`, `t[idx] = rows`). Their bytes are the same as torch's by construction;
-//! the layer gate checks them.
+//! copies, row gathers and scatters by index (`t[idx]`, `t[idx] = rows`), and the integer selections of the indexer
+//! (torch's top-k of int64 keys, kernels.topk_indices). Their bytes are the same as torch's by construction; the layer
+//! gate checks them.
 const std = @import("std");
 const cuda = @import("cuda");
 
@@ -19,6 +20,8 @@ pub const Ops = struct {
     f16_to_f32: cuda.Function,
     add2_bf16: cuda.Function,
     topk_i64: cuda.Function,
+    topk_indices: cuda.Function,
+    scatter: cuda.Function,
     to_bf16: cuda.Function,
     strided: cuda.Function,
     gather: cuda.Function,
@@ -39,6 +42,8 @@ pub const Ops = struct {
             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
             .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
             .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
+            .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
+            .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
             .to_bf16 = try pw.function("tf_f32_to_bf16_kernel"),
             .strided = try mv.function("tf_strided_copy_kernel"),
             .gather = try mv.function("tf_gather_rows_kernel"),
@@ -99,6 +104,37 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(k)));
         a.add(top);
         try cuda.launch.launch(o.topk_i64, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a);
+    }
+
+    /// kernels.topk_indices(score, k) with torch.where(top < vis, top, -1): each row's k highest fp32 scores' columns
+    /// ascending (ties to the lower column), a column at or past vis[r] as -1. score [rows, n] (row stride ss), vis
+    /// [rows] int64, out [rows, k] int64.
+    pub fn topkIndices(o: *const Ops, s: cuda.Stream, score: u64, ss: usize, rows: usize, n: usize, k: usize, vis: u64, out: u64) !void {
+        if (rows == 0) return;
+        if (k > n or k > 1024) return error.BadTopK;
+        var a: cuda.Args = .{};
+        a.add(score);
+        a.add(@as(c_longlong, @intCast(ss)));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(@as(c_int, @intCast(k)));
+        a.add(vis);
+        a.add(out);
+        try cuda.launch.launch(o.topk_indices, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a);
+    }
+
+    /// dst row idx[i] = src row i (`t[idx] = rows`, distinct int64 indices): `rows` rows of `bytes` bytes, src rows
+    /// `src_ld` bytes apart, dst rows `dst_ld`.
+    pub fn scatterRows(o: *const Ops, s: cuda.Stream, src: u64, src_ld: usize, idx: u64, dst: u64, dst_ld: usize, bytes: usize, rows: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(src);
+        a.add(@as(c_longlong, @intCast(src_ld)));
+        a.add(idx);
+        a.add(dst);
+        a.add(@as(c_longlong, @intCast(dst_ld)));
+        a.add(@as(c_longlong, @intCast(bytes)));
+        a.add(@as(c_int, @intCast(rows)));
+        try go(o.scatter, s, rows, 256, &a);
     }
 
     /// `.to(torch.bfloat16)` of `count` fp32 values (round to nearest even).

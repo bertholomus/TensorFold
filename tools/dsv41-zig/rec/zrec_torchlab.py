@@ -1,7 +1,8 @@
 """The Zig port's torch-op kernels (zig/kernels/cuda/dsv41_torch.cu) against the served build's own torch code on this
 GPU, byte for byte: ops.rms_norm (128 and 512 wide, 1 to 2,048 rows), _compress's ratio-2 softmax with the weighted
-sum, and ops.rope_ (forward and inverse); with OPS_FATBIN (dsv41_ops.cu), tf_ds_topk_i64 against torch.topk's values
-(as a set: _topk_finish sorts them). One JSON line a test and a summary.
+sum, ops.rope_ (forward and inverse) and a DSpark tap's mean over the streams; with OPS_FATBIN (dsv41_ops.cu),
+tf_ds_topk_i64 against torch.topk's values (as a set: _topk_finish sorts them) and tf_ds_topk_indices against the
+served kernels.topk_indices with torch.where(top < vis, top, -1). One JSON line a test and a summary.
 
   python zrec_torchlab.py FATBIN MODEL_DIR [OPS_FATBIN]
 """
@@ -149,6 +150,29 @@ def main() -> None:
                         ptr(pos), ctypes.c_int(rows), ctypes.c_int(half), ctypes.c_int(int(inverse))])
                 torch.cuda.synchronize()
                 report(op="rope", width=width, rows=rows, inverse=inverse, differ=differ(out, ref))
+    # a DSpark tap: h.to(fp32).mean(1).to(bf16) over the 4 streams
+    hm = load(sys.argv[1], ("tf_ds_hc_mean4_kernel",))["tf_ds_hc_mean4_kernel"]
+    d = 5120
+    for rows, case in ((128, "plain"), (3, "mixed"), (64, "negzero"), (5, "wide")):
+        h = torch.randn(rows, 4, d, device="cuda", generator=g)
+        if case == "mixed":
+            h[:, 1] *= 1e-3
+            h[:, 2] *= 1e3
+            h[:, 3] *= 1e-30
+        elif case == "negzero":
+            h[:, :, ::3] = -0.0                                  # every stream -0 at these columns
+            h[:, 0:2, 1::3] = -0.0
+            h[:, 2, 1::3] = 0.0
+        elif case == "wide":
+            h = h * 3e4
+        h = h.to(torch.bfloat16)
+        ref = h.to(torch.float32).mean(1).to(torch.bfloat16)
+        out = torch.empty((rows, d), dtype=torch.bfloat16, device="cuda")
+        launch(hm, (min(4096, (rows * d + 255) // 256), 1, 1), (256, 1, 1), 0,
+               [ptr(h), ptr(out), ctypes.c_longlong(d), ctypes.c_int(rows), ctypes.c_int(d)])
+        torch.cuda.synchronize()
+        report(op="hc_mean4", rows=rows, case=case, differ=differ(out, ref))
+
     # torch's keys.topk(k).values of unique int64 keys (the indexer's: score bits above, an index below), as a set
     if len(sys.argv) > 3:
         t = load(sys.argv[3], ("tf_ds_topk_i64_kernel",))["tf_ds_topk_i64_kernel"]
@@ -174,6 +198,32 @@ def main() -> None:
             torch.cuda.synchronize()
             got = out.sort(dim=1).values
             report(op="topk_i64", rows=rows, n=n, k=k, ks=ks, case=case, differ=int((got != ref).sum()))
+        # kernels.topk_indices(score, k) and -1 past vis: the candidate pool's layers' selection
+        from tensorfold.families.deepseek_v41.cuda import kernels as served
+        ti = load(sys.argv[3], ("tf_ds_topk_indices_kernel",))["tf_ds_topk_indices_kernel"]
+        for rows, n, k, case in ((128, 2229, 512, "plain"), (1, 2229, 512, "plain"), (128, 2229, 512, "ties"),
+                                 (16, 600, 512, "masked"), (7, 4096, 512, "zeros"), (3, 513, 512, "plain"),
+                                 (5, 100, 1, "plain"), (128, 2229, 512, "ninf")):
+            sc = torch.randn(rows, n, device="cuda", generator=g)
+            vis = torch.randint(1, n + 1, (rows,), device="cuda", generator=g)
+            if case == "ties":
+                sc = (sc * 4).round() / 4                         # long runs of equal scores
+            elif case == "zeros":
+                sc[:, ::2] = 0.0
+                sc[:, 1::4] = -0.0
+            elif case == "masked":
+                sc = sc.masked_fill(torch.arange(n, device="cuda")[None] >= vis[:, None], float("-inf"))
+            elif case == "ninf":
+                sc[:, ::5] = float("-inf")
+                vis = torch.full((rows,), n, dtype=torch.int64, device="cuda")
+            sc = sc.contiguous()
+            top = served.topk_indices(sc, k)
+            ref = torch.where(top < vis[:, None], top, -1)
+            out = torch.full((rows, k), 7, dtype=torch.int64, device="cuda")
+            launch(ti, (rows, 1, 1), (1024, 1, 1), 0,
+                   [ptr(sc), ctypes.c_longlong(n), ctypes.c_int(n), ctypes.c_int(k), ptr(vis), ptr(out)])
+            torch.cuda.synchronize()
+            report(op="topk_indices", rows=rows, n=n, k=k, case=case, differ=int((out != ref).sum()))
     print(json.dumps({"summary": {"tests": len(lines), "failed": bad, "eps": eps}}), flush=True)
 
 
