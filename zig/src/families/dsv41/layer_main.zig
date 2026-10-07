@@ -204,7 +204,7 @@ pub fn main(init: std.process.Init) !u8 {
     var chunks: usize = 1;
     var check_from: usize = 0;
     var rounds: usize = 0;
-    var drafts: usize = 0; // a drafting request's max_tokens (0: no drafter)
+    var budgets: []usize = &.{}; // --drafts: each drafting request's max_tokens, in admission order (none: no drafter)
     var light = false;
     var engram_dir: ?[]const u8 = null;
     var token_map: ?[]const u8 = null;
@@ -224,7 +224,10 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, key, "--rounds")) {
             rounds = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--drafts")) {
-            drafts = try std.fmt.parseInt(usize, val, 10);
+            var list: std.ArrayList(usize) = .empty;
+            var it = std.mem.splitScalar(u8, val, ',');
+            while (it.next()) |x| try list.append(a, try std.fmt.parseInt(usize, x, 10));
+            budgets = list.items;
         } else if (std.mem.eql(u8, key, "--light")) {
             light = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--engram")) {
@@ -298,7 +301,7 @@ pub fn main(init: std.process.Init) !u8 {
     var cache_file = try cache_dir.openFile(io, cache_name, .{});
     defer cache_file.close(io);
     const sp = try dsv41.prompt2d.split(rank, world); // world 4: the 2D split (prompt2d.zig)
-    var w = try dsv41.weights.load(gpa, &driver, .{ .cache = .{ .file = cache_file, .index = &ix, .io = io } }, cfg, sp, drafts > 0);
+    var w = try dsv41.weights.load(gpa, &driver, .{ .cache = .{ .file = cache_file, .index = &ix, .io = io } }, cfg, sp, budgets.len > 0);
     defer w.deinit();
     const load_s = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
 
@@ -367,15 +370,17 @@ pub fn main(init: std.process.Init) !u8 {
         if (std.mem.eql(u8, q.arg, "in5")) tokens = @max(tokens, @as(usize, @intCast(headInt(q) catch 0)));
     }
     var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, tokens);
-    const caches = try prompt.Caches.init(&eng, &arena, tokens);
+    // a drafting recording's pool: MultiDecoder's slots (each stream's window rings and positional stores)
+    const slots: usize = if (budgets.len > 0) draft_mod.max_streams else 1;
+    const caches = try prompt.Caches.init(&eng, &arena, tokens, slots);
     blas_ws_ptr = ch.blas_ws;
     var blas = try dsv41.cublas.Blas.open(stream, blas_ws_ptr);
     defer blas.close();
     eng.blas = &blas;
     const rings = try a.alloc(u64, cfg.layers);
     for (rings) |*r| {
-        r.* = try arena.take(eng.ringBytes());
-        try driver.check(driver.api.cuMemsetD8Async(r.*, 0, eng.ringBytes(), stream.handle), "cuMemsetD8Async");
+        r.* = try arena.take(slots * eng.ringBytes());
+        try driver.check(driver.api.cuMemsetD8Async(r.*, 0, slots * eng.ringBytes(), stream.handle), "cuMemsetD8Async");
     }
     try stream.synchronize();
     try driver.check(driver.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
@@ -414,6 +419,12 @@ pub fn main(init: std.process.Init) !u8 {
     }
 
     var run: Run = .{ .a = a, .io = io, .d = &driver, .s = stream, .fx = &fx, .rank = rank, .out = w_out, .host = try a.alloc(u8, 2 * chunk_rows * cfg.hidden * 4) };
+    if (light and budgets.len > 0) {
+        const ok = try runDrafted(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, budgets, sp);
+        try w_out.print("{{\"rank\": {d}, \"light\": true, \"drafted\": true, \"all_equal\": {}}}\n", .{ rank, ok });
+        try w_out.flush();
+        return if (ok) 0 else 1;
+    }
     if (light) {
         const ok = try runLight(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, rounds, tokens);
         try w_out.print("{{\"rank\": {d}, \"light\": true, \"all_equal\": {}}}\n", .{ rank, ok });
@@ -444,7 +455,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (rounds > 0 and run.ok and ran == n_chunks) {
         if (n_chunks != chunks or start != prompt_len) return error.RoundsNeedTheWholePrompt;
-        run.ok = try runRounds(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, seq, start, rounds, a, &arena, drafts, sp);
+        run.ok = try runRounds(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, seq, start, rounds, a, &arena, if (budgets.len > 0) budgets[0] else 0, sp);
     }
     try w_out.print("{{\"rank\": {d}, \"chunks\": {d}, \"layers\": {d}, \"rounds\": {d}, \"all_equal\": {}}}\n", .{ rank, ran, layers, rounds, run.ok });
     try w_out.flush();
@@ -931,6 +942,303 @@ fn runLight(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
         if (!run.ok) return false;
     }
     return run.ok;
+}
+
+/// A stream of the drafted light run (multi.py's Stream in MultiDecoder): its pool slot and extent, its ids (the prompt,
+/// the kept tokens, the current window's rows), its kept length, pending token, tokens out and budget; its window.
+const DStream = struct {
+    req: usize,
+    slot: usize,
+    base: i64 = 0,
+    end: i64 = 0,
+    seq: []i32,
+    len: usize = 0, // positions kept (sc.length)
+    pending: i64 = 0,
+    out: usize = 0, // tokens taken (len(s.out))
+    budget: usize,
+    done: bool = false,
+    rounds: usize = 0,
+    tokens: []i64, // the reply: the first token, then each round's new tokens
+    // this round's window: its rows in the round, from row `row`
+    want: usize = 0,
+    win: [round_mod.max_rows]i64 = undefined,
+    n: usize = 0,
+    row: usize = 0,
+};
+
+/// The first point after call `after` at `where` with argument `arg` and call before `before` (a step between two).
+fn findBefore(fx: *const Fixtures, after: u64, before: u64, where: []const u8, arg: []const u8) ?*const Point {
+    const q = fx.find(after, where, null, arg) orelse return null;
+    return if (q.call < before) q else null;
+}
+
+/// Every request of a drafting recording (the served concurrent decoder with drafts, greedy), as MultiDecoder serves
+/// them: each request's prompt through every layer into its stream's slot (the lowest free one) and extent (the base
+/// the recording's rounds show), its logits checked, its taps absorbed into the drafter's rings; then each recorded
+/// round from the port's own scheduling: the live streams in admission order, the draft depth by their count, each
+/// stream's want (its budget's rest), one batched drafter pass for the drafting streams (every recorded drafter point
+/// checked), each stream's depth from its confidences (_choose_k), the windows [pending, drafts]; the rows against the
+/// recorded round's, the round through every layer (every recorded point checked); each stream's targets (greedy), the
+/// drafts kept while equal to them, the target after them, the end of its budget; every window's taps absorbed. A
+/// round the recording holds and the scheduling does not make (or the other way) fails the run. `budgets`: each
+/// request's max_tokens in admission order.
+fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, a: std.mem.Allocator, arena: *prompt.Arena, budgets: []const usize, sp: dsv41.plan.Split) !bool {
+    const fx = run.fx;
+    const w_out = run.out;
+    const c = eng.c;
+    const pts = fx.points;
+    const vocab = vocabOf(eng);
+    const R_max = round_mod.max_rows;
+    const most = 5; // the engine's drafts (--mtp-drafts 5)
+    var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
+    var pool = try draft_mod.Pool.init(eng, arena, draft_mod.max_streams);
+    var dr = try draft_mod.Drafter.init(eng, arena, sp);
+    var streams: std.ArrayList(DStream) = .empty;
+    const host_pos = try a.alloc(i64, chunk_rows);
+    const ids64 = try a.alloc(i64, chunk_rows);
+    const ring_view = try a.alloc(u64, rings.len);
+    var prev_round: u64 = 0; // the last round's RoundDecoder.run call
+    var i: usize = 0;
+    while (i < pts.len) : (i += 1) {
+        const p = &pts[i];
+        if (isPoint(p, "Model.forward", "in2") and p.shape.len == 1) {
+            // a request's prompt: its chunks to the one that reaches the head (its logits)
+            const req = streams.items.len;
+            if (req >= budgets.len) return error.MoreRequestsThanBudgets;
+            var chunks: std.ArrayList(*const Point) = .empty;
+            var last: ?*const Point = null;
+            var j = i;
+            while (j < pts.len) : (j += 1) {
+                const q = &pts[j];
+                if (isPoint(q, "RoundDecoder.run", "in1")) break; // (a round inside a prompt's fill: not ported)
+                if (!(isPoint(q, "Model.forward", "in2") and q.shape.len == 1)) continue;
+                try chunks.append(a, q);
+                if (fx.find(q.call - 1, "Model.forward", null, "out")) |o| if (o.call == q.call) {
+                    last = q;
+                    break;
+                };
+            }
+            const lp = last orelse return error.PromptWithoutLogits;
+            var len: usize = 0;
+            for (chunks.items) |cp| len += (try ints(run, cp)).len;
+            // its slot: the lowest one no live stream holds; its extent: the first round's rows in that slot
+            var held: [draft_mod.max_streams]bool = @splat(false);
+            for (streams.items) |*st| {
+                if (!st.done) held[st.slot] = true;
+            }
+            const slot = std.mem.indexOfScalar(bool, &held, false) orelse return error.NoFreeSlot;
+            var base: i64 = 0;
+            var end: i64 = 0;
+            var found = false;
+            var k = j;
+            while (k < pts.len and !found) : (k += 1) {
+                const q = &pts[k];
+                if (!isPoint(q, "RoundDecoder.run", "in3")) continue;
+                const sl = try ints(run, q);
+                for (sl, 0..) |v, r| {
+                    if (v != @as(i64, @intCast(slot))) continue;
+                    const rpos = try ints(run, fx.find(q.call - 1, "RoundDecoder.run", null, "in2"));
+                    if (rpos[r] != @as(i64, @intCast(len))) return error.SlotNotThePrompts;
+                    base = (try ints(run, fx.find(q.call - 1, "RoundDecoder.run", null, "in4")))[r];
+                    end = (try ints(run, fx.find(q.call - 1, "RoundDecoder.run", null, "in5")))[r];
+                    found = true;
+                    break;
+                }
+            }
+            const st = try streams.addOne(a);
+            st.* = .{ .req = req, .slot = slot, .base = base, .end = end, .seq = try a.alloc(i32, len + budgets[req] + R_max), .budget = budgets[req], .tokens = try a.alloc(i64, budgets[req]) };
+            var at: usize = 0;
+            for (chunks.items) |cp| for (try ints(run, cp)) |id| {
+                st.seq[at] = @intCast(id);
+                at += 1;
+            };
+            // the prompt into its slot's rings and positional stores, its extent's compressed rows
+            const view = try caches.view(eng, slot, @intCast(base));
+            for (rings, 0..) |r, li| ring_view[li] = r + slot * eng.ringBytes();
+            const replay = len -| c.window;
+            var start: usize = 0;
+            while (start < len) {
+                const n: usize = @min(chunk_rows, len - start);
+                for (0..n) |jj| ids64[jj] = st.seq[start + jj];
+                var shared: prompt.Shared = .{};
+                try prompt.begin(eng, ch, ids64[0..n], start, host_pos);
+                if (!try runChunk(run, eng, ch, &view, &shared, ring_view, eh, st.seq[0 .. start + n], lp.call, c.layers, false, null, replay, host_pos)) return false;
+                start += n;
+            }
+            var buf: [64]u8 = undefined;
+            const prompt_ok = try run.check(try std.fmt.bufPrint(&buf, "request {d} prompt logits", .{req}), fx.find(lp.call - 1, "Model.forward", null, "out"), ch.head_g);
+            // its taps (the replayed rows, the tap layers side by side) into its slot's drafter rings
+            const d = c.hidden;
+            for (0..c.dspark_taps.slice().len) |jj| try eng.ops.copyRows(eng.s, prompt.tapRows(eng, ch, jj), d * 2, dr.at + jj * d * 2, dr.taps_w * 2, d * 2, ch.n);
+            if (fx.find(lp.call, "Drafter.absorb", null, "in3")) |ap| {
+                if (!try run.check(try std.fmt.bufPrint(&buf, "request {d} absorb taps", .{req}), ap, dr.at)) return false;
+            }
+            try dr.absorb(eng, ch, &pool, slot, dr.at, ch.n, ch.start);
+            st.len = len;
+            st.pending = @intCast(try argmax(run, ch.head_g, vocab));
+            st.tokens[0] = st.pending;
+            st.out = 1;
+            if (st.pending == c.eos or st.out >= st.budget) st.done = true;
+            try w_out.print("{{\"rank\": {d}, \"request\": {d}, \"prompt_tokens\": {d}, \"chunks\": {d}, \"slot\": {d}, \"base\": {d}, \"prompt_logits_equal\": {}, \"first\": {d}}}\n", .{ run.rank, req, len, chunks.items.len, slot, base, prompt_ok, st.pending });
+            try w_out.flush();
+            if (!found and !st.done) return error.NoRoundForThePrompt;
+            i = j;
+            continue;
+        }
+        if (!isPoint(p, "RoundDecoder.run", "in1")) continue;
+        // a round: the live streams in admission order, each one's want and window
+        const rp = p;
+        var live: [draft_mod.max_streams]*DStream = undefined;
+        var nl: usize = 0;
+        for (streams.items) |*st| {
+            if (st.done) continue;
+            if (nl == live.len) return error.TooManyStreams;
+            live[nl] = st;
+            nl += 1;
+        }
+        if (nl == 0) return error.RoundWithoutStreams;
+        const kdep = draft_mod.depth(nl, most, R_max);
+        var tok: [draft_mod.max_streams]i64 = undefined;
+        var q0: [draft_mod.max_streams]i64 = undefined;
+        var sl: [draft_mod.max_streams]i64 = undefined;
+        var nd: usize = 0;
+        for (live[0..nl]) |st| {
+            st.want = @min(kdep, st.budget -| st.out);
+            st.win[0] = st.pending;
+            st.n = 1;
+            if (st.want == 0) continue;
+            tok[nd] = st.pending;
+            q0[nd] = @intCast(st.len);
+            sl[nd] = @intCast(st.slot);
+            nd += 1;
+        }
+        var label: [64]u8 = undefined;
+        if (nd > 0) {
+            // the drafting streams' pass: its recorded inputs, every recorded point, its drafts; each stream's depth
+            const bp = findBefore(fx, prev_round, rp.call, "BatchDraftGraph.run", "in1") orelse return error.NoDraftFixture;
+            const rtok = try ints(run, bp);
+            const rq0 = try ints(run, fx.find(bp.call - 1, "BatchDraftGraph.run", null, "in2"));
+            const rsl = try ints(run, fx.find(bp.call - 1, "BatchDraftGraph.run", null, "in3"));
+            const inputs_ok = std.mem.eql(i64, rtok, tok[0..nd]) and std.mem.eql(i64, rq0, q0[0..nd]) and std.mem.eql(i64, rsl, sl[0..nd]);
+            if (!inputs_ok) {
+                try w_out.print("{{\"rank\": {d}, \"round_call\": {d}, \"draft_call\": {d}, \"draft_inputs_equal\": false}}\n", .{ run.rank, rp.call, bp.call });
+                try w_out.flush();
+                return false;
+            }
+            const steps = draft_mod.passSteps(nd, pool.slots, most, R_max, dr.n);
+            var vis: [draft_mod.max_streams * 128]usize = undefined;
+            var nv: usize = 0;
+            for (q0[0..nd], sl[0..nd]) |q, slot| {
+                var pp: i64 = @max(0, q - @as(i64, @intCast(c.window)));
+                while (pp < q) : (pp += 1) {
+                    vis[nv] = @as(usize, @intCast(slot)) * pool.ring + @as(usize, @intCast(pp)) % pool.ring;
+                    nv += 1;
+                }
+            }
+            var dc: DraftCheck = .{ .run = run, .call = bp.call, .layers = c.layers, .after = bp.call, .vis = vis[0..nv] };
+            dr.pass(eng, ch, &pool, tok[0..nd], q0[0..nd], sl[0..nd], steps, .{ .ctx = &dc, .at = DraftCheck.at }) catch |err| {
+                if (err == error.DraftMismatch) return false;
+                try w_out.print("{{\"rank\": {d}, \"draft_call\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, bp.call, @errorName(err) });
+                try w_out.flush();
+                return false;
+            };
+            var di: usize = 0;
+            for (live[0..nl]) |st| {
+                if (st.want == 0) continue;
+                const want = try ints(run, fx.find(bp.call - 1, "BatchDraftGraph.run", null, try std.fmt.bufPrint(&label, "out.{d}", .{di})));
+                if (want.len != steps or !std.mem.eql(i64, want, dr.drafts[di][0..steps])) {
+                    try w_out.print("{{\"rank\": {d}, \"draft_call\": {d}, \"stream\": {d}, \"drafts_equal\": false}}\n", .{ run.rank, bp.call, st.req });
+                    try w_out.flush();
+                    return false;
+                }
+                const kk = draft_mod.chooseK(dr.confs[di][0..steps], @min(st.want, steps), nl, most, R_max);
+                for (0..kk) |jj| st.win[1 + jj] = dr.drafts[di][jj];
+                st.n = 1 + kk;
+                di += 1;
+            }
+        }
+        // the rows: each live stream's window at its kept length, its slot and extent; its ids through the window
+        var r_ids: [R_max]i64 = undefined;
+        var r_pos: [R_max]i64 = undefined;
+        var r_sl: [R_max]i64 = undefined;
+        var r_base: [R_max]i64 = undefined;
+        var r_end: [R_max]i64 = undefined;
+        var wins: [draft_mod.max_streams]round_mod.Window = undefined;
+        var R: usize = 0;
+        for (live[0..nl], 0..) |st, wi| {
+            if (R + st.n > R_max) return error.RoundTooWide;
+            st.row = R;
+            for (0..st.n) |jj| {
+                r_ids[R + jj] = st.win[jj];
+                r_pos[R + jj] = @intCast(st.len + jj);
+                r_sl[R + jj] = @intCast(st.slot);
+                r_base[R + jj] = st.base;
+                r_end[R + jj] = st.end;
+                st.seq[st.len + jj] = @intCast(st.win[jj]);
+            }
+            wins[wi] = .{ .row = R, .n = st.n, .seq = st.seq[0 .. st.len + st.n] };
+            R += st.n;
+        }
+        const rows_ok = std.mem.eql(i64, try ints(run, rp), r_ids[0..R]) and
+            std.mem.eql(i64, try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in2")), r_pos[0..R]) and
+            std.mem.eql(i64, try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in3")), r_sl[0..R]) and
+            std.mem.eql(i64, try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in4")), r_base[0..R]) and
+            std.mem.eql(i64, try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in5")), r_end[0..R]);
+        try w_out.print("{{\"rank\": {d}, \"round_call\": {d}, \"streams\": {d}, \"drafting\": {d}, \"rows\": {d}, \"rows_equal\": {}}}\n", .{ run.rank, rp.call, nl, nd, R, rows_ok });
+        try w_out.flush();
+        if (!rows_ok) return false;
+        var fcall: u64 = 0;
+        for (fx.points) |*q| {
+            if (q.call < rp.call and std.mem.eql(u8, q.where, "RoundRunner.forward")) fcall = q.call;
+        }
+        var rc: RoundCheck = .{ .run = run, .after = rp.call, .call = rp.call, .fwd = fcall };
+        const rows: round_mod.Rows = .{ .ids = r_ids[0..R], .pos = r_pos[0..R], .slots = r_sl[0..R], .bases = r_base[0..R], .ends = r_end[0..R], .windows = wins[0..nl] };
+        round_mod.forward(eng, &rd, ch, caches, rings, eh, &.{}, rows, pool_window, .{ .ctx = &rc, .at = RoundCheck.at }) catch |err| {
+            if (err == error.RoundMismatch) return false;
+            try w_out.print("{{\"rank\": {d}, \"round_call\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, rp.call, @errorName(err) });
+            try w_out.flush();
+            return false;
+        };
+        // every window's taps into its slot's rings at once (the served eager absorb), then each stream's acceptance
+        var items: [draft_mod.max_streams]draft_mod.Item = undefined;
+        for (live[0..nl], 0..) |st, wi| items[wi] = .{ .slot = st.slot, .taps = rd.taps + st.row * dr.taps_w * 2, .n = st.n, .start = st.len };
+        try dr.absorbMany(eng, ch, &pool, items[0..nl]); // (its rows: the round's taps, checked)
+        for (live[0..nl]) |st| {
+            var targets: [R_max]i64 = undefined;
+            for (0..st.n) |jj| targets[jj] = @intCast(try argmax(run, rd.logits + (st.row + jj) * vocab * 4, vocab));
+            var acc: usize = 0;
+            while (acc + 1 < st.n and st.win[acc + 1] == targets[acc]) acc += 1;
+            st.len += acc + 1;
+            pool.absorbed[st.slot] = st.len;
+            // the new tokens: the kept drafts and the target after them, to an end token or the budget
+            var take: usize = acc + 1;
+            for (0..acc + 1) |jj| {
+                const t = if (jj < acc) st.win[jj + 1] else targets[acc];
+                if (t == c.eos) {
+                    take = jj + 1;
+                    st.done = true;
+                    break;
+                }
+            }
+            take = @min(take, st.budget -| st.out);
+            for (0..take) |jj| st.tokens[st.out + jj] = if (jj < acc) st.win[jj + 1] else targets[acc];
+            st.out += take;
+            if (st.out >= st.budget) st.done = true;
+            st.pending = if (take == 0) st.pending else (if (take - 1 < acc) st.win[take] else targets[acc]);
+            st.rounds += 1;
+        }
+        prev_round = rp.call;
+    }
+    // every stream's rounds ended where the recording's did
+    var ok = run.ok;
+    for (streams.items) |*st| {
+        try w_out.print("{{\"rank\": {d}, \"request\": {d}, \"rounds\": {d}, \"tokens\": {d}, \"done\": {}, \"reply\": [", .{ run.rank, st.req, st.rounds, st.out, st.done });
+        for (st.tokens[0..st.out], 0..) |t, jj| try w_out.print("{s}{d}", .{ if (jj == 0) "" else ", ", t });
+        try w_out.print("]}}\n", .{});
+        if (!st.done) ok = false;
+    }
+    try w_out.flush();
+    return ok;
 }
 
 /// The Engram rows' ids and their bf16 rows of layer li, for the served Engram.rows (zrec_engram_ref.py).
