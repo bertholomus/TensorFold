@@ -2,7 +2,9 @@
 decode round is one stream's one row), to the served endpoint. Code, prose and structured asks with 256 tokens, and two
 long word lists (about 3,000 and 8,000 tokens) with 128. The words come from zrec_req's fixed generator.
 
-  python3 zrec_tok.py --base URL --model NAME --key-file FILE --out OUT.json
+  python3 zrec_tok.py --base URL --model NAME --key-file FILE [--only NAME,...] [--max-tokens N] --out OUT.json
+
+--only sends just the named prompts; --max-tokens replaces each prompt's own budget.
 """
 
 import argparse
@@ -31,10 +33,17 @@ def main() -> None:
     ap.add_argument("--base", required=True)
     ap.add_argument("--model", required=True)
     ap.add_argument("--key-file", required=True)
+    ap.add_argument("--only", default="")
+    ap.add_argument("--max-tokens", type=int, default=0)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     out = []
+    only = [n for n in a.only.split(",") if n]
     for name, content, max_tokens in PROMPTS:
+        if only and name not in only:
+            continue
+        if a.max_tokens:
+            max_tokens = a.max_tokens
         if content is None:
             content = text(WORDS[name])
         body = {"model": a.model, "messages": [{"role": "user", "content": content}], "max_tokens": max_tokens,

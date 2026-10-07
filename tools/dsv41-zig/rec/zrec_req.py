@@ -1,7 +1,8 @@
 """The layer fixtures' request: one fixed chat prompt of about 2,100 tokens (a full 2,048-row prompt chunk and a short
-one), greedy, 8 tokens, to the served endpoint. The words come from a fixed generator, so every run sends the same text.
+one), greedy, 8 tokens (or --max-tokens), to the served endpoint. The words come from a fixed generator, so every run
+sends the same text.
 
-  python3 zrec_req.py --base URL --model NAME --key-file FILE --out OUT.json
+  python3 zrec_req.py --base URL --model NAME --key-file FILE [--max-tokens N] --out OUT.json
 """
 
 import argparse
@@ -36,9 +37,10 @@ def main() -> None:
     ap.add_argument("--model", required=True)
     ap.add_argument("--key-file", required=True)
     ap.add_argument("--words", type=int, default=1900)
+    ap.add_argument("--max-tokens", type=int, default=8)
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    body = {"model": a.model, "messages": [{"role": "user", "content": text(a.words)}], "max_tokens": 8,
+    body = {"model": a.model, "messages": [{"role": "user", "content": text(a.words)}], "max_tokens": a.max_tokens,
             "temperature": 0, "stream": False}
     req = urllib.request.Request(a.base.rstrip("/") + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json", "Authorization": "Bearer " + key(a.key_file)})
