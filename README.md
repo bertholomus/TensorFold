@@ -1,6 +1,6 @@
 # TensorFold
 
-> **This is a fork of TensorFold 0.6.3**, not the upstream project. It adds the `deepseek_v41` family: DeepSeek-V4.1-Flash
+> **This is a fork of TensorFold 0.6.6**, not the upstream project. It adds the `deepseek_v41` family: DeepSeek-V4.1-Flash
 > (EXL3), tensor-parallel over two NVIDIA GB10 (DGX Spark) nodes. The family is in
 > `src/tensorfold/families/deepseek_v41/`, its design, report and attribution in `tools/dsv41/`
 > (`DESIGN.md`, `REPORT.md`, `ATTRIBUTION.md`). `NOTICE` lists every upstream file this fork changes. Upstream

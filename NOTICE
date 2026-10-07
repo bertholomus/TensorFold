@@ -10,7 +10,7 @@ THIRD_PARTY_NOTICES.md.
 ----------------------------------------------------------------------------------------------------------------------
 Changes in this fork (Apache License 2.0, section 4(b))
 
-This is a fork of TensorFold 0.6.3 (upstream commit 9356df5) by BertholomusAI (Albert Lee,
+This is a fork of TensorFold 0.6.6 (upstream commit cb2ebf0; first forked from 0.6.3, 9356df5) by BertholomusAI (Albert Lee,
 https://github.com/bertholomus), Copyright 2026. It adds the deepseek_v41 model family for DeepSeek-V4.1-Flash, tensor-parallel over two NVIDIA GB10
 nodes. TensorFold's text above, LICENSE, LICENSES/ and the upstream sections of THIRD_PARTY_NOTICES.md are unchanged.
 

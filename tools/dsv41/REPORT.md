@@ -1,6 +1,6 @@
 # REPORT — DeepSeek-V4.1-Flash on our own TensorFold TP2 engine (two NVIDIA GB10 nodes)
 
-Date: 2026-10-03, release build 2026-10-04. Branch `deepseek-v41-tp2` of our TensorFold fork (on upstream TensorFold v0.6.3),
+Date: 2026-10-03, release build 2026-10-04. Branch `deepseek-v41-tp2` of our TensorFold fork (first on upstream TensorFold v0.6.3, rebased onto v0.6.6 for v0.5),
 family `src/tensorfold/families/deepseek_v41`, tools `tools/dsv41/`. Raw results:
 `<RESULTS_DIR>/` (kit: `kit-20261003T081806Z`; ours: `ours-final-20261003T123858Z`,
 `ours-20261003T102235Z`; reference: `ref/`). Design: `DESIGN.md`. Attribution: `ATTRIBUTION.md` (both in this
