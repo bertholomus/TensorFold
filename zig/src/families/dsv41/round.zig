@@ -22,7 +22,6 @@ const tri_attn = @import("tri_attn.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
-const exl3_experts2d = @import("exl3_experts2d.zig");
 const round2d = @import("round2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
