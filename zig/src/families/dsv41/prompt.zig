@@ -318,52 +318,30 @@ pub const Chunk = struct {
         var max_gk: usize = 0;
         var max_gz: usize = 0;
         ch.n_counters = 0;
-        for (e.w.layers) |lay| {
-            const in_group = [_]weights.Linear{ lay.wq_a, lay.wkv };
-            max_gk = @max(max_gk, lay.wq_a.k + lay.wkv.k);
-            max_gz = @max(max_gz, exl3_linear.zFloats(&in_group, 128));
-            var wo_k: usize = 0;
-            for (lay.wo_a[0..lay.groups]) |wo| wo_k += wo.k;
-            max_gk = @max(max_gk, wo_k);
-            max_gz = @max(max_gz, exl3_linear.zFloats(lay.wo_a[0..lay.groups], 128));
-            var ls: [16]?weights.Linear = @splat(null);
-            ls[0] = lay.wq_a;
-            ls[1] = lay.wkv;
-            ls[2] = lay.wq_b;
-            ls[3] = lay.wo_b;
-            for (lay.wo_a[0..lay.groups], 0..) |wo, g| ls[4 + g] = wo;
-            ls[8] = lay.comp_wkv;
-            ls[9] = lay.comp_wgate;
-            ls[10] = lay.idx_wq_b;
-            ls[11] = lay.idx_wk;
-            ls[12] = lay.engram_wkv;
-            for (ls) |ol| {
-                const l = ol orelse continue;
-                max_gk = @max(max_gk, l.k);
-                max_gz = @max(max_gz, exl3_linear.zFloats(&[_]weights.Linear{l}, 128));
-                if (ch.n_counters == ch.counters.len) return error.TooManyLinears;
-                const bytes = 8 * (l.n / 128) * 4;
-                const ptr = try a.take(bytes);
-                try fill(e, ptr, 0, bytes);
-                ch.counters[ch.n_counters] = .{ .words = l.words, .ptr = ptr };
-                ch.n_counters += 1;
-            }
-        }
+        for (e.w.layers) |lay| try layerLinears(e, &ch, a, lay, &max_gk, &max_gz);
         {
             // the head: one row through its own group
             const l = e.w.head;
-            max_gk = @max(max_gk, l.k);
-            max_gz = @max(max_gz, exl3_linear.zFloats(&[_]weights.Linear{l}, 128));
-            if (ch.n_counters == ch.counters.len) return error.TooManyLinears;
-            const bytes = 8 * (l.n / 128) * 4;
-            const ptr = try a.take(bytes);
-            try fill(e, ptr, 0, bytes);
-            ch.counters[ch.n_counters] = .{ .words = l.words, .ptr = ptr };
-            ch.n_counters += 1;
+            try addLinear(e, &ch, a, l, &max_gk, &max_gz);
             ch.head_x = try a.take(d * 2);
             ch.head_l = try a.take(l.n * 4);
             const hn = if (e.two) |t| t.hw[0] + t.hw[1] else l.n; // a rank's vocabulary half (2D: both pairs' parts)
             ch.head_g = try a.take(e.world * hn * 4);
+        }
+        if (e.w.dspark) |ds| {
+            // the drafter (draft.zig): its stages' linears as a layer's, main_proj, and the stages' wkv as one group
+            // (Drafter.stage_kv)
+            var kv_k: usize = 0;
+            var kv: [8]weights.Linear = undefined;
+            if (ds.blocks.len > kv.len) return error.TooManyStages;
+            for (ds.blocks, 0..) |lay, j| {
+                try layerLinears(e, &ch, a, lay, &max_gk, &max_gz);
+                kv[j] = lay.wkv;
+                kv_k += lay.wkv.k;
+            }
+            max_gk = @max(max_gk, kv_k);
+            max_gz = @max(max_gz, exl3_linear.zFloats(kv[0..ds.blocks.len], 128));
+            try addLinear(e, &ch, a, ds.main_proj, &max_gk, &max_gz);
         }
         ch.taps = try a.take(@max(c.dspark_taps.slice().len, 1) * cap * d * 2);
         ch.gxh = try a.take(128 * max_gk * 2);
@@ -378,6 +356,46 @@ pub const Chunk = struct {
         return ch;
     }
 };
+
+/// A layer's linears in the chunk's grouped-linear sizes (its attention input group, its wo_a group, each alone at 128
+/// rows) and each one's split-K counters (Chunk.init).
+fn layerLinears(e: *const Engine, ch: *Chunk, a: *Arena, lay: weights.Layer, max_gk: *usize, max_gz: *usize) !void {
+    const in_group = [_]weights.Linear{ lay.wq_a, lay.wkv };
+    max_gk.* = @max(max_gk.*, lay.wq_a.k + lay.wkv.k);
+    max_gz.* = @max(max_gz.*, exl3_linear.zFloats(&in_group, 128));
+    var wo_k: usize = 0;
+    for (lay.wo_a[0..lay.groups]) |wo| wo_k += wo.k;
+    max_gk.* = @max(max_gk.*, wo_k);
+    max_gz.* = @max(max_gz.*, exl3_linear.zFloats(lay.wo_a[0..lay.groups], 128));
+    var ls: [16]?weights.Linear = @splat(null);
+    ls[0] = lay.wq_a;
+    ls[1] = lay.wkv;
+    ls[2] = lay.wq_b;
+    ls[3] = lay.wo_b;
+    for (lay.wo_a[0..lay.groups], 0..) |wo, g| ls[4 + g] = wo;
+    ls[8] = lay.comp_wkv;
+    ls[9] = lay.comp_wgate;
+    ls[10] = lay.idx_wq_b;
+    ls[11] = lay.idx_wk;
+    ls[12] = lay.engram_wkv;
+    for (ls) |ol| {
+        const l = ol orelse continue;
+        try addLinear(e, ch, a, l, max_gk, max_gz);
+    }
+}
+
+/// One linear alone at 128 rows in the chunk's grouped-linear sizes, and its split-K counters (int32 [8 N / 128], zeros,
+/// left zero by each launch).
+fn addLinear(e: *const Engine, ch: *Chunk, a: *Arena, l: weights.Linear, max_gk: *usize, max_gz: *usize) !void {
+    max_gk.* = @max(max_gk.*, l.k);
+    max_gz.* = @max(max_gz.*, exl3_linear.zFloats(&[_]weights.Linear{l}, 128));
+    if (ch.n_counters == ch.counters.len) return error.TooManyLinears;
+    const bytes = 8 * (l.n / 128) * 4;
+    const ptr = try a.take(bytes);
+    try fill(e, ptr, 0, bytes);
+    ch.counters[ch.n_counters] = .{ .words = l.words, .ptr = ptr };
+    ch.n_counters += 1;
+}
 
 /// Model._moe_scratch's decode scratch: experts.py Scratch(rows=max(n, 64), prompt=False), zeros but its member lists'
 /// -1 (made at the first window under 64 rows and never replaced).

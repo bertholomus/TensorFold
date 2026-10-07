@@ -1,6 +1,7 @@
-//! cuBLAS (not Lt) by dlopen, for the fp32 GEMMs the served build's prompt chunks run through torch.matmul: the MoE
-//! gate's logits and the indexer's weights. torch calls cublasSgemm_v2 on one handle with CUBLAS_DEFAULT_MATH and a
-//! 32 MiB workspace (the recording's cuBLAS log); the same call on the same library picks the same algorithm.
+//! cuBLAS (not Lt) by dlopen, for the fp32 GEMMs the served build runs through torch.matmul: the MoE gate's logits and
+//! the indexer's weights of prompt chunks, the DSpark confidence head. torch calls cublasSgemm_v2 on one handle with
+//! CUBLAS_DEFAULT_MATH and a 32 MiB workspace (the recording's cuBLAS log); the same call on the same library picks the
+//! same algorithm.
 const std = @import("std");
 const cuda = @import("cuda");
 
@@ -67,5 +68,15 @@ pub const Blas = struct {
         const one: f32 = 1;
         const zero: f32 = 0;
         try b.check(b.api.cublasSgemm_v2(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, @intCast(k), x, @intCast(k), &zero, out, @intCast(n)));
+    }
+
+    /// torch.matmul of x [rows, k] fp32 (row-major) and v [1, k] fp32 transposed (the DSpark confidence head): out [rows]
+    /// fp32. A [k, 1] column is contiguous by torch's rules (a size-1 dimension's stride is not checked), so torch
+    /// issues C^T = v^T x^T untransposed: transa N, transb N, m = 1, n = rows, lda = 1, ldb = k, ldc = 1 (cuBLAS runs it
+    /// as a batched dot product).
+    pub fn xv(b: *const Blas, x: u64, v: u64, out: u64, rows: usize, k: usize) Error!void {
+        const one: f32 = 1;
+        const zero: f32 = 0;
+        try b.check(b.api.cublasSgemm_v2(b.handle, .n, .n, 1, @intCast(rows), @intCast(k), &one, v, 1, x, @intCast(k), &zero, out, 1));
     }
 };

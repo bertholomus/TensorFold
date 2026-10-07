@@ -36,6 +36,8 @@ pub const ring2d = @import("ring2d.zig");
 pub const text = @import("text.zig");
 pub const round = @import("round.zig");
 pub const round2d = @import("round2d.zig");
+pub const markov_tokens = @import("markov_tokens.zig");
+pub const draft = @import("draft.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -76,4 +78,6 @@ test {
     refAll(text);
     refAll(round);
     refAll(round2d);
+    refAll(markov_tokens);
+    refAll(draft);
 }
