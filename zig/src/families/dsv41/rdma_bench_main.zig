@@ -1,4 +1,4 @@
-//! tf-dsv41-rdma-bench: the RDMA ring (rdma_ring.zig) across real nodes, one process a rank. Rank 0 listens on
+//! tf-dsv41-rdma-bench: the RDMA ring (rdma.zig) across real nodes, one process a rank. Rank 0 listens on
 //! `--port` for the other ranks' queue-pair infos and sends every rank the whole table; once all are connected, each
 //! rank runs back-to-back gathers at each row count (50 a CUDA graph, replayed, as the Python ring's --gather-bench),
 //! the plain gather and the strided gather_into, and checks every float it received. One JSON line a rank and row count.
@@ -7,7 +7,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
-const ring = dsv41.rdma_ring;
+const ring = dsv41.rdma;
 const posix = std.posix;
 
 const usage = "usage: tf-dsv41-rdma-bench RANK WORLD MASTER_IP FATBIN DEVICES [--port P] [--rows 1,6,16,48] [--width 2560] [--reps 500] [--pdl 0|1] [--gid N]\n";
