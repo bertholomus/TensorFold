@@ -22,6 +22,7 @@ pub const Ops = struct {
     topk_i64: cuda.Function,
     topk_indices: cuda.Function,
     scatter: cuda.Function,
+    cand_fast: cuda.Function,
     to_bf16: cuda.Function,
     strided: cuda.Function,
     gather: cuda.Function,
@@ -44,6 +45,7 @@ pub const Ops = struct {
             .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
             .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
             .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
+            .cand_fast = try fm.function("tf_ds_cand_fast_kernel"),
             .to_bf16 = try pw.function("tf_f32_to_bf16_kernel"),
             .strided = try mv.function("tf_strided_copy_kernel"),
             .gather = try mv.function("tf_gather_rows_kernel"),
@@ -135,6 +137,21 @@ pub const Ops = struct {
         a.add(@as(c_longlong, @intCast(bytes)));
         a.add(@as(c_int, @intCast(rows)));
         try go(o.scatter, s, rows, 256, &a);
+    }
+
+    /// rounds.py _candidates_fast's mask when the pool takes every block: out [rows, nb] u8 (row stride os) = the block
+    /// of bsize scores (row stride ss) has a maximum above -inf, or is the row's newest, (vis - 1) // bsize.
+    pub fn candFast(o: *const Ops, s: cuda.Stream, score: u64, ss: usize, nb: usize, bsize: usize, vis: u64, out: u64, os: usize, rows: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(score);
+        a.add(@as(c_longlong, @intCast(ss)));
+        a.add(@as(c_int, @intCast(nb)));
+        a.add(@as(c_int, @intCast(bsize)));
+        a.add(vis);
+        a.add(out);
+        a.add(@as(c_longlong, @intCast(os)));
+        try cuda.launch.launch(o.cand_fast, .{ .grid = .{ .x = blocks(nb, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// `.to(torch.bfloat16)` of `count` fp32 values (round to nearest even).

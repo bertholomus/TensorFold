@@ -175,3 +175,24 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_indices_kernel(con
     long long* o = out + (long long)blockIdx.x * k;
     for (int i = threadIdx.x; i < k; i += blockDim.x) o[i] = cols[i] < v ? cols[i] : -1;
 }
+
+// rounds.py _candidates_fast where the pool takes every block (contexts up to nblocks * bsize keys): a row's block mask
+// (torch's bool, as u8) = the block's maximum (amax: a NaN wins) above -inf, or the block is the row's newest,
+// (vis - 1) // bsize (floor division). score [rows, nb * bsize] fp32 (row stride ss), vis [rows], out [rows, nb] (row
+// stride os); grid (blocks, rows).
+extern "C" __global__ void tf_ds_cand_fast_kernel(const float* score, long long ss, int nb, int bsize,
+                                                  const long long* vis, uint8_t* out, long long os) {
+    const int r = blockIdx.y;
+    const long long t = vis[r] - 1;
+    const long long last = t >= 0 ? t / bsize : -((-t + bsize - 1) / bsize);
+    for (int b = blockIdx.x * blockDim.x + threadIdx.x; b < nb; b += gridDim.x * blockDim.x) {
+        const float* s = score + (long long)r * ss + (long long)b * bsize;
+        bool nan = false, above = false;
+        for (int j = 0; j < bsize; ++j) {
+            const float x = s[j];
+            if (x != x) nan = true;
+            else if (x > -__int_as_float(0x7f800000)) above = true;
+        }
+        out[(long long)r * os + b] = (uint8_t)((!nan && above) || b == last);
+    }
+}

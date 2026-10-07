@@ -13,7 +13,9 @@ extension calls are in its phases and log too), modules.json (the extension modu
 With CUDA_INJECTION64_PATH=.../ztrace.so the phases also go to that launch tracer. With TF_ZREC_LAYERS set (a list of
 layer numbers, possibly empty), while <dir>/LAYERS exists every call of the LAYER_POINTS methods writes a line a tensor
 it takes or returns to layers.jsonl (digest, shape, dtype, first and last row's first bytes), and the listed layers'
-tensors (and Model.forward's) are saved whole under <dir>/layers/: the Zig port's layer gate (M3).
+tensors (and Model.forward's, a round's inputs, logits and taps) are saved whole under <dir>/layers/: the Zig port's
+layer gate (M3, and M4's decode rounds when they run eager: TF_DS_GRAPHS=0). A list of ints (a round's token ids,
+positions, slots and extents) is taken as an int64 tensor.
 """
 
 from __future__ import annotations
@@ -242,12 +244,19 @@ PHASES = [
 # -- per-layer fixtures -------------------------------------------------------------------------------------------
 
 LAYER_POINTS = [
-    # (module under FAMILY, class, method): the prompt path's layer steps and the gather between them
+    # (module under FAMILY, class, method[, positional arguments left out]): the prompt path's layer steps and the
+    # gather between them; a decode round's inputs, logits and taps and its attention sublayers (eager rounds only)
     ("cuda.model", "Model", "forward"),
     ("cuda.model", "Model", "attention_k"),
     ("cuda.model", "Model", "moe"),
     ("cuda.model", "Comm", "gather"),
+    ("cuda.rounds", "RoundRunner", "forward"),
+    ("cuda.rounds", "RoundDecoder", "run"),
+    ("cuda.rounds", "RoundDecoder", "_attention2", (4, 5)),     # cos, sin: whole RoPE tables
 ]
+WHOLE = ("Model.forward", "RoundRunner.forward", "RoundDecoder.run")     # saved whole whatever the layer
+# TF_ZREC_ONLY=<where>,...: only these points are written (a token recording: the prompts ids and the rounds inputs)
+ONLY = {x for x in os.environ.get("TF_ZREC_ONLY", "").split(",") if x}
 LAYERS_ON = "TF_ZREC_LAYERS" in os.environ
 LAYERS_FULL = {int(x) for x in os.environ.get("TF_ZREC_LAYERS", "").split(",") if x.strip().isdigit()}
 FULL_MAX = 256 << 20     # bytes: a bigger tensor is never saved whole
@@ -271,6 +280,8 @@ def _tensors(x, path: str):
 
     if isinstance(x, torch.Tensor):
         yield path, x
+    elif isinstance(x, (list, tuple)) and x and all(isinstance(y, int) and not isinstance(y, bool) for y in x):
+        yield path, torch.tensor(list(x), dtype=torch.int64)
     elif isinstance(x, (list, tuple)):
         for i, y in enumerate(x):
             if isinstance(y, torch.Tensor):
@@ -302,7 +313,7 @@ def _put_layer(call: int, where: str, layer: int | None, path: str, t) -> None:
         raw = c.contiguous().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
         row = len(raw) // t.shape[0] if t.dim() > 0 and t.shape[0] > 0 else len(raw)
         line.update(sha256=hashlib.sha256(raw).hexdigest(), head=raw[:64].hex(), tail=raw[len(raw) - row:][:64].hex())
-        if n <= FULL_MAX and (layer in LAYERS_FULL or where == "Model.forward"):
+        if n <= FULL_MAX and (layer in LAYERS_FULL or where in WHOLE):
             f = OUT / "layers" / f"{call:05d}.{where}.{path}.bin"
             f.parent.mkdir(parents=True, exist_ok=True)
             f.write_bytes(raw)
@@ -311,20 +322,21 @@ def _put_layer(call: int, where: str, layer: int | None, path: str, t) -> None:
         _lay_lines.append(line)
 
 
-def _layer_point(where: str, f):
-    """f, writing its tensors in and out while the LAYERS flag is up (synchronized first; never in a graph capture)."""
+def _layer_point(where: str, f, skip: tuple = ()):
+    """f, writing its tensors in and out while the LAYERS flag is up (synchronized first; never in a graph capture);
+    positional arguments in `skip` (numbered from 1 after self) are left out."""
 
     @functools.wraps(f)
     def w(*a, **k):
         import torch
 
-        if not _armed() or torch.cuda.is_current_stream_capturing():
+        if not _armed() or torch.cuda.is_current_stream_capturing() or (ONLY and where not in ONLY):
             return f(*a, **k)
         with _lock:
             _lay["call"] += 1
             call = _lay["call"]
         layer = _layer_of(a)
-        ins = [(f"in{i}", v) for i, v in enumerate(a[1:], 1)] + [(f"in.{kk}", v) for kk, v in k.items()]
+        ins = [(f"in{i}", v) for i, v in enumerate(a[1:], 1) if i not in skip] + [(f"in.{kk}", v) for kk, v in k.items()]
 
         def put(items, tag):
             try:
@@ -348,12 +360,12 @@ def _layer_point(where: str, f):
 def _patch_layers() -> None:
     import importlib
 
-    for mod, owner, attr in LAYER_POINTS:
+    for mod, owner, attr, *skip in LAYER_POINTS:
         try:
             target = getattr(importlib.import_module(f"{FAMILY}.{mod}"), owner)
             f = getattr(target, attr)
             if not getattr(f, "_zrec_layer", False):
-                setattr(target, attr, _layer_point(f"{owner}.{attr}", f))
+                setattr(target, attr, _layer_point(f"{owner}.{attr}", f, skip[0] if skip else ()))
         except Exception as e:
             print(f"zrec: no layer point {mod}.{owner}.{attr} ({e!r})", file=sys.stderr, flush=True)
 

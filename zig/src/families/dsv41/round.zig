@@ -1,0 +1,669 @@
+//! A decode round on one TP rank: the served build's RoundDecoder (rounds.py) for one stream's rows in pool slot 0,
+//! with the served switches (hc fused with the Sinkhorn half deferred and the posted mixes' dots on it; glue, rot_q,
+//! rot_attn, rot_wob, idx, comp, rowmm on; hc_rot and SHARED_OVERLAP off): the rows' streams from their token ids
+//! (embed_init), then a stretch at a time (cut before each Engram layer) every layer's attention mixes with the last
+//! sublayer's post fused in, its DSpark tap, attention (_attention2 and _kv_idx: the q norm with the window KV into the
+//! ring and the rotations folded in, q's RoPE in wq_b's epilogue, the compressor and the indexer, the sparse attention
+//! whose merge applies the inverse RoPE and rotates wo_a's inputs, wo_a's epilogue rotating wo_b's), its gather, the
+//! FFN mixes, the MoE and its gather; a stretch's last post alone; the head on every row. The served side streams (the
+//! Sinkhorn half, the L2 prefetches) run in this stream's order here, the RDMA gathers are NCCL all-gathers (the same
+//! bytes), and the round's index arithmetic (rounds.py _ix: integer ops on the positions and the stream's extent) is
+//! made on the host.
+const std = @import("std");
+const cuda = @import("cuda");
+const prompt = @import("prompt.zig");
+const weights = @import("weights.zig");
+const tri = @import("tri.zig");
+const tri_basic = @import("tri_basic.zig");
+const tri_hc = @import("tri_hc.zig");
+const tri_norm = @import("tri_norm.zig");
+const tri_attn = @import("tri_attn.zig");
+const tri_index = @import("tri_index.zig");
+const exl3_linear = @import("exl3_linear.zig");
+const exl3_experts = @import("exl3_experts.zig");
+const engram = @import("engram.zig");
+const exact = @import("exact.zig");
+
+const Engine = prompt.Engine;
+const Chunk = prompt.Chunk;
+const Caches = prompt.Caches;
+
+/// kernels.ROUND_ROWS (TF_DS_ROUND_ROWS unset: TF_DS_DECODE_ROWS, 16): a round's rows at most.
+pub const max_rows = 16;
+/// graph.py BUCKET_MIN (TF_DS_BUCKET_MIN unset).
+pub const bucket_min = 1024;
+/// The window ring's rows a slot (model.py: window + RING_EXTRA).
+const ring_extra = prompt.ring_extra;
+/// The compressor's positional store's rows a slot (model.py RAW).
+const raw_rows = prompt.raw_rows;
+
+/// graph.py bucket_for: the context bucket of a round whose deepest row sees n positions, in a pool of `cap`.
+pub fn bucketFor(n: usize, cap: usize) usize {
+    var b: usize = bucket_min;
+    while (b < n) b *= 2;
+    return @min(b, @max(cap, bucket_min));
+}
+
+/// The points a round exchanges or ends with, in the order the served build's recorder sees them (a checker's hook).
+pub const Point = enum { engram_proj, engram_gather, attn_in, attn_out, attn_gather, moe_in, moe_out, moe_gather, head_cols, head_gather, logits, taps };
+
+/// A checker of a round's buffers between its steps (synchronized first by the checker): false stops the round.
+pub const Probe = struct {
+    ctx: *anyopaque,
+    at: *const fn (ctx: *anyopaque, what: Point, layer: usize, dev: u64) anyerror!bool,
+
+    fn check(pb: ?Probe, what: Point, layer: usize, dev: u64) !void {
+        const p = pb orelse return;
+        if (!try p.at(p.ctx, what, layer, dev)) return error.RoundMismatch;
+    }
+};
+
+/// A round's rows of one stream: token ids at positions pos (consecutive), the stream in pool slot 0 with its extent
+/// [base, end) of positions.
+pub const Rows = struct { ids: []const i64, pos: []const i64, base: i64 = 0, end: i64 };
+
+/// The index tensors rounds.py's _ix makes from a round's inputs, by row (int64 [R] each, gi [R, 2]).
+const Glue = enum(u8) { wslot, wbase, cbase1, ctarget1, gpos1, vis1, cbase2, ctarget2, gpos2, vis2, rslot, gi };
+const glue_n = @as(usize, @intFromEnum(Glue.gi)) + 2; // gi (the last) takes two
+
+/// A round's buffers for up to max_rows rows (Python allocates them a round; their contents never carry over).
+pub const Round = struct {
+    r: usize = 0,
+    bucket: usize = 0,
+    glue: u64, // int64 [glue_n, max_rows]
+    // RoundDecoder.inputs: one int64 [5, R] buffer (ids, positions, slots, the extent's base and end), so a round's
+    // positions sit R * 8 bytes in: the alignment its kernels were specialized for (16-byte at even R only)
+    inputs: u64,
+    ids: u64 = 0,
+    pos: u64 = 0,
+    zero: u64, // int64 [1] = 0: m._zero, sparse_attn's WLO in ring mode
+    // the streams and the mHC state
+    h: u64,
+    h_alt: u64,
+    x: u64,
+    part: u64,
+    pre: u64,
+    pre_a: u64,
+    pre_f: u64,
+    post: u64,
+    comb: u64,
+    // attention
+    qa: u64, // bf16 [R, q_lora]
+    ykv: u64, // bf16 [R, head_dim]
+    ckv: u64, // the compressor's kv projection: bf16 (ratio 1) or fp32 [R, head_dim]
+    cgate: u64, // fp32 [R, head_dim]
+    qr: u64, // bf16 [R, q_lora]
+    kout: u64, // bf16 [R, head_dim]: q_kv_norm's KV rows
+    xhq: u64, // fp16 [wq_b, idx_wq_b][R, q_lora]: their rotated input rows (q_proj's group buffers)
+    q: u64, // bf16 [R, heads, head_dim]
+    iq: u64, // bf16 [R, index_heads, index_head_dim]
+    iq4: u64, // its fp4_qd bytes
+    iw: u64, // bf16 [R, index_heads]
+    keys: u64, // int64 [R, nb]
+    score: u64, // fp32 [R, nb]
+    cand: u64, // u8 [R, nb / candidate_block]
+    has_cand: bool = false,
+    cidx: u64, // int64 [R, index_topk]
+    kk: usize = 0,
+    ktop: u64, // int64 [R, index_topk]: torch's top-k values
+    kvg: u64, // fp32 [R, 2, head_dim]: the group's positional-store rows
+    sg: u64,
+    lat2: u64, // bf16 [R, head_dim]: the pair's weighted sum
+    lat: u64, // bf16 [R, head_dim]: the compressed latent
+    ikp: u64, // bf16 [R, index_head_dim]: idx_wk's projection
+    ik: u64, // bf16 [R, index_head_dim]: the index key
+    o: u64, // bf16 [R, heads, head_dim]
+    pm_: u64, // fp32 [R, heads, 8]: the split keys' partials
+    pl_: u64,
+    po_: u64, // fp32 [R, heads, 8, head_dim]
+    xhwo: u64, // fp16 [wo_a group][R, K]: wo_a's rotated input rows (the merge writes them)
+    xb: u64, // fp16 [R, wo_b.k]: wo_b's rotated input rows (wo_a's epilogue writes them)
+    u: u64, // bf16 [R, groups * o_lora]
+    pa: u64, // fp32 [R, D]
+    ga: u64, // fp32 [world, R, D]
+    // MoE
+    gl: u64, // fp32 [R, D / 256, experts]: the gate's chunk sums
+    pick: u64, // int32 [R, slots]
+    mw: u64, // fp32 [R, slots]
+    pm: u64, // fp32 [R, D]
+    gm: u64, // fp32 [world, R, D]
+    xs: exl3_experts.DecodeScratch,
+    // Engram
+    e_in: u64, // bf16 [R, cols * engram_head_dim]: the rows read for this rank's hash columns
+    ek: u64, // fp32 [R, engram_wkv.n]
+    ekg: u64, // fp32 [world, R, engram_wkv.n]
+    ekv: u64, // bf16 [R, engram_wkv.n]
+    // the head and the taps
+    xc: u64, // bf16 [R, D]
+    hl: u64, // fp32 [R, columns]
+    hg: u64, // fp32 [world, R, columns]
+    logits: u64, // fp32 [R, world * columns]: the rows' logits, the ranks' columns in rank order
+    taps: u64, // bf16 [R, taps * D]
+    // wo_a's suh concatenated a layer (wo_a_rot: torch.cat of the slices' suh, cached on the layer)
+    wo_suh: []u64,
+    sink: tri_hc.Sink,
+
+    pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
+        const c = e.c;
+        const w = e.w;
+        const R = max_rows;
+        const d = c.hidden;
+        const hc = c.hc;
+        const hd = c.head_dim;
+        const hl = c.heads / e.world;
+        const l0 = w.layers[0];
+        const nb_max = bucketFor(pool_cap, pool_cap);
+        var rd: Round = undefined;
+        rd.r = 0;
+        rd.bucket = 0;
+        rd.has_cand = false;
+        rd.kk = 0;
+        rd.glue = try a.take(glue_n * R * 8);
+        rd.inputs = try a.take(5 * R * 8);
+        rd.ids = rd.inputs;
+        rd.pos = rd.inputs;
+        rd.zero = try a.take(8);
+        try prompt.fill(e, rd.zero, 0, 8);
+        rd.h = try a.take(R * hc * d * 2);
+        rd.h_alt = try a.take(R * hc * d * 2);
+        rd.x = try a.take(R * d * 2);
+        rd.part = try a.take(R * tri_basic.hc_blocks * 32 * 4);
+        rd.pre = try a.take(R * hc * 4);
+        rd.pre_a = try a.take(R * hc * 4);
+        rd.pre_f = try a.take(R * hc * 4);
+        rd.post = try a.take(R * hc * 4);
+        rd.comb = try a.take(R * hc * hc * 4);
+        rd.qa = try a.take(R * c.q_lora * 2);
+        rd.ykv = try a.take(R * hd * 2);
+        rd.ckv = try a.take(R * hd * 4);
+        rd.cgate = try a.take(R * hd * 4);
+        rd.qr = try a.take(R * c.q_lora * 2);
+        rd.kout = try a.take(R * hd * 2);
+        rd.xhq = try a.take(2 * R * c.q_lora * 2);
+        rd.q = try a.take(R * hl * hd * 2);
+        rd.iq = try a.take(R * c.index_heads * c.index_head_dim * 2);
+        rd.iq4 = try a.take(R * c.index_heads * c.index_head_dim * 2);
+        rd.iw = try a.take(R * c.index_heads * 2);
+        rd.keys = try a.take(R * nb_max * 8);
+        rd.score = try a.take(R * nb_max * 4);
+        rd.cand = try a.take(R * (nb_max / c.candidate_block + 1));
+        rd.cidx = try a.take(R * c.index_topk * 8);
+        rd.ktop = try a.take(R * c.index_topk * 8);
+        rd.kvg = try a.take(R * 2 * hd * 4);
+        rd.sg = try a.take(R * 2 * hd * 4);
+        rd.lat2 = try a.take(R * hd * 2);
+        rd.lat = try a.take(R * hd * 2);
+        rd.ikp = try a.take(R * c.index_head_dim * 2);
+        rd.ik = try a.take(R * c.index_head_dim * 2);
+        rd.o = try a.take(R * hl * hd * 2);
+        rd.pm_ = try a.take(R * hl * tri_attn.attn_splits * 4);
+        rd.pl_ = try a.take(R * hl * tri_attn.attn_splits * 4);
+        rd.po_ = try a.take(R * hl * tri_attn.attn_splits * hd * 4);
+        var wo_k: usize = 0;
+        for (l0.wo_a[0..l0.groups]) |wo| wo_k += wo.k;
+        rd.xhwo = try a.take(R * wo_k * 2);
+        rd.xb = try a.take(R * l0.wo_b.k * 2);
+        rd.u = try a.take(R * l0.groups * l0.wo_a[0].n * 2);
+        rd.pa = try a.take(R * d * 4);
+        rd.ga = try a.take(e.world * R * d * 4);
+        rd.gl = try a.take(R * (d / 256) * c.experts * 4);
+        rd.pick = try a.take(R * e.slots() * 4);
+        rd.mw = try a.take(R * e.slots() * 4);
+        rd.pm = try a.take(R * d * 4);
+        rd.gm = try a.take(e.world * R * d * 4);
+        rd.xs = try decodeScratch(e, a, l0.experts, e.slots());
+        rd.e_in = 0;
+        rd.ek = 0;
+        rd.ekg = 0;
+        rd.ekv = 0;
+        for (w.layers) |lay| {
+            const ew = lay.engram_wkv orelse continue;
+            rd.e_in = try a.take(R * ew.k * 2);
+            rd.ek = try a.take(R * ew.n * 4);
+            rd.ekg = try a.take(e.world * R * ew.n * 4);
+            rd.ekv = try a.take(R * ew.n * 2);
+            break;
+        }
+        rd.xc = try a.take(R * d * 2);
+        rd.hl = try a.take(R * w.head.n * 4);
+        rd.hg = try a.take(e.world * R * w.head.n * 4);
+        rd.logits = try a.take(R * e.world * w.head.n * 4);
+        rd.taps = try a.take(R * @max(c.dspark_taps.slice().len, 1) * d * 2);
+        // wo_a_rot's suh: the slices' suh one after another (torch.cat's bytes)
+        rd.wo_suh = try gpa.alloc(u64, w.layers.len);
+        for (w.layers, 0..) |lay, li| {
+            var k: usize = 0;
+            for (lay.wo_a[0..lay.groups]) |wo| k += wo.k;
+            const dst = try a.take(k * 2);
+            var off: usize = 0;
+            for (lay.wo_a[0..lay.groups]) |wo| {
+                try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst + off * 2, wo.suh, wo.k * 2, e.s.handle), "cuMemcpyDtoDAsync");
+                off += wo.k;
+            }
+            rd.wo_suh[li] = dst;
+        }
+        var ev = try cuda.Event.init(e.d, false);
+        errdefer ev.deinit();
+        // the Sinkhorn half's side stream is this stream: its launches keep their order and plain (no-PDL) launches
+        rd.sink = .{ .s = e.s, .fork = ev };
+        return rd;
+    }
+
+    fn g(rd: *const Round, k: Glue) u64 {
+        return rd.glue + @as(u64, @intFromEnum(k)) * max_rows * 8;
+    }
+};
+
+/// Model._moe_scratch's decode scratch: experts.py Scratch(rows=max(n, 64), prompt=False), one for every layer of the
+/// same slots and experts (made at the first decode window and never replaced), zeros but its member lists' -1.
+fn decodeScratch(e: *const Engine, a: *prompt.Arena, ex: weights.Experts, slots: usize) !exl3_experts.DecodeScratch {
+    const rows = exl3_experts.exact_rows;
+    const sz = try exl3_experts.DecodeScratch.sizes(rows, slots, ex.dims, ex.width, ex.count);
+    var sc: exl3_experts.DecodeScratch = undefined;
+    sc.rows = rows;
+    sc.slots = slots;
+    inline for (.{ "xg", "xu", "xd", "z", "y", "cnt_gu", "cnt_d", "epoch", "ready", "ready_cnt", "ids", "count", "members" }, 0..) |f, j| {
+        const ptr = try a.take(sz[j]);
+        @field(sc, f) = ptr;
+        if (j == 12) {
+            try e.d.check(e.d.api.cuMemsetD32Async(ptr, 0xffffffff, sz[j] / 4, e.s.handle), "cuMemsetD32Async");
+        } else try prompt.fill(e, ptr, 0, sz[j]);
+    }
+    return sc;
+}
+
+/// rounds.py _ix's tensors for these rows (one stream in slot 0), made on the host and uploaded in one copy.
+fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
+    const R = rows.ids.len;
+    var hg: [glue_n * max_rows]i64 = @splat(0);
+    const rs: i64 = @intCast(e.c.window + ring_extra);
+    const raw: i64 = raw_rows;
+    for (0..R) |i| {
+        const p = rows.pos[i];
+        const at = struct {
+            fn f(buf: []i64, k: Glue, r: usize) *i64 {
+                return &buf[@as(usize, @intFromEnum(k)) * max_rows + r];
+            }
+        }.f;
+        // wbase = slot * RS (slot 0), wslot = wbase + pos % RS
+        at(&hg, .wbase, i).* = 0;
+        at(&hg, .wslot, i).* = @mod(p, rs);
+        // ratio 1: cbase = base, ctarget = cbase + pos, gpos = pos, vis = pos + 1
+        at(&hg, .cbase1, i).* = rows.base;
+        at(&hg, .ctarget1, i).* = rows.base + p;
+        at(&hg, .gpos1, i).* = p;
+        at(&hg, .vis1, i).* = p + 1;
+        // ratio 2: groups = pos // 2, target = groups if the group is complete else the extent's last row (scratch)
+        const cb2 = @divFloor(rows.base, 2);
+        const groups = @divFloor(p, 2);
+        const scratch = @divFloor(rows.end, 2) - 1 - cb2;
+        at(&hg, .cbase2, i).* = cb2;
+        at(&hg, .ctarget2, i).* = cb2 + (if (@mod(p + 1, 2) == 0) groups else scratch);
+        at(&hg, .gpos2, i).* = groups * 2;
+        at(&hg, .vis2, i).* = @divFloor(p + 1, 2);
+        // rslot = slot * RAW + pos % RAW; gi = rbase + (groups * 2 + [0, 1]) % RAW
+        at(&hg, .rslot, i).* = @mod(p, raw);
+        const gi0 = @as(usize, @intFromEnum(Glue.gi)) * max_rows;
+        hg[gi0 + 2 * i] = @mod(groups * 2, raw);
+        hg[gi0 + 2 * i + 1] = @mod(groups * 2 + 1, raw);
+    }
+    try prompt.upload(e, rd.glue, &hg, hg.len * 8);
+    // RoundDecoder.set: [ids, pos, slots, base, end] in one [5, R] copy
+    var in: [5 * max_rows]i64 = @splat(0);
+    for (0..R) |i| {
+        in[i] = rows.ids[i];
+        in[R + i] = rows.pos[i];
+        in[2 * R + i] = 0;
+        in[3 * R + i] = rows.base;
+        in[4 * R + i] = rows.end;
+    }
+    try prompt.upload(e, rd.inputs, &in, 5 * R * 8);
+    rd.ids = rd.inputs;
+    rd.pos = rd.inputs + R * 8;
+}
+
+/// The layer's RoPE table rows (model.py _cs: the compressed table for a compressed layer).
+fn ropeOf(e: *const Engine, lay: weights.Layer) prompt.Rope {
+    return if (lay.ratio != 0) e.compressed else e.plain;
+}
+
+/// _attention2 with _kv_idx (kv_done: q_kv_norm wrote the window KV), the served switches, xh none (hc_rot off): the
+/// layer's attention partial pa [R, D] fp32 from its mixed rows x.
+fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, sh: *prompt.Shared, li: usize) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const t = e.t;
+    const R = rd.r;
+    const hd = c.head_dim;
+    const rd_dim = c.rope_dim;
+    const hl = c.heads / e.world;
+    const ratio: usize = lay.ratio;
+    const rope = ropeOf(e, lay);
+    const ring = rings[li];
+    const ring_rows = c.window + ring_extra;
+    const pos = rd.pos;
+    // attn_in: wq_a, wkv and (a kv source of a compressed layer) the compressor's, one group
+    const has_comp = ratio != 0 and lay.comp_wkv != null;
+    const ck_dt: exl3_linear.DType = if (ratio == 1) .bf16 else .f32;
+    {
+        var ls: [4]weights.Linear = undefined;
+        var outs: [4]u64 = undefined;
+        var lds: [4]usize = undefined;
+        var dts: [4]exl3_linear.DType = undefined;
+        var n: usize = 0;
+        ls[n] = lay.wq_a;
+        outs[n] = rd.qa;
+        lds[n] = lay.wq_a.n;
+        dts[n] = .bf16;
+        n += 1;
+        ls[n] = lay.wkv;
+        outs[n] = rd.ykv;
+        lds[n] = hd;
+        dts[n] = .bf16;
+        n += 1;
+        if (has_comp) {
+            ls[n] = lay.comp_wkv.?;
+            outs[n] = rd.ckv;
+            lds[n] = hd;
+            dts[n] = ck_dt;
+            n += 1;
+            if (lay.comp_wgate) |cg| {
+                ls[n] = cg;
+                outs[n] = rd.cgate;
+                lds[n] = hd;
+                dts[n] = .f32;
+                n += 1;
+            }
+        }
+        const xs = [_]u64{ rd.x, rd.x, rd.x, rd.x };
+        const ldxs = [_]usize{ c.hidden, c.hidden, c.hidden, c.hidden };
+        try prompt.grouped(e, ch, R, ls[0..n], xs[0..n], ldxs[0..n], outs[0..n], lds[0..n], dts[0..n]);
+    }
+    // the indexer's top-k takes every entry it scans (short contexts): its selection needs no scores
+    const has_idx = ratio != 0 and lay.idx_wq_b != null;
+    const nb: usize = if (ratio != 0) rd.bucket / ratio else 0;
+    const idx_all = has_idx and li != c.candidate_source and nb <= c.index_topk;
+    const need_iq = has_idx and !idx_all;
+    // q_proj with kv (rot_q): q's RMSNorm writes wq_b's (and the indexer wq_b's) rotated rows and the window KV into
+    // the ring in one launch; wq_b's epilogue applies q's RoPE
+    {
+        var rot: [2]tri_norm.Rot = undefined;
+        var calls: [2]exl3_linear.Call = undefined;
+        var n: usize = 0;
+        const qls = [_]?weights.Linear{ lay.wq_b, if (need_iq) lay.idx_wq_b else null };
+        const outs = [_]u64{ rd.q, rd.iq };
+        for (qls) |ol| {
+            const l = ol orelse continue;
+            const xh = rd.xhq + n * R * c.q_lora * 2;
+            rot[n] = .{ .suh = l.suh, .h = xh };
+            calls[n] = .{ .layer = l, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = xh, .y = outs[n], .ldy = @intCast(l.n), .y_dtype = .bf16, .counters = 0 };
+            if (n == 0) calls[n].rope = .{ .cos = rope.cos, .sin = rope.sin, .pos = pos, .hd = @intCast(hd), .rd = @intCast(rd_dim) };
+            n += 1;
+        }
+        try tri_norm.qKvNorm(t, rd.qa, lay.wq_a.n, lay.q_norm, c.eps, rot[0..n], rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), true, rd_dim, rd.qr, rd.kout, R, lay.wq_a.n, hd);
+        try prompt.groupedRotated(e, ch, R, calls[0..n]);
+    }
+    // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
+    var comp: tri_attn.Comp = .none;
+    var cbase: ?u64 = null;
+    if (ratio != 0) {
+        const cb_k: Glue = if (ratio == 1) .cbase1 else .cbase2;
+        cbase = rd.g(cb_k);
+        if (lay.comp_wkv != null) {
+            if (ratio == 1) {
+                try tri_basic.rmsnorm(t, rd.ckv, hd, lay.comp_norm, rd.lat, hd, c.eps, R, hd);
+            } else if (ratio == 2) {
+                // rk[rslot] = kv, rs[rslot] = score; the group's two rows back (rk[gi], rs[gi]); the pair's softmax-
+                // weighted sum to bf16 (torch's ops: exact.compress2's bytes), then the RMSNorm (Triton's)
+                try e.ops.scatterRows(e.s, rd.ckv, hd * 4, rd.g(.rslot), cs.raw_kv[li], hd * 4, hd * 4, R);
+                try e.ops.scatterRows(e.s, rd.cgate, hd * 4, rd.g(.rslot), cs.raw_score[li], hd * 4, hd * 4, R);
+                try e.d.check(e.d.api.cuMemsetD8Async(ch.invalid, 0, 4, e.s.handle), "cuMemsetD8Async");
+                try e.ops.gatherRows(e.s, cs.raw_kv[li], raw_rows, rd.g(.gi), rd.kvg, hd * 4, 2 * R, ch.invalid);
+                try e.ops.gatherRows(e.s, cs.raw_score[li], raw_rows, rd.g(.gi), rd.sg, hd * 4, 2 * R, ch.invalid);
+                try e.exact.compress2(e.s, rd.kvg, rd.sg, rd.lat2, R, hd);
+                try tri_basic.rmsnorm(t, rd.lat2, hd, lay.comp_norm, rd.lat, hd, c.eps, R, hd);
+            } else return error.NotPortedYet;
+            sh.kv_layer = li;
+            const ctarget = rd.g(if (ratio == 1) .ctarget1 else .ctarget2);
+            const gpos = rd.g(if (ratio == 1) .gpos1 else .gpos2);
+            if (lay.idx_wk) |iwk| {
+                const id = c.index_head_dim;
+                try prompt.grouped(e, ch, R, &.{iwk}, &.{rd.lat}, &.{hd}, &.{rd.ikp}, &.{id}, &.{.bf16});
+                try tri_basic.rmsnorm(t, rd.ikp, id, lay.idx_k_norm, rd.ik, id, c.eps, R, id);
+                try tri_norm.ropeHeads(t, rd.ik, rope.cos, rope.sin, gpos, rd_dim, false, R, 1, id);
+                try tri_attn.fp4Store(t, rd.ik, id, cs.idx_codes[li], cs.idx_scales[li], ctarget, R, id, 32, false);
+            }
+            // the latent rotated in place (it is not read again), then stored
+            try tri_norm.ropeHeads(t, rd.lat, rope.cos, rope.sin, gpos, rd_dim, false, R, 1, hd);
+            try tri_attn.fp4Store(t, rd.lat, hd, cs.comp_codes[li], cs.comp_scales[li], ctarget, R, hd, 16, true);
+        }
+        const src = sh.kv_layer orelse return error.NoKvSource;
+        const vis = rd.g(if (ratio == 1) .vis1 else .vis2);
+        if (idx_all) {
+            // topk_indices of every scanned key is 0 .. nb - 1 whatever the scores, then the visible mask
+            var top: [max_rows * 512]i64 = undefined;
+            if (nb > 512) return error.NotPortedYet;
+            var hv: [max_rows]i64 = undefined;
+            try e.d.check(e.d.api.cuStreamSynchronize(e.s.handle), "cuStreamSynchronize");
+            try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hv, vis, R * 8), "cuMemcpyDtoH");
+            for (0..R) |r| for (0..nb) |j| {
+                top[r * nb + j] = if (@as(i64, @intCast(j)) < hv[r]) @intCast(j) else -1;
+            };
+            try prompt.upload(e, rd.cidx, &top, R * nb * 8);
+            rd.kk = nb;
+        } else if (lay.idx_wq_b != null) {
+            const ih = c.index_heads;
+            const id = c.index_head_dim;
+            const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
+            try tri_norm.ropeHeads(t, rd.iq, rope.cos, rope.sin, pos, rd_dim, false, R, ih, id);
+            try tri_attn.fp4QdP2(t, rd.iq, rd.iq4, R * ih * id);
+            try tri_norm.rowmmWts(t, rd.x, c.hidden, lay.idx_proj_h, exact.indexScale(c.index_head_dim, c.index_heads), rd.iw, R, c.hidden, ih);
+            const kk = @min(c.index_topk, nb);
+            const pow2 = kk & (kk - 1) == 0;
+            const after_src = c.candidate_source < li;
+            const top: tri_index.TopK = .{ .top = rd.ktop, .ctx = @ptrCast(@constCast(e)), .run = prompt.torchTopk };
+            if (pow2 and li != c.candidate_source) {
+                // scores -> (the pool's mask) -> top-k keys in one launch, then the selection
+                if (after_src and nb > c.candidate_blocks * c.candidate_block) return error.NotPortedYet; // index_keys_cand
+                const cand: ?tri_index.Cand = if (after_src) (if (rd.has_cand) .{ .mask = rd.cand, .stride = nb / c.candidate_block } else return error.NoCandidatePool) else null;
+                if (nb > tri_index.topk_fused_max) return error.NotPortedYet; // index_keys with tile maxima, the pruned selection
+                try tri_index.indexKeys(t, rd.iq4, k, rd.iw, vis, nb, cbase, cand, c.candidate_block, null, kk, rd.keys, R, ih, id);
+                try tri_index.topkSelect(t, rd.keys, nb, kk, vis, rd.cidx, top, R, nb);
+            } else if (pow2 and li == c.candidate_source) {
+                // the candidate source: the scores, the pool's mask from them, then their keys' top-k
+                if (nb > c.candidate_blocks * c.candidate_block) return error.NotPortedYet; // _candidate_blocks
+                if (nb % c.candidate_block != 0) return error.NotPortedYet; // _candidates' padded path
+                try tri_index.indexScore(t, rd.iq4, k, rd.iw, vis, nb, rd.score, cbase, false, null, false, R, ih, id);
+                try e.ops.candFast(e.s, rd.score, nb, nb / c.candidate_block, c.candidate_block, vis, rd.cand, nb / c.candidate_block, R);
+                rd.has_cand = true;
+                if (nb > tri_index.topk_fused_max) return error.NotPortedYet; // score_keys with tile maxima, pruned
+                try tri_index.scoreKeys(t, rd.score, null, rd.keys, R, nb);
+                try tri_index.topkSelect(t, rd.keys, nb, kk, vis, rd.cidx, top, R, nb);
+            } else return error.NotPortedYet; // the scores' topk_indices path (a top-k of no power of two)
+            rd.kk = kk;
+        }
+        comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
+    }
+    // rot_attn: the merge applies the inverse RoPE and writes wo_a's rotated input rows; wo_ab with its fold
+    const gk = lay.wo_a[0].k;
+    try tri_attn.sparseAttn(t, .{
+        .q = rd.q,
+        .out = rd.o,
+        .rows = R,
+        .h = hl,
+        .hd = hd,
+        .sink = lay.sink,
+        .wsrc = ring,
+        .wsrc_rows = ring_rows,
+        .wlo = rd.zero,
+        .ring = true,
+        .comp = comp,
+        .idx = if (ratio != 0) rd.cidx else 0,
+        .n_idx = if (ratio != 0) rd.kk else 0,
+        .pos = pos,
+        .scale = prompt.scale(hd),
+        .window = c.window,
+        .wbase = rd.g(.wbase),
+        .cbase = cbase,
+        .ring_rows = ring_rows,
+        .rot = .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
+        .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },
+    });
+    var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
+    const uw = lay.groups * lay.wo_a[0].n;
+    var col: usize = 0;
+    var off: usize = 0;
+    for (lay.wo_a[0..lay.groups], 0..) |wo, gi| {
+        calls[gi] = .{ .layer = wo, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xhwo + off * 2, .y = rd.u + col * 2, .ldy = @intCast(uw), .y_dtype = .bf16, .counters = 0, .rot = .{ .suh = lay.wo_b.suh, .xh = rd.xb, .ldr = @intCast(lay.wo_b.k), .off = @intCast(col) } };
+        col += wo.n;
+        off += R * wo.k;
+    }
+    try prompt.groupedRotated(e, ch, R, calls[0..lay.groups]);
+    var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(c.hidden), .y_dtype = .f32, .counters = 0 }};
+    try prompt.groupedRotated(e, ch, R, &cb_call);
+}
+
+/// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
+/// (rowmm_gate), the routing with the shared expert in every row's last slot, the routed experts' decode path.
+fn moe(e: *const Engine, rd: *Round, li: usize) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const R = rd.r;
+    const sl = e.slots();
+    const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
+    try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
+    try exl3_experts.decode(e.ex, e.s, lay.experts, rd.xs, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
+}
+
+/// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
+/// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
+/// hashed from `seq`, the whole sequence's ids through the rows').
+pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, pool_cap: usize, probe: ?Probe) !void {
+    const c = e.c;
+    const w = e.w;
+    const t = e.t;
+    const R = rows.ids.len;
+    if (R == 0 or R > max_rows or rows.pos.len != R) return error.BadRound;
+    if (e.two != null) return error.NotPortedYet; // the four-node split's rounds (its exchanges and column parts)
+    rd.r = R;
+    var deepest: usize = 0;
+    for (rows.pos) |p| deepest = @max(deepest, @as(usize, @intCast(p)) + 1);
+    rd.bucket = bucketFor(deepest, pool_cap);
+    rd.has_cand = false;
+    try setGlue(e, rd, rows);
+    const d = c.hidden;
+    try tri_basic.embedInit(t, w.embed, rd.ids, rd.h, rd.pre, R, d, c.hc);
+    var sh: prompt.Shared = .{};
+    var h = rd.h;
+    var spare = rd.h_alt;
+    var pre = rd.pre;
+    var pre_f = rd.pre_f;
+    var ntap: usize = 0;
+    // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on)
+    var li: usize = 0;
+    while (li < w.layers.len) {
+        var end = li + 1;
+        while (end < w.layers.len and w.layers[end].engram_wkv == null) end += 1;
+        var pending: ?u64 = null;
+        for (li..end) |l| {
+            const lay = w.layers[l];
+            if (lay.engram_wkv) |ew| {
+                if (pending) |gp| {
+                    try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
+                    pending = null;
+                }
+                const ehost = eh orelse return error.NoEngramTables;
+                try engramRows(e, rd, ehost, l, seq, rows);
+                try prompt.grouped(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
+                try Probe.check(probe, .engram_proj, l, rd.ek);
+                try e.comm.allGather(rd.ek, rd.ekg, R * ew.n, .f32, e.s);
+                try Probe.check(probe, .engram_gather, l, rd.ekg);
+                if (e.world != 2) return error.NotPortedYet;
+                try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * ew.n * 4, rd.ekv, R * ew.n);
+                try tri_basic.engramGate(t, h, rd.ekv, lay.engram_qk, spare, c.eps, R, d);
+                std.mem.swap(u64, &h, &spare);
+            }
+            // the attention mixes, the pending post fused in (pre_mix)
+            h = try mix(e, rd, h, &spare, &pending, lay.hc_attn, pre, lay.attn_norm, rd.pre_a, R);
+            if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(l)) != null) {
+                // one launch a tap, straight into its block of the taps buffer
+                try tri_basic.tap(t, h, rd.taps + ntap * d * 2, c.dspark_taps.slice().len * d, R, d);
+                ntap += 1;
+            }
+            try Probe.check(probe, .attn_in, l, rd.x);
+            try attention(e, rd, ch, cs, rings, &sh, l);
+            try Probe.check(probe, .attn_out, l, rd.pa);
+            try e.comm.allGather(rd.pa, rd.ga, R * d, .f32, e.s);
+            try Probe.check(probe, .attn_gather, l, rd.ga);
+            pending = rd.ga;
+            h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
+            try Probe.check(probe, .moe_in, l, rd.x);
+            try moe(e, rd, l);
+            try Probe.check(probe, .moe_out, l, rd.pm);
+            try e.comm.allGather(rd.pm, rd.gm, R * d, .f32, e.s);
+            try Probe.check(probe, .moe_gather, l, rd.gm);
+            pending = rd.gm;
+            std.mem.swap(u64, &pre, &pre_f);
+        }
+        if (pending) |gp| try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
+        li = end;
+    }
+    // the head on every row: the logits, the ranks' columns in rank order (g.permute(1, 0, 2))
+    try tri_basic.collapseNorm(t, h, pre, w.norm, rd.xc, c.eps, R, d);
+    const hn: usize = w.head.n;
+    try prompt.grouped(e, ch, R, &.{w.head}, &.{rd.xc}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});
+    try Probe.check(probe, .head_cols, w.layers.len, rd.hl);
+    try e.comm.allGather(rd.hl, rd.hg, R * hn, .f32, e.s);
+    try Probe.check(probe, .head_gather, w.layers.len, rd.hg);
+    for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hn * 4, hn * 4, rd.logits + k * hn * 4, e.world * hn * 4, hn * 4, R);
+    try Probe.check(probe, .logits, w.layers.len, rd.logits);
+    if (ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
+    // keep the round's streams where the next round's buffers expect nothing: every buffer is rewritten a round
+    rd.h = h;
+    rd.h_alt = spare;
+    rd.pre = pre;
+    rd.pre_f = pre_f;
+}
+
+/// rounds.py pre_mix: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare buffer,
+/// which becomes the streams), the Sinkhorn half deferred to the side stream (this one); returns the streams.
+fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params: [3]u64, pre_in: u64, norm: u64, pre_out: u64, R: usize) !u64 {
+    const c = e.c;
+    if (pending.*) |gp| {
+        const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, .{ .gathered = gp, .world = e.world, .h_out = spare.* }, rd.sink, R, c.hidden);
+        pending.* = null;
+        spare.* = h;
+        return out;
+    }
+    return tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, null, rd.sink, R, c.hidden);
+}
+
+/// Layer li's Engram rows of the round's rows (Engram.hashes of the stream's ids through each row, this rank's
+/// columns, the tables' FP8 rows decoded to bf16 as Engram._decode does) into rd.e_in.
+fn engramRows(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, li: usize, seq: []const i32, rows: Rows) !void {
+    const c = e.c;
+    const R = rows.ids.len;
+    const li32: u16 = @intCast(li);
+    const l = std.mem.indexOfScalar(u16, c.engram_layers.slice(), li32) orelse return error.NotAnEngramLayer;
+    const tbl = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    const cols = eh.hasher.cols();
+    const k = eh.hi - eh.lo;
+    const start: usize = @intCast(rows.pos[0]);
+    if (seq.len < start + R) return error.ShortSequence;
+    eh.hasher.hashes(seq, start, R, eh.hashes[0 .. R * eh.hasher.layers * cols]);
+    for (0..R) |r| {
+        for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+    }
+    const m = R * k;
+    try eh.pool.gather(tbl, eh.flat[0..m], eh.w[0 .. m * tbl.row_w], eh.s[0 .. m * tbl.row_s]);
+    for (0..m) |i| engram.decodeRow(eh.w[i * tbl.row_w ..][0..tbl.row_w], eh.s[i * tbl.row_s ..][0..tbl.row_s], eh.rows[i * tbl.row_w ..][0..tbl.row_w]);
+    try prompt.upload(e, rd.e_in, eh.rows.ptr, m * tbl.row_w * 2);
+}
+
+test "context buckets as graph.py makes them" {
+    try std.testing.expectEqual(@as(usize, 1024), bucketFor(1, 1 << 20));
+    try std.testing.expectEqual(@as(usize, 4096), bucketFor(2230, 1 << 20));
+    try std.testing.expectEqual(@as(usize, 4096), bucketFor(4096, 1 << 20));
+    try std.testing.expectEqual(@as(usize, 8192), bucketFor(4097, 1 << 20));
+    try std.testing.expectEqual(@as(usize, 4096), bucketFor(5000, 4096));
+}
