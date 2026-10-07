@@ -35,7 +35,7 @@ ADAPTIVE = os.environ.get("TF_DS_ADAPTIVE", "0") == "1"
 WARM = os.environ.get("TF_DS_WARM", "1") != "0"
 # the tower's warm-up image: "small" (default) or "largest" (logs the largest image's time and memory peak)
 VISION_WARM = os.environ.get("TF_DS_VISION_WARM") or "small"
-# synthetic prompt lengths for the warm-up: row and key counts of 1, multiples of 16 and others (Triton specializes
+# extra synthetic prompt lengths for the warm-up: row and key counts of 1, multiples of 16 and others (Triton specializes
 # integer arguments on those), short prompts on the window ring, every pick-block bucket of the prompt attention, prompts
 # past the decoder replay window at even and odd offsets (pointer alignment), a second chunk
 WARM_LENGTHS = tuple(int(v) for v in (os.environ.get("TF_DS_WARM_LENGTHS") or
@@ -190,16 +190,21 @@ class DsEngine:
     def warm(self) -> None:
         """Same steps on every rank, in the same order (prefills and graph captures issue real collectives)."""
 
+        from .kernels import DECODE_ROWS
+
         t0 = time.perf_counter()
         m = self.model
         if not self.concurrent:
             self.sc = m.new_cache(self.limit + self.max_rows + 8)
             if self.drafter is not None:
                 self.dc = self.drafter.new_cache()
-        ids = [1000 + (i * 7919) % 60000 for i in range(max(WARM_LENGTHS))]
+        # Decode's fused indexer does not warm prefill's rowmm2; tails after a chunk also reach compressed keys.
+        tails = range(1, min(PREFILL_CHUNK, DECODE_ROWS) + 1)
+        lengths = tuple(dict.fromkeys((*WARM_LENGTHS, *tails, *(PREFILL_CHUNK + n for n in tails))))
+        ids = [1000 + (i * 7919) % 60000 for i in range(max(lengths))]
         self.quiet = True
         try:
-            for n in WARM_LENGTHS:
+            for n in lengths:
                 if n + 8 <= self.limit:
                     if self.concurrent:     # --parallel decodes through round graphs (multi.warm): prompt kernels only
                         self._sample(self.prefill(self.sc, self.dc, ids[:n]), [n], None)
@@ -220,7 +225,8 @@ class DsEngine:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
         if self.rank == 0:
-            print(f"[tensorfold] warm-up: {len(WARM_LENGTHS)} prompt lengths {t1 - t0:.1f}s, decode graphs {info}, "
+            print(f"[tensorfold] warm-up: {sum(n + 8 <= self.limit for n in lengths)} prompt lengths {t1 - t0:.1f}s, "
+                  f"decode graphs {info}, "
                   f"reserved {torch.cuda.memory_reserved() / 2**30:.2f} GiB", flush=True)
 
     def vision_warm(self, ids: list[int]) -> None:
