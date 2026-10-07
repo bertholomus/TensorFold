@@ -30,6 +30,7 @@ pub const torch_pointwise: []const u8 = if (available) &Blob("fatbin_torch_point
 pub const torch_indexing: []const u8 = if (available) &Blob("fatbin_torch_indexing").bytes else &.{};
 pub const torch_movement: []const u8 = if (available) &Blob("fatbin_torch_movement").bytes else &.{};
 pub const torch_nemotron_constants: []const u8 = if (available) &Blob("fatbin_torch_nemotron_constants").bytes else &.{};
+pub const dsv41_ops: []const u8 = if (available) &Blob("fatbin_dsv41_ops").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {
