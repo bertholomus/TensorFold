@@ -6,7 +6,7 @@
 //! its rows' projection and their gather. One JSON line a point;
 //! the first difference stops the run (its first differing element and how many differ).
 //! REC_DIR: aot/ (the recording's Triton set), cubins/ (linear.cubin, experts.cubin, experts_cb.cubin: the served
-//! extension cubins), rope-plain-{cos,sin}.f32, rope.json and engram.json (zrec_fixtures.py), rank<R>/layers.jsonl and
+//! extension cubins), rope-{plain,compressed}-{cos,sin}.f32, rope.json and engram.json (zrec_fixtures.py), rank<R>/layers.jsonl and
 //! layers/. Engram layers need the original Engram tables (DIR) and the compressed token map (the lane's JSON cache).
 const std = @import("std");
 const cuda = @import("cuda");
@@ -16,6 +16,7 @@ const prompt = dsv41.prompt;
 const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--engram DIR --token-map FILE] [--dump DIR]\n";
 const rope_rows = 8192; // the plain table's first rows (chunk 0's positions and more)
 const chunk_rows = 2048;
+const cache_tokens = 4096; // the compressed caches' positions (the recorded prompt's)
 
 /// One fixture line of layers.jsonl.
 const Point = struct {
@@ -223,24 +224,30 @@ pub fn main(init: std.process.Init) !u8 {
     if (!cuda.kernels.available) return error.NoKernelImages;
     var ops = try dsv41.ops.Ops.load(&driver, cuda.kernels.torch_pointwise, cuda.kernels.torch_movement, cuda.kernels.dsv41_ops);
     defer ops.unload();
+    var ex = try dsv41.exact.Exact.load(&driver, cuda.kernels.dsv41_torch);
+    defer ex.unload();
 
     // the plain RoPE table's first rows
-    var rope_buf = try cuda.DeviceBuffer.alloc(&driver, 2 * rope_rows * (cfg.rope_dim / 2) * 4);
+    var rope_buf = try cuda.DeviceBuffer.alloc(&driver, 4 * rope_rows * (cfg.rope_dim / 2) * 4);
     defer rope_buf.free();
-    for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32" }, 0..) |name, j| {
+    for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
         var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ rec, name }), .{});
         defer f.close(io);
         const part = try a.alloc(u8, rope_rows * (cfg.rope_dim / 2) * 4);
         if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable;
         try rope_buf.upload(j * part.len, part);
     }
-    const rope: prompt.Rope = .{ .cos = rope_buf.ptr, .sin = rope_buf.ptr + rope_rows * (cfg.rope_dim / 2) * 4 };
+    const tbl = rope_rows * (cfg.rope_dim / 2) * 4;
+    const rope: prompt.Rope = .{ .cos = rope_buf.ptr, .sin = rope_buf.ptr + tbl };
+    const rope_c: prompt.Rope = .{ .cos = rope_buf.ptr + 2 * tbl, .sin = rope_buf.ptr + 3 * tbl };
 
     var arena = try prompt.Arena.init(&driver, 3 << 30);
     defer arena.deinit();
     var blas_ws_ptr: u64 = undefined;
-    var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .ex = &exk, .ops = &ops, .c = &cfg, .w = &w, .world = world, .plain = rope, .compressed = rope };
-    var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows);
+    var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = world, .plain = rope, .compressed = rope_c };
+    var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, cache_tokens);
+    const caches = try prompt.Caches.init(&eng, &arena, cache_tokens);
+    var shared: prompt.Shared = .{};
     blas_ws_ptr = ch.blas_ws;
     var blas = try dsv41.cublas.Blas.open(stream, blas_ws_ptr);
     defer blas.close();
@@ -299,7 +306,7 @@ pub fn main(init: std.process.Init) !u8 {
         const att = fx.find(after, "Model.attention_k", l, "in2") orelse return error.NoLayerFixture;
         prompt.attnMixes(&eng, &ch, li) catch |err| return report(w_out, rank, li, "attention mixes", err);
         if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention in", .{li}), att, ch.x)) break;
-        prompt.attention(&eng, &ch, li, rings[li], 0) catch |err| return report(w_out, rank, li, "attention", err);
+        prompt.attention(&eng, &ch, &caches, &shared, li, rings[li], 0) catch |err| return report(w_out, rank, li, "attention", err);
         if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention partial", .{li}), fx.find(after, "Model.attention_k", l, "out"), ch.pa)) break;
         try prompt.gather(&eng, &ch, ch.pa, ch.ga);
         if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention gather", .{li}), fx.find(att.call, "Comm.gather", null, "out"), ch.ga)) break;
