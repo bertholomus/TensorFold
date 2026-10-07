@@ -193,6 +193,15 @@ pub const Two = struct {
         }
     }
 
+    /// Comm2D.gather (TP2 inside a pair: the DSpark drafter's sublayer partials): `src` [n, width] -> `dst` [2, n, width],
+    /// this pair's two ranks in TP2 rank order: over the row pair's ring, else the four-rank all-gather's pair half
+    /// (Comm2D.gather4(x)[2p:2p + 2]).
+    pub fn pairGather(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, width: usize, esize: usize) !void {
+        if (t.rings) |rs| if (try ringed(rs.pairGather(e.s, src, dst, n, width, esize))) return;
+        const wmax = try t.allParts(e, src, n, .{ width, width }, esize);
+        try e.ops.copyRows(e.s, t.parts + 2 * t.p * n * wmax * esize, wmax * esize, dst, width * esize, width * esize, 2 * n);
+    }
+
     /// wo_2d after wo_a: the rank's four groups (this node's two in ch.u [n, uw[p]], the partner's two), then wo_b
     /// for this pair's output columns: ch.pa [n, ow[p]] fp32, the matching columns of TP2's partial.
     pub fn woB(t: *const Two, e: *const prompt.Engine, ch: *prompt.Chunk, lay: weights.Layer) !void {
