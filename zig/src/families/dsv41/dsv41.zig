@@ -8,6 +8,8 @@ pub const engram = @import("engram.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const weights = @import("weights.zig");
 pub const engram_io = @import("engram_io.zig");
+pub const link = @import("link.zig");
+pub const comm = @import("comm.zig");
 
 test {
     _ = @import("config.zig");
@@ -18,4 +20,6 @@ test {
     _ = checkpoint;
     _ = weights;
     _ = engram_io;
+    _ = link;
+    _ = comm;
 }
