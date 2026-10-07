@@ -22,6 +22,7 @@ const tri_markov = @import("tri_markov.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
+const draft2d = @import("draft2d.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -194,9 +195,9 @@ pub const Drafter = struct {
         const d = c.hidden;
         const hc = c.hc;
         const hd = c.head_dim;
-        const hl = e.heads();
         const R = max_rows;
         const b0 = ds.blocks[0];
+        const hl = b0.wq_b.n / hd; // the blocks' heads (TP2's on a 2D node too: TP2 inside the pair)
         var dr: Drafter = undefined;
         dr.ds = ds;
         dr.n = c.dspark_block;
@@ -253,7 +254,7 @@ pub const Drafter = struct {
         // the Markov loop: every token's slot -1 (none), then the cached rows of the first 256 frequent tokens
         const none = try a.take(c.vocab * 4);
         try e.d.check(e.d.api.cuMemsetD32Async(none, 0xffffffff, c.vocab, e.s.handle), "cuMemsetD32Async");
-        dr.mk = try tri_markov.Markov.init(c.*, sp, ds.markov_head, ds.markov_embed, none);
+        dr.mk = if (e.two) |tw| try draft2d.markov(c.*, tw, ds.markov_head, ds.markov_embed, none) else try tri_markov.Markov.init(c.*, sp, ds.markov_head, ds.markov_embed, none);
         const k = markov_tokens.cached.len;
         const tok = try a.take(k * 8);
         try prompt.upload(e, tok, &markov_tokens.cached, k * 8);
@@ -275,7 +276,7 @@ pub const Drafter = struct {
             .stage = try a.take(max_streams * dr.mk.cols * 2),
         };
         try prompt.fill(e, dr.msc.send, 0, max_streams * 4 * 4);
-        dr.mg = try a.take(e.world * max_streams * 4 * 4);
+        dr.mg = try a.take(dr.mk.world * max_streams * 4 * 4);
         dr.out = try a.take(max_streams * (max_block + 1) * 8);
         // the confidence head
         const rank = c.markov_rank;
@@ -418,14 +419,14 @@ pub const Drafter = struct {
             try Probe.check(probe, .attn_ring, j, pool.rings[j]);
             try dr.attention(e, ch, pool, j, R);
             try Probe.check(probe, .attn_out, j, dr.pa);
-            try e.comm.allGather(dr.pa, dr.ga, R * d, .f32, e.s);
+            if (e.two) |tw| try tw.pairGather(e, dr.pa, dr.ga, R, d, 4) else try e.comm.allGather(dr.pa, dr.ga, R * d, .f32, e.s);
             try Probe.check(probe, .attn_gather, j, dr.ga);
             pending = dr.ga;
             h = try dr.mix(e, h, &spare, &pending, lay.hc_ffn, dr.pre_a, lay.ffn_norm, pre_f, R);
             try Probe.check(probe, .moe_in, j, dr.x);
             try dr.moe(e, j, R);
             try Probe.check(probe, .moe_out, j, dr.pm);
-            try e.comm.allGather(dr.pm, dr.gm, R * d, .f32, e.s);
+            if (e.two) |tw| try tw.pairGather(e, dr.pm, dr.gm, R, d, 4) else try e.comm.allGather(dr.pm, dr.gm, R * d, .f32, e.s);
             try Probe.check(probe, .moe_gather, j, dr.gm);
             pending = dr.gm;
             std.mem.swap(u64, &pre, &pre_f);
@@ -492,7 +493,7 @@ pub const Drafter = struct {
         const lay = dr.ds.blocks[j];
         const hd = c.head_dim;
         const rd = c.rope_dim;
-        const hl = e.heads();
+        const hl = lay.wq_b.n / hd; // the block's heads (TP2's on a 2D node too)
         const rope = e.plain; // a window-only stage (Model._cs: ratio 0)
         const pos = dr.row(1);
         // attn_in(comp=False): wq_a and wkv, one group

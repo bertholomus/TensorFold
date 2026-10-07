@@ -57,6 +57,8 @@ pub const Markov = struct {
     s_tiles: usize,
     n_part: usize,
     bp: usize,
+    // the head's logits one row of lg_w columns a row (a 2D node's quarter, draft2d.zig); 0: TP2's [segs, rows, n_cols]
+    lg_w: usize = 0,
 
     /// Markov.__init__'s geometry for rank s.rank of s.world (head and emb [V, rank]); fill then makes the cached rows.
     pub fn init(c: Config, s: Split, head: u64, emb: u64, none: u64) !Markov {
@@ -107,13 +109,15 @@ pub const Markov = struct {
     pub fn localBest(m: Markov, t: Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, i: usize, sc: Scratch) !?u64 {
         if (n > np) return error.TooManyRows;
         const nc = m.n_cols;
+        const lw = if (m.lg_w != 0) m.lg_w else nc; // the logits' row width
+        const l_seg = if (m.lg_w != 0) nc else n * block * nc; // a segment's offset in them
         const tok = out + 8 * i;
         try m.bias(t, tok, ts, m.slot, sc.stage, m.cols, n);
         try t.run("_score", .{ u(m.s_tiles), u(m.segs), 1 }, &.{
-            p("LG", "*fp32", lg + 4 * i * nc), int("l_seg", n * block * nc), int("l_row", block * nc),     p("TOK", "*i64", tok),
-            int("t_stride", ts),               p("SLOT", "*i32", m.slot),    p("CACHE", "*fp16", m.cache), int("c_row", m.cols),
-            p("STAGE", "*fp16", sc.stage),     int("s_row", m.cols),         p("PV", "*fp32", sc.pv),      p("PI", "*i32", sc.pi),
-            int("n_rows", n),                  int("n_cols", nc),            int("seg0", m.seg0),          int("n_part", m.n_part),
+            p("LG", "*fp32", lg + 4 * i * lw), int("l_seg", l_seg),       int("l_row", block * lw),     p("TOK", "*i64", tok),
+            int("t_stride", ts),               p("SLOT", "*i32", m.slot), p("CACHE", "*fp16", m.cache), int("c_row", m.cols),
+            p("STAGE", "*fp16", sc.stage),     int("s_row", m.cols),      p("PV", "*fp32", sc.pv),      p("PI", "*i32", sc.pi),
+            int("n_rows", n),                  int("n_cols", nc),         int("seg0", m.seg0),          int("n_part", m.n_part),
         }, &.{ ci("BC", bc), t.pdlConst() });
         try t.run("_finish", .{ u(n), 1, 1 }, &.{
             p("PV", "*fp32", sc.pv), p("PI", "*i32", sc.pi),      int("n_part", m.n_part),            p("OUT", "*i64", out + 8 * (i + 1)),
