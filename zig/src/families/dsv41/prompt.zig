@@ -2,8 +2,11 @@
 //! build's kernels: the streams of the chunk's tokens (embed_init), then a layer at a time the attention mixes (hc_pre, or
 //! hc_pre_pf with the previous layer's gathered MoE partials posted first), attention (attention_k), the gather of its
 //! partials, the FFN mixes with that post fused in (hc_pre_pf), the MoE and its gather, whose post goes into the next
-//! layer's mixes (switch "hc_pf2"); before an Engram layer's mixes, its Engram (engram_apply). So far window-only
-//! layers (compress ratio 0); the others return error.NotPortedYet.
+//! layer's mixes (switch "hc_pf2"); before an Engram layer's mixes, its Engram (engram_apply). Compressed layers
+//! (ratio 1, 2): a kv source's compressor and index keys into the caches (kv_source_update), the indexer's top-k
+//! (prompt_keys: scored keys and the selection), and the sparse attention over the window and the selected latents.
+//! Not yet: the candidate pool's layers (the candidate source and after), later chunks' carried rows (the ring, the
+//! positional store); those return error.NotPortedYet.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -21,9 +24,13 @@ const cublas = @import("cublas.zig");
 const comm = @import("comm.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
+const exact = @import("exact.zig");
+const tri_index = @import("tri_index.zig");
 
 /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
 pub const ring_extra = 16;
+/// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
+pub const raw_rows = 64;
 
 /// Device memory carved from one allocation in 256-byte aligned pieces, freed together.
 pub const Arena = struct {
@@ -59,6 +66,7 @@ pub const Engine = struct {
     pf: *const exl3_prefill.Kernels,
     ex: *const exl3_experts.Kernels,
     ops: *const ops.Ops,
+    exact: *const exact.Exact,
     c: *const Config,
     w: *const weights.Weights,
     world: usize,
@@ -109,6 +117,24 @@ pub const Chunk = struct {
     neg: u64, // int64 [cap], -1: no ring slot (model.py _neg)
     ring_idx: u64, // int64 [ring]
     invalid: u64, // uint32 [1]
+    // compressed layers
+    kvc: u64 = 0, // fp32 [cap, head_dim]: the compressor's kv projection
+    scc: u64 = 0, // fp32 [cap, head_dim]: its gate scores
+    lat: u64 = 0, // bf16 [cap, head_dim]: the compressed latents
+    lat2: u64 = 0, // bf16 [cap, head_dim]: their RoPE'd copy (the cache's)
+    ik: u64 = 0, // bf16 [cap, index_head_dim]: the index keys
+    groups: u64 = 0, // int64 [cap]: the new latents' groups
+    gpos: u64 = 0, // int64 [cap]: their positions (group * ratio)
+    raw_idx: u64 = 0, // int64 [RAW]
+    iq: u64 = 0, // bf16 [cap, index_heads * index_head_dim]
+    iq4: u64 = 0, // bf16 [cap, index_heads * index_head_dim]: fp4_qd's bytes
+    wl: u64 = 0, // fp32 [cap, index_heads]
+    iw: u64 = 0, // bf16 [cap, index_heads]: the heads' weights
+    vis: u64 = 0, // int64 [cap]: compressed entries a row sees
+    keys: u64 = 0, // int64 [cap, max_comp]
+    tmax: u64 = 0, // int64 [cap, cdiv(max_comp, 64)]
+    cidx: u64 = 0, // int64 [cap, index_topk]: the selected latents
+    max_comp: usize = 0,
     // MoE
     xf: u64, // fp32 [cap, D]
     gate_f: u64, // fp32 [experts, D]
@@ -127,8 +153,9 @@ pub const Chunk = struct {
     blas_ws: u64, // cuBLAS workspace
     pending: bool = false, // gm holds a MoE gather whose post is not in h yet
 
-    /// Every buffer for `cap` rows from `a`; the scratch the served build zeros (or fills with -1) is set the same.
-    pub fn init(e: *const Engine, a: *Arena, cap: usize) !Chunk {
+    /// Every buffer for `cap` rows from `a`, the compressed layers' for chunks ending by position `tokens`; the scratch
+    /// the served build zeros (or fills with -1) is set the same.
+    pub fn init(e: *const Engine, a: *Arena, cap: usize, tokens: usize) !Chunk {
         const c = e.c;
         const d = c.hidden;
         const hc = c.hc;
@@ -175,6 +202,31 @@ pub const Chunk = struct {
         ch.wts = try a.take(cap * sl * 4);
         ch.pm = try a.take(cap * d * 4);
         ch.gm = try a.take(e.world * cap * d * 4);
+        // compressed layers: the smallest ratio sets the most compressed entries a row can see
+        var min_ratio: usize = 0;
+        for (e.w.layers) |lay| {
+            if (lay.ratio != 0 and (min_ratio == 0 or lay.ratio < min_ratio)) min_ratio = lay.ratio;
+        }
+        if (min_ratio != 0) {
+            const ih = c.index_heads * c.index_head_dim;
+            ch.max_comp = tokens / min_ratio;
+            ch.kvc = try a.take(cap * c.head_dim * 4);
+            ch.scc = try a.take(cap * c.head_dim * 4);
+            ch.lat = try a.take(cap * c.head_dim * 2);
+            ch.lat2 = try a.take(cap * c.head_dim * 2);
+            ch.ik = try a.take(cap * c.index_head_dim * 2);
+            ch.groups = try a.take(cap * 8);
+            ch.gpos = try a.take(cap * 8);
+            ch.raw_idx = try a.take(raw_rows * 8);
+            ch.iq = try a.take(cap * ih * 2);
+            ch.iq4 = try a.take(cap * ih * 2);
+            ch.wl = try a.take(cap * c.index_heads * 4);
+            ch.iw = try a.take(cap * c.index_heads * 2);
+            ch.vis = try a.take(cap * 8);
+            ch.keys = try a.take(cap * ch.max_comp * 8);
+            ch.tmax = try a.take(cap * ((ch.max_comp + tri_index.tile - 1) / tri_index.tile) * 8);
+            ch.cidx = try a.take(cap * c.index_topk * 8);
+        }
         for (e.w.layers) |lay| {
             const ew = lay.engram_wkv orelse continue;
             ch.eb = try a.take(cap * ew.k * 2);
@@ -225,6 +277,50 @@ pub const Chunk = struct {
     }
 };
 
+/// One sequence's compressed-attention caches (model.py SeqCache: comp, index_k, comp_raw), by kv-source layer: the
+/// compressed latents as packed FP4 (codes [rows, head_dim / 2], E8M0 scales [rows, head_dim / 16]), the index keys
+/// (codes [rows, index_head_dim / 2], scales [rows, index_head_dim / 32], 127 when unwritten) and, at ratio 2, the
+/// positional store of the compressor's raw kv and scores (fp32 [RAW, head_dim] each). rows = cap / ratio + 2.
+pub const Caches = struct {
+    comp_codes: [64]u64 = @splat(0),
+    comp_scales: [64]u64 = @splat(0),
+    idx_codes: [64]u64 = @splat(0),
+    idx_scales: [64]u64 = @splat(0),
+    raw_kv: [64]u64 = @splat(0),
+    raw_score: [64]u64 = @splat(0),
+
+    pub fn init(e: *const Engine, a: *Arena, cap: usize) !Caches {
+        const c = e.c;
+        var cs: Caches = .{};
+        for (e.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            const rows = cap / r + 2;
+            cs.comp_codes[i] = try a.take(rows * c.head_dim / 2);
+            cs.comp_scales[i] = try a.take(rows * c.head_dim / 16);
+            try e.d.check(e.d.api.cuMemsetD8_v2(cs.comp_codes[i], 0, rows * c.head_dim / 2), "cuMemsetD8");
+            try e.d.check(e.d.api.cuMemsetD8_v2(cs.comp_scales[i], 0, rows * c.head_dim / 16), "cuMemsetD8");
+            if (lay.idx_wk != null) {
+                cs.idx_codes[i] = try a.take(rows * c.index_head_dim / 2);
+                cs.idx_scales[i] = try a.take(rows * c.index_head_dim / 32);
+                try e.d.check(e.d.api.cuMemsetD8_v2(cs.idx_codes[i], 0, rows * c.index_head_dim / 2), "cuMemsetD8");
+                try e.d.check(e.d.api.cuMemsetD8_v2(cs.idx_scales[i], 127, rows * c.index_head_dim / 32), "cuMemsetD8");
+            }
+            if (r > 1) {
+                cs.raw_kv[i] = try a.take(raw_rows * c.head_dim * 4);
+                cs.raw_score[i] = try a.take(raw_rows * c.head_dim * 4);
+                try e.d.check(e.d.api.cuMemsetD8_v2(cs.raw_kv[i], 0, raw_rows * c.head_dim * 4), "cuMemsetD8");
+                try e.d.check(e.d.api.cuMemsetD8_v2(cs.raw_score[i], 0, raw_rows * c.head_dim * 4), "cuMemsetD8");
+            }
+        }
+        return cs;
+    }
+};
+
+/// What one forward carries from layer to layer (model.py _forward_k's `shared`): the latest kv-source layer, and the
+/// latest indexer's selection (in the chunk's cidx, kk a row).
+pub const Shared = struct { kv_layer: ?usize = null, kk: ?usize = null };
+
 /// The chunk's rows: token ids at positions start .., their streams h [n, hc, D] (every stream the token's embedding
 /// row) and pre [n, hc] = (1, 0, 0, 0): embed_init, the bytes of forward()'s embedding rows expanded over the streams.
 pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_pos: []i64) !void {
@@ -266,18 +362,19 @@ fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: usize,
     try exl3_prefill.matmul(e.pf, e.t, ch.ws, l, x, .bf16, ldx, out, out_type, os, ch.n);
 }
 
-/// attention_k of a window-only layer: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the
-/// layer's window ring (bf16 [window + RING_EXTRA, head_dim]). `floor`: no window key before this position.
-pub fn attention(e: *const Engine, ch: *Chunk, li: usize, ring: u64, floor: usize) !void {
+/// attention_k: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the layer's window ring
+/// (bf16 [window + RING_EXTRA, head_dim]). A compressed layer also attends to its kv source's latents the indexer picks
+/// (a kv source first compresses the chunk into them). `floor`: no window key before this position.
+pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, ring: u64, floor: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
-    if (lay.ratio != 0) return error.NotPortedYet;
     const n = ch.n;
     const start = ch.start;
     const hd = c.head_dim;
     const rd = c.rope_dim;
     const hl = e.heads();
-    const rope = e.plain;
+    // _cs: the layer's RoPE kind (compressed layers rotate by the compressed table) for every rotation it makes
+    const rope = if (lay.ratio != 0) e.compressed else e.plain;
     const ring_rows = c.window + ring_extra;
     if (n <= ring_extra) return error.NotPortedYet; // ring mode (verify windows)
     // attn_in: wq_a and wkv of x, one prompt GEMM each
@@ -295,6 +392,24 @@ pub fn attention(e: *const Engine, ch: *Chunk, li: usize, ring: u64, floor: usiz
     const kv = ch.wsrc + (start - lo) * hd * 2;
     // slots -1: the keys go to wsrc only (ring_mode is off); the ring is written after the attention
     try tri_norm.kvNormRope(e.t, ch.y, lay.kv_norm, rope.cos, rope.sin, ch.pos, ring, ring_rows, ch.neg, c.eps, true, rd, kv, n, hd);
+    var comp: tri_attn.Comp = .none;
+    var n_idx: usize = 0;
+    if (lay.ratio != 0) {
+        const r: usize = lay.ratio;
+        if (lay.comp_wkv != null) try kvSourceUpdate(e, ch, cs, sh, li);
+        const src = sh.kv_layer orelse return error.NoKvSource;
+        const n_comp_end = (start + n) / r;
+        // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
+        var vis_host: [4096]i64 = undefined;
+        if (n > vis_host.len) return error.ChunkTooLong;
+        for (0..n) |i| vis_host[i] = @intCast((start + i + 1) / r);
+        try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.vis, &vis_host, n * 8), "cuMemcpyHtoD");
+        if (lay.idx_wq_b) |wqb| try indexer(e, ch, cs, sh, li, wqb, src, n_comp_end, rope);
+        const kk = sh.kk orelse return error.NoIndexerSelection;
+        comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
+        n_idx = kk;
+        if (kk % 16 != 0) return error.NotPortedYet; // a prompt chunk's idx padded to whole 16-column tiles
+    }
     try tri_attn.sparseAttn(e.t, .{
         .q = ch.q,
         .out = ch.o,
@@ -306,6 +421,9 @@ pub fn attention(e: *const Engine, ch: *Chunk, li: usize, ring: u64, floor: usiz
         .wsrc_rows = wsrc_rows,
         .wlo = ch.wlo,
         .ring = false,
+        .comp = comp,
+        .idx = if (n_idx > 0) ch.cidx else 0,
+        .n_idx = n_idx,
         .pos = ch.pos,
         .scale = scale(hd),
         .window = c.window,
@@ -332,6 +450,108 @@ pub fn attention(e: *const Engine, ch: *Chunk, li: usize, ring: u64, floor: usiz
         col += wo.n;
     }
     try mm(e, ch, lay.wo_b, ch.u, uw, ch.pa, .fp32, c.hidden);
+}
+
+/// kv_source_update of a kv-source layer on the chunk (no earlier pending row: a chunk starting on a group boundary):
+/// _compress's new latents (ratio 1: RMSNorm of the bf16 projection; ratio 2: of the pairs' softmax-weighted kv), its
+/// positional store's last RAW rows, then the index keys (RMSNorm of idx_wk's projection, RoPE) and the RoPE'd latents
+/// into the caches as FP4 (fp4_store).
+fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const n = ch.n;
+    const start = ch.start;
+    const hd = c.head_dim;
+    const rd = c.rope_dim;
+    const r: usize = lay.ratio;
+    const cwkv = lay.comp_wkv.?;
+    if (start % r != 0) return error.NotPortedYet; // the group's earlier rows from the positional store
+    const full = n / r;
+    if (r == 1) {
+        try mm(e, ch, cwkv, ch.x, c.hidden, ch.lat2, .bf16, hd);
+        try e.exact.rmsNorm(e.s, ch.lat2, hd, lay.comp_norm, ch.lat, hd, n, hd, c.eps);
+    } else {
+        if (r != 2) return error.NotPortedYet;
+        try mm(e, ch, cwkv, ch.x, c.hidden, ch.kvc, .fp32, hd);
+        try mm(e, ch, lay.comp_wgate.?, ch.x, c.hidden, ch.scc, .fp32, hd);
+        // rk[pw] = kv[-keep:], rs[pw] = score[-keep:]: pw = positions start + n - keep .. % RAW
+        if (n < raw_rows) return error.NotPortedYet; // fewer rows than the store: a scatter of some slots
+        const keep: usize = raw_rows;
+        var idx: [raw_rows]i64 = undefined;
+        for (0..keep) |j| {
+            const row = n - keep + j;
+            idx[(start + row) % raw_rows] = @intCast(row);
+        }
+        try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.raw_idx, &idx, keep * 8), "cuMemcpyHtoD");
+        try e.d.check(e.d.api.cuMemsetD8_v2(ch.invalid, 0, 4), "cuMemsetD8");
+        try e.ops.gatherRows(e.s, ch.kvc, n, ch.raw_idx, cs.raw_kv[li], hd * 4, keep, ch.invalid);
+        try e.ops.gatherRows(e.s, ch.scc, n, ch.raw_idx, cs.raw_score[li], hd * 4, keep, ch.invalid);
+        if (full == 0) return error.NotPortedYet;
+        try e.exact.compress2(e.s, ch.kvc, ch.scc, ch.lat2, full, hd);
+        try e.exact.rmsNorm(e.s, ch.lat2, hd, lay.comp_norm, ch.lat, hd, full, hd, c.eps);
+    }
+    sh.kv_layer = li;
+    // groups first // r .. and their positions group * r (the rotations _rot reads)
+    var g_host: [4096]i64 = undefined;
+    var p_host: [4096]i64 = undefined;
+    if (full > g_host.len) return error.ChunkTooLong;
+    for (0..full) |j| {
+        g_host[j] = @intCast(start / r + j);
+        p_host[j] = @intCast((start / r + j) * r);
+    }
+    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.groups, &g_host, full * 8), "cuMemcpyHtoD");
+    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.gpos, &p_host, full * 8), "cuMemcpyHtoD");
+    const rot = e.compressed;
+    if (lay.idx_wk) |iwk| {
+        const id = c.index_head_dim;
+        if (full <= 128) return error.NotPortedYet; // decode-sized: the grouped EXL3 linear
+        try exl3_prefill.matmul(e.pf, e.t, ch.ws, iwk, ch.lat, .bf16, hd, ch.lat2, .bf16, id, full);
+        try e.exact.rmsNorm(e.s, ch.lat2, id, lay.idx_k_norm, ch.ik, id, full, id, c.eps);
+        try e.exact.rope(e.s, ch.ik, id, id - rd, rot.cos, rot.sin, ch.gpos, full, rd / 2, false);
+        // switch "comp": the packed cache's rows in one launch (fp4_store: store_rows' bytes)
+        try tri_attn.fp4Store(e.t, ch.ik, id, cs.idx_codes[li], cs.idx_scales[li], ch.groups, full, id, 32, false);
+    }
+    try e.ops.copyRows(e.s, ch.lat, hd * 2, ch.lat2, hd * 2, hd * 2, full);
+    try e.exact.rope(e.s, ch.lat2, hd, hd - rd, rot.cos, rot.sin, ch.gpos, full, rd / 2, false);
+    try tri_attn.fp4Store(e.t, ch.lat2, hd, cs.comp_codes[li], cs.comp_scales[li], ch.groups, full, hd, 16, true);
+}
+
+/// The indexer of a layer with index queries (switch "prompt_keys", layers before the candidate source): the
+/// queries (idx_wq_b of q's latent, RoPE, fp4_qd's bytes), the heads' weights (x.float() @ idx_proj.t() through cuBLAS,
+/// to bf16, times idx_dim ** -0.5 * idx_heads ** -0.5), each row's int64 keys of the kv source's index keys and the
+/// top-k selection into cidx.
+fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, wqb: weights.Linear, src: usize, n_comp_end: usize, rope: Rope) !void {
+    const lay = e.w.layers[li];
+    const c = e.c;
+    const n = ch.n;
+    const ih = c.index_heads;
+    const id = c.index_head_dim;
+    if (n_comp_end == 0) return error.NotPortedYet; // cidx [n, 0]
+    if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
+    try mm(e, ch, wqb, ch.qr, lay.wq_a.n, ch.iq, .bf16, ih * id);
+    try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
+    // switch "idx": fp4_qd's bytes in one launch
+    try tri_attn.fp4QdP2(e.t, ch.iq, ch.iq4, n * ih * id);
+    if (n <= tri_index.decode_rows) return error.NotPortedYet; // rowmm2 of the fp16 projection
+    try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
+    try e.blas.xwT(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
+    try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
+    const kk = @min(c.index_topk, n_comp_end);
+    // rows in blocks so the [rows, n_comp] keys stay bounded at long contexts
+    const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1))));
+    if (rb < n) return error.NotPortedYet; // more than one row block
+    const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
+    if (!keyed) return error.NotPortedYet; // the candidate pool's layers
+    const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
+    try tri_index.indexScore(e.t, ch.iq4, k, ch.iw, ch.vis, n_comp_end, ch.keys, null, true, ch.tmax, false, n, ih, id);
+    const no_topk: tri_index.TopK = .{ .top = 0, .run = noTorchTopk };
+    if (tri_index.prunes(n_comp_end, kk)) return error.NotPortedYet; // the pruned search's buffers
+    try tri_index.topkSelectPruned(e.t, ch.keys, n_comp_end, ch.tmax, kk, ch.vis, ch.cidx, .{ .tpos = 0, .cand = 0, .every = 0 }, no_topk, n, n_comp_end);
+    sh.kk = kk;
+}
+
+fn noTorchTopk(_: ?*anyopaque, _: tri.Tri, _: u64, _: usize, _: usize, _: usize, _: usize, _: u64) anyerror!void {
+    return error.NotPortedYet; // torch.topk of more keys than the fused selection takes
 }
 
 /// hd ** -0.5 as Triton passes the Python float: rounded to fp32.
