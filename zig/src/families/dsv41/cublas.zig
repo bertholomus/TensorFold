@@ -1,0 +1,71 @@
+//! cuBLAS (not Lt) by dlopen, for the fp32 GEMMs the served build's prompt chunks run through torch.matmul: the MoE
+//! gate's logits and the indexer's weights. torch calls cublasSgemm_v2 on one handle with CUBLAS_DEFAULT_MATH and a
+//! 32 MiB workspace (the recording's cuBLAS log); the same call on the same library picks the same algorithm.
+const std = @import("std");
+const cuda = @import("cuda");
+
+pub const Status = c_int;
+pub const Handle = ?*opaque {};
+pub const Op = enum(c_int) { n = 0, t = 1 };
+pub const default_math: c_int = 0;
+
+pub const Error = error{ LibraryUnavailable, MissingSymbol, CublasFailed };
+
+const S = Status;
+const D = u64;
+
+pub const Api = struct {
+    cublasCreate_v2: *const fn (*Handle) callconv(.c) S,
+    cublasDestroy_v2: *const fn (Handle) callconv(.c) S,
+    cublasSetStream_v2: *const fn (Handle, cuda.abi.Stream) callconv(.c) S,
+    cublasSetWorkspace_v2: *const fn (Handle, D, usize) callconv(.c) S,
+    cublasSetMathMode: *const fn (Handle, c_int) callconv(.c) S,
+    cublasSgemm_v2: *const fn (Handle, Op, Op, c_int, c_int, c_int, *const f32, D, c_int, D, c_int, *const f32, D, c_int) callconv(.c) S,
+};
+
+/// One handle bound to a stream, with torch's workspace size and math mode.
+pub const Blas = struct {
+    lib: std.DynLib,
+    api: Api,
+    handle: Handle = null,
+
+    /// torch's default cuBLAS workspace on this GPU (the recorded cublasSetWorkspace_v2 size).
+    pub const workspace_bytes: usize = 32 << 20;
+
+    pub fn open(stream: cuda.Stream, workspace: u64) Error!Blas {
+        var lib = std.DynLib.open("libcublas.so.13") catch std.DynLib.open("libcublas.so") catch return error.LibraryUnavailable;
+        errdefer lib.close();
+        var api: Api = undefined;
+        const info = @typeInfo(Api).@"struct";
+        inline for (info.field_names, info.field_types) |name, T| {
+            @field(api, name) = lib.lookup(T, name) orelse return error.MissingSymbol;
+        }
+        var b: Blas = .{ .lib = lib, .api = api };
+        try b.check(api.cublasCreate_v2(&b.handle));
+        try b.check(api.cublasSetStream_v2(b.handle, stream.handle));
+        try b.check(api.cublasSetWorkspace_v2(b.handle, workspace, workspace_bytes));
+        try b.check(api.cublasSetMathMode(b.handle, default_math));
+        return b;
+    }
+
+    pub fn close(b: *Blas) void {
+        _ = b.api.cublasDestroy_v2(b.handle);
+        b.lib.close();
+        b.* = undefined;
+    }
+
+    fn check(_: *const Blas, s: Status) Error!void {
+        if (s != 0) {
+            std.log.err("cuBLAS status {d}", .{s});
+            return error.CublasFailed;
+        }
+    }
+
+    /// torch.matmul of x [rows, k] fp32 (row-major) and w [n, k] fp32 transposed: out [rows, n] fp32, as torch issues
+    /// it (column-major C^T = W x^T: transa T, transb N, m = n, n = rows, lda = ldb = k, ldc = n, alpha 1, beta 0).
+    pub fn xwT(b: *const Blas, x: u64, w: u64, out: u64, rows: usize, k: usize, n: usize) Error!void {
+        const one: f32 = 1;
+        const zero: f32 = 0;
+        try b.check(b.api.cublasSgemm_v2(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, @intCast(k), x, @intCast(k), &zero, out, @intCast(n)));
+    }
+};

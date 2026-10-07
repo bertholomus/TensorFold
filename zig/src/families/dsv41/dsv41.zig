@@ -12,18 +12,22 @@ pub const link = @import("link.zig");
 pub const comm = @import("comm.zig");
 pub const tri = @import("tri.zig");
 pub const tri_basic = @import("tri_basic.zig");
+pub const cublas = @import("cublas.zig");
 
 test {
-    _ = @import("config.zig");
-    _ = native;
-    _ = rank_cache;
-    _ = plan;
-    _ = engram;
-    _ = checkpoint;
-    _ = weights;
-    _ = engram_io;
-    _ = link;
-    _ = comm;
-    _ = tri;
-    _ = tri_basic;
+    // every declaration of every file, so functions no test calls are still compiled
+    const refAll = @import("std").testing.refAllDecls;
+    refAll(@import("config.zig"));
+    refAll(native);
+    refAll(rank_cache);
+    refAll(plan);
+    refAll(engram);
+    refAll(checkpoint);
+    refAll(weights);
+    refAll(engram_io);
+    refAll(link);
+    refAll(comm);
+    refAll(tri);
+    refAll(tri_basic);
+    refAll(cublas);
 }
