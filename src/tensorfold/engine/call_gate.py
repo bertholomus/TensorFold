@@ -136,6 +136,64 @@ class ThinkBudget:
         self.open = self.open and int(token) != self.think_end
 
 
+class ThinkLoop:
+    """A reasoning loop guard: a reply still thinking whose reasoning stopped saying anything new gets ``close`` (the
+    thinking budget's: a newline, </think>, a blank line) and goes on to its answer.
+
+    "Nothing new": in ``windows`` windows of ``width`` reply tokens in a row, fewer than ``least`` of the window's token
+    ``n``-grams were not seen in any earlier window (GitHub #9's word-8-gram novelty signal, on token ids). A reply
+    looping on the same few lines (GitHub #6: "OK. / Writing. / Let me write." to the max_tokens cap) has ~0.002; a
+    reasoning that moves on ~0.9. The decision is a function of the committed tokens alone."""
+
+    def __init__(self, close: Sequence[int], think_end: int, width: int = 1024, n: int = 8, least: float = 0.02,
+                 windows: int = 3) -> None:
+        self.close, self.think_end = [int(t) for t in close], int(think_end)
+        self.width, self.n, self.least, self.windows = int(width), int(n), float(least), int(windows)
+        self.open = True
+        self.seen: set = set()                   # every earlier window's n-grams
+        self.tail: list[int] = []                # the n - 1 tokens before this window (n-grams across its edge)
+        self.win: list[int] = []                 # this window's tokens
+        self.dry = 0                             # windows in a row with less than ``least`` new
+        self.fired = False
+
+    def _novelty(self, toks: Sequence[int]) -> float:
+        seq = [*self.tail, *toks]
+        grams = [tuple(seq[j:j + self.n]) for j in range(len(seq) - self.n + 1)]
+        return sum(1 for g in grams if g not in self.seen) / max(1, len(grams))
+
+    def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
+        """(index in the next committed ``tokens`` the close goes after, the close), as ``CallGate.cut``."""
+
+        if not self.open:
+            return None
+        need = self.width - len(self.win)        # tokens until this window ends
+        for i, token in enumerate(tokens):
+            if int(token) == self.think_end:
+                return None
+            if i + 1 == need:
+                if self.dry + 1 >= self.windows and self._novelty([*self.win, *tokens[:need]]) < self.least:
+                    return i + 1, list(self.close)
+                return None
+        return None
+
+    def observe(self, token: int) -> None:
+        if not self.open:
+            return
+        if int(token) == self.think_end:
+            self.open = False
+            return
+        self.win.append(int(token))
+        if len(self.win) < self.width:
+            return
+        nov = self._novelty(self.win)
+        seq = [*self.tail, *self.win]
+        self.seen.update(tuple(seq[j:j + self.n]) for j in range(len(seq) - self.n + 1))
+        self.tail, self.win = seq[-(self.n - 1):], []
+        self.dry = self.dry + 1 if nov < self.least else 0
+        if self.dry >= self.windows:                  # the cut's close follows: its </think> closes the gate
+            self.fired = True
+
+
 def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], bool]], Any], prompt: Sequence[int],
                    max_tokens: int, gates: Sequence[Any], on_tokens: Callable[[list[int]], bool]) -> Any:
     """Decode with ``gates``: at a cut go on from the prompt, reply and fix, or (a ``replay`` gate) run the prompt again."""
@@ -184,4 +242,4 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     return stats
 
 
-__all__ = ["CallGate", "ThinkBudget", "call_format", "generate_gated"]
+__all__ = ["CallGate", "ThinkBudget", "ThinkLoop", "call_format", "generate_gated"]
