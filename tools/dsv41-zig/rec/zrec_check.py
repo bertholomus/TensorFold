@@ -21,7 +21,7 @@ for mod, owner, attr, _ in zrec.PHASES:
         bad.append(f"{mod}.{owner}.{attr} ({e!r})")
 sigs, bad_layers = {}, []
 if zrec.LAYERS_ON:
-    for mod, owner, attr in zrec.LAYER_POINTS:
+    for mod, owner, attr, *_ in zrec.LAYER_POINTS:
         try:
             g = getattr(getattr(importlib.import_module(f"{zrec.FAMILY}.{mod}"), owner), attr)
             if not getattr(g, "_zrec_layer", False):
@@ -36,4 +36,4 @@ ops = json.load(open(os.path.join(os.environ["TF_ZREC_DIR"], "aten.json")))["ops
 seen = sorted({r["op"] for r in ops if r["phase"] == "check"})
 print(json.dumps({"signatures": sigs, "layer_points_missing": bad_layers}))
 print(json.dumps({"unpatched": bad, "check_ops": seen}))
-sys.exit(1 if bad or not seen else 0)
+sys.exit(1 if bad or bad_layers or not seen else 0)

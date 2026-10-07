@@ -24,6 +24,7 @@ pub const tri_hc = @import("tri_hc.zig");
 pub const exl3_prefill = @import("exl3_prefill.zig");
 pub const ops = @import("ops.zig");
 pub const exl3_experts = @import("exl3_experts.zig");
+pub const exl3_experts_rec = @import("exl3_experts_rec.zig");
 pub const prompt = @import("prompt.zig");
 pub const exact = @import("exact.zig");
 pub const rdma_seq = @import("rdma_seq.zig");
@@ -32,6 +33,7 @@ pub const exl3_experts2d = @import("exl3_experts2d.zig");
 pub const prompt2d = @import("prompt2d.zig");
 pub const ring2d = @import("ring2d.zig");
 pub const text = @import("text.zig");
+pub const round = @import("round.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -60,6 +62,7 @@ test {
     refAll(exl3_prefill);
     refAll(ops);
     refAll(exl3_experts);
+    refAll(exl3_experts_rec);
     refAll(prompt);
     refAll(exact);
     refAll(rdma_seq);
@@ -68,4 +71,5 @@ test {
     refAll(prompt2d);
     refAll(ring2d);
     refAll(text);
+    refAll(round);
 }

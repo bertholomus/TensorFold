@@ -4,7 +4,8 @@
 // address (cuPointerGetAttribute) is written as <ptr> and left out of the launch's identity, so launches that differ
 // only by their buffers collapse into one line. A launch through the runtime is taken at the driver call beneath it
 // when CUPTI reports that call, else at the runtime call ("via":"rt"). For the Zig port's conformance tests of the
-// kernels that are not Triton's (the extensions' and torch's).
+// kernels that are not Triton's (the extensions' and torch's). ZTRACE_ALL=<prefix>: in a phase starting with it every
+// launch is written, in order, with its number ("n") and stream ("stream"): an eager decode round's whole sequence.
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <cupti.h>      // with generated_cuda_runtime_api_meta.h (the runtime launch parameters)
@@ -23,6 +24,7 @@ static uint64_t seen[1 << 20];          // hashes of the distinct launches writt
 static uint64_t ptr_v[1 << 16];         // cuPointerGetAttribute answers by value (direct mapped)
 static unsigned char ptr_p[1 << 16];
 static unsigned long long launches, written, by_rt, unresolved;
+static const char* all_prefix;          // ZTRACE_ALL
 typedef int (*func_by_symbol_t)(void**, const void*);
 static func_by_symbol_t func_by_symbol;
 
@@ -85,7 +87,7 @@ static CUfunction resolve(CUfunction f, const char** name) {
 }
 
 static void record(const char* name, CUfunction f, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned by,
-                   unsigned bz, unsigned smem, int pdl, void** params, const char* via) {
+                   unsigned bz, unsigned smem, int pdl, void** params, const char* via, const void* stream) {
     pthread_mutex_lock(&mu);
     ++launches;
     if (via[0] == 'r') ++by_rt;
@@ -126,14 +128,17 @@ static void record(const char* name, CUfunction f, unsigned gx, unsigned gy, uns
         }
         h = fnv(h, &sz, sizeof(sz));
     }
-    if (first_time(h)) {
+    const int all = all_prefix && strncmp(phase, all_prefix, strlen(all_prefix)) == 0;
+    if (all || first_time(h)) {
         ++written;
         fputs("{\"phase\":\"", out);
         put_json_str(out, phase);
         fputs("\",\"name\":\"", out);
         put_json_str(out, name);
-        fprintf(out, "\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"smem\":%u,\"pdl\":%d,\"via\":\"%s\",\"params\":\"%s\"}\n",
+        fprintf(out, "\",\"grid\":[%u,%u,%u],\"block\":[%u,%u,%u],\"smem\":%u,\"pdl\":%d,\"via\":\"%s\",\"params\":\"%s\"",
                 gx, gy, gz, bx, by, bz, smem, pdl, via, hex);
+        if (all) fprintf(out, ",\"n\":%llu,\"stream\":\"%p\"", launches, stream);
+        fputs("}\n", out);
     }
     pthread_mutex_unlock(&mu);
 }
@@ -160,7 +165,7 @@ static void CUPTIAPI callback(void* ud, CUpti_CallbackDomain dom, CUpti_Callback
         if (id == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel || id == CUPTI_DRIVER_TRACE_CBID_cuLaunchKernel_ptsz) {
             const cuLaunchKernel_params* p = (const cuLaunchKernel_params*)d->functionParams;
             record(d->symbolName, p->f, p->gridDimX, p->gridDimY, p->gridDimZ, p->blockDimX, p->blockDimY, p->blockDimZ,
-                   p->sharedMemBytes, 0, p->kernelParams, "drv");
+                   p->sharedMemBytes, 0, p->kernelParams, "drv", p->hStream);
         } else {
             const cuLaunchKernelEx_params* p = (const cuLaunchKernelEx_params*)d->functionParams;
             const CUlaunchConfig* c = p->config;
@@ -169,7 +174,7 @@ static void CUPTIAPI callback(void* ud, CUpti_CallbackDomain dom, CUpti_Callback
                 if (c->attrs[i].id == CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION)
                     pdl = c->attrs[i].value.programmaticStreamSerializationAllowed;
             record(d->symbolName, p->f, c->gridDimX, c->gridDimY, c->gridDimZ, c->blockDimX, c->blockDimY, c->blockDimZ,
-                   c->sharedMemBytes, pdl, p->kernelParams, "drv");
+                   c->sharedMemBytes, pdl, p->kernelParams, "drv", c->hStream);
         }
         return;
     }
@@ -185,12 +190,12 @@ static void CUPTIAPI callback(void* ud, CUpti_CallbackDomain dom, CUpti_Callback
     if (id == CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_v7000 || id == CUPTI_RUNTIME_TRACE_CBID_cudaLaunchKernel_ptsz_v7000) {
         const cudaLaunchKernel_v7000_params* p = (const cudaLaunchKernel_v7000_params*)d->functionParams;
         record(d->symbolName, rt_func(p->func), p->gridDim.x, p->gridDim.y, p->gridDim.z, p->blockDim.x, p->blockDim.y,
-               p->blockDim.z, (unsigned)p->sharedMem, 0, p->args, "rt");
+               p->blockDim.z, (unsigned)p->sharedMem, 0, p->args, "rt", p->stream);
     } else {
         const cudaLaunchKernelExC_v11060_params* p = (const cudaLaunchKernelExC_v11060_params*)d->functionParams;
         const cudaLaunchConfig_t* c = p->config;
         record(d->symbolName, rt_func(p->func), c->gridDim.x, c->gridDim.y, c->gridDim.z, c->blockDim.x, c->blockDim.y,
-               c->blockDim.z, (unsigned)c->dynamicSmemBytes, rt_pdl(c), (void**)p->args, "rt");
+               c->blockDim.z, (unsigned)c->dynamicSmemBytes, rt_pdl(c), (void**)p->args, "rt", c->stream);
     }
 }
 
@@ -209,6 +214,8 @@ static void finish(void) { ztrace_flush(); }
 
 int InitializeInjection(void) {
     const char* path = getenv("ZTRACE_FILE");
+    all_prefix = getenv("ZTRACE_ALL");
+    if (all_prefix && !*all_prefix) all_prefix = NULL;
     out = fopen(path ? path : "/tmp/ztrace.jsonl", "w");
     if (!out) return 0;
     setvbuf(out, NULL, _IOFBF, 1 << 20);

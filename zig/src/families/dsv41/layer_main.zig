@@ -8,6 +8,10 @@
 //! chunk F on compare every point a layer exchanges with the served build's bytes: the attention's input rows and
 //! partial, its gather, the MoE's input rows and partial, its gather, on an Engram layer its rows' projection and their
 //! gather; after a chunk's last layer the DSpark taps, the head's columns, their gather and the prompt's logits.
+//! With --rounds K the recorded decode rounds follow (eager serial rounds: RoundDecoder.run's rows, the stream in pool
+//! slot 0): the first K of them through round.zig, each checked at every layer's exchanges (Engram's projection and
+//! gather, the attention's input rows, partial and gather, the MoE's), the head's columns and gather, the logits and the
+//! taps, and the greedy next token against the next round's.
 //! One JSON line a point; the first difference stops the run (its first differing element and how many differ).
 //! REC_DIR: aot/ (the recording's Triton set), cubins/ (linear.cubin, linear_grouped.cubin, experts.cubin,
 //! experts_cb.cubin: the served extension cubins), rope-{plain,compressed}-{cos,sin}.f32, rope.json and engram.json (zrec_fixtures.py), rank<R>/layers.jsonl and
@@ -16,8 +20,9 @@ const std = @import("std");
 const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const prompt = dsv41.prompt;
+const round_mod = dsv41.round;
 
-const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--engram DIR --token-map FILE] [--dump DIR]\n";
+const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--rounds K] [--engram DIR --token-map FILE] [--dump DIR]\n";
 const rope_rows = 8192; // the plain table's first rows (chunk 0's positions and more)
 const chunk_rows = 2048;
 const cache_tokens = 4096; // the compressed caches' positions (the recorded prompt's)
@@ -147,6 +152,7 @@ pub fn main(init: std.process.Init) !u8 {
     var layers: usize = 1;
     var chunks: usize = 1;
     var check_from: usize = 0;
+    var rounds: usize = 0;
     var engram_dir: ?[]const u8 = null;
     var token_map: ?[]const u8 = null;
     var dump: ?[]const u8 = null;
@@ -160,6 +166,8 @@ pub fn main(init: std.process.Init) !u8 {
             chunks = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--check-from")) {
             check_from = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--rounds")) {
+            rounds = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--engram")) {
             engram_dir = val;
         } else if (std.mem.eql(u8, key, "--token-map")) {
@@ -310,7 +318,7 @@ pub fn main(init: std.process.Init) !u8 {
         eh = try prompt.EngramHost.init(a, &cfg, dsv41.engram.Hasher.init(cfg, map, mult), &tables, pool.?, sp.rank, sp.world, chunk_rows);
     }
     // the whole sequence's ids (Engram hashes n-grams across chunk boundaries)
-    const seq = try a.alloc(i32, total);
+    const seq = try a.alloc(i32, total + rounds * round_mod.max_rows);
     {
         var at: usize = 0;
         for (chunk_ids[0..n_chunks]) |ids| for (ids) |id| {
@@ -342,9 +350,122 @@ pub fn main(init: std.process.Init) !u8 {
         start += ids.len;
         ran += 1;
     }
-    try w_out.print("{{\"rank\": {d}, \"chunks\": {d}, \"layers\": {d}, \"all_equal\": {}}}\n", .{ rank, ran, layers, run.ok });
+    if (rounds > 0 and run.ok and ran == n_chunks) {
+        if (n_chunks != chunks or start != prompt_len) return error.RoundsNeedTheWholePrompt;
+        run.ok = try runRounds(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, seq, start, rounds, a, &arena);
+    }
+    try w_out.print("{{\"rank\": {d}, \"chunks\": {d}, \"layers\": {d}, \"rounds\": {d}, \"all_equal\": {}}}\n", .{ rank, ran, layers, rounds, run.ok });
     try w_out.flush();
     return if (run.ok) 0 else 1;
+}
+
+/// The recorded rounds' checker: each point found after the last one matched, as the recorder numbered the calls.
+const RoundCheck = struct {
+    run: *Run,
+    after: u64,
+    att: u64 = 0,
+    moe: u64 = 0,
+    call: u64, // the round's RoundDecoder.run
+    fwd: u64, // its RoundRunner.forward
+
+    fn at(ctx: *anyopaque, what: round_mod.Point, layer: usize, dev: u64) anyerror!bool {
+        const rc: *RoundCheck = @ptrCast(@alignCast(ctx));
+        const fx = rc.run.fx;
+        const l: i64 = @intCast(layer);
+        var buf: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&buf, "R{d} L{d} {s}", .{ rc.call, layer, @tagName(what) });
+        const pt: ?*const Point = switch (what) {
+            .engram_proj => fx.find(rc.after, "Comm.gather", null, "in1"),
+            .engram_gather => fx.find(rc.after, "Comm.gather", null, "out"),
+            .attn_in => fx.find(rc.after, "RoundDecoder._attention2", l, "in2"),
+            .attn_out => fx.find(rc.after, "RoundDecoder._attention2", l, "out"),
+            .attn_gather => fx.find(rc.att, "Comm.gather", null, "out"),
+            .moe_in => fx.find(rc.att, "Model.moe", l, "in2"),
+            .moe_out => fx.find(rc.att, "Model.moe", l, "out"),
+            .moe_gather => fx.find(rc.moe, "Comm.gather", null, "out"),
+            .head_cols => fx.find(rc.after, "Comm.gather", null, "in1"),
+            .head_gather => fx.find(rc.after, "Comm.gather", null, "out"),
+            .logits => fx.find(rc.call - 1, "RoundDecoder.run", null, "out"),
+            .taps => fx.find(rc.fwd - 1, "RoundRunner.forward", null, "out.1"),
+        };
+        const ok = try rc.run.check(label, pt, dev);
+        if (pt) |q| switch (what) {
+            .engram_gather => rc.after = q.call,
+            .attn_in => rc.att = q.call,
+            .moe_in => rc.moe = q.call,
+            .moe_gather => rc.after = q.call,
+            else => {},
+        };
+        return ok;
+    }
+};
+
+/// A fixture tensor of int64 values, whole (a round's input rows).
+fn ints(run: *Run, p: ?*const Point) ![]const i64 {
+    const pt = p orelse return error.NoRoundFixture;
+    const name = pt.file orelse return error.NoRoundFixture;
+    const bytes = try std.Io.Dir.cwd().readFileAllocOptions(run.io, try std.fs.path.join(run.a, &.{ run.fx.dir, "layers", name }), run.a, .limited(1 << 20), .@"8", null);
+    return std.mem.bytesAsSlice(i64, bytes);
+}
+
+/// The index of the first largest of n fp32 values on the device (torch.argmax's choice).
+fn argmax(run: *Run, dev: u64, n: usize) !usize {
+    try run.s.synchronize();
+    const host = try run.a.alloc(f32, n);
+    try run.d.check(run.d.api.cuMemcpyDtoH_v2(host.ptr, dev, n * 4), "cuMemcpyDtoH");
+    var best: usize = 0;
+    for (host, 0..) |v, i| {
+        if (v > host[best]) best = i;
+    }
+    return best;
+}
+
+/// The recorded decode rounds after the prompt: each RoundDecoder.run's rows (ids, positions, the stream's extent) through
+/// round.zig with every point checked; the greedy next token (from the prompt's logits, then each round's) against the
+/// next round's. False on the first difference.
+fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []i32, prompt_len: usize, rounds: usize, a: std.mem.Allocator, arena: *prompt.Arena) !bool {
+    const fx = run.fx;
+    const w_out = run.out;
+    const vocab = eng.world * eng.w.head.n;
+    var rd = try round_mod.Round.init(eng, arena, a, cache_tokens);
+    var next = try argmax(run, ch.head_g, vocab); // greedy from the prompt's logits
+    var have = prompt_len;
+    var after: u64 = 0;
+    for (0..rounds) |k| {
+        const rp = fx.find(after, "RoundDecoder.run", null, "in1") orelse {
+            try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"note\": \"no more recorded rounds\"}}\n", .{ run.rank, k });
+            try w_out.flush();
+            break;
+        };
+        const ids = try ints(run, rp);
+        const pos = try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in2"));
+        const base = try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in4"));
+        const end = try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in5"));
+        const fwd = fx.find(after, "RoundRunner.forward", null, "out.0") orelse return error.NoRoundFixture;
+        _ = fwd;
+        const greedy_ok = ids.len > 0 and ids[0] == @as(i64, @intCast(next));
+        try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"call\": {d}, \"rows\": {d}, \"pos\": {d}, \"id\": {d}, \"greedy\": {d}, \"greedy_equal\": {}}}\n", .{ run.rank, k, rp.call, ids.len, pos[0], ids[0], next, greedy_ok });
+        try w_out.flush();
+        if (pos[0] != @as(i64, @intCast(have))) return error.RoundNotNext;
+        for (ids, 0..) |id, i| seq[have + i] = @intCast(id);
+        have += ids.len;
+        // the RoundRunner.forward around this run: the last one before it
+        var fcall: u64 = 0;
+        for (fx.points) |*q| {
+            if (q.call < rp.call and std.mem.eql(u8, q.where, "RoundRunner.forward")) fcall = q.call;
+        }
+        var rc: RoundCheck = .{ .run = run, .after = rp.call, .call = rp.call, .fwd = fcall };
+        const rows: round_mod.Rows = .{ .ids = ids, .pos = pos, .base = base[0], .end = end[0] };
+        round_mod.forward(eng, &rd, ch, caches, rings, eh, seq[0..have], rows, cache_tokens, .{ .ctx = &rc, .at = RoundCheck.at }) catch |err| {
+            if (err == error.RoundMismatch) return false;
+            try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, k, @errorName(err) });
+            try w_out.flush();
+            return false;
+        };
+        next = try argmax(run, rd.logits + (ids.len - 1) * vocab * 4, vocab);
+        after = rp.call;
+    }
+    return run.ok;
 }
 
 /// One chunk's layers through the prompt forward, each exchange checked against the fixtures after the chunk's call
@@ -360,6 +481,8 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
     var floor: usize = 0;
     var kv_done: ?usize = null;
     var label_buf: [64]u8 = undefined;
+    // the DSpark taps only when the recorded forward took them (a drafting engine: Model.forward's taps list)
+    const want_taps = if (fx.find(call - 1, "Model.forward", null, "post.in.taps.0")) |q| q.call == call else false;
     for (0..layers) |li| {
         const l: i64 = @intCast(li);
         if (li == c.layers / 2) {
@@ -386,8 +509,10 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
             after = eg.call;
         }
         // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
-        if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| {
-            prompt.tap(eng, ch, j) catch |err| return report(w_out, rank, li, "tap", err);
+        if (want_taps) {
+            if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| {
+                prompt.tap(eng, ch, j) catch |err| return report(w_out, rank, li, "tap", err);
+            }
         }
         const att = fx.find(after, "Model.attention_k", l, "in2") orelse return report(w_out, rank, li, "attention fixture", error.NoLayerFixture);
         prompt.attnMixes(eng, ch, li) catch |err| return report(w_out, rank, li, "attention mixes", err);
@@ -408,7 +533,7 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
         after = mg.call;
         if (li + 1 < c.layers) continue;
         // the chunk's end: the taps (Model.forward's list), the head on the last row, the prompt's logits
-        for (0..c.dspark_taps.slice().len) |j| {
+        for (0..if (want_taps) c.dspark_taps.slice().len else 0) |j| {
             var arg_buf: [32]u8 = undefined;
             const arg = try std.fmt.bufPrint(&arg_buf, "post.in.taps.{d}", .{j});
             if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "tap {d}", .{j}), fx.find(call - 1, "Model.forward", null, arg), prompt.tapRows(eng, ch, j))) return false;

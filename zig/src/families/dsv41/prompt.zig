@@ -80,12 +80,12 @@ pub const Engine = struct {
     compressed: Rope,
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
 
-    fn heads(e: *const Engine) usize {
+    pub fn heads(e: *const Engine) usize {
         if (e.two) |t| return t.heads;
         return e.c.heads / e.world;
     }
 
-    fn slots(e: *const Engine) usize {
+    pub fn slots(e: *const Engine) usize {
         return e.c.top_k + 1;
     }
 
@@ -357,12 +357,12 @@ pub const Chunk = struct {
 
 /// Host bytes to the device in the stream's order (the stream is non-blocking: the legacy stream's synchronous copies
 /// would not wait for its kernels). Pageable host memory is staged before the call returns.
-fn upload(e: *const Engine, dst: u64, src: *const anyopaque, bytes: usize) !void {
+pub fn upload(e: *const Engine, dst: u64, src: *const anyopaque, bytes: usize) !void {
     try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(dst, src, bytes, e.s.handle), "cuMemcpyHtoDAsync");
 }
 
 /// cuMemsetD8 in the stream's order.
-fn fill(e: *const Engine, dst: u64, value: u8, bytes: usize) !void {
+pub fn fill(e: *const Engine, dst: u64, value: u8, bytes: usize) !void {
     try e.d.check(e.d.api.cuMemsetD8Async(dst, value, bytes, e.s.handle), "cuMemsetD8Async");
 }
 
@@ -374,7 +374,7 @@ fn fill32(e: *const Engine, dst: u64, value: u32, words: usize) !void {
 /// A layer's split-K counters (Exl3Linear.counters) by its trellis words.
 pub const Counter = struct { words: u64, ptr: u64 };
 
-fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
+pub fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
     for (ch.counters[0..ch.n_counters]) |c| if (c.words == l.words) return c.ptr;
     return error.NoCounters;
 }
@@ -383,7 +383,7 @@ fn counterOf(ch: *const Chunk, l: weights.Linear) !u64 {
 /// row stride ldxs[i]) into the group's buffer, then a glinear launch for each (bits, warps) set, outputs into outs[i]
 /// (row stride ldos[i], dtype types[i]); programmatic dependent launches, split-K partials dropped from L2 (the served
 /// TF_EXL3_PDL and TF_EXL3_L2_DISCARD).
-fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
+pub fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Linear, xs: []const u64, ldxs: []const usize, outs: []const u64, ldos: []const usize, types: []const exl3_linear.DType) !void {
     if (m == 0 or m > 128 or ls.len > 8) return error.NotADecodeWindow;
     var calls: [8]exl3_linear.Call = undefined;
     var off: usize = 0;
@@ -393,6 +393,14 @@ fn grouped(e: *const Engine, ch: *const Chunk, m: usize, ls: []const weights.Lin
     }
     try exl3_linear.rotMany(e.lin, e.s, calls[0..ls.len], m, true);
     try exl3_linear.glinear(e.lin, e.s, calls[0..ls.len], m, ch.gz, true, true);
+}
+
+/// Exl3Group.rotated on m rows already rotated into each call's xh (a kernel that folds the rotation in wrote them):
+/// the glinear launches alone, each call's counters and folds as given.
+pub fn groupedRotated(e: *const Engine, ch: *const Chunk, m: usize, calls: []exl3_linear.Call) !void {
+    if (m == 0 or m > 128 or calls.len > exl3_linear.gmax) return error.NotADecodeWindow;
+    for (calls) |*c| c.counters = try counterOf(ch, c.layer);
+    try exl3_linear.glinear(e.lin, e.s, calls, m, ch.gz, true, true);
 }
 
 /// One sequence's compressed-attention caches (model.py SeqCache: comp, index_k, comp_raw), by kv-source layer: the
@@ -706,7 +714,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
 }
 
 /// topk_select's torch step, keys.topk(k).values: the top-k set of the unique int64 keys (ops.topkI64).
-fn torchTopk(ctx: ?*anyopaque, _: tri.Tri, keys: u64, ks: usize, rows: usize, n: usize, k: usize, top: u64) anyerror!void {
+pub fn torchTopk(ctx: ?*anyopaque, _: tri.Tri, keys: u64, ks: usize, rows: usize, n: usize, k: usize, top: u64) anyerror!void {
     const e: *const Engine = @ptrCast(@alignCast(ctx.?));
     try e.ops.topkI64(e.s, keys, ks, rows, n, k, top);
 }

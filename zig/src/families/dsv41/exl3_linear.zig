@@ -135,8 +135,16 @@ fn template3(s: []const u8) ?[3]u32 {
     return out;
 }
 
+/// Exl3Group.rotated's `rot` for a layer: its outputs also rotated into the next layer's input rows (rot_many's bits
+/// of y): that layer's suh, its rotated rows (fp16, row stride ldr) and the output's column offset there.
+pub const RotOut = struct { suh: u64, xh: u64, ldr: i64, off: u32 };
+
+/// Exl3Group.rotated's `rope` for a layer: its bf16 outputs leave with rope_heads applied (cos / sin fp32 [*, rd / 2],
+/// positions int64 [M], heads of hd columns, RoPE on their last rd).
+pub const RopeOut = struct { cos: u64, sin: u64, pos: u64, hd: u32, rd: u32 };
+
 /// One layer's call: its rotated input rows, its output rows and dtype, its split-K counters (int32 [8 N / 128], left
-/// zero by the kernel) and, for SK > 1, its partials' place in the launch's Z.
+/// zero by the kernel) and, for SK > 1, its partials' place in the launch's Z; the folds its epilogue makes.
 pub const Call = struct {
     layer: weights.Linear,
     x: u64,
@@ -147,6 +155,8 @@ pub const Call = struct {
     ldy: i64,
     y_dtype: DType,
     counters: u64,
+    rot: ?RotOut = null,
+    rope: ?RopeOut = null,
 };
 
 /// rot_many: every layer's input rows rotated into its xh rows [M, K] fp16, one launch.
@@ -162,8 +172,8 @@ pub fn rotMany(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: u
     try cuda.launch.launch(k.rot_many, .{ .grid = .{ .x = @intCast((warps + 3) / 4) }, .block = .{ .x = 128 }, .pdl = pdl }, stream, &args);
 }
 
-/// The glinear launches of a group (Exl3Group.rotated, no folds): each (bits, codebook, warps) set in first-seen
-/// order, its split layers' partials in z (fp32, SK * M * N floats each, in order).
+/// The glinear launches of a group (Exl3Group.rotated, with each call's folds): each (bits, codebook, warps) set in
+/// first-seen order, its split layers' partials in z (fp32, SK * M * N floats each, in order).
 pub fn glinear(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: usize, z: u64, pdl: bool, discard: bool) !void {
     var done: [gmax]bool = @splat(false);
     for (calls, 0..) |first, i| {
@@ -180,6 +190,19 @@ pub fn glinear(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: u
             const s = strides(c.layer);
             const n: usize = @intCast(a.n);
             a.l[n] = .{ .xh = c.xh, .ldx = @intCast(c.layer.k), .T = c.layer.words, .stride_k = s[0], .stride_nb = s[1], .svh = c.layer.svh, .y = c.y, .y_dtype = @intFromEnum(c.y_dtype), .ldy = c.ldy, .K = @intCast(c.layer.k), .N = @intCast(c.layer.n), .SK = @intCast(pj.sk), .counters = c.counters, .first = @intCast(blocks) };
+            if (c.rot) |r| {
+                a.l[n].rsuh = r.suh;
+                a.l[n].rxh = r.xh;
+                a.l[n].ldr = r.ldr;
+                a.l[n].roff = @intCast(r.off);
+            }
+            if (c.rope) |r| {
+                a.l[n].rcos = r.cos;
+                a.l[n].rsin = r.sin;
+                a.l[n].rpos = r.pos;
+                a.l[n].rhd = @intCast(r.hd);
+                a.l[n].rrd = @intCast(r.rd);
+            }
             if (pj.sk > 1) {
                 a.l[n].Z = z + zoff * 4;
                 zoff += @as(u64, pj.sk) * m * c.layer.n;
