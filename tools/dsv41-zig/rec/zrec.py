@@ -253,10 +253,20 @@ LAYER_POINTS = [
     ("cuda.rounds", "RoundRunner", "forward"),
     ("cuda.rounds", "RoundDecoder", "run"),
     ("cuda.rounds", "RoundDecoder", "_attention2", (4, 5)),     # cos, sin: whole RoPE tables
+    # the drafter (M5): its batched pass (the drafts), its stages, each block's attention (with the block's ring
+    # plane: the absorbed keys), the Markov loop, its absorbs of the target's taps
+    ("cuda.dspark", "BatchDraftGraph", "run"),
+    ("cuda.dspark", "BatchDraftGraph", "_stages_fused"),
+    ("cuda.dspark", "BatchDraftGraph", "_attention"),
+    ("cuda.markov", "Markov", "steps"),
+    ("cuda.dspark", "Drafter", "absorb", (1, 2)),                # dc, sc: caches
+    ("cuda.dspark", "Drafter", "absorb_many", (1, 2)),           # dpool, sc
+    ("cuda.dspark", "Drafter", "draft", (1, 2)),                 # dc, sc
 ]
 # saved whole whatever the layer (TF_ZREC_WHOLE=<where>,... overrides: a token recording keeps only the prompts)
 WHOLE = tuple(x for x in os.environ["TF_ZREC_WHOLE"].split(",") if x) if "TF_ZREC_WHOLE" in os.environ else (
-    "Model.forward", "RoundRunner.forward", "RoundDecoder.run")
+    "Model.forward", "RoundRunner.forward", "RoundDecoder.run", "BatchDraftGraph.run", "BatchDraftGraph._stages_fused",
+    "Markov.steps", "Drafter.absorb", "Drafter.absorb_many", "Drafter.draft")
 # TF_ZREC_ONLY=<where>,...: only these points are written (a token recording: the prompts ids and the rounds inputs)
 ONLY = {x for x in os.environ.get("TF_ZREC_ONLY", "").split(",") if x}
 LAYERS_ON = "TF_ZREC_LAYERS" in os.environ
@@ -275,19 +285,21 @@ def _armed() -> bool:
     return _lay["armed"]
 
 
-def _tensors(x, path: str):
-    """(path, tensor) for x when it is a tensor, or for each tensor in x when it is a list or tuple."""
+def _tensors(x, path: str, depth: int = 0):
+    """(path, tensor) for x when it is a tensor, an int list (as int64) or an int (at depth > 0), or for each such item
+    in x when it is a list or tuple (two levels deep: a list of windows, of (slot, taps, position) items)."""
 
     import torch
 
     if isinstance(x, torch.Tensor):
         yield path, x
+    elif isinstance(x, int) and not isinstance(x, bool) and depth > 0:
+        yield path, torch.tensor([x], dtype=torch.int64)
     elif isinstance(x, (list, tuple)) and x and all(isinstance(y, int) and not isinstance(y, bool) for y in x):
         yield path, torch.tensor(list(x), dtype=torch.int64)
-    elif isinstance(x, (list, tuple)):
+    elif isinstance(x, (list, tuple)) and depth < 2:
         for i, y in enumerate(x):
-            if isinstance(y, torch.Tensor):
-                yield f"{path}.{i}", y
+            yield from _tensors(y, f"{path}.{i}", depth + 1)
 
 
 def _layer_of(a) -> int | None:

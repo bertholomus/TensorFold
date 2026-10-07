@@ -4,8 +4,9 @@
 // address (cuPointerGetAttribute) is written as <ptr> and left out of the launch's identity, so launches that differ
 // only by their buffers collapse into one line. A launch through the runtime is taken at the driver call beneath it
 // when CUPTI reports that call, else at the runtime call ("via":"rt"). For the Zig port's conformance tests of the
-// kernels that are not Triton's (the extensions' and torch's). ZTRACE_ALL=<prefix>: in a phase starting with it every
-// launch is written, in order, with its number ("n") and stream ("stream"): an eager decode round's whole sequence.
+// kernels that are not Triton's (the extensions' and torch's). ZTRACE_ALL=<prefix>[,<prefix>...]: in a phase starting
+// with one of them every launch is written, in order, with its number ("n") and stream ("stream"): an eager decode
+// round's whole sequence, the drafter's.
 #include <cuda.h>
 #include <cuda_runtime_api.h>
 #include <cupti.h>      // with generated_cuda_runtime_api_meta.h (the runtime launch parameters)
@@ -24,7 +25,21 @@ static uint64_t seen[1 << 20];          // hashes of the distinct launches writt
 static uint64_t ptr_v[1 << 16];         // cuPointerGetAttribute answers by value (direct mapped)
 static unsigned char ptr_p[1 << 16];
 static unsigned long long launches, written, by_rt, unresolved;
-static const char* all_prefix;          // ZTRACE_ALL
+static char all_list[512];              // ZTRACE_ALL's prefixes, comma-separated
+static int all_on;
+
+static int all_phase(void) {
+    if (!all_on) return 0;
+    const char* p = all_list;
+    while (*p) {
+        const char* e = strchr(p, ',');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        if (n && strncmp(phase, p, n) == 0) return 1;
+        if (!e) break;
+        p = e + 1;
+    }
+    return 0;
+}
 typedef int (*func_by_symbol_t)(void**, const void*);
 static func_by_symbol_t func_by_symbol;
 
@@ -128,7 +143,7 @@ static void record(const char* name, CUfunction f, unsigned gx, unsigned gy, uns
         }
         h = fnv(h, &sz, sizeof(sz));
     }
-    const int all = all_prefix && strncmp(phase, all_prefix, strlen(all_prefix)) == 0;
+    const int all = all_phase();
     if (all || first_time(h)) {
         ++written;
         fputs("{\"phase\":\"", out);
@@ -214,8 +229,11 @@ static void finish(void) { ztrace_flush(); }
 
 int InitializeInjection(void) {
     const char* path = getenv("ZTRACE_FILE");
-    all_prefix = getenv("ZTRACE_ALL");
-    if (all_prefix && !*all_prefix) all_prefix = NULL;
+    const char* all = getenv("ZTRACE_ALL");
+    if (all && *all) {
+        strncpy(all_list, all, sizeof(all_list) - 1);
+        all_on = 1;
+    }
     out = fopen(path ? path : "/tmp/ztrace.jsonl", "w");
     if (!out) return 0;
     setvbuf(out, NULL, _IOFBF, 1 << 20);
