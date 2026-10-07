@@ -1,9 +1,14 @@
 //! Engram rows from the original FP8 tables on local NVMe: a weight row and its scale row a row id, read by offset with
 //! one pread each on a pool of threads (engram_io.cpp's gather_rows2), so a step's random rows cost about one latency.
+//! gatherDirect reads them through O_DIRECT descriptors (gather_rows2_direct_at: each row's 4 KiB-aligned span into an
+//! aligned bounce buffer, then the row copied out; the same bytes, the page cache skipped), and engram_aio.zig submits
+//! a decode round's rows as kernel AIO on the same descriptors.
 const std = @import("std");
+const dio = @import("core").direct_io;
 
-/// One layer's table: [rows, row_w] FP8 weights and [rows, row_s] E8M0 scales, by file and offset.
-pub const Table = struct { fd_w: std.c.fd_t, base_w: u64, row_w: usize, fd_s: std.c.fd_t, base_s: u64, row_s: usize, rows: u64 };
+/// One layer's table: [rows, row_w] FP8 weights and [rows, row_s] E8M0 scales, by file and offset; fd_wd / fd_sd the same
+/// files through O_DIRECT (-1 where the file system refuses it: the buffered ones serve).
+pub const Table = struct { fd_w: std.c.fd_t, base_w: u64, row_w: usize, fd_s: std.c.fd_t, base_s: u64, row_s: usize, rows: u64, fd_wd: std.c.fd_t = -1, fd_sd: std.c.fd_t = -1 };
 
 pub const Tables = struct {
     gpa: std.mem.Allocator,
@@ -20,7 +25,7 @@ pub const Tables = struct {
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
-        var halves: std.AutoHashMapUnmanaged(u32, [2]?struct { fd: std.c.fd_t, base: u64, row: usize, rows: u64 }) = .empty;
+        var halves: std.AutoHashMapUnmanaged(u32, [2]?struct { fd: std.c.fd_t, dfd: std.c.fd_t, base: u64, row: usize, rows: u64 }) = .empty;
         var it = d.iterate();
         while (try it.next(io)) |e| {
             if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
@@ -36,6 +41,7 @@ pub const Tables = struct {
             const h = try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{});
             if (h != .object) return error.BadSafetensors;
             var opened: ?std.c.fd_t = null;
+            var direct: std.c.fd_t = -1;
             var names = h.object.iterator();
             while (names.next()) |kv| {
                 const name = kv.key_ptr.*;
@@ -47,10 +53,18 @@ pub const Tables = struct {
                     if (fd < 0) return error.FileNotFound;
                     try t.fds.append(gpa, fd);
                     opened = fd;
+                    // and through O_DIRECT where the file system allows it
+                    var df = dio.File.open(path) catch null;
+                    if (df) |*f| {
+                        if (f.direct) {
+                            try t.fds.append(gpa, f.fd);
+                            direct = f.fd;
+                        } else f.close();
+                    }
                 }
                 const gop = try halves.getOrPut(a, layer);
                 if (!gop.found_existing) gop.value_ptr.* = .{ null, null };
-                gop.value_ptr[which] = .{ .fd = opened.?, .base = 8 + n + en.begin, .row = en.cols * en.size, .rows = en.rows };
+                gop.value_ptr[which] = .{ .fd = opened.?, .dfd = direct, .base = 8 + n + en.begin, .row = en.cols * en.size, .rows = en.rows };
             }
         }
         var hv = halves.iterator();
@@ -58,7 +72,7 @@ pub const Tables = struct {
             const w = kv.value_ptr[0] orelse return error.MissingEngramTable;
             const s = kv.value_ptr[1] orelse return error.MissingEngramTable;
             if (w.rows != s.rows) return error.BadEngramTable;
-            try t.layers.put(gpa, kv.key_ptr.*, .{ .fd_w = w.fd, .base_w = w.base, .row_w = w.row, .fd_s = s.fd, .base_s = s.base, .row_s = s.row, .rows = w.rows });
+            try t.layers.put(gpa, kv.key_ptr.*, .{ .fd_w = w.fd, .base_w = w.base, .row_w = w.row, .fd_s = s.fd, .base_s = s.base, .row_s = s.row, .rows = w.rows, .fd_wd = w.dfd, .fd_sd = s.dfd });
         }
         return t;
     }
@@ -101,6 +115,15 @@ fn layerOf(name: []const u8) !u32 {
     return std.fmt.parseInt(u32, rest[0..dot], 10);
 }
 
+/// The largest row a direct read takes: its span is at most three 4 KiB blocks (read_row_direct's bounce buffer).
+pub const direct_row_max = 2 * dio.alignment;
+
+/// A row through an O_DIRECT descriptor (read_row_direct): its aligned span into `bounce`, then the row copied out.
+fn readDirect(fd: std.c.fd_t, bounce: []align(dio.alignment) u8, out: []u8, at: u64) !void {
+    const f: dio.File = .{ .fd = fd, .direct = true };
+    @memcpy(out, try f.read(bounce, at, out.len));
+}
+
 fn preadAll(fd: std.c.fd_t, out: []u8, at: u64) !void {
     var done: usize = 0;
     while (done < out.len) {
@@ -135,6 +158,7 @@ pub const Pool = struct {
         next: std.atomic.Value(usize) = .init(0),
         finished: std.atomic.Value(usize) = .init(0),
         failed: std.atomic.Value(bool) = .init(false),
+        direct: bool = false,
     };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, n: usize) !*Pool {
@@ -191,14 +215,21 @@ pub const Pool = struct {
     }
 
     fn work(p: *Pool, j: *Job) void {
+        var bounce: [3 * dio.alignment]u8 align(dio.alignment) = undefined;
         while (true) {
             const i = j.next.fetchAdd(1, .monotonic);
             if (i >= j.ids.len) return;
             const id: u64 = @intCast(j.ids[i]);
             const ok = id < j.t.rows;
             if (ok) {
-                preadAll(j.t.fd_w, j.out_w[i * j.t.row_w ..][0..j.t.row_w], j.t.base_w + id * j.t.row_w) catch j.failed.store(true, .monotonic);
-                preadAll(j.t.fd_s, j.out_s[i * j.t.row_s ..][0..j.t.row_s], j.t.base_s + id * j.t.row_s) catch j.failed.store(true, .monotonic);
+                const w = j.out_w[i * j.t.row_w ..][0..j.t.row_w];
+                const s = j.out_s[i * j.t.row_s ..][0..j.t.row_s];
+                if (j.direct and j.t.fd_wd >= 0) {
+                    readDirect(j.t.fd_wd, &bounce, w, j.t.base_w + id * j.t.row_w) catch j.failed.store(true, .monotonic);
+                } else preadAll(j.t.fd_w, w, j.t.base_w + id * j.t.row_w) catch j.failed.store(true, .monotonic);
+                if (j.direct and j.t.fd_sd >= 0) {
+                    readDirect(j.t.fd_sd, &bounce, s, j.t.base_s + id * j.t.row_s) catch j.failed.store(true, .monotonic);
+                } else preadAll(j.t.fd_s, s, j.t.base_s + id * j.t.row_s) catch j.failed.store(true, .monotonic);
             } else j.failed.store(true, .monotonic);
             if (j.finished.fetchAdd(1, .acq_rel) + 1 == j.ids.len) {
                 p.mutex.lockUncancelable(p.io);
@@ -210,9 +241,19 @@ pub const Pool = struct {
 
     /// Rows `ids` of table `t` into out_w ([ids.len, row_w]) and out_s ([ids.len, row_s]); this thread reads too.
     pub fn gather(p: *Pool, t: Table, ids: []const i64, out_w: []u8, out_s: []u8) !void {
+        return p.run(t, ids, out_w, out_s, false);
+    }
+
+    /// gather through the tables' O_DIRECT descriptors (gather_rows2_direct_at), the buffered ones where there are none.
+    pub fn gatherDirect(p: *Pool, t: Table, ids: []const i64, out_w: []u8, out_s: []u8) !void {
+        if (t.row_w > direct_row_max or t.row_s > direct_row_max) return error.RowTooWide;
+        return p.run(t, ids, out_w, out_s, true);
+    }
+
+    fn run(p: *Pool, t: Table, ids: []const i64, out_w: []u8, out_s: []u8, direct: bool) !void {
         if (out_w.len != ids.len * t.row_w or out_s.len != ids.len * t.row_s) return error.BadSize;
         if (ids.len == 0) return;
-        var job: Job = .{ .t = t, .ids = ids, .out_w = out_w, .out_s = out_s };
+        var job: Job = .{ .t = t, .ids = ids, .out_w = out_w, .out_s = out_s, .direct = direct };
         p.mutex.lockUncancelable(p.io);
         p.job = &job;
         p.gen += 1;
@@ -254,6 +295,12 @@ test "rows of a toy table by id, on the pool" {
     var w: [3 * 4]u8 = undefined;
     var s: [3]u8 = undefined;
     try pool.gather(tab, &.{ 5, 0, 2 }, &w, &s);
+    try std.testing.expectEqualSlices(u8, &.{ 20, 21, 22, 23, 0, 1, 2, 3, 8, 9, 10, 11 }, &w);
+    try std.testing.expectEqualSlices(u8, &.{ 29, 24, 26 }, &s);
+    // the O_DIRECT path (or the buffered one where the test's file system refuses it): the same bytes
+    @memset(&w, 0);
+    @memset(&s, 0);
+    try pool.gatherDirect(tab, &.{ 5, 0, 2 }, &w, &s);
     try std.testing.expectEqualSlices(u8, &.{ 20, 21, 22, 23, 0, 1, 2, 3, 8, 9, 10, 11 }, &w);
     try std.testing.expectEqualSlices(u8, &.{ 29, 24, 26 }, &s);
     try std.testing.expectError(error.ReadFailed, pool.gather(tab, &.{6}, w[0..4], s[0..1]));
