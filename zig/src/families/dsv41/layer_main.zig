@@ -12,7 +12,12 @@
 //! serial, or a drafting recording's windows of the pending token and its drafts): the first K of the prompt's request
 //! through round.zig, each checked at every layer's exchanges (Engram's projection and gather, the attention's input
 //! rows, partial and gather, the MoE's), the head's columns and gather, the logits and the taps, and the served
-//! acceptance (the rows' greedy tokens against the drafts the next round kept and its first row).
+//! acceptance (the rows' greedy tokens against the drafts the next round kept and its first row). With --drafts B (a
+//! drafting recording; B the request's max_tokens) the drafter runs as served around them (draft.zig): the prompt's taps
+//! absorbed into its rings, then before each round the batched pass (every recorded drafter point: each stage's
+//! attention rows, ring plane, partial and gather, the MoE's, the stages' streams, the head's columns, the Markov loop's
+//! drafts) and the served depth from its confidences (_choose_k) against the round's window, after it the window's taps
+//! absorbed.
 //! With --light 1 (a token recording: TF_ZREC_ONLY=Model.forward,RoundDecoder.run) every recorded request instead: its
 //! prompt's chunks through every layer unchecked, the prompt's logits checked, then its rounds (at most K with
 //! --rounds K, all without), each round's logits checked and its greedy token against the recorded next one; the
@@ -26,8 +31,9 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const prompt = dsv41.prompt;
 const round_mod = dsv41.round;
+const draft_mod = dsv41.draft;
 
-const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--rounds K] [--engram DIR --token-map FILE] [--dump DIR]\n";
+const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--rounds K] [--drafts B] [--engram DIR --token-map FILE] [--dump DIR]\n";
 const rope_rows = 8192; // the plain table's first rows (chunk 0's positions and more)
 const chunk_rows = 2048;
 const cache_tokens = 4096; // the compressed caches' positions at least (the recorded prompt's)
@@ -141,6 +147,43 @@ const Run = struct {
             try r.out.print(", \"ours\": \"{x}\", \"served\": \"{x}\"", .{ r.host[f * esize ..][0..esize], want[f * esize ..][0..esize] });
         }
     }
+
+    /// Our buffer `dev` against fixture point `p` (saved whole) on the listed rows only: a pool plane whose other rows
+    /// the step does not read (the served pool's rows hold its warm-up's keys).
+    fn checkRows(r: *Run, label: []const u8, p: ?*const Point, dev: u64, rows: []const usize) !bool {
+        const pt = p orelse {
+            try r.out.print("{{\"rank\": {d}, \"point\": \"{s}\", \"error\": \"no fixture\"}}\n", .{ r.rank, label });
+            try r.out.flush();
+            r.ok = false;
+            return false;
+        };
+        const name = pt.file orelse return error.NotSavedWhole;
+        try r.s.synchronize();
+        const bytes = numel(pt.shape) * dtypeBytes(pt.dtype);
+        const row_bytes = numel(pt.shape[1..]) * dtypeBytes(pt.dtype);
+        if (bytes > r.host.len) r.host = try r.a.alloc(u8, bytes); // the arena: no free
+        try r.d.check(r.d.api.cuMemcpyDtoH_v2(r.host.ptr, dev, bytes), "cuMemcpyDtoH");
+        const want = try std.Io.Dir.cwd().readFileAlloc(r.io, try std.fs.path.join(r.a, &.{ r.fx.dir, "layers", name }), r.a, .limited(1 << 31));
+        defer r.a.free(want);
+        if (want.len != bytes) return error.SavedSizeDiffers;
+        var differ: usize = 0;
+        var first: ?usize = null;
+        for (rows) |row| {
+            const o = row * row_bytes;
+            if (o + row_bytes > bytes) return error.RowOutOfRange;
+            if (!std.mem.eql(u8, r.host[o..][0..row_bytes], want[o..][0..row_bytes])) {
+                differ += 1;
+                if (first == null) first = row;
+            }
+        }
+        const same = differ == 0;
+        try r.out.print("{{\"rank\": {d}, \"point\": \"{s}\", \"call\": {d}, \"rows\": {d}, \"equal\": {}", .{ r.rank, label, pt.call, rows.len, same });
+        if (first) |f| try r.out.print(", \"first_row\": {d}, \"rows_differ\": {d}", .{ f, differ });
+        try r.out.print("}}\n", .{});
+        try r.out.flush();
+        if (!same) r.ok = false;
+        return same;
+    }
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -161,6 +204,7 @@ pub fn main(init: std.process.Init) !u8 {
     var chunks: usize = 1;
     var check_from: usize = 0;
     var rounds: usize = 0;
+    var drafts: usize = 0; // a drafting request's max_tokens (0: no drafter)
     var light = false;
     var engram_dir: ?[]const u8 = null;
     var token_map: ?[]const u8 = null;
@@ -179,6 +223,8 @@ pub fn main(init: std.process.Init) !u8 {
             check_from = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--rounds")) {
             rounds = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--drafts")) {
+            drafts = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--light")) {
             light = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--engram")) {
@@ -242,7 +288,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     const replay: usize = prompt_len -| cfg.window;
 
-    // the weights (no DSpark blocks) from the lane's rank cache
+    // the weights (the DSpark blocks with --drafts) from the lane's rank cache
     const t0 = std.Io.Timestamp.now(io, .awake);
     var cache_dir = try std.Io.Dir.cwd().openDir(io, args[2], .{ .iterate = true });
     defer cache_dir.close(io);
@@ -252,7 +298,7 @@ pub fn main(init: std.process.Init) !u8 {
     var cache_file = try cache_dir.openFile(io, cache_name, .{});
     defer cache_file.close(io);
     const sp = try dsv41.prompt2d.split(rank, world); // world 4: the 2D split (prompt2d.zig)
-    var w = try dsv41.weights.load(gpa, &driver, .{ .cache = .{ .file = cache_file, .index = &ix, .io = io } }, cfg, sp, false);
+    var w = try dsv41.weights.load(gpa, &driver, .{ .cache = .{ .file = cache_file, .index = &ix, .io = io } }, cfg, sp, drafts > 0);
     defer w.deinit();
     const load_s = @as(f64, @floatFromInt(t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
 
@@ -398,7 +444,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     if (rounds > 0 and run.ok and ran == n_chunks) {
         if (n_chunks != chunks or start != prompt_len) return error.RoundsNeedTheWholePrompt;
-        run.ok = try runRounds(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, seq, start, rounds, a, &arena);
+        run.ok = try runRounds(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, seq, start, rounds, a, &arena, drafts, sp);
     }
     try w_out.print("{{\"rank\": {d}, \"chunks\": {d}, \"layers\": {d}, \"rounds\": {d}, \"all_equal\": {}}}\n", .{ rank, ran, layers, rounds, run.ok });
     try w_out.flush();
@@ -471,15 +517,59 @@ fn argmax(run: *Run, dev: u64, n: usize) !usize {
     return best;
 }
 
+/// The recorded drafter pass's checker: its points after the pass's BatchDraftGraph.run call, stage j's carrying layer
+/// `layers` + j, each gather the first after its stage's attention or MoE call.
+const DraftCheck = struct {
+    run: *Run,
+    call: u64, // the pass's BatchDraftGraph.run
+    layers: usize,
+    after: u64,
+    vis: []const usize, // the plane rows the pass reads: each stream's window positions in its slot
+    att: u64 = 0,
+    moe: u64 = 0,
+
+    fn at(ctx: *anyopaque, what: draft_mod.Point, stage: usize, dev: u64) anyerror!bool {
+        const dc: *DraftCheck = @ptrCast(@alignCast(ctx));
+        const fx = dc.run.fx;
+        const l: i64 = @intCast(dc.layers + stage);
+        var buf: [64]u8 = undefined;
+        const label = try std.fmt.bufPrint(&buf, "D{d} S{d} {s}", .{ dc.call, stage, @tagName(what) });
+        const pt: ?*const Point = switch (what) {
+            .attn_in => fx.find(dc.after, "BatchDraftGraph._attention", l, "in2"),
+            .attn_ring => fx.find(dc.after, "BatchDraftGraph._attention", l, "in3"),
+            .attn_out => fx.find(dc.after, "BatchDraftGraph._attention", l, "out"),
+            .attn_gather => fx.find(dc.att, "Comm.gather", null, "out"),
+            .moe_in => fx.find(dc.att, "Model.moe", l, "in2"),
+            .moe_out => fx.find(dc.att, "Model.moe", l, "out"),
+            .moe_gather => fx.find(dc.moe, "Comm.gather", null, "out"),
+            .stages_h => fx.find(dc.call, "BatchDraftGraph._stages_fused", null, "out.0"),
+            .stages_pre => fx.find(dc.call, "BatchDraftGraph._stages_fused", null, "out.1"),
+            .local => fx.find(dc.call, "Markov.steps", null, "in1"),
+            .markov => fx.find(dc.call, "Markov.steps", null, "post.in2"),
+        };
+        const ok = if (what == .attn_ring) try dc.run.checkRows(label, pt, dev, dc.vis) else try dc.run.check(label, pt, dev);
+        if (pt) |q| switch (what) {
+            .attn_in => dc.att = q.call,
+            .moe_in => dc.moe = q.call,
+            .moe_gather => dc.after = q.call,
+            else => {},
+        };
+        return ok;
+    }
+};
+
 /// The recorded decode rounds after the prompt: each RoundDecoder.run's rows (ids, positions, the stream's extent) through
 /// round.zig with every point checked. A round's rows are its window: the pending token and the drafts it verifies (one
 /// row a round when serial). The rows' greedy tokens (their targets) decide the next round as the served round keeps
 /// them (multi.py _round): the drafts while each equals its target, then the target after them; the next round starts
 /// at the kept position with that target, its rows overwriting the rejected ones (in the Engram sequence too). Only the
-/// recorded prompt's request: a later prompt ends the rounds. False on the first difference.
-fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []i32, prompt_len: usize, rounds: usize, a: std.mem.Allocator, arena: *prompt.Arena) !bool {
+/// recorded prompt's request: a later prompt ends the rounds. `drafts` (the request's max_tokens; 0: none): the
+/// drafter around each round, its pass checked at every recorded point, its drafts and served depth against the
+/// round's window, the window's taps absorbed after it. False on the first difference.
+fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []i32, prompt_len: usize, rounds: usize, a: std.mem.Allocator, arena: *prompt.Arena, drafts: usize, sp: dsv41.plan.Split) !bool {
     const fx = run.fx;
     const w_out = run.out;
+    const c = eng.c;
     const vocab = vocabOf(eng);
     const R_max = round_mod.max_rows;
     var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
@@ -494,6 +584,24 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
         for (fx.points) |*q| {
             if (q.call < first.call and isPoint(q, "Model.forward", "in2")) after = q.call;
         }
+    }
+    // the drafter: its pool (MultiDecoder's slots), the prompt's taps (the replayed rows, the tap layers' rows side by
+    // side) absorbed into slot 0's rings from the taps' first position (Drafter.absorb after the prompt's last chunk)
+    var pool: draft_mod.Pool = undefined;
+    var dr: draft_mod.Drafter = undefined;
+    if (drafts > 0) {
+        pool = try draft_mod.Pool.init(eng, arena, draft_mod.max_streams);
+        dr = try draft_mod.Drafter.init(eng, arena, sp);
+        const d = c.hidden;
+        for (0..c.dspark_taps.slice().len) |j| try eng.ops.copyRows(eng.s, prompt.tapRows(eng, ch, j), d * 2, dr.at + j * d * 2, dr.taps_w * 2, d * 2, ch.n);
+        if (fx.find(after, "Drafter.absorb", null, "in3")) |ap| {
+            if (!try run.check("prompt absorb taps", ap, dr.at)) return false;
+        }
+        dr.absorb(eng, ch, &pool, 0, dr.at, ch.n, ch.start) catch |err| {
+            try w_out.print("{{\"rank\": {d}, \"absorb\": \"prompt\", \"error\": \"{s}\"}}\n", .{ run.rank, @errorName(err) });
+            try w_out.flush();
+            return false;
+        };
     }
     for (0..rounds) |k| {
         const rp = fx.find(after, "RoundDecoder.run", null, "in1") orelse {
@@ -526,6 +634,52 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
         try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"call\": {d}, \"rows\": {d}, \"pos\": {d}, \"id\": {d}, \"kept\": {d}, \"accept_equal\": {}}}\n", .{ run.rank, k, rp.call, ids.len, pos[0], ids[0], kept, accept_ok });
         try w_out.flush();
         if (!accept_ok) run.ok = false;
+        if (drafts > 0) {
+            // the round's drafter pass (its BatchDraftGraph.run, before the round's forward)
+            const bp = fx.find(after, "BatchDraftGraph.run", null, "in1") orelse return error.NoDraftFixture;
+            if (bp.call > rp.call) return error.NoDraftFixture;
+            const tok = try ints(run, bp);
+            const q0 = try ints(run, fx.find(bp.call - 1, "BatchDraftGraph.run", null, "in2"));
+            const sl = try ints(run, fx.find(bp.call - 1, "BatchDraftGraph.run", null, "in3"));
+            const most = 5; // the engine's drafts (--mtp-drafts 5)
+            const steps = draft_mod.passSteps(tok.len, pool.slots, most, R_max, dr.n);
+            // the plane rows the pass reads: each stream's window (its 128 positions before q0) in its slot
+            var vis: [draft_mod.max_streams * 128]usize = undefined;
+            var nv: usize = 0;
+            for (q0, sl) |q, slot| {
+                var p: i64 = @max(0, q - @as(i64, @intCast(c.window)));
+                while (p < q) : (p += 1) {
+                    vis[nv] = @as(usize, @intCast(slot)) * pool.ring + @as(usize, @intCast(p)) % pool.ring;
+                    nv += 1;
+                }
+            }
+            var dc: DraftCheck = .{ .run = run, .call = bp.call, .layers = c.layers, .after = bp.call, .vis = vis[0..nv] };
+            dr.pass(eng, ch, &pool, tok, q0, sl, steps, .{ .ctx = &dc, .at = DraftCheck.at }) catch |err| {
+                if (err == error.DraftMismatch) return false;
+                try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"draft_call\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, k, bp.call, @errorName(err) });
+                try w_out.flush();
+                return false;
+            };
+            // its drafts against the recorded ones, the served depth from its confidences against the window's
+            var arg_buf: [16]u8 = undefined;
+            const want = try ints(run, fx.find(bp.call - 1, "BatchDraftGraph.run", null, try std.fmt.bufPrint(&arg_buf, "out.{d}", .{0})));
+            var drafts_ok = want.len == steps;
+            if (drafts_ok) for (0..steps) |j| {
+                if (dr.drafts[0][j] != want[j]) drafts_ok = false;
+            };
+            const emitted: usize = @intCast(pos[0] - @as(i64, @intCast(prompt_len)) + 1);
+            const cap_k = @min(draft_mod.depth(1, most, R_max), drafts -| emitted);
+            const kk = draft_mod.chooseK(dr.confs[0][0..steps], @min(cap_k, steps), 1, most, R_max);
+            var window_ok = kk + 1 == ids.len;
+            if (window_ok) for (1..ids.len) |j| {
+                if (ids[j] != dr.drafts[0][j - 1]) window_ok = false;
+            };
+            try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"draft_call\": {d}, \"steps\": {d}, \"drafts_equal\": {}, \"k\": {d}, \"conf\": [", .{ run.rank, k, bp.call, steps, drafts_ok, kk });
+            for (dr.confs[0][0..steps], 0..) |cf, j| try w_out.print("{s}{e}", .{ if (j == 0) "" else ", ", cf });
+            try w_out.print("], \"window_equal\": {}}}\n", .{window_ok});
+            try w_out.flush();
+            if (!drafts_ok or !window_ok) run.ok = false;
+        }
         const p0: usize = @intCast(pos[0]);
         if (pos[0] < 0 or p0 + ids.len > seq.len) return error.RoundNotNext;
         for (ids, 0..) |id, i| seq[p0 + i] = @intCast(id);
@@ -542,6 +696,15 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
             try w_out.flush();
             return false;
         };
+        if (drafts > 0) {
+            // the window's rows into slot 0's rings at once (TF_DS_EAGER_ABSORB: before the round's tokens are known)
+            const items = [_]draft_mod.Item{.{ .slot = 0, .taps = rd.taps, .n = ids.len, .start = p0 }};
+            try dr.absorbMany(eng, ch, &pool, &items);
+            if (fx.find(rp.call, "Drafter.absorb_many", null, "in3.0.1")) |ap| {
+                var label: [48]u8 = undefined;
+                if (!try run.check(try std.fmt.bufPrint(&label, "R{d} absorb taps", .{rp.call}), ap, dr.at)) return false;
+            }
+        }
         for (0..ids.len) |j| targets[j] = try argmax(run, rd.logits + j * vocab * 4, vocab);
         @memcpy(prev_ids[0..ids.len], ids);
         prev_n = ids.len;
