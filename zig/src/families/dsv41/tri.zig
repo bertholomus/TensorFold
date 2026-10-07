@@ -149,10 +149,11 @@ pub fn conform(fn_name: []const u8, call: *const fn (Tri, Case) anyerror!void) !
         errdefer std.debug.print("{s} case {d} (phase {s})\n", .{ fn_name, ci, c.v.get("phase").?.string });
         try std.testing.expectEqual(c.grid(), k.grid);
         var consts = c.v.get("consts").?.object.iterator();
-        while (consts.next()) |e| {
+        recorded: while (consts.next()) |e| {
             const got = for (k.consts) |x| {
                 if (std.mem.eql(u8, x.name, e.key_ptr.*)) break x;
             } else {
+                if (e.value_ptr.* == .integer and e.value_ptr.integer == 1 and folded(k.args, e.key_ptr.*)) continue :recorded;
                 std.debug.print("constexpr {s} not passed\n", .{e.key_ptr.*});
                 return error.TestUnexpectedResult;
             };
@@ -197,5 +198,20 @@ pub fn conform(fn_name: []const u8, call: *const fn (Tri, Case) anyerror!void) !
             try std.testing.expectEqualStrings(tritonType(t[0].string), got.value.ptr.ty);
             try std.testing.expectEqual(t[3].bool, got.value.ptr.addr % 16 == 0);
         }
+        // and no argument the kernel does not take, which aot.Set.find would refuse
+        for (k.args) |x| {
+            if (c.v.get("scalars").?.object.get(x.name) != null or c.v.get("tensors").?.object.get(x.name) != null) continue;
+            if (folded(k.args, x.name)) {
+                if (c.v.get("consts").?.object.get(x.name)) |r| if (r == .integer and r.integer == 1) continue;
+            }
+            std.debug.print("argument {s} passed but not taken by this variant\n", .{x.name});
+            return error.TestUnexpectedResult;
+        }
     }
+}
+
+/// An int argument of 1, which Triton folds into a constexpr of the variant; aot.Set.find takes either form.
+fn folded(args: []const aot.Arg, name: []const u8) bool {
+    for (args) |a| if (std.mem.eql(u8, a.name, name)) return a.value == .i32 and a.value.i32 == 1;
+    return false;
 }
