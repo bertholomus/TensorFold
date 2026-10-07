@@ -53,6 +53,7 @@ pub fn main(init: std.process.Init) !u8 {
     };
     var requests_file: ?[]const u8 = null;
     var parallel: usize = dsv41.model.max_streams;
+    var arena_gib: ?usize = null;
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -66,7 +67,7 @@ pub fn main(init: std.process.Init) !u8 {
         } else if (std.mem.eql(u8, key, "--drafts")) {
             o.drafts = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--arena-gib")) {
-            o.arena_bytes = try std.fmt.parseInt(usize, val, 10) << 30;
+            arena_gib = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--engram")) {
             o.engram_dir = val;
         } else if (std.mem.eql(u8, key, "--token-map")) {
@@ -74,6 +75,7 @@ pub fn main(init: std.process.Init) !u8 {
         } else return error.BadArgument;
     }
     if (parallel == 0 or parallel > dsv41.model.max_streams) return error.BadArgument;
+    o.arena_bytes = (arena_gib orelse dsv41.native.defaultArenaGib(o.pool)) << 30; // (rank 1 of a server: the server's)
 
     var out_buf: [1 << 14]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);

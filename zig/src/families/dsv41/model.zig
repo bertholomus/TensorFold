@@ -34,6 +34,7 @@ pub const Options = struct {
     model_dir: []const u8, // config.json
     cache_dir: []const u8, // the lane's per-rank weight file (TF_DS_RANK_CACHE)
     kit_dir: []const u8, // a gate dir's layout: aot/, cubins/, rope-{plain,compressed}-{cos,sin}.f32, engram.json
+    aot_dir: ?[]const u8 = null, // the recorded Triton set (aot.json and its cubins; null: kit_dir/aot)
     rank: u32,
     world: u32,
     master: [4]u8,
@@ -137,7 +138,7 @@ pub const Model = struct {
         errdefer m.comm.deinit();
 
         // kernels: the recorded Triton set, the served extension cubins, the torch-op images
-        m.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, try std.fs.path.join(a, &.{ o.kit_dir, "aot" }));
+        m.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }));
         errdefer m.set.deinit();
         m.pf = try exl3_prefill.Kernels.load(d, try readKit(a, io, o.kit_dir, "linear.cubin"));
         errdefer m.pf.unload();
