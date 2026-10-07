@@ -74,3 +74,104 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_i64_kernel(const l
         }
     }
 }
+
+// t[idx] = rows of whole rows (index_put_ with distinct indices: the window ring's and the positional store's slots):
+// dst row idx[r] = src row r, `bytes` bytes a row (16-byte words when the rows are aligned so), a row a block.
+extern "C" __global__ void tf_ds_scatter_rows_kernel(const uint8_t* src, long long src_ld, const long long* idx,
+                                                     uint8_t* dst, long long dst_ld, long long bytes, int rows) {
+    const int r = blockIdx.x;
+    if (r >= rows) return;
+    const uint8_t* s = src + (long long)r * src_ld;
+    uint8_t* d = dst + idx[r] * dst_ld;
+    if ((((uintptr_t)s | (uintptr_t)d | (uintptr_t)bytes) & 15) == 0) {
+        const uint4* s4 = (const uint4*)s;
+        uint4* d4 = (uint4*)d;
+        for (long long j = threadIdx.x; j < bytes / 16; j += blockDim.x) d4[j] = s4[j];
+    } else {
+        for (long long j = threadIdx.x; j < bytes; j += blockDim.x) d[j] = s[j];
+    }
+}
+
+// topk_indices' key of score x at column j as an unsigned integer in the keys' signed order: x's bits (-0 as +0, as
+// score + 0.0 makes it), ordered as signed integers, above the inverted column.
+__device__ __forceinline__ unsigned long long tf_ds_score_key(float x, int j) {
+    unsigned int bits = __float_as_uint(x);
+    if (bits == 0x80000000u) bits = 0u;                        // + 0.0
+    const int sb = (int)bits;
+    const int ordered = sb < 0 ? (sb ^ 0x7FFFFFFF) : sb;
+    const unsigned long long key = ((unsigned long long)(long long)ordered << 32) | (unsigned long long)(0xFFFFFFFFu - (unsigned int)j);
+    return key ^ 0x8000000000000000ull;                       // signed order as unsigned
+}
+
+// kernels.topk_indices(score, k), then torch.where(top < vis, top, -1) (model.py attention_k, the candidate pool's
+// layers), a row a block (1024 threads): each score's int64 key (its bits, -0 as +0 (score + 0.0), ordered as signed
+// integers, above the inverted column: a total order, ties to the lower column), the k largest keys by a radix select
+// (eight 8-bit digits from the top), their columns ascending (a bitonic sort), a column at or past vis[r] as -1.
+// score [rows, n] fp32 (row stride ss), vis [rows] int64, out [rows, k] int64; k <= 1024 and k <= n.
+extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_indices_kernel(const float* score, long long ss, int n,
+                                                                              int k, const long long* vis,
+                                                                              long long* out) {
+    __shared__ unsigned int hist[256];
+    __shared__ unsigned long long prefix_s, mask_s;
+    __shared__ int want_s, count_s;
+    __shared__ long long cols[1024];
+    const float* row = score + (long long)blockIdx.x * ss;
+    if (threadIdx.x == 0) {
+        prefix_s = 0;
+        mask_s = 0;
+        want_s = k;
+        count_s = 0;
+    }
+    __syncthreads();
+    for (int d = 7; d >= 0; --d) {
+        for (int b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;
+        __syncthreads();
+        const unsigned long long prefix = prefix_s, mask = mask_s;
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            const unsigned long long u = tf_ds_score_key(row[i], i);
+            if ((u & mask) == prefix) atomicAdd(&hist[(u >> (8 * d)) & 0xff], 1u);
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            int want = want_s;
+            int b = 255;
+            for (; b > 0; --b) {
+                if ((int)hist[b] >= want) break;
+                want -= (int)hist[b];
+            }
+            want_s = want;
+            prefix_s = prefix | ((unsigned long long)b << (8 * d));
+            mask_s = mask | (0xffull << (8 * d));
+        }
+        __syncthreads();
+    }
+    const unsigned long long kth = prefix_s;   // the keys are unique: exactly k at or above it
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        if (tf_ds_score_key(row[i], i) >= kth) {
+            const int at = atomicAdd(&count_s, 1);
+            if (at < k) cols[at] = i;
+        }
+    }
+    int p = 1;
+    while (p < k) p <<= 1;
+    for (int i = k + threadIdx.x; i < p; i += blockDim.x) cols[i] = 0x7FFFFFFFFFFFFFFFll;
+    for (int size = 2; size <= p; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            __syncthreads();
+            const int i = threadIdx.x;
+            const int j = i ^ stride;
+            if (i < p && j > i) {
+                const bool up = (i & size) == 0;
+                const long long a = cols[i], b = cols[j];
+                if ((a > b) == up) {
+                    cols[i] = b;
+                    cols[j] = a;
+                }
+            }
+        }
+    }
+    __syncthreads();
+    const long long v = vis[blockIdx.x];
+    long long* o = out + (long long)blockIdx.x * k;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) o[i] = cols[i] < v ? cols[i] : -1;
+}

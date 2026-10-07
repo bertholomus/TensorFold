@@ -1,7 +1,7 @@
 //! The served forward's torch arithmetic at torch's own rounding points (zig/kernels/cuda/dsv41_torch.cu), byte-equal to
 //! the served build's torch ops on GB10 (tools/dsv41-zig/rec/zrec_torchlab.py): ops.rms_norm with its mean in torch's
-//! reduction order, _compress's ratio-2 softmax and weighted sum, ops.rope_'s complex multiply, and the indexer's
-//! bf16 head weights.
+//! reduction order, _compress's ratio-2 softmax and weighted sum, ops.rope_'s complex multiply, the indexer's bf16
+//! head weights and the DSpark taps' mean over the streams.
 const std = @import("std");
 const cuda = @import("cuda");
 
@@ -31,6 +31,7 @@ pub const Exact = struct {
     k_compress2: cuda.Function,
     k_rope: cuda.Function,
     k_bf16_scale: cuda.Function,
+    k_hc_mean4: cuda.Function,
 
     /// cuda.kernels.dsv41_torch (or the fatbin's bytes).
     pub fn load(d: *const cuda.Driver, image: []const u8) !Exact {
@@ -42,6 +43,7 @@ pub const Exact = struct {
             .k_compress2 = try m.function("tf_ds_compress2_kernel"),
             .k_rope = try m.function("tf_ds_rope_kernel"),
             .k_bf16_scale = try m.function("tf_ds_bf16_scale_kernel"),
+            .k_hc_mean4 = try m.function("tf_ds_hc_mean4_kernel"),
         };
     }
 
@@ -111,6 +113,18 @@ pub const Exact = struct {
         a.add(@as(u64, count));
         a.add(scale);
         try cuda.launch.launch(e.k_bf16_scale, .{ .grid = .{ .x = blocks(count, 256) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// h.to(fp32).mean(1).to(bf16) of the streams h [rows, 4, d] bf16 into out [rows, d] (row stride os): a DSpark tap.
+    pub fn hcMean4(e: *const Exact, s: cuda.Stream, h: u64, out: u64, os: usize, rows: usize, d: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(h);
+        a.add(out);
+        a.add(@as(c_longlong, @intCast(os)));
+        a.add(@as(c_int, @intCast(rows)));
+        a.add(@as(c_int, @intCast(d)));
+        try cuda.launch.launch(e.k_hc_mean4, .{ .grid = .{ .x = @min(4096, blocks(rows * d, 256)) }, .block = .{ .x = 256 } }, s, &a);
     }
 };
 
