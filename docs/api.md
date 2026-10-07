@@ -2,9 +2,32 @@
 
 The base URL is `http://127.0.0.1:8080/v1` with the default server settings.
 
+## API keys
+
+Both servers accept repeated `--api-key KEY`, comma-separated `TENSORFOLD_API_KEY`, and `--api-key-file PATH`.
+The sources add keys together. A file has one key per line, optional `label: key` entries, and lines starting with
+`#` for comments. Set its permissions to `0600`; startup refuses a file readable by other users.
+The server stores SHA-256 digests and compares every configured digest for each authentication attempt.
+
+Send `Authorization: Bearer KEY` from OpenAI-compatible clients, or `x-api-key: KEY` from Messages clients.
+Missing or invalid credentials return HTTP 401 with `WWW-Authenticate: Bearer` and the route's error format.
+All `/v1/*`, tokenization, metrics and their inference aliases require a key; `--metrics-open` opens both metrics
+routes. `/health` remains open and returns only `{"status":"ok"}` when keys are configured.
+With no keys, the existing open routes and health details stay unchanged; a non-loopback bind prints a warning.
+
+Replace the key file atomically to rotate keys. Its modification time is checked at most once a second; SIGHUP
+requests an immediate reload. An empty, unreadable or malformed replacement closes authenticated routes until a
+valid file returns. Request logs and `tensorfold:requests_total` use labels, never keys or digests.
+Unnamed keys receive `cli-N`, `env-N` or `file-N` labels. Labels contain at most 64 letters, digits, dots,
+underscores or hyphens; choose non-secret labels.
+
+`tensorfold service install MODEL --api-key-file PATH` forwards the file to its server.
+For the control room, `tensorfold tui --url URL --token-env VARIABLE` sends that variable's value as a bearer key.
+Prefer a restricted file over command-line keys, which can appear in the operating system's process list.
+
 | Route | Behavior |
 | --- | --- |
-| `GET /v1/models` | Served model ID; MLX also lists configured aliases |
+| `GET /v1/models` | Served model ID and any configured aliases (both servers) |
 | `GET /health` | Server health and available status information |
 | `GET /metrics`, `GET /v1/metrics` | Prometheus text: requests, KV occupancy, drafts and latency (both servers) |
 | `POST /v1/chat/completions` | Text chat, optional image input, tools and reasoning; streamed or non-streamed |
@@ -119,6 +142,11 @@ a background prompt's ~1 s prefill waited 0.57 s on Qwen3.6, against 0.70 s with
 (the 27B: 0.69-0.89 s against 2.98-3.66 s). Flash Next, and an engine serving one request at a time, finish a
 background prompt's prefill once it has started. Two-rank engines serving one request at a time
 only order the queue.
+
+`--name-priority ID=background` gives one served id (`--name` or an `--alias`) a default priority: a request that
+asks for it and sends no `priority` of its own is treated as `priority: "background"`. The request's own `priority`
+field always wins over the default. This lets one CUDA server answer to several ids at their usual priority while a
+background-only client (a batch extractor, say) gets one id that always yields, without sending the field itself.
 
 ## Messages and tools
 

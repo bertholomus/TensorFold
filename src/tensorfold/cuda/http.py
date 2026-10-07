@@ -131,7 +131,8 @@ def make_handler(app: App):
                 self._json(200, {"object": "list", "data": [{"id": model_id, "object": "model", "owned_by": "tensorfold",
                                                              **extra} for model_id in app.model_ids]})
             elif self.path.rstrip("/") in ("/health", "/v1/health"):
-                self._json(200, health.of(app).snapshot(app))
+                self._json(200, {"status": "ok"} if getattr(getattr(app, "auth", None), "enabled", False)
+                           else health.of(app).snapshot(app))
             elif responses.route(self.path):
                 responses.get(self, app, responses.route(self.path))
             else:
@@ -312,7 +313,8 @@ def make_handler(app: App):
                     return
             self._json(200, payload)
 
-    return Handler
+    from tensorfold.server.auth_http import handler
+    return handler(Handler, app)
 
 
 def serve(app: App, host: str, port: int) -> None:
@@ -326,7 +328,10 @@ def serve(app: App, host: str, port: int) -> None:
     signal.signal(signal.SIGTERM, _terminate)
     server = Server((host, port), make_handler(app))
     try:
-        server.serve_forever()
+        from contextlib import nullcontext
+        auth = getattr(app, "auth", None)
+        with auth.signals() if auth is not None else nullcontext():
+            server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:

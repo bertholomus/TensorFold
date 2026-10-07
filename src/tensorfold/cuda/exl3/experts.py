@@ -33,6 +33,62 @@ PROMPT = os.environ.get("TF_EXL3_PROMPT_TILES", "1") != "0"
 # order: other bits); needs N and K multiples of 256 (GLM-5.3's shapes), else mma.
 PROMPT_KERNEL = os.environ.get("TF_EXL3_PROMPT_KERNEL") or "mma"
 MMA_KB = 4                        # experts_grouped.cuh's MMA_KB
+# TF_EXL3_MMA_KB2=1 (default off): a projection whose K chains MMA_KB does not divide (a TP2 DeepSeek-V4.1 rank's
+# down: 1152 / 16 / 4 warps = 18 k tiles a chain) takes the mma kernel at 2 k tiles a step (each chain's k tiles in the
+# same order: the same bits as grouped_rows). Measured on GB10 (layer 10, rank 0's half): 2x slower than grouped_rows
+# at 2048 rows (a layer's routed experts 57.1 vs 27.7 ms), so those projections keep grouped_rows
+MMA_KB2 = os.environ.get("TF_EXL3_MMA_KB2", "0") != "0"
+# TF_EXL3_MMA_KB6=1: such projections take 6 k tiles a step where 6 divides their chains (the down's 18), the kernel's
+# shared memory then dynamic (64.5 KB a program)
+MMA_KB6 = os.environ.get("TF_EXL3_MMA_KB6", "0") != "0"
+
+
+# TF_EXL3_GROUP_LIST=1 (default): prompt chunks' grouped launches (grouped_mma, grouped_rows) walk a work list of
+# (expert place, member group) pairs instead of a grid of every place x the busiest expert's groups. The shared expert
+# has every row of a chunk, so that grid launched ~1.4M programs a layer at 2048 rows, ~97 % of them for groups no
+# routed expert has; the programs that run and their arithmetic are the same either way (the same bits)
+GROUP_LIST = os.environ.get("TF_EXL3_GROUP_LIST", "1") != "0"
+
+
+def _list_len(P: int, maxu: int, rows: int) -> int:
+    """A work list's length: at most maxu places hold P member slots, so they have at most (P + maxu (rows - 1)) // rows
+    groups of ``rows`` (the shape's alone; ext.work_list fills the tail with pairs no program runs)."""
+
+    return (P + maxu * (rows - 1)) // rows
+
+
+def _work_list(s, ids: torch.Tensor, rows: int, total: int) -> torch.Tensor:
+    """(place, group) int32 pairs of the used places' member groups of ``rows`` rows, ``total`` of them (the host
+    read the sum: repeat_interleave then needs no sync). The reference of ext.work_list (tests)."""
+
+    maxu = ids.shape[0]
+    g = _groups_per_place(s, ids, rows)
+    place = torch.repeat_interleave(torch.arange(maxu, device=ids.device), g, output_size=total)
+    start = torch.cumsum(g, 0) - g
+    group = torch.arange(total, device=ids.device) - start[place]
+    return torch.stack([place, group], 1).to(torch.int32).contiguous()
+
+
+def _groups_per_place(s, ids: torch.Tensor, rows: int) -> torch.Tensor:
+    maxu = ids.shape[0]
+    used = torch.arange(maxu, device=ids.device) < s.count.to(torch.int64)
+    cnt = s.counts.to(torch.int64)[ids.to(torch.int64).clamp(0, s.counts.numel() - 1)]
+    return torch.where(used, (cnt + rows - 1) // rows, 0)
+
+
+def _mma_steps() -> int:
+    """grouped_mma's allowed steps besides MMA_KB, as its fold argument's upper bits carry them (1: 2, 2: 6)."""
+
+    return (1 if MMA_KB2 else 0) | (2 if MMA_KB6 else 0)
+
+
+def _mma_chains(k_tiles: int, warps: int, splits: int) -> bool:
+    """Whether the prompt mma kernel takes K chains of this projection (k_tiles / (warps x splits) k tiles each)."""
+
+    if k_tiles % (warps * splits):
+        return False
+    chain = k_tiles // (warps * splits)
+    return chain % MMA_KB == 0 or (MMA_KB6 and chain % 6 == 0) or (MMA_KB2 and chain % 2 == 0)
 # "mma3": mma2 with gate/up's input rotation inside (rows made from the layer input in shared memory, no rot_in, no
 # rotated copies; bf16 input, up to 4 bits a gate/up weight: the same bits as mma2's setting 0), and with the combine
 # down's per-slot epilogue inside it: weighted slot outputs in bf16 (half of z's bytes), added by combine_y.
@@ -66,7 +122,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v14", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v18", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -185,6 +241,13 @@ def default_config(K: int, N: int, gateup: bool) -> tuple[int, int, int, int]:
     raise ValueError(f"no tile setting divides K={K}, N={N}")
 
 
+def prompt_z(D: int, I: int) -> int:
+    """Floats a row-slot of a prompt chunk's z holds: gate and up's folded sums (2 I), then mma3's bf16 down outputs
+    (D / 2), or down's one-split sums (D)."""
+
+    return max(2 * I + D // 2, D)
+
+
 class Scratch:
     """Buffers for up to ``rows`` rows of ``slots`` slots; slots whose pick is not a routed expert are left to the caller.
 
@@ -203,10 +266,16 @@ class Scratch:
         self.xg = None if prompt else torch.zeros((P, D), dtype=torch.float16, device=device)
         self.xu = None if prompt else torch.zeros((P, D), dtype=torch.float16, device=device)
         self.xd = torch.zeros((P, I), dtype=torch.float16, device=device)
-        # gate and up write 2 * splits * P * I partials, down splits * P * D
-        self.z = torch.zeros((max(2 * self.cfg_gu[2] * I, self.cfg_d[2] * D) * P,), dtype=torch.float32, device=device)
+        # gate and up write 2 * splits * P * I partials, down splits * P * D. Prompt chunks' grouped launches fold the
+        # splits (gate / up: one sum each; mma3's bf16 down outputs after them), so a prompt scratch starts at that
+        # size and routed() grows it for a call that needs the splits (TF_EXL3_PROMPT_TILES=0, shapes the tiles do not
+        # divide): 528 -> 294 MB at 2048 rows of a TP2 DeepSeek-V4.1 rank
+        zrow = prompt_z(D, I) if prompt else max(2 * self.cfg_gu[2] * I, self.cfg_d[2] * D)
+        self.z = torch.zeros((zrow * P,), dtype=torch.float32, device=device)
+        self.prompt = prompt
         self.y = None if prompt else torch.zeros((P, D), dtype=torch.float32, device=device)
         self.no_y = torch.zeros((1,), dtype=torch.float32, device=device)       # a pointer for calls that skip y
+        self.no_work = torch.zeros((0,), dtype=torch.int32, device=device)    # grouped launches without a work list
         maxu = min(P, ex.count)
         # the fused decode launches' counters, one per (expert place, 128 columns of I) and per (row, 128 columns of D);
         # zero between launches (each launch's last program of a block resets its counter)
@@ -272,7 +341,9 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         # a prompt chunk: experts' member counts on the device, the busiest one read back once to size the member
         # groups, then each used expert lists its members (the grouping of any number of rows, in parallel)
         ext.group_count(pick, s.counts, R, slots, E)
-        busiest = int(s.counts.max())
+        # the member lists' stride: the busiest expert's count read back, or (work lists: no program walks past an
+        # expert's groups) R itself, no host read; a chunk's shared expert has all R rows, so the stride is the same
+        busiest = R if GROUP_LIST else int(s.counts.max())
         tile = 16 * max(PROMPT_TILES["gateup"][2], PROMPT_TILES["down"][2])
         members = s.members_buf[:ids.shape[0] * max(tile, -(-busiest // tile) * tile)].view(ids.shape[0], -1)
         ext.group_place(pick, s.counts, ids, s.count, members, R, slots, E)
@@ -299,8 +370,28 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     # mma per projection: a down whose K chains do not split into MMA_KB steps (a TP2 DeepSeek-V4.1 rank: I = 1152)
     # still lets gate/up take the mma kernel
     mma_ok = not mma2 and fast and kern in ("mma", "mma2", "mma3") and I % 64 == 0 and D % 64 == 0
-    mma = mma_ok and (D // 16) % (s.cfg_gu[1] * s.cfg_gu[2] * MMA_KB) == 0
-    mma_d = mma_ok and (I // 16) % (s.cfg_d[1] * s.cfg_d[2] * MMA_KB) == 0
+    mma = mma_ok and _mma_chains(D // 16, s.cfg_gu[1], s.cfg_gu[2])
+    mma_d = mma_ok and _mma_chains(I // 16, s.cfg_d[1], s.cfg_d[2])
+    work_gu = work_d = s.no_work
+    if fast and GROUP_LIST and not (mma2 or mma3):
+        # the work lists of the gate / up and the down launches (64-row blocks for the mma kernel, the rows kernel's
+        # member groups): one launch on the device, each list as long as the shape allows (no host read)
+        rows_gu = 64 if mma else 16 * PROMPT_TILES["gateup"][2]
+        rows_d = 64 if mma_d else 16 * PROMPT_TILES["down"][2]
+        maxu = ids.shape[0]
+        work_gu = torch.empty((_list_len(P, maxu, rows_gu), 2), dtype=torch.int32, device=x.device)
+        work_d = (work_gu if rows_d == rows_gu else
+                  torch.empty((_list_len(P, maxu, rows_d), 2), dtype=torch.int32, device=x.device))
+        ext.work_list(s.counts, ids, s.count, work_gu, rows_gu, s.no_work if work_d is work_gu else work_d, rows_d)
+    if getattr(s, "prompt", False):
+        # a prompt scratch's z starts at the folded sums' size; a call that writes split partials (gate / up without
+        # the fast path, a down written per split) grows it first (eager prompt chunks only: no graph holds it)
+        if fast:
+            need = P * max(2 * I + (D // 2 if mma3 else 0), D * (1 if (mma2 or mma3 or mma_d) else s.cfg_d[2]))
+        else:
+            need = P * max(2 * sk * I, s.cfg_d[2] * D)
+        if s.z.numel() < need:
+            s.z = torch.zeros((need,), dtype=torch.float32, device=x.device)
     if mma3:
         ext.grouped_mma3(x, x.stride(0), ex.suh_g, ex.suh_u, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids,
                          s.count, members, s.z, D, I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], MMA3_NW)
@@ -311,12 +402,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     elif mma:
         # every split's chains in one program, their sum from 0 as the epilogue would add them
         ext.grouped_mma(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
-                        P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], 1)
+                        P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], 1 | _mma_steps() << 1, work_gu)
     elif fast:
         # one program runs the K splits in order and writes their sum from 0, as the epilogue would add them
         pnt, ppf, pg = PROMPT_TILES["gateup"]
         ext.grouped_rows(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
-                         I, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_gu[0], ex.k2_gu[1], 1)
+                         I, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_gu[0], ex.k2_gu[1], 1, work_gu)
     else:
         cp = DECODE_STAGES if (mode != "old" and ex.aligned16 and nt == 8 and w == 4) else 0
         ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
@@ -342,12 +433,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     elif mma_d:
         # one split is written as is; several are folded in order from 0 (down_combine's order) into one
         ext.grouped_mma(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
-                        I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1))
+                        I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1) | _mma_steps() << 1, work_d)
         dsk = 1
     elif fast:
         pnt, ppf, pg = PROMPT_TILES["down"]
         ext.grouped_rows(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
-                         I, D, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_d[0], ex.k2_d[1], 0)
+                         I, D, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_d[0], ex.k2_d[1], 0, work_d)
     else:
         cp = DECODE_STAGES if (mode != "old" and ex.aligned16 and nt == 8 and w == 4) else 0
         ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,

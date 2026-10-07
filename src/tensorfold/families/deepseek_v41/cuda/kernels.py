@@ -212,7 +212,34 @@ SMALL_SWITCHES = {
                                                                  # largest kept, their indices sorted and masked (the
                                                                  # same set as torch's top-k: a total order), instead
                                                                  # of torch.topk + _topk_finish
-    "hc_dots": os.environ.get("TF_DS_HC_DOTS", "1") != "0",      # (with "hc_defer") a posted mHC step's main-
+    "topk_prune": os.environ.get("TF_DS_TOPK_PRUNE", "1") != "0",   # a long indexer row's top-k from the tiles whose
+                                                                 # maximum key is among the k largest maxima (the
+                                                                 # score kernel writes each 64-key tile's maximum):
+                                                                 # the keys are unique, so every top-k key lies in
+                                                                 # one of those k tiles; 64 k keys searched, not n
+    "prompt_keys": os.environ.get("TF_DS_PROMPT_KEYS", "1") != "0",   # a prompt chunk's indexer (layers before the
+                                                                 # candidate source) writes the top-k keys from the
+                                                                 # score kernel and selects with topk_select, instead
+                                                                 # of fp32 scores, six torch passes to keys,
+                                                                 # torch.topk and a sort (the same row blocks, bits)
+    "tile_skip": os.environ.get("TF_DS_TILE_SKIP", "1") != "0",   # decode rounds: an indexer key tile wholly at
+                                                                 # or past a row's visible count skips its dots (all
+                                                                 # -inf anyway) and, when only the pruned selection
+                                                                 # reads the keys, writes none (PAD tile maximum)
+    "hc_pf": os.environ.get("TF_DS_HC_PF", "0") != "0",          # (default off: slower at 2048 rows, see below)
+                                                                 # prompt chunks: the mHC mixes through hc_pre2
+                                                                 # (_hc_mix_part: 8 rows a program share each mixing
+                                                                 # weight tile, each row's dots the same) and the
+                                                                 # attention sublayer's post fused into the FFN's mixes;
+                                                                 # the same bits, but on GB10 at 2048 rows post + mixes
+                                                                 # 2.75 -> 10.28 ms, mixes 1.58 -> 1.95 ms (hc_pre2 is
+                                                                 # shaped for decode windows)
+    "cand_only": os.environ.get("TF_DS_CAND_ONLY", "1") != "0",   # decode rounds past the pool's width: the
+                                                                 # reindex layers score only the candidate pool's
+                                                                 # blocks (index_keys_cand), not the full row masked
+                                                                 # to -inf outside them (the same top-k: the pool holds
+                                                                 # >= k finite keys or every visible position)
+    "hc_dots": os.environ.get("TF_DS_HC_DOTS", "1") != "0",     # (with "hc_defer") a posted mHC step's main-
                                                                  # stream kernel is the post alone (the new streams);
                                                                  # the mixes' partial dots of them (_hc_mix_part on the
                                                                  # stored streams) run on the side stream before the
@@ -1464,25 +1491,12 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
 
 # -- indexer scores: sum_h relu(q_h . k_t) w_h over t < n, masked past each row's visible count -------------------
 @triton.jit
-def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, CAND, cs, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr,
-                 PACKED: tl.constexpr, HAS_BASE: tl.constexpr, PDL: tl.constexpr = False,
-                 HAS_CAND: tl.constexpr = False, CB: tl.constexpr = 8, KEYS: tl.constexpr = False):
-    if PDL:
-        gdc_wait()
-        gdc_launch_dependents()
-    r = tl.program_id(0)
-    b = tl.program_id(1)
+def _index_tile(Q, K, KS, Wt, r, kt, ld, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr, PACKED: tl.constexpr):
+    """One row's scores of one key tile before the visible mask: sum_h relu(q_h . k_t) w_h (keys read where ``ld``)."""
+
     HALF: tl.constexpr = ID // 2
     hh = tl.arange(0, IH)
     hc = tl.arange(0, HALF)
-    t = b * BN + tl.arange(0, BN)
-    ok = t < n                         # the scores written (every t < n: -inf past the row's visible keys)
-    if HAS_BASE:                       # a concurrent round: the row's stream's keys start at pool row KB[r]
-        kt = tl.load(KB + r) + t
-        ld = ok & (t < tl.load(VIS + r))   # keys read: none past its own visible ones (its extent may end the pool)
-    else:
-        kt = t
-        ld = ok
     q_lo = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + hc[None, :])
     q_hi = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + HALF + hc[None, :])
     if PACKED:
@@ -1500,8 +1514,41 @@ def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, CAND, cs, IH: tl.constexpr, ID: 
         k_hi = tl.load(K + kt[:, None] * ID + HALF + hc[None, :], mask=ld[:, None], other=0.0)
     s = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))      # [IH, BN] fp32
     w = tl.load(Wt + r * IH + hh).to(tl.float32)
-    sc = tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
+    return tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
+
+
+@triton.jit
+def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, CAND, cs, TMAX, nt, IH: tl.constexpr, ID: tl.constexpr,
+                 BN: tl.constexpr, PACKED: tl.constexpr, HAS_BASE: tl.constexpr, PDL: tl.constexpr = False,
+                 HAS_CAND: tl.constexpr = False, CB: tl.constexpr = 8, KEYS: tl.constexpr = False,
+                 HAS_TMAX: tl.constexpr = False, SKIP_DEAD: tl.constexpr = False, DEAD_PAD: tl.constexpr = False):
+    """SKIP_DEAD (switch "tile_skip"): a tile wholly at or past the row's visible count is all -inf whatever its keys,
+    so its dots are skipped (the same values written). DEAD_PAD (keys with tile maxima, for topk_select_pruned only):
+    such a tile writes no keys and PAD_KEY as its maximum; the pruned selection then never gathers it (its maximum
+    names no position), and a row with fewer than k live tiles takes PAD keys where the full row has -inf keys at or
+    past vis: -1 either way."""
+
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    b = tl.program_id(1)
+    t = b * BN + tl.arange(0, BN)
+    ok = t < n                         # the scores written (every t < n: -inf past the row's visible keys)
     vis = tl.load(VIS + r)
+    if HAS_BASE:                       # a concurrent round: the row's stream's keys start at pool row KB[r]
+        kt = tl.load(KB + r) + t
+        ld = ok & (t < vis)            # keys read: none past its own visible ones (its extent may end the pool)
+    else:
+        kt = t
+        ld = ok
+    if SKIP_DEAD:
+        if b * BN < vis:
+            sc = _index_tile(Q, K, KS, Wt, r, kt, ld, IH, ID, BN, PACKED)
+        else:
+            sc = tl.full((BN,), float("-inf"), tl.float32)
+    else:
+        sc = _index_tile(Q, K, KS, Wt, r, kt, ld, IH, ID, BN, PACKED)
     sc = tl.where(t < vis, sc, float("-inf"))
     if HAS_CAND:                       # apply_candidates: -inf outside the candidate pool's blocks
         keep = tl.load(CAND + r * cs + t // CB, mask=ok, other=0)
@@ -1510,15 +1557,26 @@ def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, CAND, cs, IH: tl.constexpr, ID: 
         bits = tl.where(sc == 0.0, 0, sc.to(tl.int32, bitcast=True))    # (score + 0.0: -0 as +0)
         ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
         key = (ordered << 32) | (0xFFFFFFFF - t.to(tl.int64))
-        tl.store(OUT + r * n + t, key, mask=ok)
+        if DEAD_PAD:
+            if b * BN < vis:
+                tl.store(OUT + r * n + t, key, mask=ok)
+                tl.store(TMAX + r * nt + b, tl.max(tl.where(ok, key, -9223372036854775808), axis=0))
+            else:
+                tl.store(TMAX + r * nt + b, -9223372036854775808)
+        else:
+            tl.store(OUT + r * n + t, key, mask=ok)
+            if HAS_TMAX:               # the tile's largest key (topk_select_pruned)
+                tl.store(TMAX + r * nt + b, tl.max(tl.where(ok, key, -9223372036854775808), axis=0))
     else:
         tl.store(OUT + r * n + t, sc, mask=ok)
 
 
 @triton.jit
-def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, IH: tl.constexpr, ID: tl.constexpr, BN: tl.constexpr,
-                      RB: tl.constexpr, PACKED: tl.constexpr):
-    """Prompt chunks: RB rows a program share each key tile (dequantized once for all of them)."""
+def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, TMAX, nt, IH: tl.constexpr, ID: tl.constexpr,
+                      BN: tl.constexpr, RB: tl.constexpr, PACKED: tl.constexpr, KEYS: tl.constexpr = False,
+                      HAS_TMAX: tl.constexpr = False):
+    """Prompt chunks: RB rows a program share each key tile (dequantized once for all of them). KEYS: the scores as
+    topk_indices' int64 keys (as _index_score's KEYS)."""
 
     rb = tl.program_id(0)
     b = tl.program_id(1)
@@ -1550,39 +1608,54 @@ def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, IH: tl.constexpr, ID: tl.
     sc = tl.sum(tl.reshape(tl.maximum(s, 0.0) * w[:, None], (RB, IH, BN)), axis=1)    # [RB, BN]
     vis = tl.load(VIS + rr, mask=rok, other=0)
     sc = tl.where(t[None, :] < vis[:, None], sc, float("-inf"))
-    tl.store(OUT + rr[:, None] * n + t[None, :], sc, mask=rok[:, None] & ok[None, :])
+    if KEYS:                           # topk_indices' keys: the score's bits in total order above, ~index below
+        bits = tl.where(sc == 0.0, 0, sc.to(tl.int32, bitcast=True))    # (score + 0.0: -0 as +0)
+        ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
+        key = (ordered << 32) | (0xFFFFFFFF - t[None, :].to(tl.int64))
+        tl.store(OUT + rr[:, None] * n + t[None, :], key, mask=rok[:, None] & ok[None, :])
+        if HAS_TMAX:                   # each row's largest key of the tile (topk_select_pruned)
+            tl.store(TMAX + rr * nt + b, tl.max(tl.where(ok[None, :], key, -9223372036854775808), axis=1), mask=rok)
+    else:
+        tl.store(OUT + rr[:, None] * n + t[None, :], sc, mask=rok[:, None] & ok[None, :])
 
 
 def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
-                out: torch.Tensor | None = None, base: torch.Tensor | None = None) -> torch.Tensor:
+                out: torch.Tensor | None = None, base: torch.Tensor | None = None, keys: bool = False,
+                tmax: bool = False, rowwise: bool = False):
     """q [R, IH, ID] bf16, k bf16 [>= n, ID] or a packed FP4 pair (codes [N, ID/2], E8M0 [N, ID/32]),
     w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r]). Decode / verify windows (R <= DECODE_ROWS) take one row a program
-    (row-invariant); prompt chunks share each key tile among 8 rows."""
+    (row-invariant); prompt chunks share each key tile among 8 rows (``rowwise``: one row a program for them too).
+    ``keys``: topk_indices' int64 keys of those scores instead (the same kernels, so the same scores; for
+    topk_select); with ``tmax`` also each 64-key tile's largest key: returns (keys, [R, ceil(n / 64)] int64)."""
 
     rows, ih, idim = q.shape
     if out is None:
-        out = torch.empty((rows, n), dtype=torch.float32, device=q.device)
+        out = torch.empty((rows, n), dtype=torch.int64 if keys else torch.float32, device=q.device)
     packed = isinstance(k, tuple)
     codes, scales = k if packed else (k, k)
     bn = 64
-    if rows <= DECODE_ROWS:
-        _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, vis if base is None else base,
-                                                 vis, 0, IH=ih, ID=idim, BN=bn, PACKED=packed,
-                                                 HAS_BASE=base is not None, num_warps=4, **_pdl())
+    nt = triton.cdiv(n, bn)
+    tm = torch.empty((rows, nt), dtype=torch.int64, device=q.device) if tmax else out
+    if rows <= DECODE_ROWS or rowwise:
+        _index_score[(rows, nt)](q, codes, scales, w, vis, out, n, vis if base is None else base, vis, 0, tm, nt,
+                                 IH=ih, ID=idim, BN=bn, PACKED=packed, HAS_BASE=base is not None, num_warps=4,
+                                 KEYS=keys, HAS_TMAX=tmax and keys, SKIP_DEAD=SMALL_SWITCHES["tile_skip"], **_pdl())
     else:
         assert base is None, "concurrent rounds are decode windows (DECODE_ROWS rows at most)"
         rbs = 8
-        _index_score_rows[(triton.cdiv(rows, rbs), triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, rows,
-                                                                          IH=ih, ID=idim, BN=bn, RB=rbs,
-                                                                          PACKED=packed, num_warps=8)
-    return out
+        _index_score_rows[(triton.cdiv(rows, rbs), nt)](q, codes, scales, w, vis, out, n, rows, tm, nt,
+                                                         IH=ih, ID=idim, BN=bn, RB=rbs, PACKED=packed, KEYS=keys,
+                                                         HAS_TMAX=tmax and keys, num_warps=8)
+    return (out, tm) if tmax else out
 
 
 def index_keys(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int, base: torch.Tensor | None = None,
-               cand: torch.Tensor | None = None, cand_block: int = 8) -> torch.Tensor:
+               cand: torch.Tensor | None = None, cand_block: int = 8, tmax: bool = False, pruned_k: int = 0):
     """topk_indices' int64 keys [R, n] of index_score's scores (decode windows), with apply_candidates' mask (``cand``:
     the pool's block mask [R, >= ceil(n / cand_block)]) folded in: one launch for index_score + apply_candidates +
-    the keys' six torch ops, the same keys."""
+    the keys' six torch ops, the same keys. ``pruned_k`` (with ``tmax``): the keys go only to
+    topk_select_pruned(keys, tmax, pruned_k, vis), which then searches tiles (prunes(n, pruned_k)): tiles wholly at or
+    past a row's vis write no keys and PAD_KEY as their maximum (switch "tile_skip"; the same selection)."""
 
     rows, ih, idim = q.shape
     assert rows <= DECODE_ROWS
@@ -1592,10 +1665,87 @@ def index_keys(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int, b
     bn = 64
     has_cand = cand is not None
     cv = cand.view(torch.uint8) if has_cand else vis
-    _index_score[(rows, triton.cdiv(n, bn))](q, codes, scales, w, vis, out, n, vis if base is None else base,
-                                             cv, cv.stride(0) if has_cand else 0, IH=ih, ID=idim, BN=bn,
-                                             PACKED=packed, HAS_BASE=base is not None, num_warps=4,
-                                             HAS_CAND=has_cand, CB=cand_block, KEYS=True, **_pdl())
+    nt = triton.cdiv(n, bn)
+    tm = torch.empty((rows, nt), dtype=torch.int64, device=q.device) if tmax else out
+    _index_score[(rows, nt)](q, codes, scales, w, vis, out, n, vis if base is None else base,
+                             cv, cv.stride(0) if has_cand else 0, tm, nt, IH=ih, ID=idim, BN=bn,
+                             PACKED=packed, HAS_BASE=base is not None, num_warps=4,
+                             HAS_CAND=has_cand, CB=cand_block, KEYS=True, HAS_TMAX=tmax,
+                             SKIP_DEAD=SMALL_SWITCHES["tile_skip"],
+                             DEAD_PAD=SMALL_SWITCHES["tile_skip"] and tmax and prunes(n, pruned_k), **_pdl())
+    return (out, tm) if tmax else out
+
+
+# (switch "cand_only") the reindex layers' scores over the candidate pool only: lane j of a row is position
+# CBLK[r, j // CB] * CB + j % CB (PAD_KEY where the block id is -1), scored and keyed exactly as _index_score scores and
+# keys that position (the same tile shape and dots, the position's own index in the key), so the pool's keys are the
+# full-width row's keys at those positions, and every key outside the pool (-inf there) is left out
+@triton.jit
+def _index_score_cand(Q, K, KS, Wt, VIS, OUT, n, nout, KB, CBLK, cbs, IH: tl.constexpr, ID: tl.constexpr,
+                      BN: tl.constexpr, PACKED: tl.constexpr, HAS_BASE: tl.constexpr, CB: tl.constexpr,
+                      PDL: tl.constexpr = False):
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    b = tl.program_id(1)
+    HALF: tl.constexpr = ID // 2
+    hh = tl.arange(0, IH)
+    hc = tl.arange(0, HALF)
+    j = b * BN + tl.arange(0, BN)
+    jok = j < nout
+    blk = tl.load(CBLK + r * cbs + j // CB, mask=jok, other=-1).to(tl.int64)
+    t = blk * CB + j % CB
+    ok = jok & (blk >= 0) & (t < n)
+    if HAS_BASE:
+        kt = tl.load(KB + r) + t
+        ld = ok & (t < tl.load(VIS + r))
+    else:
+        kt = t
+        ld = ok
+    q_lo = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + hc[None, :])
+    q_hi = tl.load(Q + r * (IH * ID) + hh[:, None] * ID + HALF + hc[None, :])
+    if PACKED:
+        cb = tl.load(K + kt[:, None] * HALF + hc[None, :], mask=ld[:, None], other=0).to(tl.int32)
+        g = tl.arange(0, HALF // 32)
+        el = tl.load(KS + kt[:, None] * (ID // 32) + g[None, :], mask=ld[:, None], other=127).to(tl.int32)
+        eh = tl.load(KS + kt[:, None] * (ID // 32) + HALF // 32 + g[None, :], mask=ld[:, None], other=127).to(tl.int32)
+        sl = (el << 23).to(tl.float32, bitcast=True)
+        sh = (eh << 23).to(tl.float32, bitcast=True)
+        k_lo = tl.reshape(tl.reshape(_e2m1(cb & 15), (BN, HALF // 32, 32)) * sl[:, :, None], (BN, HALF)).to(tl.bfloat16)
+        k_hi = tl.reshape(tl.reshape(_e2m1(cb >> 4), (BN, HALF // 32, 32)) * sh[:, :, None], (BN, HALF)).to(tl.bfloat16)
+    else:
+        k_lo = tl.load(K + kt[:, None] * ID + hc[None, :], mask=ld[:, None], other=0.0)
+        k_hi = tl.load(K + kt[:, None] * ID + HALF + hc[None, :], mask=ld[:, None], other=0.0)
+    s = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))      # [IH, BN] fp32
+    w = tl.load(Wt + r * IH + hh).to(tl.float32)
+    sc = tl.sum(tl.maximum(s, 0.0) * w[:, None], axis=0)
+    vis = tl.load(VIS + r)
+    sc = tl.where(t < vis, sc, float("-inf"))
+    bits = tl.where(sc == 0.0, 0, sc.to(tl.int32, bitcast=True))        # (score + 0.0: -0 as +0)
+    ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
+    key = (ordered << 32) | (0xFFFFFFFF - t)
+    tl.store(OUT + r * nout + j, tl.where(ok, key, -9223372036854775808), mask=jok)
+
+
+def index_keys_cand(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int, cblk: torch.Tensor,
+                    cand_block: int = 8, base: torch.Tensor | None = None) -> torch.Tensor:
+    """index_keys(..., cand=mask) restricted to the pool: ``cblk`` [R, B] int32 the pool's block ids (-1: none) ->
+    int64 keys [R, B * cand_block], each the full-width key of its position (PAD_KEY for -1 blocks). Every key the
+    full-width row has outside the pool is a -inf key; a full pool holds >= k finite keys, and a pool that is not full
+    holds every visible position, so topk_select of these keys == topk_select of the full-width masked keys."""
+
+    rows, ih, idim = q.shape
+    assert rows <= DECODE_ROWS and cblk.dtype == torch.int32
+    nout = cblk.shape[1] * cand_block
+    out = torch.empty((rows, nout), dtype=torch.int64, device=q.device)
+    packed = isinstance(k, tuple)
+    codes, scales = k if packed else (k, k)
+    bn = 64
+    _index_score_cand[(rows, triton.cdiv(nout, bn))](q, codes, scales, w, vis, out, n, nout,
+                                                    vis if base is None else base, cblk, cblk.stride(0),
+                                                    IH=ih, ID=idim, BN=bn, PACKED=packed,
+                                                    HAS_BASE=base is not None, CB=cand_block, num_warps=4, **_pdl())
     return out
 
 
@@ -1635,6 +1785,7 @@ def _topk_sel(KEYS, VIS, OUT, N: tl.constexpr, KK: tl.constexpr, PDL: tl.constex
 
 
 TOPK_FUSED_MAX = int(os.environ.get("TF_DS_TOPK_FUSED_MAX") or 4096)   # keys a row the fused selection takes at most
+PAD_KEY = -9223372036854775808         # int64 min: below every key the indexer makes (pads past n)
 
 
 def topk_select(keys: torch.Tensor, k: int, vis: torch.Tensor) -> torch.Tensor:
@@ -1653,7 +1804,49 @@ def topk_select(keys: torch.Tensor, k: int, vis: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _score_keys(S, OUT, n, BN: tl.constexpr, PDL: tl.constexpr = False):
+def _gather_tiles(KEYS, TPOS, OUT, n, ks, BN: tl.constexpr, KK: tl.constexpr, PDL: tl.constexpr = False):
+    """Program (row, j): the row's BN keys of the tile holding position TPOS[row, j] (PAD_KEY past n) into
+    OUT[row, j * BN:(j + 1) * BN]."""
+
+    if PDL:
+        gdc_wait()
+        gdc_launch_dependents()
+    r = tl.program_id(0)
+    j = tl.program_id(1)
+    pos = tl.load(TPOS + r * KK + j)
+    t = (pos // BN) * BN + tl.arange(0, BN)
+    key = tl.load(KEYS + r * ks + t, mask=(t < n) & (pos >= 0), other=-9223372036854775808)
+    tl.store(OUT + r * (KK * BN) + j * BN + tl.arange(0, BN), key)
+
+
+TOPK_PRUNE_BN = 64                     # the score kernels' key tile (their tile maxima)
+
+
+def prunes(n: int, k: int) -> bool:
+    """topk_select_pruned searches tiles (not every key) for rows of n keys: the switch on, more than TOPK_FUSED_MAX
+    keys and more than k tiles."""
+
+    return SMALL_SWITCHES["topk_prune"] and k > 0 and n > TOPK_FUSED_MAX and triton.cdiv(n, TOPK_PRUNE_BN) > k
+
+
+def topk_select_pruned(keys: torch.Tensor, tmax: torch.Tensor, k: int, vis: torch.Tensor) -> torch.Tensor:
+    """topk_select(keys, k, vis) from the k tiles (TOPK_PRUNE_BN keys each) with the largest tile maxima ``tmax``:
+    every one of a row's k largest keys lies in such a tile (keys are unique: fewer than k keys, so fewer than k tile
+    maxima, exceed one of them), so the k largest of those tiles' keys are the row's. The same int64 [R, k]."""
+
+    rows, n = keys.shape
+    if not prunes(n, k) or keys.stride(1) != 1:
+        return topk_select(keys, k, vis)
+    every = torch.full((rows,), 1 << 40, dtype=torch.int64, device=keys.device)       # no mask: tile positions
+    tpos = topk_select(tmax, k, every)                  # positions of the k largest tile maxima, sorted
+    cand = torch.empty((rows, k * TOPK_PRUNE_BN), dtype=torch.int64, device=keys.device)
+    _gather_tiles[(rows, k)](keys, tpos, cand, n, keys.stride(0), BN=TOPK_PRUNE_BN, KK=k, num_warps=1, **_pdl())
+    return topk_select(cand, k, vis)
+
+
+@triton.jit
+def _score_keys(S, OUT, n, TMAX, nt, BN: tl.constexpr, PDL: tl.constexpr = False, HAS_TMAX: tl.constexpr = False,
+                TB: tl.constexpr = 64):
     if PDL:
         gdc_wait()
         gdc_launch_dependents()
@@ -1663,16 +1856,25 @@ def _score_keys(S, OUT, n, BN: tl.constexpr, PDL: tl.constexpr = False):
     sc = tl.load(S + r * n + t, mask=ok, other=0.0)
     bits = tl.where(sc == 0.0, 0, sc.to(tl.int32, bitcast=True))
     ordered = tl.where(bits < 0, bits ^ 0x7FFFFFFF, bits).to(tl.int64)
-    tl.store(OUT + r * n + t, (ordered << 32) | (0xFFFFFFFF - t.to(tl.int64)), mask=ok)
+    key = (ordered << 32) | (0xFFFFFFFF - t.to(tl.int64))
+    tl.store(OUT + r * n + t, key, mask=ok)
+    if HAS_TMAX:                       # each TB-key tile's largest key (topk_select_pruned)
+        tm = tl.max(tl.reshape(tl.where(ok, key, -9223372036854775808), (BN // TB, TB)), axis=1)
+        j = tl.program_id(1) * (BN // TB) + tl.arange(0, BN // TB)
+        tl.store(TMAX + r * nt + j, tm, mask=j < nt)
 
 
-def score_keys(score: torch.Tensor) -> torch.Tensor:
-    """topk_indices' int64 keys of fp32 scores [R, n] (contiguous), one launch."""
+def score_keys(score: torch.Tensor, tmax: bool = False):
+    """topk_indices' int64 keys of fp32 scores [R, n] (contiguous), one launch; with ``tmax`` also each 64-key
+    tile's largest key: returns (keys, [R, ceil(n / 64)] int64)."""
 
     rows, n = score.shape
     out = torch.empty((rows, n), dtype=torch.int64, device=score.device)
-    _score_keys[(rows, triton.cdiv(n, 1024))](score, out, n, BN=1024, num_warps=4, **_pdl())
-    return out
+    nt = triton.cdiv(n, TOPK_PRUNE_BN)
+    tm = torch.empty((rows, nt), dtype=torch.int64, device=score.device) if tmax else out
+    _score_keys[(rows, triton.cdiv(n, 1024))](score, out, n, tm, nt, BN=1024, num_warps=4, HAS_TMAX=tmax,
+                                             TB=TOPK_PRUNE_BN, **_pdl())
+    return (out, tm) if tmax else out
 
 
 # fp4_qd(x, 32, e4m3_scale=False) (the indexer's q): 32-element blocks, a power-of-two scale (ops._pow2_ceil of

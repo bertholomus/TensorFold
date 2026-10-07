@@ -3,6 +3,62 @@
 `tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
 GitHub has the full notes and the measurements behind them.
 
+## 0.6.6 (6 Oct 2026)
+
+- **`--name-priority ID=background` on the CUDA server.** A request that names that served id (`--name` or an
+  `--alias`) and sends no `priority` of its own is served as `priority: "background"`, so it yields to foreground
+  requests. A request's own `priority` always wins. This suits clients that can choose a model id but cannot add a
+  field to the request, such as batch extractors. On one DGX Spark, a foreground request behind four background ones
+  got its first token in 0.2 s instead of 21 s, with replies unchanged (#445). Thanks to @philip-pentatonic.
+
+## 0.6.5 (3 Oct 2026)
+
+- **Qwen3.6-35B-A3B drafts with its own MTP layer on Macs,** as on CUDA. Chains of up to four drafts are verified in
+  the lane rounds, alone or with other streams, and each round's depth comes from the Mac's measured costs, with plain
+  rounds where drafts do not pay. Replies equal `"draft": false`. On an M3 Ultra it decodes 1.5-2.1x `--no-drafts` on
+  short prompts, thinking on or off, and 1.3x at a 28,400-token prompt with the same time to first token: 1.5-1.7x
+  mlx-vlm 0.7.4 with its MTP drafter. DFlash v1 stays available with `--drafter z-lab/Qwen3.6-35B-A3B-DFlash`.
+- **Nemotron on CUDA drafts as deep as its rows pay for.** The MTP head drafts up to 15 levels, one CUDA graph each,
+  and a chain stops where the next verify row would cost more time than its draft is expected to save. Window and
+  level costs are measured at startup on each GPU. Against 0.6.4's default this decodes about 6% faster on one DGX
+  Spark and on two, and 7% faster on an RTX PRO 6000, with replies equal to `"draft": false`. `--mtp-confidence` sets
+  a fixed floor instead.
+- **Nemotron verify windows on M5 Macs read each routed expert once from two rows** (eight before). One stream decodes
+  1-3% faster at three to five lanes, with the same tokens.
+- **API keys on both servers:** `--api-key` (repeatable), `--api-key-file` (one key, or `label: key`, a line; reread on
+  `SIGHUP`) or `TENSORFOLD_API_KEY`. Requests send `Authorization: Bearer` or `x-api-key`. `/health` stays open;
+  `/metrics` needs a key unless `--metrics-open`.
+- **Thinking stays the chat template's default, and the server says so:** one startup line names `--no-thinking`, and
+  a reply that reaches `max_tokens` before it leaves its think block (empty `content`, all `reasoning_content`) gets a
+  warning line.
+- The test suite collects on Macs that have PyTorch but not Triton.
+
+## 0.6.4 (3 Oct 2026)
+
+- **Flash Next on two DGX Sparks serves concurrent requests.** `--parallel N` with two CUDA ranks runs every stream
+  in shared lane rounds, and drafted replies still equal one-token decoding (#141, #180, #219, closes #123). The two
+  ranks now share one communicator interface, so a faster transport can plug in without touching the engines.
+  Thanks to @BHCC2025, @jschmied, @plotarmordev and @jayleaton.
+- **Startup memory on Macs:** prompt chunks are probed smallest first, and a larger probe runs only when its worst
+  case fits the memory budget (#271). Thanks to @boxabirds for the report.
+- **`tensorfold plan`** prints the model and context budget before any weights load (#281), and both `/metrics`
+  routes report the process memory footprint (#277). Thanks to @akol1.
+- Flash Next on CUDA builds its extensions before loading weights (#202) and gathers prompt n-gram rows before
+  waiting on earlier copies (#201). Thanks to @mcclanahanaman.
+- Flash Next on CUDA rereads EXL3 n-gram tables after warm-up and pins their page runs (#254). Thanks to
+  @grearjake-star.
+- `--decode-share` takes effect on Flash Next CUDA: shared prompt rows are sized from completed stand-alone passes
+  (#248, closes #230). Thanks to @simon-lin88.
+- CUDA tree attention folds its partial sums in fp32 groups. Precision is unchanged, but long replies can differ
+  from 0.6.3 in the last bits (#268). Thanks to @Arminova.
+- Flash Next on CUDA refuses cards below sm_120 at startup, before loading weights, and its CUDA tests skip there
+  (#261). Thanks to @mcclanahanaman for the report.
+- `docs/recipes/README.md` lists the minimum card and Mac memory for each family (#139). Thanks to @tomByrer for
+  asking.
+- Benchmark helpers fail early on Python below 3.11 (#276). Thanks to @akol1.
+- Tests collect without the optional MLX or terminal-interface dependencies (#288), and the docs say `--alias`
+  works on the CUDA server too (#289). Thanks to @plotarmordev.
+
 ## 0.6.3 (2 Oct 2026)
 
 - **Nemotron on M5 Macs: copied text verifies up to 64 tokens a round.** A lone stream's copy window grows from 16 to

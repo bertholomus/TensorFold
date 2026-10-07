@@ -385,7 +385,7 @@ class DsEngine:
         m = self.model
         assert start % PREFILL_CHUNK == 0 and start < len(prompt), (start, len(prompt))
         sc.length = start
-        del sc.host[start:]
+        sc.host.truncate(start)
         use_drafts = dc is not None
         if use_drafts:
             dc.absorbed = 0

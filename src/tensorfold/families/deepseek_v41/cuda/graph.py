@@ -250,9 +250,8 @@ class GraphRunner:
         g = self.graphs.get(key)
         e_rows = None
         if m.engram is not None:
-            del sc.host[start:]
-            sc.host.extend(int(t) for t in ids)
-            hashes = m.engram.hashes(sc.host, start, n)
+            sc.host.set(start, ids)
+            hashes = m.engram.hashes(sc.host.view(), start, n)
             lo, hi = m.engram.cols
             e_rows = {i: m.engram.rows(i, hashes[:, m.cfg.engram_layers.index(i), lo:hi])
                       for i in m.cfg.engram_layers if i < len(m.w.layers)}

@@ -46,6 +46,92 @@ def freqs_cis(dim: int, seqlen: int, orig_len: int, base: float, factor: float, 
     return torch.polar(torch.ones_like(ang), ang).to(device)
 
 
+# The engine's RoPE tables: (cos, sin) fp32 [rows, dim/2] a rope kind, no complex table kept. Rows below ROPE_COMPAT are
+# freqs_cis(dim, ROPE_COMPAT, ...)'s: every lane up to e5074cf ran --context 262144 on a 2^19-row table, and a CPU
+# table's last bits may depend on its length (the reason the engine reads one table), so the rows an earlier lane served
+# keep their bits. Rows from ROPE_COMPAT on come from the same formula in blocks of ROPE_BLOCK rows, each block one call
+# of the same shape, so no row's bits depend on how long the table is. Rows are aligned up to ROPE_ALIGN (the old
+# tables were the next power of two: 2^21 rows, 2 GiB for both kinds with their complex copies, at a 1M context).
+ROPE_COMPAT = 1 << 19
+ROPE_BLOCK = 1 << 16
+ROPE_ALIGN = 4096
+
+
+def rope_block(dim: int, start: int, n: int, orig_len: int, base: float, factor: float, beta_fast: float,
+               beta_slow: float) -> torch.Tensor:
+    """freqs_cis's rotations at positions start .. start + n - 1: complex64 [n, dim/2] on the CPU (its arithmetic)."""
+
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=F32) / dim))
+    if orig_len > 0:
+        def corr(rot: float) -> float:
+            return dim * math.log(orig_len / (rot * 2 * math.pi)) / (2 * math.log(base))
+
+        low = max(math.floor(corr(beta_fast)), 0)
+        high = min(math.ceil(corr(beta_slow)), dim - 1)
+        ramp = ((torch.arange(dim // 2, dtype=F32) - low) / max(high - low, 1e-3)).clamp(0, 1)
+        smooth = 1 - ramp
+        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+    ang = torch.outer(torch.arange(start, start + n, dtype=torch.int64).to(F32), freqs)     # exact below 2^24
+    return torch.polar(torch.ones_like(ang), ang)
+
+
+def rope_cs(dim: int, rows: int, orig_len: int, base: float, factor: float, beta_fast: float, beta_slow: float,
+            device: str = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
+    """(cos, sin) fp32 [rows, dim/2] on ``device``: freqs_cis's real and imaginary parts, rows below ROPE_COMPAT from
+    freqs_cis(dim, ROPE_COMPAT, ...) itself, the rest from rope_block in ROPE_BLOCK steps (see ROPE_COMPAT)."""
+
+    half = dim // 2
+    cos = torch.empty((rows, half), dtype=F32, device=device)
+    sin = torch.empty((rows, half), dtype=F32, device=device)
+    f = freqs_cis.__wrapped__(dim, ROPE_COMPAT, orig_len, base, factor, beta_fast, beta_slow, device="cpu")
+    n = min(rows, ROPE_COMPAT)
+    cos[:n].copy_(f.real[:n])
+    sin[:n].copy_(f.imag[:n])
+    del f
+    for start in range(ROPE_COMPAT, rows, ROPE_BLOCK):
+        f = rope_block(dim, start, ROPE_BLOCK, orig_len, base, factor, beta_fast, beta_slow)
+        n = min(rows - start, ROPE_BLOCK)
+        cos[start:start + n].copy_(f.real[:n])
+        sin[start:start + n].copy_(f.imag[:n])
+    return cos, sin
+
+
+class RopeTables:
+    """The engine's (cos, sin) table a rope kind (rope_cs): the compressed layers' (YaRN, compress_rope_theta) and
+    the others' (rope_theta), each built at its first use for a row count (aligned up to ROPE_ALIGN) and kept: graphs
+    captured on a table hold its address, so none is ever replaced or freed."""
+
+    def __init__(self, cfg: Cfg, device: str = "cuda"):
+        self.cfg, self.device = cfg, device
+        self.tables: dict = {}
+
+    def args(self, compressed: bool) -> tuple:
+        c = self.cfg
+        if compressed:
+            return (c.orig_len, c.compress_theta, c.rope_factor, c.beta_fast, c.beta_slow)
+        return (0, c.rope_theta, c.rope_factor, c.beta_fast, c.beta_slow)
+
+    @staticmethod
+    def rows(need: int) -> int:
+        return max(ROPE_ALIGN, -(-int(need) // ROPE_ALIGN) * ROPE_ALIGN)
+
+    def cs(self, compressed: bool, need: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """(cos, sin) [rows(need), rope_dim / 2] of this kind (the longest table already made when it holds them:
+        the same bits in every row)."""
+
+        compressed = bool(compressed)
+        rows = self.rows(need)
+        have = [r for k, r in self.tables if k == compressed and r >= rows]
+        if have:
+            return self.tables[(compressed, max(have))]
+        t = self.tables[(compressed, rows)] = rope_cs(self.cfg.rope_dim, rows, *self.args(compressed),
+                                                      device=self.device)
+        return t
+
+    def nbytes(self) -> int:
+        return sum(x.numel() * x.element_size() for pair in self.tables.values() for x in pair)
+
+
 def rope_(x: torch.Tensor, f: torch.Tensor, inverse: bool = False) -> torch.Tensor:
     """Rotate adjacent pairs of x's last dim in place by f [rows, dim/2]; x [rows, ..., dim] (rows first)."""
 
@@ -228,6 +314,55 @@ def compressed_token_map(tokenizer_json: str | Path) -> tuple[list[int], int]:
             key_to_new[key] = new
         lookup[tid] = new
     return lookup, len(key_to_new)
+
+
+class HostIds:
+    """A sequence's token ids on the host (Engram's n-grams; -1 at image positions) in a growable int32 buffer: 4 bytes
+    an id where a Python list of ints held ~36 (a 1M prompt ~4 MiB instead of ~36 MiB, each kept prompt's copy alike).
+    ``ids[a:b]`` is an int32 array view (valid until the next ``set``), ``len(ids)`` the ids held."""
+
+    __slots__ = ("buf", "n")
+
+    def __init__(self, ids=()) -> None:
+        a = np.asarray(ids, dtype=np.int64).reshape(-1)
+        assert a.size == 0 or (a.min() >= -2**31 and a.max() < 2**31), "ids fit int32"
+        self.buf = np.array(a, dtype=np.int32)
+        self.n = a.size
+
+    def __len__(self) -> int:
+        return self.n
+
+    def __getitem__(self, s):
+        return self.buf[:self.n][s]
+
+    def view(self) -> np.ndarray:
+        """Every id held (an int32 view)."""
+
+        return self.buf[:self.n]
+
+    def truncate(self, start: int) -> None:
+        """Keep the ids before ``start`` (as ``del ids[start:]``)."""
+
+        self.n = min(self.n, max(0, start))
+
+    def set(self, start: int, ids) -> None:
+        """The ids from ``start`` on are ``ids`` (as ``del l[start:]; l.extend(ids)``); ``start`` <= len."""
+
+        assert 0 <= start <= self.n, (start, self.n)
+        a = np.asarray(ids, dtype=np.int64).reshape(-1)
+        assert a.size == 0 or (a.min() >= -2**31 and a.max() < 2**31), "ids fit int32"
+        end = start + a.size
+        if end > self.buf.size:
+            grown = np.empty(max(end, self.buf.size + self.buf.size // 2, 1024), dtype=np.int32)
+            grown[:start] = self.buf[:start]
+            self.buf = grown
+        self.buf[start:end] = a
+        self.n = end
+
+    def copy(self, top: int | None = None) -> "HostIds":
+        """The first ``top`` ids (all of them when None) as a buffer of their own."""
+
+        return HostIds(self.buf[:self.n if top is None else min(top, self.n)])
 
 
 class EngramHasher:

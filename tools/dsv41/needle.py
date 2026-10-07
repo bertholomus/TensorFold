@@ -1,10 +1,12 @@
 """Needle-in-a-haystack recall against an OpenAI chat server (stdlib only).
 
   python3 needle.py --base URL --model M [--key-file F] --lengths 8192,32768,131072 --depths 0.1,0.5,0.9 --out F
+  python3 needle.py --base URL --model M --shared --lengths 131072 --depths 0.1,0.5,0.9 --out F
 
 A random passphrase is placed at a relative depth of a filler text of about the given token length (sized with the
 server's /tokenize), and the model is asked for it at the end, thinking off, greedy. Recall = the passphrase appears in
-the reply.
+the reply. With --shared, one haystack per length carries one labelled vault needle per depth and each label is asked
+for in its own follow-up request against the same text.
 """
 
 import argparse
@@ -40,6 +42,7 @@ def main():
     p.add_argument("--lengths", default="8192,32768,131072")
     p.add_argument("--depths", default="0.1,0.5,0.9")
     p.add_argument("--seed", type=int, default=7)
+    p.add_argument("--shared", action="store_true")
     p.add_argument("--out")
     a = p.parse_args()
     key = None
@@ -48,31 +51,73 @@ def main():
         key = line.split("=", 1)[1].strip().strip("'\"") if "=" in line else line.strip()
     rng = random.Random(a.seed)
     rows = []
-    for length in [int(x) for x in a.lengths.split(",")]:
-        for depth in [float(x) for x in a.depths.split(",")]:
-            phrase = f"{rng.choice(CODE_WORDS)}-{rng.choice(CODE_WORDS)}-{rng.randrange(1000, 9999)}"
-            needle = f" The secret passphrase is {phrase}. Remember it. "
+    if a.shared:
+        depths = [float(x) for x in a.depths.split(",")]
+        for length in [int(x) for x in a.lengths.split(",")]:
+            phrases, needles = [], []
+            for k in range(len(depths)):
+                phrase = f"{rng.choice(CODE_WORDS)}-{rng.choice(CODE_WORDS)}-{rng.randrange(1000, 9999)}"
+                phrases.append(phrase)
+                needles.append(f" The secret passphrase for vault {chr(65 + k)} is {phrase}. Remember it. ")
             words = [rng.choice(WORDS) for _ in range(int(length * 0.75))]
-            # grow to the target length by the tokenizer
+
             def build(ws):
-                cut = int(len(ws) * depth)
-                return "Read the notes below.\n" + " ".join(ws[:cut]) + needle + " ".join(ws[cut:])
+                # each needle lands at its own relative depth of the word list (positions are taken on the
+                # pre-insertion list and shifted by needles already inserted before them)
+                parts = list(ws)
+                order = sorted(range(len(depths)), key=lambda k: int(len(ws) * depths[k]))
+                off = 0
+                for k in order:
+                    parts.insert(int(len(ws) * depths[k]) + off, needles[k])
+                    off += 1
+                return "Read the notes below.\n" + " ".join(parts)
+
             text = build(words)
             n = len(post(a.base, "/tokenize", {"model": a.model, "prompt": text}, key)["tokens"])
             while n < length - 300:
                 words += [rng.choice(WORDS) for _ in range(int((length - n) * 0.7))]
                 text = build(words)
                 n = len(post(a.base, "/tokenize", {"model": a.model, "prompt": text}, key)["tokens"])
-            q = text + "\n\nWhat is the secret passphrase mentioned in the notes? Reply with the passphrase only."
-            t0 = time.time()
-            out = post(a.base, "/v1/chat/completions", {"model": a.model, "messages": [{"role": "user", "content": q}],
-                                                         "max_tokens": 32, "temperature": 0,
-                                                         "chat_template_kwargs": {"enable_thinking": False}}, key)
-            reply = out["choices"][0]["message"]["content"] or ""
-            row = {"length": length, "prompt_tokens": out.get("usage", {}).get("prompt_tokens"), "depth": depth,
-                   "phrase": phrase, "found": phrase in reply, "reply": reply[:80], "seconds": round(time.time() - t0, 1)}
-            print(json.dumps(row), flush=True)
-            rows.append(row)
+            for k, depth in enumerate(depths):
+                label = chr(65 + k)
+                q = text + f"\n\nWhat is the secret passphrase for vault {label} mentioned in the notes? Reply with the passphrase only."
+                t0 = time.time()
+                out = post(a.base, "/v1/chat/completions", {"model": a.model, "messages": [{"role": "user", "content": q}],
+                                                             "max_tokens": 32, "temperature": 0,
+                                                             "chat_template_kwargs": {"enable_thinking": False}}, key)
+                reply = out["choices"][0]["message"]["content"] or ""
+                row = {"length": length, "prompt_tokens": out.get("usage", {}).get("prompt_tokens"),
+                       "cached_tokens": (out.get("usage", {}).get("prompt_tokens_details") or {}).get("cached_tokens") or 0,
+                       "depth": depth, "label": label, "phrase": phrases[k], "found": phrases[k] in reply,
+                       "reply": reply[:80], "seconds": round(time.time() - t0, 1), "shared": True}
+                print(json.dumps(row), flush=True)
+                rows.append(row)
+    else:
+        for length in [int(x) for x in a.lengths.split(",")]:
+            for depth in [float(x) for x in a.depths.split(",")]:
+                phrase = f"{rng.choice(CODE_WORDS)}-{rng.choice(CODE_WORDS)}-{rng.randrange(1000, 9999)}"
+                needle = f" The secret passphrase is {phrase}. Remember it. "
+                words = [rng.choice(WORDS) for _ in range(int(length * 0.75))]
+                # grow to the target length by the tokenizer
+                def build(ws):
+                    cut = int(len(ws) * depth)
+                    return "Read the notes below.\n" + " ".join(ws[:cut]) + needle + " ".join(ws[cut:])
+                text = build(words)
+                n = len(post(a.base, "/tokenize", {"model": a.model, "prompt": text}, key)["tokens"])
+                while n < length - 300:
+                    words += [rng.choice(WORDS) for _ in range(int((length - n) * 0.7))]
+                    text = build(words)
+                    n = len(post(a.base, "/tokenize", {"model": a.model, "prompt": text}, key)["tokens"])
+                q = text + "\n\nWhat is the secret passphrase mentioned in the notes? Reply with the passphrase only."
+                t0 = time.time()
+                out = post(a.base, "/v1/chat/completions", {"model": a.model, "messages": [{"role": "user", "content": q}],
+                                                             "max_tokens": 32, "temperature": 0,
+                                                             "chat_template_kwargs": {"enable_thinking": False}}, key)
+                reply = out["choices"][0]["message"]["content"] or ""
+                row = {"length": length, "prompt_tokens": out.get("usage", {}).get("prompt_tokens"), "depth": depth,
+                       "phrase": phrase, "found": phrase in reply, "reply": reply[:80], "seconds": round(time.time() - t0, 1)}
+                print(json.dumps(row), flush=True)
+                rows.append(row)
     summ = {"cases": len(rows), "found": sum(r["found"] for r in rows)}
     print(json.dumps({"summary": summ}), flush=True)
     if a.out:

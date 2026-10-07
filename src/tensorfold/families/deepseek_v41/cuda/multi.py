@@ -99,6 +99,15 @@ STEP_TIMEOUT = float(os.environ.get("TF_DS_STEP_TIMEOUT") or 900.0)
 KEEP = os.environ.get("TF_DS_KEEP", "1") == "1"
 KEEP_ENTRIES = int(os.environ.get("TF_DS_KEEP_ENTRIES") or 8)
 KEEP_MARKS = int(os.environ.get("TF_DS_KEEP_MARKS") or 10)
+# TF_DS_KEEP_SHRINK=1 (default): a request that needs room cuts the oldest kept prompt back to its largest kept boundary
+# that makes the room (_shrink) before it forgets one whole; prompts also keep boundaries at 3/4 and 7/8 of their
+# length (and every kept boundary in their upper half), so a long kept prompt shrinks a little, not to half. A 1M kept
+# prompt left 10,240 free positions and any chat beside it (the lane's 32,768 default reply) forgot all of it.
+# 0: forget whole kept prompts, doubling boundaries only, as before
+KEEP_SHRINK = os.environ.get("TF_DS_KEEP_SHRINK", "1") == "1"
+# prompts of at least this many tokens get the 3/4 and 7/8 boundaries (one ring snapshot each, ~8 MB): the ones whose
+# fill is expensive to repeat; shorter prompts keep the boundaries they had
+KEEP_SHRINK_MIN = int(os.environ.get("TF_DS_KEEP_SHRINK_MIN") or 131072)
 
 
 ALIGN = 2048                     # extents start and end on multiples of this many positions
@@ -540,6 +549,11 @@ class MultiDecoder:
         while b <= n:
             marks.add(b)
             b *= 2
+        if KEEP_SHRINK and n >= KEEP_SHRINK_MIN:     # cut points near a long prompt's end (_shrink)
+            for num, den in ((3, 4), (7, 8)):
+                b = n * num // den // C * C
+                if b >= C:
+                    marks.add(b)
         return marks
 
     def _snapshot(self, index: int):
@@ -594,6 +608,29 @@ class MultiDecoder:
             ex.give(k.base, k.size)
         return any(b - a >= ex.size(need) for a, b in ex.gaps)
 
+    def _shrink(self, k: Kept, need: int) -> bool:
+        """Cut kept prompt ``k`` back to its largest kept boundary below its top whose freed tail makes room for
+        ``need`` positions: its rows, snapshots, keys and host ids up to that boundary stay (a later prompt resumes
+        there, as from any kept boundary), the rest of its extent goes back. False when no boundary makes the room.
+        A function of state every rank holds (extents, boundaries), so every rank cuts the same."""
+
+        for m in sorted((b for b in k.snaps if b < k.top), reverse=True):
+            size = self.extents.size(m)
+            if size >= k.size:
+                continue
+            trial = Extents(0, self.extents.align)
+            trial.total, trial.gaps = self.extents.total, list(self.extents.gaps)
+            trial.give(k.base + size, k.size - size)
+            if any(b - a >= trial.size(need) for a, b in trial.gaps):
+                self.extents.give(k.base + size, k.size - size)
+                k.size, k.top = size, m
+                k.snaps = {b: v for b, v in k.snaps.items() if b <= m}
+                k.keys = None if k.keys is None else k.keys[:m].copy()
+                k.host = k.host.copy(m)
+                self.keep_stats["shrunk"] = self.keep_stats.get("shrunk", 0) + 1
+                return True
+        return False
+
     def _place(self, need: int, src: Kept | None) -> tuple[int | None, str]:
         """An extent for ``need`` positions (every rank the same): a free one (``src``'s rows get copied in, "copy"),
         else ``src``'s own extent grown in place ("here"), else after the oldest other kept prompts give theirs back;
@@ -612,7 +649,8 @@ class MultiDecoder:
                     raise RuntimeError("a kept prompt's extent was not free to take back")
             others = sorted((k for k in self.kept.values() if k is not src), key=lambda k: k.tick)
             if others:
-                self._forget(others[0])
+                if not (KEEP_SHRINK and self._shrink(others[0], need)):
+                    self._forget(others[0])
                 continue
             if src is None:
                 return None, "fresh"
@@ -630,6 +668,8 @@ class MultiDecoder:
         marks = sorted(snaps)
         if len(marks) > KEEP_MARKS:
             must = {b for b in marks if (b // C) & (b // C - 1) == 0} | set(marks[-2:])
+            if KEEP_SHRINK:
+                must |= {b for b in marks if 2 * b > marks[-1]}       # the upper half's cut points (_shrink)
             rest = [b for b in marks if b not in must]
             marks = sorted(must | set(rest[:max(0, KEEP_MARKS - len(must))]))
         return marks
@@ -646,7 +686,7 @@ class MultiDecoder:
         if s.size > size:
             self.extents.give(s.base + size, s.size - size)
         keys = getattr(s, "keys", None)
-        k = Kept(self.next_kept, s.base, size, top, list(s.st.sc.host[:top]), {b: s.snaps[b] for b in marks},
+        k = Kept(self.next_kept, s.base, size, top, s.st.sc.host.copy(top), {b: s.snaps[b] for b in marks},
                  self._replay(), None if keys is None else keys[:top], self.ticks)
         self.kept[k.eid] = k
         self.next_kept += 1
@@ -738,7 +778,7 @@ class MultiDecoder:
                     print(f"[tensorfold] kept prompt {src.eid}: continued at {cut} of {len(s.prompt)} ({how})",
                           flush=True)
                 self._restore(index, src.snaps[cut])
-                slot.sc.host = list(src.host[:cut])
+                slot.sc.host = src.host.copy(cut)
                 s.snaps = {b: v for b, v in src.snaps.items() if b <= cut}
             image = None
             later = [p for p in positions if p >= cut]
@@ -927,8 +967,8 @@ class MultiDecoder:
             want = {s.sid: (min(k, s.count - len(s.out)) if s.draft else 0) for s in live}
             drafting = [s for s in live if want[s.sid] > 0]
             if drafting:                                 # the rows known before the drafts: their Engram rows now
-                self.runner.engram_touch([s.st.sc.host[max(0, s.st.sc.length - 8):s.st.sc.length] + [s.pending]
-                                          for s in live])
+                self.runner.engram_touch([[*s.st.sc.host[max(0, s.st.sc.length - 8):s.st.sc.length].tolist(),
+                                           s.pending] for s in live])
             proposed, confs = {}, {}
             _ht("touched")
             if drafting:
@@ -955,9 +995,8 @@ class MultiDecoder:
                 P = sc.length
                 drafts: list[int] = proposed.get(s.sid, [])
                 window = [s.pending] + drafts
-                del sc.host[P:]
-                sc.host.extend(int(t) for t in window)
-                windows.append((s.st.index, s.base, s.size, P, window, sc.host))
+                sc.host.set(P, window)
+                windows.append((s.st.index, s.base, s.size, P, window, sc.host.view()))
                 kept.append((s, P, drafts))
             _ht("drafts back + plan")
             logits, taps = self.runner.forward(windows)

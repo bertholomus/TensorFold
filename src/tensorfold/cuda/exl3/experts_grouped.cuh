@@ -378,15 +378,21 @@ __global__ void __launch_bounds__(W * 32) grouped_rows_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int nexp) {
+    float* __restrict__ Z, int K, int N, int P, int SK, int maxm, int slots, int nexp,
+    const int* __restrict__ work) {
     constexpr int GR = 16 * G;
     constexpr int TPT = 16 * NT * 16 / (W * 32);          // a thread's outputs of a member tile in the warp sum
-    const int u = blockIdx.z % nexp;
+    // the work list (prompt chunks): grid.z walks (expert place, member group) pairs where it walked the expert places
+    // (nexp is then the list's length and grid.x 1), so no program is launched for a group an expert does not have, and
+    // an expert's programs still run back to back (its rows stay in L2 across its column blocks)
+    const int zz = (int)(blockIdx.z % nexp);
+    const int u = work ? work[2 * zz] : zz;
     if (u >= ucount[0]) return;
-    const int mg = blockIdx.x;
+    const int mg = work ? work[2 * zz + 1] : (int)blockIdx.x;
+    const int zi = (int)(blockIdx.z / nexp);              // (matrix, split)
     const int splits = FOLD ? 1 : SK;                     // grid splits (FOLD runs them all in one program)
-    const int split0 = FOLD ? 0 : (blockIdx.z / nexp) % SK;
-    const int mat = blockIdx.z / nexp / splits;
+    const int split0 = FOLD ? 0 : zi % SK;
+    const int mat = zi / splits;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -525,7 +531,8 @@ __global__ void __launch_bounds__(W * 32) grouped_rows_kernel(
 // from 0 (the gate/up epilogue's order: it then reads one split), without (SK 1) the split's sum is written as is.
 constexpr int MMA_ROWS = 64;        // member rows a program
 constexpr int MMA_COLS = 64;        // columns a program
-constexpr int MMA_KB = 4;           // k tiles a step (it divides every chain: 24 for GLM's gate/up, 8 for its down)
+constexpr int MMA_KB = 4;           // k tiles a step (it divides every chain: 24 for GLM's gate/up, 8 for its down);
+                                    // chains it does not divide (a TP2 DeepSeek-V4.1 rank's down: 18) take 2 a step
 constexpr int MMA_STAGES = 3;       // row stages in flight
 constexpr int MMA_LD = MMA_KB * 16 + 8;     // halfs a staged row (padded: ldmatrix rows fall in distinct banks)
 constexpr int MMA_DEC = MMA_KB / 2;         // weight tiles a warp decodes a step (8 warps, 4 n16 tiles a k tile)
@@ -545,20 +552,21 @@ __device__ __forceinline__ void ldmatrix_x4(uint32_t (&a)[4], const void* smem) 
                  : "r"(s));
 }
 
-template <int CB, int K2, bool FOLD>
+template <int CB, int K2, bool FOLD, int KB>
 __device__ __forceinline__ void mma_slice(const uint32_t* __restrict__ T, int NTILES, int KT, int per_range, int WK,
                                           int nt0, const half* __restrict__ X, int K, const int* rows_sh, bool live,
-                                          int warp, int lane, half (&As)[MMA_STAGES][MMA_ROWS][MMA_LD],
-                                          uint4 (&bsh)[2][MMA_KB][4][32], float (&tot)[4][4]) {
+                                          int warp, int lane, half (&As)[MMA_STAGES][MMA_ROWS][KB * 16 + 8],
+                                          uint4 (&bsh)[2][KB][4][32], float (&tot)[4][4]) {
+    constexpr int MMA_DEC_ = KB / 2;                       // weight tiles a warp decodes a step
     constexpr int LW = Fmt<K2>::LW;
     const LaneMap<K2> map(lane);
     const size_t kstride = (size_t)NTILES * Fmt<K2>::TW;
-    const int dk = (warp >> 2) * MMA_DEC, dn = warp & 3;      // the tiles this warp decodes: k tiles dk .. of a step, n16 dn
+    const int dk = (warp >> 2) * MMA_DEC_, dn = warp & 3;      // the tiles this warp decodes: k tiles dk .. of a step, n16 dn
     const uint32_t* tp = T + ((size_t)dk * NTILES + nt0 + dn) * Fmt<K2>::TW + lane;
     const int rg = warp & 3, cg = warp >> 2;                  // its rows 16 rg .., its n16 tiles 2 cg, 2 cg + 1
-    const int NS = KT / MMA_KB;
-    // the staged chunks this thread copies: row tid / 4, 16 bytes (tid % 4) + 4 c of the step's MMA_KB * 16 columns
-    constexpr int CPR = MMA_KB / 2;                           // chunks a thread a step
+    const int NS = KT / KB;
+    // the staged chunks this thread copies: row tid / 4, 16 bytes (tid % 4) + 4 c of the step's KB * 16 columns
+    constexpr int CPR = KB / 2;                           // chunks a thread a step
     const int crow = threadIdx.x >> 2, cpart = threadIdx.x & 3;
     const int cr = rows_sh[crow];
     const half* src = X + (size_t)(cr < 0 ? 0 : cr) * K + cpart * 8;
@@ -570,21 +578,21 @@ __device__ __forceinline__ void mma_slice(const uint32_t* __restrict__ T, int NT
         if (st < NS)
 #pragma unroll
             for (int c = 0; c < CPR; ++c)
-                cp_async16(&As[st][crow][(cpart + 4 * c) * 8], src + st * MMA_KB * 16 + 32 * c, cr >= 0);
+                cp_async16(&As[st][crow][(cpart + 4 * c) * 8], src + st * KB * 16 + 32 * c, cr >= 0);
         cp_async_commit();
     }
-    uint32_t words[MMA_DEC][LW];
+    uint32_t words[MMA_DEC_][LW];
 #pragma unroll
-    for (int d = 0; d < MMA_DEC; ++d) load_words<K2>(words[d], tp + (size_t)d * kstride, lane);
+    for (int d = 0; d < MMA_DEC_; ++d) load_words<K2>(words[d], tp + (size_t)d * kstride, lane);
 #pragma unroll
-    for (int d = 0; d < MMA_DEC; ++d) {
+    for (int d = 0; d < MMA_DEC_; ++d) {
         uint32_t b0[2], b1[2];
         decode_tile<CB, K2>(words[d], map, lane, b0, b1);
         bsh[0][dk + d][dn][lane] = make_uint4(b0[0], b0[1], b1[0], b1[1]);
     }
     if (NS > 1)
 #pragma unroll
-        for (int d = 0; d < MMA_DEC; ++d) load_words<K2>(words[d], tp + (size_t)(MMA_KB + d) * kstride, lane);
+        for (int d = 0; d < MMA_DEC_; ++d) load_words<K2>(words[d], tp + (size_t)(KB + d) * kstride, lane);
     cp_async_wait<MMA_STAGES - 2>();
     __syncthreads();
 
@@ -603,25 +611,25 @@ __device__ __forceinline__ void mma_slice(const uint32_t* __restrict__ T, int NT
 #pragma unroll
                 for (int c = 0; c < CPR; ++c)
                     cp_async16(&As[ahead % MMA_STAGES][crow][(cpart + 4 * c) * 8],
-                               src + (size_t)ahead * MMA_KB * 16 + 32 * c, cr >= 0);
+                               src + (size_t)ahead * KB * 16 + 32 * c, cr >= 0);
             cp_async_commit();
         }
-        uint32_t fr[MMA_DEC][4];                              // the next step's tiles (their words came a step ago)
+        uint32_t fr[MMA_DEC_][4];                              // the next step's tiles (their words came a step ago)
         if (st + 1 < NS) {
 #pragma unroll
-            for (int d = 0; d < MMA_DEC; ++d) {
+            for (int d = 0; d < MMA_DEC_; ++d) {
                 uint32_t b0[2], b1[2];
                 decode_tile<CB, K2>(words[d], map, lane, b0, b1);
                 fr[d][0] = b0[0]; fr[d][1] = b0[1]; fr[d][2] = b1[0]; fr[d][3] = b1[1];
             }
             if (st + 2 < NS)
 #pragma unroll
-                for (int d = 0; d < MMA_DEC; ++d)
-                    load_words<K2>(words[d], tp + (size_t)((st + 2) * MMA_KB + d) * kstride, lane);
+                for (int d = 0; d < MMA_DEC_; ++d)
+                    load_words<K2>(words[d], tp + (size_t)((st + 2) * KB + d) * kstride, lane);
         }
         if (live) {
 #pragma unroll
-            for (int kk = 0; kk < MMA_KB; ++kk) {
+            for (int kk = 0; kk < KB; ++kk) {
                 uint32_t a[4];
                 ldmatrix_x4(a, &As[stage][lrow][kk * 16 + lcol]);
 #pragma unroll
@@ -633,7 +641,7 @@ __device__ __forceinline__ void mma_slice(const uint32_t* __restrict__ T, int NT
                 }
             }
         }
-        left -= MMA_KB;
+        left -= KB;
         if (left == 0) {                                      // a chain ends: into its split's sum, in order
 #pragma unroll
             for (int i = 0; i < 4; ++i)
@@ -653,23 +661,26 @@ __device__ __forceinline__ void mma_slice(const uint32_t* __restrict__ T, int NT
         }
         if (st + 1 < NS)
 #pragma unroll
-            for (int d = 0; d < MMA_DEC; ++d)
+            for (int d = 0; d < MMA_DEC_; ++d)
                 bsh[buf ^ 1][dk + d][dn][lane] = make_uint4(fr[d][0], fr[d][1], fr[d][2], fr[d][3]);
         cp_async_wait<MMA_STAGES - 2>();                     // this thread's copies for the next step have landed
         __syncthreads();
     }
 }
 
-template <int CB, int LO, int HI, bool FOLD>
+template <int CB, int LO, int HI, bool FOLD, int KB>
 __global__ void __launch_bounds__(256) grouped_mma_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int WK, int maxm, int slots, int nexp) {
-    const int u = blockIdx.z % nexp;
+    float* __restrict__ Z, int K, int N, int P, int SK, int WK, int maxm, int slots, int nexp,
+    const int* __restrict__ work) {
+    // the work list (as grouped_rows_kernel's): grid.z walks (expert place, 64-row member block) pairs
+    const int zz = (int)(blockIdx.z % nexp);
+    const int u = work ? work[2 * zz] : zz;
     if (u >= ucount[0]) return;
-    const int mb = blockIdx.x;
-    const int mat = blockIdx.z / nexp;
+    const int mb = work ? work[2 * zz + 1] : (int)blockIdx.x;
+    const int mat = (int)(blockIdx.z / nexp);
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -680,8 +691,16 @@ __global__ void __launch_bounds__(256) grouped_mma_kernel(
     const int per_range = KT / (SK * WK);
 
     __shared__ int rows_sh[MMA_ROWS];
-    __shared__ __align__(16) half As[MMA_STAGES][MMA_ROWS][MMA_LD];
-    __shared__ uint4 bsh[2][MMA_KB][4][32];                   // two steps' B fragments: [step][k tile][n16][lane]
+    // the staged rows and two steps' B fragments ([step][k tile][n16][lane]): static up to 4 k tiles a step, dynamic
+    // at 6 (64.5 KB, past the 48 KB of static shared memory; the launcher sets the attribute)
+    using AsT = half[MMA_STAGES][MMA_ROWS][KB * 16 + 8];
+    using BsT = uint4[2][KB][4][32];
+    constexpr bool DYN = KB > 4;
+    __shared__ __align__(16) half As_s[DYN ? 1 : MMA_STAGES][DYN ? 1 : MMA_ROWS][DYN ? 8 : KB * 16 + 8];
+    __shared__ uint4 bsh_s[DYN ? 1 : 2][DYN ? 1 : KB][4][32];
+    extern __shared__ __align__(16) unsigned char mma_dyn[];
+    AsT& As = DYN ? *reinterpret_cast<AsT*>(mma_dyn) : *reinterpret_cast<AsT*>(&As_s[0][0][0]);
+    BsT& bsh = DYN ? *reinterpret_cast<BsT*>(mma_dyn + sizeof(AsT)) : *reinterpret_cast<BsT*>(&bsh_s[0][0][0][0]);
     for (int i = threadIdx.x; i < MMA_ROWS; i += 256) {
         const int m = mb * MMA_ROWS + i;
         const int code = m < maxm ? members[u * maxm + m] : -1;
@@ -704,7 +723,7 @@ __global__ void __launch_bounds__(256) grouped_mma_kernel(
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            mma_slice<CB, K2_, FOLD>(T, NTILES, KT, per_range, WK, nt0, X, K, rows_sh, live, warp, lane, As, bsh, \
+            mma_slice<CB, K2_, FOLD, KB>(T, NTILES, KT, per_range, WK, nt0, X, K, rows_sh, live, warp, lane, As, bsh, \
                                      tot);                                                                      \
         else                                                                                                    \
             __trap();                                                                                           \
@@ -1758,16 +1777,20 @@ struct GroupedArgs {
     int mats, nt, warps, pf, lo, hi;
     int g = 1;           // grouped_rows: member tiles a program
     int fold = 0;        // grouped_rows / grouped_mma: one program runs every split (writes their sum: Z [mats, 1, P, N])
+    const int* work = nullptr;   // grouped_rows / grouped_mma: (expert place, member group) pairs, nwork of them
+    int nwork = 0;
 };
 
 template <int CB>
 void grouped_rows_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MG = (a.maxm + 16 * a.g - 1) / (16 * a.g);
-    dim3 grid((unsigned)MG, (unsigned)(a.N / (16 * a.nt)), (unsigned)(a.nexp_max * a.mats * (a.fold ? 1 : a.SK)));
+    if (a.work && a.nwork == 0) return;                   // no member group anywhere
+    const int nz = a.work ? a.nwork : a.nexp_max;         // grid.z's places: the list's pairs, or every place
+    dim3 grid(a.work ? 1u : (unsigned)MG, (unsigned)(a.N / (16 * a.nt)), (unsigned)(nz * a.mats * (a.fold ? 1 : a.SK)));
 #define TF_LAUNCH_F(NT_, W_, PF_, G_, LO_, HI_, F_)                                                             \
     grouped_rows_kernel<CB, NT_, W_, PF_, LO_, HI_, G_, F_><<<grid, W_ * 32, 0, stream>>>(                      \
         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK, a.maxm, \
-        a.slots, a.nexp_max)
+        a.slots, nz, a.work)
 #define TF_LAUNCH(NT_, W_, PF_, G_, LO_, HI_)                                                                   \
     do {                                                                                                        \
         if (a.fold) TF_LAUNCH_F(NT_, W_, PF_, G_, LO_, HI_, true);                                              \
@@ -1791,22 +1814,42 @@ void grouped_rows_launch(const GroupedArgs& a, cudaStream_t stream) {
 template <int CB>
 void grouped_mma_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MB = (a.maxm + MMA_ROWS - 1) / MMA_ROWS;
-    dim3 grid((unsigned)MB, (unsigned)(a.N / MMA_COLS), (unsigned)(a.nexp_max * a.mats));
+    if (a.work && a.nwork == 0) return;                   // no member block anywhere
+    const int nz = a.work ? a.nwork : a.nexp_max;         // grid.z's places: the list's pairs, or every place
+    dim3 grid(a.work ? 1u : (unsigned)MB, (unsigned)(a.N / MMA_COLS), (unsigned)(nz * a.mats));
+#define TF_LAUNCH_K(LO_, HI_, F_, KB_)                                                                         \
+    do {                                                                                                        \
+        auto fn = grouped_mma_kernel<CB, LO_, HI_, F_, KB_>;                                                     \
+        const size_t dyn = KB_ > 4 ? sizeof(half) * MMA_STAGES * MMA_ROWS * (KB_ * 16 + 8) +                    \
+                                         sizeof(uint4) * 2 * KB_ * 4 * 32 : 0;                                  \
+        if (dyn) C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)dyn)); \
+        fn<<<grid, 256, dyn, stream>>>(a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members,  \
+                                       a.z, a.K, a.N, a.P, a.SK, a.warps, a.maxm, a.slots, nz, a.work);        \
+    } while (0)
 #define TF_LAUNCH_F(LO_, HI_, F_)                                                                               \
-    grouped_mma_kernel<CB, LO_, HI_, F_><<<grid, 256, 0, stream>>>(                                             \
-        a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,        \
-        a.warps, a.maxm, a.slots, a.nexp_max)
+    do {                                                                                                        \
+        if (kb == 4) TF_LAUNCH_K(LO_, HI_, F_, 4);                                                              \
+        else if (kb == 6) TF_LAUNCH_K(LO_, HI_, F_, 6);                                                         \
+        else TF_LAUNCH_K(LO_, HI_, F_, 2);                                                                      \
+    } while (0)
 #define TF_LAUNCH(LO_, HI_)                                                                                     \
     do {                                                                                                        \
         if (a.fold) TF_LAUNCH_F(LO_, HI_, true);                                                                \
         else TF_LAUNCH_F(LO_, HI_, false);                                                                      \
     } while (0)
-    TORCH_CHECK((a.K / 16) % (a.SK * a.warps * MMA_KB) == 0, "prompt mma: ", MMA_KB, " k tiles a step must divide a chain");
+    // MMA_KB (4) k tiles a step where they divide a chain, else 6 or 2 where the caller allows them (a.pf: 1 = 2 a
+    // step, 2 = 6 a step; a TP2 DeepSeek-V4.1 rank's down has 18-tile chains); each chain's k tiles run in the same
+    // order whatever the step, so every output keeps its bits
+    const int chain = (a.K / 16) / (a.SK * a.warps);
+    TORCH_CHECK((a.K / 16) % (a.SK * a.warps) == 0, "prompt mma: K tiles do not split into the chains");
+    const int kb = chain % MMA_KB == 0 ? 4 : ((a.pf & 2) && chain % 6 == 0) ? 6 : ((a.pf & 1) && chain % 2 == 0) ? 2 : 0;
+    TORCH_CHECK(kb != 0, "prompt mma: chains of ", chain, " k tiles take no allowed step");
     if (a.lo == 8 && a.hi == 8) TF_LAUNCH(8, 8);
     else if (a.lo >= 2 && a.hi <= 10) TF_LAUNCH(2, 10);
     else TF_LAUNCH(2, 16);
 #undef TF_LAUNCH
 #undef TF_LAUNCH_F
+#undef TF_LAUNCH_K
 }
 
 // grouped_mma2_kernel: a program per (64 member rows, 256 columns, expert, matrix); shared memory sized to the widest

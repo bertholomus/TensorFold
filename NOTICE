@@ -44,6 +44,7 @@ Modified upstream files:
   src/tensorfold/serve_options.py              --vision for families with their own image path (CUDA_VISION)
   src/tensorfold/cuda/reply_text.py            DSML tool-call parsing for DeepSeek-V4.1
   src/tensorfold/server/request_options.py     reasoning_effort "off" heard as "none"
+  src/tensorfold/server/authentication.py      the no-key startup line names the CUDA server's TF_API_KEY gate
   .gitignore                                   ignores macOS ._* files
 
 The "git log" of this branch and tools/dsv41/ATTRIBUTION.md describe the changes and their sources.

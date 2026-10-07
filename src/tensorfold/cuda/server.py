@@ -18,6 +18,7 @@ from tensorfold.server.messages import validate_modalities
 from tensorfold.server.probabilities import TokenBytes, probability_options
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
 from tensorfold.server.stopping import matched_stop, stop_options
+from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
@@ -72,7 +73,8 @@ class App:
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
                  context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
                  aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
-                 vision_image_tokens: int | None = None):
+                 vision_image_tokens: int | None = None,
+                 background_ids: tuple[str, ...] | frozenset[str] = ()):
         from tokenizers import Tokenizer
 
         self.engine = engine
@@ -82,6 +84,7 @@ class App:
                         **({} if vision_image_tokens is None else {"max_visual_tokens": vision_image_tokens}))
         self.served = served
         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
+        self.background_ids = frozenset(background_ids)   # --name-priority ID=background: a default for this id
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
@@ -128,6 +131,8 @@ class App:
         if problem is None and grammar.request_spec(body) and "constraint" not in inspect.signature(
                 self.engine.generate).parameters:
             problem = "this model's engine does not enforce structured output"
+        if problem is None and grammar.request_spec(body) and getattr(self.engine, "refuses_structured_output", None):
+            problem = self.engine.refuses_structured_output       # e.g. Flash Next on two ranks with --parallel
         return problem
 
     def _grammars(self) -> grammar.Grammars:
@@ -482,8 +487,9 @@ class App:
         shaped = prepared.grammar is not None or prepared.think_budget > 0
         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
         budget = self._think_budget(prepared, think_end)
-        # priority "background" (or a session-title request): after the others, as on the Mac
-        background = body.get("priority") == "background" or (chat and is_title_request(body.get("messages"), tools))
+        # background: the request's own priority, else --name-priority's default for its id; title requests always
+        by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
+        background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
         concurrent = getattr(self.engine, "concurrent", False)
         turns = None if concurrent else self._turns()
         if concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
@@ -552,6 +558,9 @@ class App:
         if tail:
             final["content"] = tail
         finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
+        warning = unanswered(finish, chat and thinking, content, calls)
+        if warning:
+            print(warning, flush=True)
         print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}

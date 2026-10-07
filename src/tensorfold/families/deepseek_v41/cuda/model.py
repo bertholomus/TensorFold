@@ -21,7 +21,7 @@ from tensorfold.cuda.exl3 import prefill as exl3_prefill
 
 from ..config import Cfg
 from . import kernels as K
-from ..ops import (BF16, F32, EngramHasher, fp4_qd, fp8_qd, freqs_cis, hc_split_sinkhorn, rms_norm, rope_,
+from ..ops import (BF16, F32, EngramHasher, HostIds, RopeTables, fp4_qd, fp8_qd, hc_split_sinkhorn, rms_norm, rope_,
                    sparse_attn)
 
 RAW = 64                            # per-position compressor inputs kept (a verify window rolls back by length alone)
@@ -401,7 +401,7 @@ class SeqCache:
     index_k: dict = field(default_factory=dict)       # kv-source layer -> [cap // ratio, idx_dim] bf16 (fp4-rounded)
     comp_raw: dict = field(default_factory=dict)      # ratio>1 kv-source layer -> (kv, score) [RAW, D] f32 by position
     tokens: torch.Tensor | None = None                # [cap] int64 token ids
-    host: list = field(default_factory=list)          # the same ids on the host (Engram hashes)
+    host: HostIds = field(default_factory=HostIds)    # the same ids on the host (Engram hashes; int32)
     ring_size: int = 0
 
 
@@ -691,6 +691,7 @@ class Model:
         c = self.cfg
         self.Hl = c.n_heads // w.world
         self.scratch: dict = {}
+        self.rope = RopeTables(c)
         self._zero = torch.zeros((1,), dtype=torch.int64, device="cuda")
         if not KERNELS and KV_QUANT:
             raise ValueError("TF_DS_KERNELS=0 (the torch path) reads bf16 caches only: also set TF_DS_KV=bf16")
@@ -766,29 +767,27 @@ class Model:
         v.tokens = pool.tokens[base:base + size]
         return v
 
-    def _freqs(self, layer: int, n: int) -> torch.Tensor:
-        c = self.cfg
-        if c.compress_ratios[layer]:
-            return freqs_cis(c.rope_dim, n, c.orig_len, c.compress_theta, c.rope_factor, c.beta_fast, c.beta_slow)
-        return freqs_cis(c.rope_dim, n, 0, c.rope_theta, c.rope_factor, c.beta_fast, c.beta_slow)
-
     def _cs(self, layer: int, sc: SeqCache):
-        """(cos, sin) fp32 [cap, rope_dim / 2] for this layer's rope kind."""
+        """(cos, sin) fp32 [rows, rope_dim / 2] for this layer's rope kind: one table a kind for the engine's whole
+        window (``rope_cap``) whatever the cache, so a stream's prompt and its rounds read the same rows
+        (ops.RopeTables: no row's bits depend on the table's length, and the rows below 2^19 keep the bits of the
+        2^19-row table every earlier lane read)."""
 
-        f = self._f(layer, sc)
-        key = (self.cfg.compress_ratios[layer] > 0, f.shape[0])
-        t = self.scratch.get(("cs", key))
-        if t is None:
-            t = (f.real.contiguous().float(), f.imag.contiguous().float())
-            self.scratch[("cs", key)] = t
-        return t
+        return self.rope.cs(self.cfg.compress_ratios[layer] > 0, max(sc.cap, getattr(self, "rope_cap", 0)))
+
+    def _rot(self, layer: int, sc: SeqCache, idx) -> torch.Tensor:
+        """The complex rotations at positions ``idx`` (a slice or an index tensor): _cs's rows as one complex tensor,
+        the values the complex table held (cos and sin are its real and imaginary parts)."""
+
+        cos, sin = self._cs(layer, sc)
+        return torch.complex(cos[idx], sin[idx])
 
     def _f(self, layer: int, sc: SeqCache) -> torch.Tensor:
-        # one table per rope kind, for the engine's whole window (``rope_cap``) whatever the cache: a table built at
-        # another length can differ in a row's last bits (the CPU's vectorized sin/cos), and a stream's prompt and its
-        # rounds must read the same rows
-        cap = 1 << max(12, (max(sc.cap, getattr(self, "rope_cap", 0)) - 1).bit_length())
-        return self._freqs(layer, cap)
+        """This layer's rotations as one complex table [rows, rope_dim / 2], made from _cs's table and not kept (the
+        engine reads _cs and _rot; this is for tools)."""
+
+        cos, sin = self._cs(layer, sc)
+        return torch.complex(cos, sin)
 
     # -- mHC -------------------------------------------------------------------------------------------------------
     def hc_mixes(self, h: torch.Tensor, params):
@@ -865,13 +864,13 @@ class Model:
         n = x.shape[0]
         rd, hd = c.rope_dim, c.head_dim
         ratio = lay.ratio
-        f = self._f(lay.idx, sc)
+        fs = self._rot(lay.idx, sc, slice(start, start + n))           # this block's rows' rotations
         pos = torch.arange(start, start + n, device=x.device)
         qr = rms_norm(mm(lay.wq_a, x), lay.q_norm, c.eps)
         q = mm(lay.wq_b, qr).view(n, self.Hl, hd)
-        rope_(q[..., -rd:], f[start:start + n])
+        rope_(q[..., -rd:], fs)
         kv = rms_norm(mm(lay.wkv, x), lay.kv_norm, c.eps)
-        rope_(kv[..., -rd:], f[start:start + n])
+        rope_(kv[..., -rd:], fs)
         if KV_QUANT:
             kv = fp8_qd(kv, 32)
         # window keys: the ring's last (window - 1) positions before start, then this block's rows
@@ -891,13 +890,13 @@ class Model:
                 shared["kv_layer"] = lay.idx
                 if lat is not None and lay.idx_wk is not None:
                     k = rms_norm(mm(lay.idx_wk, lat), lay.idx_k_norm, c.eps)
-                    rope_(k[..., -rd:], f[groups * ratio])
+                    rope_(k[..., -rd:], self._rot(lay.idx, sc, groups * ratio))
                     if KV_QUANT:
                         k = fp4_qd(k, 32, e4m3_scale=False)
                     sc.index_k[lay.idx][groups] = k
                 if lat is not None:
                     lat = lat.clone()
-                    rope_(lat[..., -rd:], f[groups * ratio])
+                    rope_(lat[..., -rd:], self._rot(lay.idx, sc, groups * ratio))
                     if KV_QUANT:
                         lat = fp4_qd(lat, 16, e4m3_scale=True)
                     sc.comp[lay.idx][groups] = lat
@@ -909,7 +908,7 @@ class Model:
                     cidx = torch.full((n, 0), -1, dtype=torch.long, device=x.device)
                 else:
                     iq = mm(lay.idx_wq_b, qr).view(n, c.idx_heads, c.idx_dim)
-                    rope_(iq[..., -rd:], f[start:start + n])
+                    rope_(iq[..., -rd:], fs)
                     if KV_QUANT:
                         iq = fp4_qd(iq, 32, e4m3_scale=False)
                     wts = (x.to(F32) @ lay.idx_proj.t()).to(BF16) * (c.idx_dim ** -0.5 * c.idx_heads ** -0.5)
@@ -934,7 +933,7 @@ class Model:
             off = keys_w.shape[0]
             idx = torch.cat([widx, torch.where(cidx >= 0, cidx + off, -1)], -1)
         o = sparse_attn(q, keys, lay.sink, idx, hd ** -0.5)
-        rope_(o[..., -rd:], f[start:start + n], inverse=True)
+        rope_(o[..., -rd:], fs, inverse=True)
         # write this block's window keys into the ring (positions start .. start+n-1)
         keep = min(n, R)
         ring[pos[-keep:] % R] = kv[-keep:]
@@ -949,13 +948,14 @@ class Model:
         rd, ratio = c.rope_dim, lay.ratio
         lat, groups = self._compress(lay, x, sc, start)
         shared["kv_layer"] = lay.idx
+        rot = self._rot(lay.idx, sc, groups * ratio) if lat is not None else None    # the groups' rotations
         if lat is not None and lay.idx_wk is not None:
             k = rms_norm(mm(lay.idx_wk, lat), lay.idx_k_norm, c.eps)
-            rope_(k[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
+            rope_(k[..., -rd:], rot)
             store_rows(sc.index_k[lay.idx], groups, k, 32, False)
         if lat is not None:
             lat = lat.clone()
-            rope_(lat[..., -rd:], self._f(lay.idx, sc)[groups * ratio])
+            rope_(lat[..., -rd:], rot)
             store_rows(sc.comp[lay.idx], groups, lat, 16, True)
 
     def attention_k(self, lay, x: torch.Tensor, sc: SeqCache, start: int, shared: dict, pos: torch.Tensor,
@@ -1009,9 +1009,22 @@ class Model:
                     cidx = torch.empty((n, kk), dtype=torch.int64, device=x.device)
                     # rows in blocks so the [rows, n_comp] score matrix stays bounded at long contexts
                     rb = max(16, min(n, (1 << 26) // (4 * max(n_comp_end, 1))))
+                    # (switch "prompt_keys") layers before the candidate source: the score kernel writes the top-k
+                    # keys and each 64-key tile's maximum, and topk_select_pruned searches only the k tiles with the
+                    # largest maxima (exact: keys are unique), in the same row blocks, so the same kernels score each
+                    # row: the same selection, without the fp32 scores, six torch passes to keys and a full top-k
+                    keyed = (K.on("prompt_keys") and lay.idx != c.cand_source and not 0 <= c.cand_source < lay.idx
+                             and kk & (kk - 1) == 0)
                     cand_parts = []
                     for r0 in range(0, n, rb):
                         r1 = min(n, r0 + rb)
+                        if keyed:
+                            vr = vis[r0:r1].contiguous()
+                            keys, tm = K.index_score(iq[r0:r1].contiguous(), sc.index_k[src],
+                                                     wts[r0:r1].contiguous(), vr, n_comp_end, keys=True, tmax=True)
+                            cidx[r0:r1] = K.topk_select_pruned(keys, tm, kk, vr)
+                            del keys, tm
+                            continue
                         score = K.index_score(iq[r0:r1].contiguous(), sc.index_k[src], wts[r0:r1].contiguous(),
                                               vis[r0:r1].contiguous(), n_comp_end)
                         if lay.idx == c.cand_source:
@@ -1182,9 +1195,8 @@ class Model:
         if self.engram is not None:
             if host_ids is None:
                 host_ids = ids.tolist()
-            del sc.host[start:]
-            sc.host.extend(int(t) for t in host_ids)
-            hashes = self.engram.hashes(sc.host, start, n)                          # [n, L, cols] host
+            sc.host.set(start, host_ids)
+            hashes = self.engram.hashes(sc.host.view(), start, n)                   # [n, L, cols] host
         shared: dict = {}
         if KERNELS:
             return self._forward_k(sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay, img)
@@ -1227,6 +1239,7 @@ class Model:
         post = torch.empty((n, c.hc), dtype=F32, device=dev)
         comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
         floor, kv_done = 0, False
+        h_alt = None                                             # (switch "hc_pf") the streams' second buffer
         self.taps_start = start
         for lay in w.layers:
             if replay is not None and lay.idx == c.n_layers // 2:
@@ -1260,19 +1273,32 @@ class Model:
             if taps is not None and lay.idx in c.dspark_taps:
                 taps.append(h.to(F32).mean(1).to(BF16))
             fn, scale, base = lay.hc_attn
+            hc_pf = K.on("hc_pf") and c.dim % 1024 == 0
             with _T("hc"):
-                K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb,
-                         part)
+                if hc_pf:
+                    K.hc_pre2(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post,
+                              comb, part)
+                else:
+                    K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post,
+                             comb, part)
             with _T("attn_r%d" % (2 if lay.comp_wkv is not None else 1 if lay.idx_wq_b is not None else 0)):
                 pa = self.attention_k(lay, x, sc, start, shared, pos, floor=floor,
                                       kv_done=kv_done and lay.idx == c.n_layers // 2)
             with _T("gather"):
                 g = self.comm.gather(pa)
             with _T("hc"):
-                K.hc_post(g, h, post, comb, h)
                 fn, scale, base = lay.hc_ffn
-                K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post, comb,
-                         part)
+                if hc_pf:
+                    # (switch "hc_pf") the attention post fused into the FFN mixes: the posted streams go to the
+                    # other buffer (programs still read h), which becomes h
+                    if h_alt is None or h_alt.shape != h.shape:
+                        h_alt = torch.empty_like(h)
+                    h, h_alt = K.hc_pre2(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x,
+                                         pre_f, post, comb, part, gathered=g, h_out=h_alt), h
+                else:
+                    K.hc_post(g, h, post, comb, h)
+                    K.hc_pre(h, fn, scale, base, pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_f, post,
+                             comb, part)
             with _T("moe"):
                 pm = self.moe(lay, x, img=img)
             with _T("gather"):

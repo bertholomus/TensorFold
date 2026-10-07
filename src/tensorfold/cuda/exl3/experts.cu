@@ -143,6 +143,59 @@ __global__ void __launch_bounds__(PLACE_THREADS) group_place_kernel(const int* _
     for (int j = base + threadIdx.x; j < maxm; j += PLACE_THREADS) members[u * maxm + j] = -1;
 }
 
+// Prompt chunks' work lists (experts.GROUP_LIST): the (expert place, member group) pairs of the used places, groups of
+// rows0 (rows1) member rows, in place order and in group order within a place (the order the grids ran them in), then
+// sentinel pairs (a place past every used one: its programs return at once) up to each list's length n0 (n1), a bound
+// the host takes from the shape alone. One block; no host read of the lists' sizes.
+constexpr int LIST_THREADS = 1024;
+constexpr int LIST_NONE = 0x7fffffff;
+
+__global__ void __launch_bounds__(LIST_THREADS) work_list_kernel(const int* __restrict__ counts,
+                                                                 const int* __restrict__ uids,
+                                                                 const int* __restrict__ ucount, int maxu,
+                                                                 int* __restrict__ work0, int rows0, int n0,
+                                                                 int* __restrict__ work1, int rows1, int n1) {
+    __shared__ int warp_tot[LIST_THREADS / 32];
+    const int nu = ucount[0];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int l = 0; l < (work1 ? 2 : 1); ++l) {
+        int* work = l ? work1 : work0;
+        const int rows = l ? rows1 : rows0, n = l ? n1 : n0;
+        int base = 0;
+        for (int start = 0; start < maxu; start += LIST_THREADS) {
+            const int p = start + threadIdx.x;
+            const int g = (p < maxu && p < nu) ? (counts[uids[p]] + rows - 1) / rows : 0;
+            int inc = g;                              // inclusive scan of the groups in thread (= place) order
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const int v = __shfl_up_sync(0xffffffffu, inc, o);
+                if (lane >= o) inc += v;
+            }
+            if (lane == 31) warp_tot[warp] = inc;
+            __syncthreads();
+            int prior = 0, total = 0;
+            for (int w = 0; w < LIST_THREADS / 32; ++w) {
+                prior += w < warp ? warp_tot[w] : 0;
+                total += warp_tot[w];
+            }
+            const int first = base + prior + inc - g;
+            for (int j = 0; j < g; ++j) {
+                const int q = first + j;
+                if (q < n) {                          // (always: n bounds every list the counts allow)
+                    work[2 * q] = p;
+                    work[2 * q + 1] = j;
+                }
+            }
+            base += total;
+            __syncthreads();                          // warp_tot is rewritten by the next round
+        }
+        for (int q = base + threadIdx.x; q < n; q += LIST_THREADS) {
+            work[2 * q] = LIST_NONE;
+            work[2 * q + 1] = 0;
+        }
+    }
+}
+
 // Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
@@ -504,7 +557,8 @@ void exl3x_grouped_rows_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
                              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids,
                              const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z, int64_t mats,
                              int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t cb, int64_t nt,
-                             int64_t warps, int64_t pf, int64_t g, int64_t lo, int64_t hi, int64_t fold) {
+                             int64_t warps, int64_t pf, int64_t g, int64_t lo, int64_t hi, int64_t fold,
+                             const at::Tensor& work) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % (16 * nt) == 0, "K and N must split evenly");
     TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
     tf_exl3x::GroupedArgs a;
@@ -523,6 +577,8 @@ void exl3x_grouped_rows_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
     a.mats = (int)mats; a.nt = (int)nt; a.warps = (int)warps; a.pf = (int)pf; a.lo = (int)lo; a.hi = (int)hi;
     a.g = (int)g;
     a.fold = (int)fold;
+    a.work = work.numel() ? work.data_ptr<int>() : nullptr;
+    a.nwork = (int)(work.numel() / 2);
     auto stream = at::cuda::getCurrentCUDAStream();
     if (cb == 0) tf_exl3x::grouped_rows_launch<0>(a, stream);
     else if (cb == 1) tf_exl3x::grouped_rows_launch<1>(a, stream);
@@ -535,8 +591,10 @@ void exl3x_grouped_mma_cuda(const at::Tensor& X0, const at::Tensor& X1, const at
                             const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids,
                             const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z, int64_t mats,
                             int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t cb, int64_t warps,
-                            int64_t lo, int64_t hi, int64_t fold) {
+                            int64_t lo, int64_t hi, int64_t fold, const at::Tensor& work) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % tf_exl3x::MMA_COLS == 0, "K and N must split evenly");
+    const int64_t steps = fold >> 1;                         // the steps besides 4 a launch may take (1: 2, 2: 6)
+    fold &= 1;
     TORCH_CHECK(fold || SK == 1, "an unfolded prompt mma launch writes one split");
     TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
     tf_exl3x::GroupedArgs a;
@@ -552,9 +610,11 @@ void exl3x_grouped_mma_cuda(const at::Tensor& X0, const at::Tensor& X1, const at
     a.z = Z.data_ptr<float>();
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = (int)SK; a.maxm = (int)members.size(1); a.slots = (int)slots;
     a.nexp_max = (int)uids.size(0);
-    a.mats = (int)mats; a.nt = tf_exl3x::MMA_COLS / 16; a.warps = (int)warps; a.pf = tf_exl3x::MMA_KB;
+    a.mats = (int)mats; a.nt = tf_exl3x::MMA_COLS / 16; a.warps = (int)warps; a.pf = (int)steps;
     a.lo = (int)lo; a.hi = (int)hi;
     a.fold = (int)fold;
+    a.work = work.numel() ? work.data_ptr<int>() : nullptr;
+    a.nwork = (int)(work.numel() / 2);
     auto stream = at::cuda::getCurrentCUDAStream();
     if (cb == 0) tf_exl3x::grouped_mma_launch<0>(a, stream);
     else if (cb == 1) tf_exl3x::grouped_mma_launch<1>(a, stream);
@@ -716,6 +776,15 @@ void exl3x_group_place_cuda(const at::Tensor& pick, const at::Tensor& counts, at
     group_place_kernel<<<(unsigned)E, PLACE_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         pick.data_ptr<int>(), counts.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(),
         members.data_ptr<int>(), (int)(R * slots), (int)slots, (int)E, (int)members.size(1));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_work_list_cuda(const at::Tensor& counts, const at::Tensor& uids, const at::Tensor& ucount,
+                          at::Tensor& work0, int64_t rows0, at::Tensor& work1, int64_t rows1) {
+    work_list_kernel<<<1, LIST_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
+        counts.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), (int)uids.numel(),
+        work0.data_ptr<int>(), (int)rows0, (int)(work0.numel() / 2),
+        work1.numel() ? work1.data_ptr<int>() : nullptr, (int)rows1, (int)(work1.numel() / 2));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

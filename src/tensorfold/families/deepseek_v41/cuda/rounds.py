@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 
 import torch
+import torch.nn.functional as F
 
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
@@ -32,6 +33,12 @@ ENGRAM_TOUCH = os.environ.get("TF_DS_ENGRAM_TOUCH", "1") == "1"
 # non-blocking copy, not five synchronous ones (each waited for the stream: GPU idle between the drafts and the forward);
 # also the drafter's inputs (dspark.py; the absorb's indices stay synchronous: pinned was slower there). 0: as before
 ONE_COPY = os.environ.get("TF_DS_ONE_COPY", "1") == "1"
+# TF_DS_ROUND_SHARED_OUT=1 (default): a RoundRunner's graphs write their logits and taps into one pair of buffers the
+# runner makes before any capture ([16, vocab] fp32, [16, taps] bf16), not a pair a graph in the graph pool (64 graphs
+# at ready held ~284 MiB a rank; long contexts capture more). The same copies of the same values: a round's logits and
+# taps are read (sampled, absorbed) before the runner's next round, so one pair serves every graph. forward() returns
+# views of the pair, valid until the runner's next forward (clone to keep them). 0: a pair a graph, as before
+SHARED_OUT = os.environ.get("TF_DS_ROUND_SHARED_OUT", "1") == "1"
 
 
 def _candidates_fast(score: torch.Tensor, vis: torch.Tensor, nblocks: int, bsize: int) -> torch.Tensor:
@@ -48,14 +55,28 @@ def _candidates_fast(score: torch.Tensor, vis: torch.Tensor, nblocks: int, bsize
     return (s > float("-inf")) | (torch.arange(nb, device=score.device)[None] == last[:, None])
 
 
+def _candidate_blocks(score: torch.Tensor, vis: torch.Tensor, nblocks: int, bsize: int) -> torch.Tensor:
+    """model._candidates' pool as block ids [rows, nblocks] int32 (-1: no block), for index_keys_cand: the blocks
+    _candidates' mask sets (the same top-k of the block maxima, the newest block pinned in, finite maxima only)."""
+
+    width = score.shape[-1]
+    s = F.pad(score, (0, -width % bsize), value=float("-inf")).unflatten(-1, (-1, bsize)).amax(-1)
+    nb = s.shape[-1]
+    last = (vis - 1) // bsize
+    s = s.masked_fill(torch.arange(nb, device=score.device)[None] == last[:, None], float("inf"))
+    idx = K.topk_indices(s, min(nblocks, nb))
+    return torch.where(s.gather(-1, idx) > float("-inf"), idx, -1).to(torch.int32)
+
+
 class RoundDecoder:
     """Graph-captured forward of R rows from several streams over a pool; inputs in device buffers: token ids,
     positions, slots, Engram rows."""
 
-    def __init__(self, model: Model, pool: PoolCache, rows: int, bucket: int, taps: bool):
+    def __init__(self, model: Model, pool: PoolCache, rows: int, bucket: int, taps: bool, out: tuple | None = None):
         if rows > MAX_ROWS:
             raise ValueError(f"a concurrent round holds {MAX_ROWS} rows at most, not {rows}")
         self.m, self.pool, self.R, self.bucket, self.want_taps = model, pool, rows, bucket, taps
+        self.out = out                                  # (logits, taps) buffers the runner's graphs share (SHARED_OUT)
         c = model.cfg
         dev = "cuda"
         self.inputs = torch.zeros((5, rows), dtype=torch.long, device=dev)  # one buffer, so one copy fills it
@@ -314,18 +335,37 @@ class RoundDecoder:
                 wscale = c.idx_dim ** -0.5 * c.idx_heads ** -0.5
                 wts = K.rowmm_wts(x, lay.idx_proj_h, wscale) if fused else rowmm(x, lay.idx_proj_h).to(BF16) * wscale
                 kk = min(c.idx_topk, nb)
-                if fused and lay.idx != c.cand_source and kk & (kk - 1) == 0:
+                if fused and 0 <= c.cand_source < lay.idx and kk & (kk - 1) == 0 and "cblk" in shared:
+                    # past the pool's width: score the pool's blocks only (the same keys there, -inf keys elsewhere
+                    # left out: the same top-k)
+                    keys = K.index_keys_cand(iq, pool.index_k[src], wts, vis, nb, shared["cblk"], c.cand_block,
+                                             base=cbase)
+                    shared["topk"] = K.topk_select(keys, kk, vis)
+                elif fused and lay.idx != c.cand_source and kk & (kk - 1) == 0:
                     # scores -> (candidate mask) -> top-k keys in one launch, the top-k's indices sorted and masked
                     # in one more (the cand-source layer keeps the scores for _candidates)
                     cand = shared["cand"] if 0 <= c.cand_source < lay.idx else None
-                    keys = K.index_keys(iq, pool.index_k[src], wts, vis, nb, base=cbase, cand=cand,
-                                        cand_block=c.cand_block)
-                    shared["topk"] = K.topk_select(keys, kk, vis)
+                    if nb > K.TOPK_FUSED_MAX and K.on("topk_prune"):
+                        # long buckets: each 64-key tile's maximum too; the top-k from the k best tiles (exact)
+                        keys, tm = K.index_keys(iq, pool.index_k[src], wts, vis, nb, base=cbase, cand=cand,
+                                                cand_block=c.cand_block, tmax=True, pruned_k=kk)
+                        shared["topk"] = K.topk_select_pruned(keys, tm, kk, vis)
+                    else:
+                        keys = K.index_keys(iq, pool.index_k[src], wts, vis, nb, base=cbase, cand=cand,
+                                            cand_block=c.cand_block)
+                        shared["topk"] = K.topk_select(keys, kk, vis)
                 elif fused and lay.idx == c.cand_source and kk & (kk - 1) == 0:
                     # the cand-source layer: the scores for the candidate pool, then their keys' top-k as above
                     score = K.index_score(iq, pool.index_k[src], wts, vis, nb, base=cbase)
-                    shared["cand"] = _candidates_fast(score, vis, c.cand_blocks, c.cand_block)
-                    shared["topk"] = K.topk_select(K.score_keys(score), kk, vis)
+                    if K.on("cand_only") and nb > c.cand_blocks * c.cand_block:
+                        shared["cblk"] = _candidate_blocks(score, vis, c.cand_blocks, c.cand_block)
+                    else:
+                        shared["cand"] = _candidates_fast(score, vis, c.cand_blocks, c.cand_block)
+                    if nb > K.TOPK_FUSED_MAX and K.on("topk_prune"):
+                        keys, tm = K.score_keys(score, tmax=True)
+                        shared["topk"] = K.topk_select_pruned(keys, tm, kk, vis)
+                    else:
+                        shared["topk"] = K.topk_select(K.score_keys(score), kk, vis)
                 else:
                     score = K.index_score(iq, pool.index_k[src], wts, vis, nb, base=cbase)
                     if lay.idx == c.cand_source:
@@ -410,10 +450,18 @@ class RoundDecoder:
         xc = K.collapse_norm(h, pre.contiguous(), w.norm, c.eps)
         local = mm(w.head, xc, F32)
         g = m.comm.gather(local)
-        self.logits = g.permute(1, 0, 2).reshape(n, -1)
+        out = self.out
+        if out is not None and out[0].shape[1] == g.shape[0] * g.shape[2]:
+            lg = out[0][:n]
+            lg.view(n, g.shape[0], g.shape[2]).copy_(g.permute(1, 0, 2))   # reshape's copy, into the shared rows
+            self.logits = lg
+        else:
+            self.logits = g.permute(1, 0, 2).reshape(n, -1)
         if len(taps) == 2 and isinstance(taps[1], int):     # the taps buffer (every tap layer written)
             assert taps[1] * c.dim == taps[0].shape[1]
             self.taps = taps[0]
+        elif taps and out is not None and out[1].shape[1] == sum(t.shape[1] for t in taps):
+            self.taps = torch.cat(taps, -1, out=out[1][:n])
         else:
             self.taps = torch.cat(taps, -1) if taps else None
 
@@ -477,7 +525,11 @@ class RoundDecoder:
                     # one launch a tap, straight into its block of the taps buffer (made at the first tap)
                     if not taps:
                         ntap = sum(1 for i in c.dspark_taps if i < len(m.w.layers))
-                        taps.append(torch.empty((h.shape[0], ntap * c.dim), dtype=BF16, device=h.device))
+                        out = self.out
+                        if out is not None and out[1].shape[1] == ntap * c.dim:
+                            taps.append(out[1][:h.shape[0]])            # the runner's shared rows (SHARED_OUT)
+                        else:
+                            taps.append(torch.empty((h.shape[0], ntap * c.dim), dtype=BF16, device=h.device))
                         taps.append(0)
                     j = taps[1]
                     K.tap(h, taps[0][:, j * c.dim:(j + 1) * c.dim])
@@ -569,6 +621,12 @@ class RoundRunner:
         self.graphs: dict = {} if graphs else None
         self.graph_pool = graph_pool
         self.captures = 0
+        self.out = None
+        if SHARED_OUT:                                  # outside every capture: each graph writes these same rows
+            c, w = model.cfg, model.w
+            ntap = sum(1 for i in c.dspark_taps if i < len(w.layers))
+            self.out = (torch.empty((MAX_ROWS, w.head.n * model.comm.world), dtype=F32, device="cuda"),
+                        torch.empty((MAX_ROWS, max(ntap, 1) * c.dim), dtype=BF16, device="cuda"))
 
     def bucket(self, deepest: int) -> int:
         return bucket_for(deepest, self.pool.cap)
@@ -597,7 +655,8 @@ class RoundRunner:
 
     def forward(self, windows: list[tuple], replay: bool = True) -> tuple[torch.Tensor, torch.Tensor | None]:
         """``windows``: each stream's (slot, extent base, extent size, first position, token ids, host ids so far):
-        rows in that order. Returns logits [R, V] and taps [R, 3 d] (the rows in window order); ``replay=False``
+        rows in that order. Returns logits [R, V] and taps [R, 3 d] (the rows in window order; with SHARED_OUT views of
+        the runner's pair, valid until its next forward); ``replay=False``
         only captures a missing graph (warm-up) and returns (None, None)."""
 
         m = self.m
@@ -635,7 +694,7 @@ class RoundRunner:
         key = (R, b)
         g = self.graphs.get(key) if self.graphs is not None else None
         if g is None:
-            g = RoundDecoder(m, self.pool, R, b, True)
+            g = RoundDecoder(m, self.pool, R, b, True, out=self.out)
             g.set(ids, pos, slots, base, end)
             if self.graphs is not None:
                 if self.graph_pool is None:

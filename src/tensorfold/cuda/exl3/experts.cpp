@@ -8,11 +8,12 @@ void exl3x_grouped_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&,
 void exl3x_grouped_rows_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                             const at::Tensor&);
 void exl3x_grouped_mma_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                             const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                             const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                            int64_t, int64_t, int64_t, int64_t, int64_t);
+                            int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&);
 void exl3x_grouped_mma2_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
@@ -31,6 +32,8 @@ void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, 
 void exl3x_group_count_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_group_place_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t,
                             int64_t, int64_t);
+void exl3x_work_list_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, at::Tensor&,
+                          int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -87,7 +90,9 @@ void grouped_rows(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& 
                   const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                   const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
                   int64_t slots, int64_t cb, int64_t nt, int64_t warps, int64_t pf, int64_t g, int64_t lo,
-                  int64_t hi, int64_t fold) {
+                  int64_t hi, int64_t fold, const at::Tensor& work) {
+    TORCH_CHECK(!work.numel() || (work.is_cuda() && work.scalar_type() == at::kInt && work.is_contiguous()),
+                "work: a contiguous int32 CUDA tensor of (place, group) pairs, or empty");
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -102,13 +107,16 @@ void grouped_rows(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& 
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_rows_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, nt,
-                            warps, pf, g, lo, hi, fold);
+                            warps, pf, g, lo, hi, fold, work);
 }
 
 void grouped_mma(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
                  const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                  const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P, int64_t SK,
-                 int64_t slots, int64_t cb, int64_t warps, int64_t lo, int64_t hi, int64_t fold) {
+                 int64_t slots, int64_t cb, int64_t warps, int64_t lo, int64_t hi, int64_t fold,
+                 const at::Tensor& work) {
+    TORCH_CHECK(!work.numel() || (work.is_cuda() && work.scalar_type() == at::kInt && work.is_contiguous()),
+                "work: a contiguous int32 CUDA tensor of (place, group) pairs, or empty");
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -123,7 +131,7 @@ void grouped_mma(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
     c10::cuda::CUDAGuard guard(X0.device());
     exl3x_grouped_mma_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, SK, slots, cb, warps,
-                           lo, hi, fold);
+                           lo, hi, fold, work);
 }
 
 void grouped_mma2(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
@@ -239,6 +247,20 @@ void group_place(const at::Tensor& pick, const at::Tensor& counts, at::Tensor ui
     TORCH_CHECK(members.size(0) >= uids.numel() && members.size(1) >= 1, "members too small");
     c10::cuda::CUDAGuard guard(pick.device());
     exl3x_group_place_cuda(pick, counts, uids, ucount, members, R, slots, E);
+}
+
+void work_list(const at::Tensor& counts, const at::Tensor& uids, const at::Tensor& ucount, at::Tensor work0,
+               int64_t rows0, at::Tensor work1, int64_t rows1) {
+    check(counts, at::kInt, "counts");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(work0, at::kInt, "work0");
+    TORCH_CHECK(!work1.numel() || (work1.is_cuda() && work1.scalar_type() == at::kInt && work1.is_contiguous()),
+                "work1: a contiguous int32 CUDA tensor, or empty");
+    TORCH_CHECK(work0.numel() % 2 == 0 && work1.numel() % 2 == 0 && rows0 > 0 && rows1 > 0,
+                "work lists hold (place, group) pairs; groups hold rows");
+    c10::cuda::CUDAGuard guard(counts.device());
+    exl3x_work_list_cuda(counts, uids, ucount, work0, rows0, work1, rows1);
 }
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
@@ -417,6 +439,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("group", &group);
     m.def("group_count", &group_count);
     m.def("group_place", &group_place);
+    m.def("work_list", &work_list);
     m.def("rot_in", &rot_in);
     m.def("gateup_epilogue", &gateup_epilogue);
     m.def("down_epilogue", &down_epilogue);
