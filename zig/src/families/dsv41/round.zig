@@ -106,6 +106,8 @@ pub const Round = struct {
     cidx: u64, // int64 [R, index_topk]
     kk: usize = 0,
     ktop: u64, // int64 [R, index_topk]: torch's top-k values
+    tmax: u64, // int64 [R, nb / 64]: each 64-key tile's largest key (past TOPK_FUSED_MAX keys)
+    pbufs: tri_index.PrunedBufs, // topk_select_pruned's tpos [R, k], cand [R, k * 64] and every [R]
     kvg: u64, // fp32 [R, 2, head_dim]: the group's positional-store rows
     sg: u64,
     lat2: u64, // bf16 [R, head_dim]: the pair's weighted sum
@@ -127,7 +129,6 @@ pub const Round = struct {
     mw: u64, // fp32 [R, slots]
     pm: u64, // fp32 [R, D]
     gm: u64, // fp32 [world, R, D]
-    xs: exl3_experts.DecodeScratch,
     // Engram
     e_in: u64, // bf16 [R, cols * engram_head_dim]: the rows read for this rank's hash columns
     ek: u64, // fp32 [R, engram_wkv.n]
@@ -189,6 +190,13 @@ pub const Round = struct {
         rd.cand = try a.take(R * (nb_max / c.candidate_block + 1));
         rd.cidx = try a.take(R * c.index_topk * 8);
         rd.ktop = try a.take(R * c.index_topk * 8);
+        rd.tmax = try a.take(R * (nb_max / tri_index.tile + 1) * 8);
+        rd.pbufs = .{ .tpos = try a.take(R * c.index_topk * 8), .cand = try a.take(R * c.index_topk * tri_index.tile * 8), .every = try a.take(R * 8) };
+        {
+            // topk_select_pruned's `every`: a visible count past every tile position (torch.full, each call)
+            var ev: [max_rows]i64 = @splat(tri_index.every_vis);
+            try prompt.upload(e, rd.pbufs.every, &ev, R * 8);
+        }
         rd.kvg = try a.take(R * 2 * hd * 4);
         rd.sg = try a.take(R * 2 * hd * 4);
         rd.lat2 = try a.take(R * hd * 2);
@@ -211,7 +219,6 @@ pub const Round = struct {
         rd.mw = try a.take(R * e.slots() * 4);
         rd.pm = try a.take(R * d * 4);
         rd.gm = try a.take(e.world * R * d * 4);
-        rd.xs = try decodeScratch(e, a, l0.experts, e.slots());
         rd.e_in = 0;
         rd.ek = 0;
         rd.ekg = 0;
@@ -253,24 +260,6 @@ pub const Round = struct {
         return rd.glue + @as(u64, @intFromEnum(k)) * max_rows * 8;
     }
 };
-
-/// Model._moe_scratch's decode scratch: experts.py Scratch(rows=max(n, 64), prompt=False), one for every layer of the
-/// same slots and experts (made at the first decode window and never replaced), zeros but its member lists' -1.
-fn decodeScratch(e: *const Engine, a: *prompt.Arena, ex: weights.Experts, slots: usize) !exl3_experts.DecodeScratch {
-    const rows = exl3_experts.exact_rows;
-    const sz = try exl3_experts.DecodeScratch.sizes(rows, slots, ex.dims, ex.width, ex.count);
-    var sc: exl3_experts.DecodeScratch = undefined;
-    sc.rows = rows;
-    sc.slots = slots;
-    inline for (.{ "xg", "xu", "xd", "z", "y", "cnt_gu", "cnt_d", "epoch", "ready", "ready_cnt", "ids", "count", "members" }, 0..) |f, j| {
-        const ptr = try a.take(sz[j]);
-        @field(sc, f) = ptr;
-        if (j == 12) {
-            try e.d.check(e.d.api.cuMemsetD32Async(ptr, 0xffffffff, sz[j] / 4, e.s.handle), "cuMemsetD32Async");
-        } else try prompt.fill(e, ptr, 0, sz[j]);
-    }
-    return sc;
-}
 
 /// rounds.py _ix's tensors for these rows (one stream in slot 0), made on the host and uploaded in one copy.
 fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
@@ -466,9 +455,15 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
                 // scores -> (the pool's mask) -> top-k keys in one launch, then the selection
                 if (after_src and nb > c.candidate_blocks * c.candidate_block) return error.NotPortedYet; // index_keys_cand
                 const cand: ?tri_index.Cand = if (after_src) (if (rd.has_cand) .{ .mask = rd.cand, .stride = nb / c.candidate_block } else return error.NoCandidatePool) else null;
-                if (nb > tri_index.topk_fused_max) return error.NotPortedYet; // index_keys with tile maxima, the pruned selection
-                try tri_index.indexKeys(t, rd.iq4, k, rd.iw, vis, nb, cbase, cand, c.candidate_block, null, kk, rd.keys, R, ih, id);
-                try tri_index.topkSelect(t, rd.keys, nb, kk, vis, rd.cidx, top, R, nb);
+                if (nb > tri_index.topk_fused_max) {
+                    // long buckets: each 64-key tile's maximum too; topk_select_pruned (the k best tiles, or torch's
+                    // top-k of every key when there are no more tiles than k)
+                    try tri_index.indexKeys(t, rd.iq4, k, rd.iw, vis, nb, cbase, cand, c.candidate_block, rd.tmax, kk, rd.keys, R, ih, id);
+                    try tri_index.topkSelectPruned(t, rd.keys, nb, rd.tmax, kk, vis, rd.cidx, rd.pbufs, top, R, nb);
+                } else {
+                    try tri_index.indexKeys(t, rd.iq4, k, rd.iw, vis, nb, cbase, cand, c.candidate_block, null, kk, rd.keys, R, ih, id);
+                    try tri_index.topkSelect(t, rd.keys, nb, kk, vis, rd.cidx, top, R, nb);
+                }
             } else if (pow2 and li == c.candidate_source) {
                 // the candidate source: the scores, the pool's mask from them, then their keys' top-k
                 if (nb > c.candidate_blocks * c.candidate_block) return error.NotPortedYet; // _candidate_blocks
@@ -476,9 +471,13 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
                 try tri_index.indexScore(t, rd.iq4, k, rd.iw, vis, nb, rd.score, cbase, false, null, false, R, ih, id);
                 try e.ops.candFast(e.s, rd.score, nb, nb / c.candidate_block, c.candidate_block, vis, rd.cand, nb / c.candidate_block, R);
                 rd.has_cand = true;
-                if (nb > tri_index.topk_fused_max) return error.NotPortedYet; // score_keys with tile maxima, pruned
-                try tri_index.scoreKeys(t, rd.score, null, rd.keys, R, nb);
-                try tri_index.topkSelect(t, rd.keys, nb, kk, vis, rd.cidx, top, R, nb);
+                if (nb > tri_index.topk_fused_max) {
+                    try tri_index.scoreKeys(t, rd.score, rd.tmax, rd.keys, R, nb);
+                    try tri_index.topkSelectPruned(t, rd.keys, nb, rd.tmax, kk, vis, rd.cidx, rd.pbufs, top, R, nb);
+                } else {
+                    try tri_index.scoreKeys(t, rd.score, null, rd.keys, R, nb);
+                    try tri_index.topkSelect(t, rd.keys, nb, kk, vis, rd.cidx, top, R, nb);
+                }
             } else return error.NotPortedYet; // the scores' topk_indices path (a top-k of no power of two)
             rd.kk = kk;
         }
@@ -525,14 +524,14 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
 
 /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
 /// (rowmm_gate), the routing with the shared expert in every row's last slot, the routed experts' decode path.
-fn moe(e: *const Engine, rd: *Round, li: usize) !void {
+fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     const R = rd.r;
     const sl = e.slots();
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
-    try exl3_experts.decode(e.ex, e.s, lay.experts, rd.xs, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
+    try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
 }
 
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
@@ -598,7 +597,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
             pending = rd.ga;
             h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
             try Probe.check(probe, .moe_in, l, rd.x);
-            try moe(e, rd, l);
+            try moe(e, rd, ch, l);
             try Probe.check(probe, .moe_out, l, rd.pm);
             try e.comm.allGather(rd.pm, rd.gm, R * d, .f32, e.s);
             try Probe.check(probe, .moe_gather, l, rd.gm);

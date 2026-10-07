@@ -254,7 +254,9 @@ LAYER_POINTS = [
     ("cuda.rounds", "RoundDecoder", "run"),
     ("cuda.rounds", "RoundDecoder", "_attention2", (4, 5)),     # cos, sin: whole RoPE tables
 ]
-WHOLE = ("Model.forward", "RoundRunner.forward", "RoundDecoder.run")     # saved whole whatever the layer
+# saved whole whatever the layer (TF_ZREC_WHOLE=<where>,... overrides: a token recording keeps only the prompts)
+WHOLE = tuple(x for x in os.environ["TF_ZREC_WHOLE"].split(",") if x) if "TF_ZREC_WHOLE" in os.environ else (
+    "Model.forward", "RoundRunner.forward", "RoundDecoder.run")
 # TF_ZREC_ONLY=<where>,...: only these points are written (a token recording: the prompts ids and the rounds inputs)
 ONLY = {x for x in os.environ.get("TF_ZREC_ONLY", "").split(",") if x}
 LAYERS_ON = "TF_ZREC_LAYERS" in os.environ
