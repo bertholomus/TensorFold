@@ -5,7 +5,9 @@
 //! mixes then add in rank order, as on TP2), `catRank` the rank's whole wo_a output or expert intermediate from the
 //! two pairs' parts. Prompt chunks exchange over NCCL across the four (the RDMA rings drop prompt-size bursts on the
 //! switch: slots P6, P7b), each as one all-gather of every node's part then copies into place: the bytes Comm2D's
-//! NCCL paths (gather4, _p2p) put there.
+//! NCCL paths (gather4, _p2p) put there. With RDMA rings (Two.rings, ring2d.zig) the exchanges the lane sends over
+//! them take them, written straight into place: quarters of fewer than 64 rows (decode windows; TF_DS_2D_PROMPT_NCCL
+//! keeps prompt chunks on NCCL) and every cat_rank its column pair's ring takes; the same bytes either way.
 //!
 //! prompt.zig takes it through thin hooks behind Engine.two; a TP2 engine has none and runs as before. The decode
 //! rounds' part is round2d.zig's, on this node state.
@@ -16,6 +18,7 @@ const plan = @import("plan.zig");
 const prompt = @import("prompt.zig");
 const weights = @import("weights.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
+const ring2d = @import("ring2d.zig");
 const round_rows = @import("round.zig").max_rows;
 const Link = @import("link.zig").Link;
 const Comm = @import("comm.zig").Comm;
@@ -102,6 +105,7 @@ pub const Two = struct {
     u_full: u64, // bf16 [cap, uw0 + uw1]: the rank's wo_a output, pair 0's groups then pair 1's
     xd_full: u64, // fp16 [cap * slots, gu0 + gu1]: the rank's expert intermediate, pair 0's blocks then pair 1's
     own: u64, // fp16 [round rows, uw[p]]: a round's half of wo_b's rotated input rows (wo_a's epilogue, round2d.woRot)
+    rings: ?*const ring2d.Rings, // the RDMA rings (TF_DS_2D_INTO, TF_DS_2D_GROUPS), when the caller opened them
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -136,6 +140,7 @@ pub const Two = struct {
         t.u_full = try a.take(cap * (t.uw[0] + t.uw[1]) * 2);
         t.xd_full = try a.take(@max(cap, round_rows) * slots * (t.gu[0] + t.gu[1]) * 2);
         t.own = try a.take(round_rows * t.uw[pp] * 2);
+        t.rings = null;
         return t;
     }
 
@@ -152,9 +157,19 @@ pub const Two = struct {
         return wmax;
     }
 
+    /// Whether a ring took the exchange: false when there is none or the part does not fit it (nothing sent then).
+    fn ringed(r: anyerror!void) !bool {
+        r catch |err| switch (err) {
+            error.TooLarge, error.NotFloat4 => return false,
+            else => return err,
+        };
+        return true;
+    }
+
     /// quarters (Comm2D.quarters): `src` [n, w[p]] (this node's columns of its TP2 rank's partial) -> `dst`
     /// [2, n, w0 + w1]: rank r's partial, pair 0's columns then pair 1's, for every r.
     pub fn quarters(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
+        if (t.rings) |rs| if (n < 64 and try ringed(rs.quarters(e.s, src, dst, n, w, esize))) return;
         const wmax = try t.allParts(e, src, n, w, esize);
         const row = (w[0] + w[1]) * esize;
         for (0..4) |g| {
@@ -167,6 +182,7 @@ pub const Two = struct {
     /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's
     /// part then pair 1's (from its column partner, the same rank of the other pair).
     pub fn catRank(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, w: [2]usize, esize: usize) !void {
+        if (t.rings) |rs| if (try ringed(rs.catRank(e.s, src, dst, n, w, esize))) return;
         const wmax = try t.allParts(e, src, n, w, esize);
         const row = (w[0] + w[1]) * esize;
         for (0..2) |pg| {
