@@ -130,7 +130,8 @@ const Peer = struct {
 
 pub const Ring = struct {
     d: *const cuda.Driver,
-    v: *const Verbs,
+    verbs: Verbs,
+    v: *const Verbs = undefined,
     k: Kernels,
     s: Settings,
     rank: u32,
@@ -169,11 +170,13 @@ pub const Ring = struct {
     }
 
     /// Rings, metadata and queue pairs (in INIT, receives posted) on `devices`; `connect` with every rank's `info` next.
-    pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, v: *const Verbs, k: Kernels, devices: []const []const u8, rank: u32, world: u32, s: Settings) Error!*Ring {
+    pub fn create(gpa: std.mem.Allocator, d: *const cuda.Driver, k: Kernels, devices: []const []const u8, rank: u32, world: u32, s: Settings) Error!*Ring {
         if (world < 2 or world > max_ranks or rank >= world or devices.len == 0 or devices.len > max_devices) return error.BadInfo;
         if (s.slots < 2 or s.slots > seqs.max_slots or s.max_bytes == 0 or s.max_bytes % 64 != 0) return error.BadInfo;
         const r = try gpa.create(Ring);
         errdefer gpa.destroy(r);
+        var verbs = try Verbs.open(null);
+        errdefer verbs.close();
         var hr = try HostReg.open();
         errdefer hr.lib.close();
         var send = try Pinned.alloc(d, &hr, s.slots * s.max_bytes);
@@ -185,7 +188,8 @@ pub const Ring = struct {
         var scalars = try cuda.DeviceBuffer.alloc(d, 80);
         errdefer scalars.free();
         try scalars.fill8(0, null);
-        r.* = .{ .d = d, .v = v, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars };
+        r.* = .{ .d = d, .verbs = verbs, .k = k, .s = s, .rank = rank, .world = world, .hr = hr, .send = send, .recv = recv, .meta = meta, .scalars = scalars };
+        r.v = &r.verbs;
         errdefer for (r.nics[0..r.nd]) |*n| r.closeNic(n);
         for (devices) |name| {
             r.nics[r.nd] = try r.openNic(name);
@@ -246,6 +250,7 @@ pub const Ring = struct {
         r.recv.free(&r.hr);
         r.send.free(&r.hr);
         r.hr.lib.close();
+        r.verbs.close();
         gpa.destroy(r);
     }
 

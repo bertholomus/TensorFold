@@ -121,6 +121,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     ds_layer.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_layer.addImport("cuda", cuda);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-layer", .root_module = ds_layer }));
+    // the RDMA ring across real nodes (rdma_ring.zig): rendezvous, gathers at each row count, every float checked
+    const ds_rdma = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/rdma_bench_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_rdma.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_rdma.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-rdma-bench", .root_module = ds_rdma }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.core, mods.tokenizer, build_options, true);
 }
 
