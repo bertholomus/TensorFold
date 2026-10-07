@@ -35,7 +35,6 @@ const draft_mod = dsv41.draft;
 const sampling = dsv41.sampling;
 
 const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--rounds K] [--drafts B] [--engram DIR --token-map FILE] [--dump DIR]\n";
-const rope_rows = 8192; // the plain table's first rows (chunk 0's positions and more)
 const chunk_rows = 2048;
 const cache_tokens = 4096; // the compressed caches' positions at least (the recorded prompt's)
 /// The served pool's window (--context): the bucket rule's cap (graph.py bucket_for).
@@ -350,21 +349,47 @@ pub fn main(init: std.process.Init) !u8 {
     var ex = try dsv41.exact.Exact.load(&driver, cuda.kernels.dsv41_torch);
     defer ex.unload();
 
-    // the plain RoPE table's first rows
+    // the caches' positions: the deepest round's bucket and the widest extent the recording reaches (every row's: a
+    // concurrent round's rows are several streams'); the deepest position any row or prompt reaches
+    var tokens: usize = cache_tokens;
+    var deepest: usize = 0;
+    var filled: usize = 0; // the current prompt's positions so far (its chunks, until a round)
+    for (fx.points) |*q| {
+        if (std.mem.eql(u8, q.where, "Model.forward") and std.mem.eql(u8, q.arg, "in2") and q.shape.len == 1) {
+            filled += @intCast(q.shape[0]);
+            deepest = @max(deepest, filled);
+            continue;
+        }
+        if (!std.mem.eql(u8, q.where, "RoundDecoder.run")) continue;
+        filled = 0;
+        const in2 = std.mem.eql(u8, q.arg, "in2");
+        if (!in2 and !std.mem.eql(u8, q.arg, "in5")) continue;
+        var most: i64 = headInt(q) catch 0;
+        if (q.file) |name| {
+            const bytes = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rank_dir, "layers", name }), a, .limited(1 << 20), .@"8", null);
+            for (std.mem.bytesAsSlice(i64, bytes)) |v| most = @max(most, v);
+        }
+        const m: usize = @intCast(@max(most, 0));
+        if (in2) deepest = @max(deepest, m + round_mod.max_rows);
+        tokens = @max(tokens, if (in2) round_mod.bucketFor(m + 1, pool_window) else m);
+    }
+    // the RoPE tables' rows every position reaches (the fixtures hold the served tables' first rows)
+    const rope_rows = @max(@min(tokens, deepest + 1), chunk_rows);
     var rope_buf = try cuda.DeviceBuffer.alloc(&driver, 4 * rope_rows * (cfg.rope_dim / 2) * 4);
     defer rope_buf.free();
     for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
         var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ rec, name }), .{});
         defer f.close(io);
         const part = try a.alloc(u8, rope_rows * (cfg.rope_dim / 2) * 4);
-        if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable;
+        if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // (a fixture of fewer rows)
         try rope_buf.upload(j * part.len, part);
+        a.free(part);
     }
     const tbl = rope_rows * (cfg.rope_dim / 2) * 4;
     const rope: prompt.Rope = .{ .cos = rope_buf.ptr, .sin = rope_buf.ptr + tbl };
     const rope_c: prompt.Rope = .{ .cos = rope_buf.ptr + 2 * tbl, .sin = rope_buf.ptr + 3 * tbl };
 
-    var arena = try prompt.Arena.init(&driver, 3 << 30);
+    var arena = try prompt.Arena.init(&driver, 5 << 30); // (a 1M pool's caches, the candidate pool's buffers)
     defer arena.deinit();
     var blas_ws_ptr: u64 = undefined;
     var two: ?dsv41.prompt2d.Two = if (sp.pair != null) try dsv41.prompt2d.Two.init(&cfg, &w, &arena, sp, chunk_rows) else null;
@@ -383,21 +408,6 @@ pub fn main(init: std.process.Init) !u8 {
         two.?.rings = &rdma_rings.?;
     }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
-    // the caches' positions: the deepest round's bucket and the widest extent the recording reaches (every row's: a
-    // concurrent round's rows are several streams')
-    var tokens: usize = cache_tokens;
-    for (fx.points) |*q| {
-        if (!std.mem.eql(u8, q.where, "RoundDecoder.run")) continue;
-        const in2 = std.mem.eql(u8, q.arg, "in2");
-        if (!in2 and !std.mem.eql(u8, q.arg, "in5")) continue;
-        var most: i64 = headInt(q) catch 0;
-        if (q.file) |name| {
-            const bytes = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rank_dir, "layers", name }), a, .limited(1 << 20), .@"8", null);
-            for (std.mem.bytesAsSlice(i64, bytes)) |v| most = @max(most, v);
-        }
-        const m: usize = @intCast(@max(most, 0));
-        tokens = @max(tokens, if (in2) round_mod.bucketFor(m + 1, pool_window) else m);
-    }
     var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, tokens);
     // a drafting recording's pool: MultiDecoder's slots (each stream's window rings and positional stores)
     const slots: usize = if (budgets.len > 0) draft_mod.max_streams else 1;

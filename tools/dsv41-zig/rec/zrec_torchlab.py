@@ -2,7 +2,9 @@
 GPU, byte for byte: ops.rms_norm (128 and 512 wide, 1 to 2,048 rows), _compress's ratio-2 softmax with the weighted
 sum, ops.rope_ (forward and inverse) and a DSpark tap's mean over the streams; with OPS_FATBIN (dsv41_ops.cu),
 tf_ds_topk_i64 against torch.topk's values (as a set: _topk_finish sorts them) and tf_ds_topk_indices against the
-served kernels.topk_indices with torch.where(top < vis, top, -1). One JSON line a test and a summary.
+served kernels.topk_indices with torch.where(top < vis, top, -1) (k up to 2,048); the candidate pool's kernels
+(tf_ds_block_max, tf_ds_pool_pick, tf_ds_apply_pool) against model._candidates, rounds._candidate_blocks and
+model.apply_candidates. One JSON line a test and a summary.
 
   python zrec_torchlab.py FATBIN MODEL_DIR [OPS_FATBIN]
 """
@@ -203,7 +205,8 @@ def main() -> None:
         ti = load(sys.argv[3], ("tf_ds_topk_indices_kernel",))["tf_ds_topk_indices_kernel"]
         for rows, n, k, case in ((128, 2229, 512, "plain"), (1, 2229, 512, "plain"), (128, 2229, 512, "ties"),
                                  (16, 600, 512, "masked"), (7, 4096, 512, "zeros"), (3, 513, 512, "plain"),
-                                 (5, 100, 1, "plain"), (128, 2229, 512, "ninf")):
+                                 (5, 100, 1, "plain"), (128, 2229, 512, "ninf"), (4, 3000, 2048, "plain"),
+                                 (16, 20000, 2048, "ties"), (2, 65536, 2048, "ninf"), (3, 2048, 2048, "plain")):
             sc = torch.randn(rows, n, device="cuda", generator=g)
             vis = torch.randint(1, n + 1, (rows,), device="cuda", generator=g)
             if case == "ties":
@@ -224,6 +227,56 @@ def main() -> None:
                    [ptr(sc), ctypes.c_longlong(n), ctypes.c_int(n), ctypes.c_int(k), ptr(vis), ptr(out)])
             torch.cuda.synchronize()
             report(op="topk_indices", rows=rows, n=n, k=k, case=case, differ=int((out != ref).sum()))
+        # the candidate pool past 2,048 blocks: model._candidates' mask and rounds._candidate_blocks' list from
+        # tf_ds_block_max + tf_ds_topk_indices (k 2048, no mask) + tf_ds_pool_pick, model.apply_candidates from
+        # tf_ds_apply_pool, each against the served function on the same scores
+        from tensorfold.families.deepseek_v41.cuda import model as served_model, rounds as served_rounds
+        fs = load(sys.argv[3], ("tf_ds_block_max_kernel", "tf_ds_pool_pick_kernel", "tf_ds_apply_pool_kernel",
+                                "tf_ds_topk_indices_kernel"))
+        for rows, width, case in ((4, 20000, "plain"), (16, 65536, "masked"), (3, 147000, "masked"),
+                                  (8, 16390, "ninf"), (2, 20000, "ties"), (5, 16400, "zeros")):
+            sc = torch.randn(rows, width, device="cuda", generator=g)
+            vis = torch.randint(width // 2, width + 1, (rows,), device="cuda", generator=g)
+            if case == "masked":                                   # as the indexer leaves them: -inf at or past vis
+                sc = sc.masked_fill(torch.arange(width, device="cuda")[None] >= vis[:, None], float("-inf"))
+            elif case == "ninf":                                   # whole blocks of -inf
+                blk = torch.rand(rows, -(-width // 8), device="cuda", generator=g) < 0.3
+                sc = sc.masked_fill(blk.repeat_interleave(8, dim=1)[:, :width], float("-inf"))
+            elif case == "ties":
+                sc = (sc * 2).round() / 2
+            elif case == "zeros":
+                sc[:, ::3] = 0.0
+                sc[:, 1::3] = -0.0
+            sc = sc.contiguous()
+            nb = -(-width // 8)
+            k = min(2048, nb)
+            bmax = torch.empty((rows, nb), dtype=torch.float32, device="cuda")
+            launch(fs["tf_ds_block_max_kernel"], ((nb + 255) // 256, rows, 1), (256, 1, 1), 0,
+                   [ptr(sc), ctypes.c_longlong(width), ctypes.c_int(width), ctypes.c_int(8), ptr(vis), ptr(bmax),
+                    ctypes.c_longlong(nb), ctypes.c_int(nb)])
+            every = torch.full((rows,), 1 << 40, dtype=torch.int64, device="cuda")
+            pidx = torch.full((rows, k), 7, dtype=torch.int64, device="cuda")
+            launch(fs["tf_ds_topk_indices_kernel"], (rows, 1, 1), (1024, 1, 1), 0,
+                   [ptr(bmax), ctypes.c_longlong(nb), ctypes.c_int(nb), ctypes.c_int(k), ptr(every), ptr(pidx)])
+            mask = torch.full((rows, nb), 7, dtype=torch.uint8, device="cuda")
+            cblk = torch.full((rows, k), 7, dtype=torch.int32, device="cuda")
+            launch(fs["tf_ds_pool_pick_kernel"], (rows, 1, 1), (1024, 1, 1), 0,
+                   [ptr(bmax), ctypes.c_longlong(nb), ctypes.c_int(nb), ptr(pidx), ctypes.c_int(k), ptr(mask),
+                    ctypes.c_longlong(nb), ptr(cblk)])
+            torch.cuda.synchronize()
+            ref_mask = served_model._candidates(sc, vis[:, None], 2048, 8)
+            ref_cblk = served_rounds._candidate_blocks(sc, vis, 2048, 8)
+            report(op="candidates", rows=rows, width=width, case=case, differ=int((mask.bool() != ref_mask).sum()))
+            report(op="candidate_blocks", rows=rows, width=width, case=case, differ=int((cblk != ref_cblk).sum()))
+            ref = sc.clone()
+            served_model.apply_candidates(ref, ref_mask, 8)
+            got = sc.clone()
+            launch(fs["tf_ds_apply_pool_kernel"], ((width + 255) // 256, rows, 1), (256, 1, 1), 0,
+                   [ptr(got), ctypes.c_longlong(width), ctypes.c_int(width), ctypes.c_int(8), ptr(mask),
+                    ctypes.c_longlong(nb)])
+            torch.cuda.synchronize()
+            report(op="apply_candidates", rows=rows, width=width, case=case,
+                   differ=int((got.view(torch.int32) != ref.view(torch.int32)).sum()))
     print(json.dumps({"summary": {"tests": len(lines), "failed": bad, "eps": eps}}), flush=True)
 
 

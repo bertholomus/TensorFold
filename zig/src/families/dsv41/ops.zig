@@ -23,6 +23,9 @@ pub const Ops = struct {
     topk_indices: cuda.Function,
     scatter: cuda.Function,
     cand_fast: cuda.Function,
+    block_max: cuda.Function,
+    pool_pick: cuda.Function,
+    apply_pool: cuda.Function,
     to_bf16: cuda.Function,
     strided: cuda.Function,
     gather: cuda.Function,
@@ -46,6 +49,9 @@ pub const Ops = struct {
             .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
             .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
             .cand_fast = try fm.function("tf_ds_cand_fast_kernel"),
+            .block_max = try fm.function("tf_ds_block_max_kernel"),
+            .pool_pick = try fm.function("tf_ds_pool_pick_kernel"),
+            .apply_pool = try fm.function("tf_ds_apply_pool_kernel"),
             .to_bf16 = try pw.function("tf_f32_to_bf16_kernel"),
             .strided = try mv.function("tf_strided_copy_kernel"),
             .gather = try mv.function("tf_gather_rows_kernel"),
@@ -113,7 +119,7 @@ pub const Ops = struct {
     /// [rows] int64, out [rows, k] int64.
     pub fn topkIndices(o: *const Ops, s: cuda.Stream, score: u64, ss: usize, rows: usize, n: usize, k: usize, vis: u64, out: u64) !void {
         if (rows == 0) return;
-        if (k > n or k > 1024) return error.BadTopK;
+        if (k > n or k > 2048) return error.BadTopK;
         var a: cuda.Args = .{};
         a.add(score);
         a.add(@as(c_longlong, @intCast(ss)));
@@ -152,6 +158,55 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(c_longlong, @intCast(os)));
         try cuda.launch.launch(o.cand_fast, .{ .grid = .{ .x = blocks(nb, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// The candidate pool's block maxima (model.py _candidates, rounds.py _candidate_blocks): out [rows, nb] fp32 (row
+    /// stride os, nb = ceil(width / bsize)) = each block's maximum of the scores [rows, width] (row stride ss; the last
+    /// block padded with -inf, a NaN wins), the row's newest block (vis - 1) // bsize pinned to +inf.
+    pub fn blockMax(o: *const Ops, s: cuda.Stream, score: u64, ss: usize, width: usize, bsize: usize, vis: u64, out: u64, os: usize, rows: usize) !void {
+        if (rows == 0) return;
+        const nb = (width + bsize - 1) / bsize;
+        var a: cuda.Args = .{};
+        a.add(score);
+        a.add(@as(c_longlong, @intCast(ss)));
+        a.add(@as(c_int, @intCast(width)));
+        a.add(@as(c_int, @intCast(bsize)));
+        a.add(vis);
+        a.add(out);
+        a.add(@as(c_longlong, @intCast(os)));
+        a.add(@as(c_int, @intCast(nb)));
+        try cuda.launch.launch(o.block_max, .{ .grid = .{ .x = blocks(nb, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// The pool from each row's top blocks idx [rows, k] int64 of the block maxima bmax [rows, nb] (row stride bs):
+    /// _candidates' mask u8 [rows, nb] (row stride ms; zeros but the picked blocks above -inf) and/or
+    /// _candidate_blocks' list int32 [rows, k] (the block, or -1 when its maximum is not above -inf); 0 leaves one out.
+    pub fn poolPick(o: *const Ops, s: cuda.Stream, bmax: u64, bs: usize, nb: usize, idx: u64, k: usize, mask: u64, ms: usize, cblk: u64, rows: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(bmax);
+        a.add(@as(c_longlong, @intCast(bs)));
+        a.add(@as(c_int, @intCast(nb)));
+        a.add(idx);
+        a.add(@as(c_int, @intCast(k)));
+        a.add(mask);
+        a.add(@as(c_longlong, @intCast(ms)));
+        a.add(cblk);
+        try cuda.launch.launch(o.pool_pick, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, s, &a);
+    }
+
+    /// model.py apply_candidates, in place: -inf at every column of score [rows, width] (row stride ss) whose block of
+    /// bsize the row's pool mask (u8, row stride ms) leaves out.
+    pub fn applyPool(o: *const Ops, s: cuda.Stream, score: u64, ss: usize, width: usize, bsize: usize, mask: u64, ms: usize, rows: usize) !void {
+        if (rows == 0) return;
+        var a: cuda.Args = .{};
+        a.add(score);
+        a.add(@as(c_longlong, @intCast(ss)));
+        a.add(@as(c_int, @intCast(width)));
+        a.add(@as(c_int, @intCast(bsize)));
+        a.add(mask);
+        a.add(@as(c_longlong, @intCast(ms)));
+        try cuda.launch.launch(o.apply_pool, .{ .grid = .{ .x = blocks(width, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// `.to(torch.bfloat16)` of `count` fp32 values (round to nearest even).
