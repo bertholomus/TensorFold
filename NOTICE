@@ -39,7 +39,9 @@ Modified upstream files:
   tests/cuda/test_exl3_experts.py              tests for the fused decode path
   src/tensorfold/cuda/http.py                  optional API key (TF_API_KEY / TF_API_KEY_FILE), all routes but /health;
                                                max_model_len in /v1/models
-  src/tensorfold/cuda/server.py                a family's own image prompts continue through its vision object
+  src/tensorfold/cuda/server.py                a family's own image prompts continue through its vision object; an opt-in reasoning
+                                               loop guard (TF_LOOP_GUARD, the request's "loop_guard")
+  src/tensorfold/engine/call_gate.py           ThinkLoop: the loop guard's token 8-gram novelty check
   src/tensorfold/cuda/comm.py                  NCCL abort and asynchronous-error hooks (a concurrent lane's watchdog)
   src/tensorfold/serve_options.py              --vision for families with their own image path (CUDA_VISION)
   src/tensorfold/cuda/reply_text.py            DSML tool-call parsing for DeepSeek-V4.1
