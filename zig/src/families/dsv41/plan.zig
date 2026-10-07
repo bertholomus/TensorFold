@@ -28,7 +28,7 @@ pub const Split = struct {
     pub fn engramRows(s: Split, c: Config) usize {
         return (c.engram_ngram - 1) * c.engram_heads / s.world * c.engram_head_dim;
     }
-    fn range(s: Split, per: usize) [2]usize {
+    pub fn range(s: Split, per: usize) [2]usize {
         return .{ s.rank * per, (s.rank + 1) * per };
     }
 };
@@ -42,30 +42,40 @@ pub const Want = struct {
     n16: ?usize = null,
 };
 
+/// plain(name, dtype)'s key: f"{name}|{dtype}", the dtype as torch prints it.
+pub fn plainKey(buf: []u8, tensor: []const u8, dtype: ?DType) ![]const u8 {
+    const t = if (dtype) |d| switch (d) {
+        .f32 => "torch.float32",
+        .f16 => "torch.float16",
+        else => return error.UnsupportedDType,
+    } else "None";
+    return std.fmt.bufPrint(buf, "{s}|{s}", .{ tensor, t });
+}
+
+/// exl3_parts(prefix, cols, rows)'s key for one part ("tr", "suh" or "svh"); a range prints as Python's tuple.
+pub fn partKey(buf: []u8, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize, part: []const u8) ![]const u8 {
+    var cb: [48]u8 = undefined;
+    var rb: [48]u8 = undefined;
+    const cs = if (cols) |c| try std.fmt.bufPrint(&cb, "({d}, {d})", .{ c[0], c[1] }) else "None";
+    const rs = if (rows) |r| try std.fmt.bufPrint(&rb, "({d}, {d})", .{ r[0], r[1] }) else "None";
+    return std.fmt.bufPrint(buf, "{s}|{s}|{s}|{s}", .{ prefix, cs, rs, part });
+}
+
 const Builder = struct {
     a: std.mem.Allocator,
     out: std.ArrayList(Want) = .empty,
 
-    /// plain(name, dtype): f"{name}|{dtype}", the dtype as torch prints it.
     fn plain(b: *Builder, tensor: []const u8, dtype: ?DType) !void {
-        const t = if (dtype) |d| switch (d) {
-            .f32 => "torch.float32",
-            .f16 => "torch.float16",
-            else => unreachable,
-        } else "None";
-        try b.out.append(b.a, .{ .key = try std.fmt.allocPrint(b.a, "{s}|{s}", .{ tensor, t }), .dtype = dtype });
+        var buf: [256]u8 = undefined;
+        try b.out.append(b.a, .{ .key = try b.a.dupe(u8, try plainKey(&buf, tensor, dtype)), .dtype = dtype });
     }
 
-    /// exl3_parts(prefix, cols, rows): f"{prefix}|{cols}|{rows}|tr", "|suh", "|svh" (a range prints as Python's tuple).
     fn exl3(b: *Builder, prefix: []const u8, cols: ?[2]usize, rows: ?[2]usize, k: ?usize, n: ?usize) !void {
-        var cb: [48]u8 = undefined;
-        var rb: [48]u8 = undefined;
-        const cs = if (cols) |c| try std.fmt.bufPrint(&cb, "({d}, {d})", .{ c[0], c[1] }) else "None";
-        const rs = if (rows) |r| try std.fmt.bufPrint(&rb, "({d}, {d})", .{ r[0], r[1] }) else "None";
         const k16: ?usize = if (rows) |r| (r[1] - r[0]) / 16 else if (k) |x| x / 16 else null;
         const n16: ?usize = if (cols) |c| (c[1] - c[0]) / 16 else if (n) |x| x / 16 else null;
         for ([_][]const u8{ "tr", "suh", "svh" }) |part| {
-            const key = try std.fmt.allocPrint(b.a, "{s}|{s}|{s}|{s}", .{ prefix, cs, rs, part });
+            var buf: [256]u8 = undefined;
+            const key = try b.a.dupe(u8, try partKey(&buf, prefix, cols, rows, part));
             const is_tr = std.mem.eql(u8, part, "tr");
             try b.out.append(b.a, .{ .key = key, .dtype = if (is_tr) .i16 else .f16, .k16 = if (is_tr) k16 else null, .n16 = if (is_tr) n16 else null });
         }
