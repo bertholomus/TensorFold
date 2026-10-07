@@ -35,6 +35,34 @@ def hasher(cfg: Cfg, token_map: list[int]) -> Engram:
     return e
 
 
+def jit_table() -> dict:
+    """Every Triton JITFunction the engine's modules define: its arguments and the ones Triton never specializes
+    (aot_pack.py's --jit input), by module-qualified name."""
+
+    import importlib
+    import pkgutil
+
+    import tensorfold
+    from triton.runtime.jit import JITFunction
+
+    for m in pkgutil.walk_packages(tensorfold.__path__, "tensorfold."):
+        if m.name.startswith(("tensorfold.families.deepseek_v41", "tensorfold.cuda")):
+            try:
+                importlib.import_module(m.name)
+            except Exception:
+                pass
+    out = {}
+    for mod in list(sys.modules.values()):
+        if not getattr(mod, "__name__", "").startswith("tensorfold."):
+            continue
+        for v in vars(mod).values():
+            if isinstance(v, JITFunction):
+                names = list(v.arg_names)
+                nospec = [names[i] if isinstance(i, int) else i for i in (v.do_not_specialize or [])]
+                out[f"{v.fn.__module__}.{v.fn.__qualname__}"] = {"args": names, "do_not_specialize": nospec}
+    return out
+
+
 def main() -> None:
     model_dir, map_path, out = sys.argv[1:4]
     os.makedirs(out, exist_ok=True)
@@ -56,7 +84,10 @@ def main() -> None:
            "cases": cases}
     with open(os.path.join(out, "engram.json"), "w") as f:
         json.dump(doc, f)
-    print(json.dumps({"engram_cases": len(cases), "multipliers": doc["multipliers"]}))
+    jit = jit_table()
+    with open(os.path.join(out, "jit.json"), "w") as f:
+        json.dump(jit, f, indent=1)
+    print(json.dumps({"engram_cases": len(cases), "multipliers": doc["multipliers"], "jit_functions": len(jit)}))
 
 
 if __name__ == "__main__":
