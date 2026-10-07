@@ -163,14 +163,16 @@ pub fn read(sh: *const Shards, key: []const u8, out: []u8) !void {
     const es = (try dtypeOf(t.dtype)).size();
     if (std.mem.eql(u8, k.part, "tr")) {
         const row = t.dim(1) * t.dim(2) * es; // one K tile row: every N tile's words
-        if (k.rows) |r| return @memcpy(out, t.bytes[r[0] / 16 * row ..][0..out.len]);
-        if (k.cols) |c| {
+        const k0 = if (k.rows) |r| r[0] / 16 else 0;
+        if (k.cols) |c| { // output columns, of the given input rows when both are set (the 2D split's wo_b, down, Engram)
             const tile = t.dim(2) * es;
             const lo = c[0] / 16 * tile;
             const w = (c[1] - c[0]) / 16 * tile;
-            for (0..t.dim(0)) |i| @memcpy(out[i * w ..][0..w], t.bytes[i * row + lo ..][0..w]);
+            const kt = if (k.rows) |r| (r[1] - r[0]) / 16 else t.dim(0);
+            for (0..kt) |i| @memcpy(out[i * w ..][0..w], t.bytes[(k0 + i) * row + lo ..][0..w]);
             return;
         }
+        if (k.rows != null) return @memcpy(out, t.bytes[k0 * row ..][0..out.len]);
         return @memcpy(out, t.bytes);
     }
     const sel: ?[2]usize = if (std.mem.eql(u8, k.part, "suh")) k.rows else k.cols;
@@ -231,6 +233,11 @@ test "column, row and whole slices of a toy trellis and its scales" {
     var rows: [16]u8 = undefined;
     try read(&sh, "w|None|(16, 32)|tr", &rows);
     try std.testing.expectEqualSlices(u8, body[16..32], &rows);
+    // both: K tile row 1, its tiles 2 and 3 (the 2D split's down and wo_b keys)
+    var both: [8]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 8), (try describe(&sh, "w|(32, 64)|(16, 32)|tr")).bytes);
+    try read(&sh, "w|(32, 64)|(16, 32)|tr", &both);
+    try std.testing.expectEqualSlices(u8, body[24..32], &both);
     var suh: [32]u8 = undefined;
     try read(&sh, "w|None|(16, 32)|suh", &suh);
     try std.testing.expectEqualSlices(u8, body[32 + 32 .. 96], &suh);

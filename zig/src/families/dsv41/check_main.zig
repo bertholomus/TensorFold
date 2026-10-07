@@ -32,7 +32,9 @@ pub fn main(init: std.process.Init) !u8 {
     const name = try dsv41.rank_cache.find(a, io, dir, rank, world);
     var ix = try dsv41.rank_cache.open(init.gpa, io, dir, name);
     defer ix.deinit();
-    const want = try dsv41.plan.wants(a, cfg, .{ .rank = rank, .world = world }, dspark);
+    // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the cache file is still rank g of 4
+    const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2 } else .{ .rank = rank, .world = world };
+    const want = try dsv41.plan.wants(a, cfg, split, dspark);
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);
     const w = &out.interface;

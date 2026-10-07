@@ -3,6 +3,8 @@
 //!
 //! Heads 32 a rank (wq_b columns, wo_a groups, wo_b input rows, sinks), experts' intermediate 1152 a rank (gate and up
 //! by output column, down by input row), the head's vocabulary halves, Engram wkv by hash column; the rest replicated.
+//! On four nodes the exact 2D split (DESIGN-TP4.md 4.2, weights.py load_block_2d): a node is TP2 rank r inside pair p
+//! and keeps pair p's whole 128-column blocks of each of its rank's split outputs; DSpark stays TP2 inside the pair.
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const DType = @import("rank_cache.zig").DType;
@@ -11,6 +13,10 @@ const DType = @import("rank_cache.zig").DType;
 pub const Split = struct {
     rank: u32,
     world: u32,
+    /// The 2D split's pair (node g = 2 p + r, `world` 2 inside the pair); null: plain TP over `world`.
+    pair: ?u32 = null,
+    /// TF_DS_2D_DOWN: pair 0's blocks of the experts' down outputs (hidden / 128 of them; 20 is even).
+    down0: usize = 20,
 
     pub fn heads(s: Split, c: Config) usize {
         return c.heads / s.world;
@@ -30,6 +36,16 @@ pub const Split = struct {
     }
     pub fn range(s: Split, per: usize) [2]usize {
         return .{ s.rank * per, (s.rank + 1) * per };
+    }
+    /// The pair's part of `r` in whole 128-column blocks: the first `first` (default the larger half) are pair 0's.
+    pub fn cut(s: Split, r: [2]usize, first: ?usize) [2]usize {
+        const n = (r[1] - r[0]) / 128;
+        const mid = r[0] + (first orelse (n + 1) / 2) * 128;
+        return if (s.pair.? == 0) .{ r[0], mid } else .{ mid, r[1] };
+    }
+    /// The pair's part of `r` on a 2D split, else `r` (the plain TP slice).
+    fn part(s: Split, r: [2]usize, first: ?usize) [2]usize {
+        return if (s.pair != null) s.cut(r, first) else r;
     }
 };
 
@@ -98,14 +114,17 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
     try b.plain(try b.fmt("{s}.ffn_norm.weight", .{p}), null);
     try b.exl3(try b.fmt("{s}.attn.wq_a", .{p}), null, null, d, c.q_lora);
     try b.plain(try b.fmt("{s}.attn.q_norm.weight", .{p}), null);
-    try b.exl3(try b.fmt("{s}.attn.wq_b", .{p}), s.range(hl * c.head_dim), null, c.q_lora, null);
+    try b.exl3(try b.fmt("{s}.attn.wq_b", .{p}), s.part(s.range(hl * c.head_dim), null), null, c.q_lora, null);
     try b.exl3(try b.fmt("{s}.attn.wkv", .{p}), null, null, d, c.head_dim);
     try b.plain(try b.fmt("{s}.attn.kv_norm.weight", .{p}), null);
     try b.plain(try b.fmt("{s}.attn.attn_sink", .{p}), .f32);
-    for (s.rank * gl..(s.rank + 1) * gl) |g| {
+    // 2D: the pair's half of its rank's groups (split2d.py wo_a_groups)
+    const g0 = s.rank * gl + if (s.pair) |pp| pp * (gl / 2) else 0;
+    for (g0..g0 + if (s.pair != null) gl / 2 else gl) |g| {
         try b.exl3(try b.fmt("{s}.attn.wo_a.slice.{d}", .{ p, g }), null, null, c.heads / c.o_groups * c.head_dim, c.o_lora);
     }
-    try b.exl3(try b.fmt("{s}.attn.wo_b", .{p}), null, s.range(gl * c.o_lora), null, d);
+    const wo_b_cols: ?[2]usize = if (s.pair != null) s.cut(.{ 0, d }, null) else null;
+    try b.exl3(try b.fmt("{s}.attn.wo_b", .{p}), wo_b_cols, s.range(gl * c.o_lora), null, d);
     if (c.kv_sources.has(i)) {
         try b.exl3(try b.fmt("{s}.attn.compressor.wkv", .{p}), null, null, d, null);
         try b.plain(try b.fmt("{s}.attn.compressor.norm.weight", .{p}), null);
@@ -121,15 +140,18 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
     }
     try b.plain(try b.fmt("{s}.ffn.gate.weight", .{p}), .f16);
     try b.plain(try b.fmt("{s}.ffn.gate.bias", .{p}), .f32);
-    const cols = s.range(s.inter(c));
+    const half = s.range(s.inter(c));
+    const gate_up = s.part(half, null); // 2D: blocks 0-4 (pair 0) or 5-8 (pair 1) of the rank's 9 (TF_DS_2D_GU=first)
+    const down_cols: ?[2]usize = if (s.pair != null) s.cut(.{ 0, d }, s.down0) else null;
     for (0..experts + 1) |e| {
         const ep = if (e < experts) try b.fmt("{s}.ffn.experts.{d}", .{ p, e }) else try b.fmt("{s}.ffn.shared_experts", .{p});
-        try b.exl3(try b.fmt("{s}.w1", .{ep}), cols, null, d, null);
-        try b.exl3(try b.fmt("{s}.w3", .{ep}), cols, null, d, null);
-        try b.exl3(try b.fmt("{s}.w2", .{ep}), null, cols, null, d);
+        try b.exl3(try b.fmt("{s}.w1", .{ep}), gate_up, null, d, null);
+        try b.exl3(try b.fmt("{s}.w3", .{ep}), gate_up, null, d, null);
+        try b.exl3(try b.fmt("{s}.w2", .{ep}), down_cols, half, null, d);
     }
     if (c.engram_layers.has(i)) {
-        try b.exl3(try b.fmt("{s}.engram.wkv", .{p}), null, s.range(s.engramRows(c)), null, null);
+        const engram_cols: ?[2]usize = if (s.pair != null) s.cut(.{ 0, 5 * d }, null) else null;
+        try b.exl3(try b.fmt("{s}.engram.wkv", .{p}), engram_cols, s.range(s.engramRows(c)), null, null);
         try b.plain(try b.fmt("{s}.engram.q_weight", .{p}), .f32);
         try b.plain(try b.fmt("{s}.engram.k_weight", .{p}), .f32);
     }
@@ -140,10 +162,12 @@ pub fn wants(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
     var b: Builder = .{ .a = a };
     try b.plain("embed.weight", null);
     try b.plain("norm.weight", null);
-    try b.exl3("head", s.range(s.vocab(c)), null, c.hidden, null);
+    try b.exl3("head", s.part(s.range(s.vocab(c)), null), null, c.hidden, null);
     for (0..c.layers) |i| try block(&b, c, s, try b.fmt("layers.{d}", .{i}), i, c.experts);
     if (dspark and c.dspark_block > 0) {
-        for (0..c.draft_layers) |j| try block(&b, c, s, try b.fmt("mtp.{d}", .{j}), c.layers + j, c.draft_experts);
+        // DSpark stays TP2 inside the pair on a 2D split (weights.py _load_2d: load_block at world 2)
+        const tp2: Split = .{ .rank = s.rank, .world = s.world };
+        for (0..c.draft_layers) |j| try block(&b, c, tp2, try b.fmt("mtp.{d}", .{j}), c.layers + j, c.draft_experts);
         const last = try b.fmt("mtp.{d}", .{c.draft_layers - 1});
         try b.exl3("mtp.0.main_proj", null, null, c.dspark_taps.len * c.hidden, c.hidden);
         try b.plain("mtp.0.main_norm.weight", null);
@@ -179,4 +203,38 @@ test "a rank's tensors in load order: the split's ranges, keys as Python prints 
     try std.testing.expect(seen_wq_b and seen_down and seen_engram);
     try std.testing.expectEqual(@as(usize, 4), wo_a);
     try std.testing.expectEqualStrings("mtp.2.confidence_head.proj.weight|None", w[w.len - 1].key);
+}
+
+test "the 2D split: node 2 (rank 0 of pair 1) keeps pair 1's blocks, DSpark stays TP2" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: @import("config.zig").Why = .{};
+    const c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    const w = try wants(a, c, .{ .rank = 0, .world = 2, .pair = 1 }, true);
+    const tp2 = try wants(a, c, .{ .rank = 0, .world = 2 }, true);
+    try std.testing.expectEqual(tp2.len - 2 * 3 * c.layers, w.len); // two wo_a groups a layer, not four
+    try std.testing.expectEqualStrings("head|(32384, 64640)|None|tr", w[2].key);
+    const expect = [_][]const u8{
+        "layers.0.attn.wq_b|(8192, 16384)|None|tr",
+        "layers.0.attn.wo_a.slice.2|None|None|tr",
+        "layers.0.attn.wo_a.slice.3|None|None|tr",
+        "layers.0.attn.wo_b|(2560, 5120)|(0, 4096)|tr",
+        "layers.0.ffn.experts.0.w1|(640, 1152)|None|tr",
+        "layers.0.ffn.experts.0.w2|(2560, 5120)|(0, 1152)|tr",
+        "layers.1.engram.wkv|(12800, 25600)|(0, 3072)|tr",
+        "mtp.0.attn.wq_b|(0, 16384)|None|tr",
+        "mtp.0.attn.wo_a.slice.3|None|None|tr",
+    };
+    for (expect) |k| {
+        var found = false;
+        for (w) |x| found = found or std.mem.eql(u8, x.key, k);
+        if (!found) std.debug.print("missing {s}\n", .{k});
+        try std.testing.expect(found);
+    }
+    for (w) |x| try std.testing.expect(!std.mem.eql(u8, x.key, "layers.0.attn.wo_a.slice.1|None|None|tr"));
+    const p0 = try wants(a, c, .{ .rank = 1, .world = 2, .pair = 0 }, false);
+    var down0 = false;
+    for (p0) |x| down0 = down0 or std.mem.eql(u8, x.key, "layers.5.ffn.shared_experts.w2|(0, 2560)|(1152, 2304)|tr");
+    try std.testing.expect(down0);
 }
