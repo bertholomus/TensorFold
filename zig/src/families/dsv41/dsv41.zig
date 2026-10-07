@@ -4,10 +4,12 @@ pub const Config = @import("config.zig").Config;
 pub const native = @import("native.zig");
 pub const rank_cache = @import("rank_cache.zig");
 pub const plan = @import("plan.zig");
+pub const engram = @import("engram.zig");
 
 test {
     _ = @import("config.zig");
     _ = native;
     _ = rank_cache;
     _ = plan;
+    _ = engram;
 }
