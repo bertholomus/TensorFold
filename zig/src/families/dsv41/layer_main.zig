@@ -8,10 +8,11 @@
 //! chunk F on compare every point a layer exchanges with the served build's bytes: the attention's input rows and
 //! partial, its gather, the MoE's input rows and partial, its gather, on an Engram layer its rows' projection and their
 //! gather; after a chunk's last layer the DSpark taps, the head's columns, their gather and the prompt's logits.
-//! With --rounds K the recorded decode rounds follow (eager serial rounds: RoundDecoder.run's rows, the stream in pool
-//! slot 0): the first K of them through round.zig, each checked at every layer's exchanges (Engram's projection and
-//! gather, the attention's input rows, partial and gather, the MoE's), the head's columns and gather, the logits and the
-//! taps, and the greedy next token against the next round's.
+//! With --rounds K the recorded decode rounds follow (eager rounds: RoundDecoder.run's rows, the stream in pool slot 0;
+//! serial, or a drafting recording's windows of the pending token and its drafts): the first K of the prompt's request
+//! through round.zig, each checked at every layer's exchanges (Engram's projection and gather, the attention's input
+//! rows, partial and gather, the MoE's), the head's columns and gather, the logits and the taps, and the served
+//! acceptance (the rows' greedy tokens against the drafts the next round kept and its first row).
 //! With --light 1 (a token recording: TF_ZREC_ONLY=Model.forward,RoundDecoder.run) every recorded request instead: its
 //! prompt's chunks through every layer unchecked, the prompt's logits checked, then its rounds (at most K with
 //! --rounds K, all without), each round's logits checked and its greedy token against the recorded next one; the
@@ -232,9 +233,11 @@ pub fn main(init: std.process.Init) !u8 {
     chunk_call[n_chunks] = std.math.maxInt(u64);
     var total: usize = 0;
     for (chunk_ids[0..n_chunks]) |ids| total += ids.len;
-    // the recorded prompt's length (every chunk's rows): the bounded replay starts a window before its end
+    // the recorded prompt's length (its chunks' rows: every chunk before the first round, a recording of several
+    // requests holding later prompts after it): the bounded replay starts a window before its end
     var prompt_len: usize = 0;
     for (fx.points) |p| {
+        if (std.mem.eql(u8, p.where, "RoundDecoder.run")) break;
         if (std.mem.eql(u8, p.where, "Model.forward") and std.mem.eql(u8, p.arg, "in2") and p.shape.len == 1) prompt_len += @intCast(p.shape[0]);
     }
     const replay: usize = prompt_len -| cfg.window;
@@ -469,19 +472,37 @@ fn argmax(run: *Run, dev: u64, n: usize) !usize {
 }
 
 /// The recorded decode rounds after the prompt: each RoundDecoder.run's rows (ids, positions, the stream's extent) through
-/// round.zig with every point checked; the greedy next token (from the prompt's logits, then each round's) against the
-/// next round's. False on the first difference.
+/// round.zig with every point checked. A round's rows are its window: the pending token and the drafts it verifies (one
+/// row a round when serial). The rows' greedy tokens (their targets) decide the next round as the served round keeps
+/// them (multi.py _round): the drafts while each equals its target, then the target after them; the next round starts
+/// at the kept position with that target, its rows overwriting the rejected ones (in the Engram sequence too). Only the
+/// recorded prompt's request: a later prompt ends the rounds. False on the first difference.
 fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []i32, prompt_len: usize, rounds: usize, a: std.mem.Allocator, arena: *prompt.Arena) !bool {
     const fx = run.fx;
     const w_out = run.out;
     const vocab = vocabOf(eng);
+    const R_max = round_mod.max_rows;
     var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
-    var next = try argmax(run, ch.head_g, vocab); // greedy from the prompt's logits
-    var have = prompt_len;
+    var targets: [R_max]usize = undefined;
+    targets[0] = try argmax(run, ch.head_g, vocab); // greedy from the prompt's logits
+    var prev_ids: [R_max]i64 = undefined;
+    var prev_n: usize = 1; // the prompt: its last row's target only
+    var prev_pos: i64 = @as(i64, @intCast(prompt_len)) - 1;
+    // from the prompt's last chunk (the latest Model.forward before the first round): a later one is another request's
     var after: u64 = 0;
+    if (fx.find(0, "RoundDecoder.run", null, "in1")) |first| {
+        for (fx.points) |*q| {
+            if (q.call < first.call and isPoint(q, "Model.forward", "in2")) after = q.call;
+        }
+    }
     for (0..rounds) |k| {
         const rp = fx.find(after, "RoundDecoder.run", null, "in1") orelse {
             try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"note\": \"no more recorded rounds\"}}\n", .{ run.rank, k });
+            try w_out.flush();
+            break;
+        };
+        if (fx.find(after, "Model.forward", null, "in2")) |mf| if (mf.call < rp.call) {
+            try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"note\": \"a later request's prompt: its rounds are not this prompt's\"}}\n", .{ run.rank, k });
             try w_out.flush();
             break;
         };
@@ -489,14 +510,25 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
         const pos = try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in2"));
         const base = try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in4"));
         const end = try ints(run, fx.find(rp.call - 1, "RoundDecoder.run", null, "in5"));
-        const fwd = fx.find(after, "RoundRunner.forward", null, "out.0") orelse return error.NoRoundFixture;
-        _ = fwd;
-        const greedy_ok = ids.len > 0 and ids[0] == @as(i64, @intCast(next));
-        try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"call\": {d}, \"rows\": {d}, \"pos\": {d}, \"id\": {d}, \"greedy\": {d}, \"greedy_equal\": {}}}\n", .{ run.rank, k, rp.call, ids.len, pos[0], ids[0], next, greedy_ok });
+        if (ids.len == 0 or ids.len > R_max or pos.len != ids.len) return error.BadRound;
+        // the previous round's acceptance: its kept drafts equal their targets, its first rejected one does not, and
+        // this round's first row is the target after the kept ones
+        const kept = pos[0] - prev_pos - 1;
+        var accept_ok = kept >= 0 and kept < prev_n;
+        if (accept_ok) {
+            const ka: usize = @intCast(kept);
+            for (0..ka) |j| {
+                if (prev_ids[j + 1] != @as(i64, @intCast(targets[j]))) accept_ok = false;
+            }
+            if (ka + 1 < prev_n and prev_ids[ka + 1] == @as(i64, @intCast(targets[ka]))) accept_ok = false;
+            if (ids[0] != @as(i64, @intCast(targets[ka]))) accept_ok = false;
+        }
+        try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"call\": {d}, \"rows\": {d}, \"pos\": {d}, \"id\": {d}, \"kept\": {d}, \"accept_equal\": {}}}\n", .{ run.rank, k, rp.call, ids.len, pos[0], ids[0], kept, accept_ok });
         try w_out.flush();
-        if (pos[0] != @as(i64, @intCast(have))) return error.RoundNotNext;
-        for (ids, 0..) |id, i| seq[have + i] = @intCast(id);
-        have += ids.len;
+        if (!accept_ok) run.ok = false;
+        const p0: usize = @intCast(pos[0]);
+        if (pos[0] < 0 or p0 + ids.len > seq.len) return error.RoundNotNext;
+        for (ids, 0..) |id, i| seq[p0 + i] = @intCast(id);
         // the RoundRunner.forward around this run: the last one before it
         var fcall: u64 = 0;
         for (fx.points) |*q| {
@@ -504,13 +536,16 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
         }
         var rc: RoundCheck = .{ .run = run, .after = rp.call, .call = rp.call, .fwd = fcall };
         const rows: round_mod.Rows = .{ .ids = ids, .pos = pos, .base = base[0], .end = end[0] };
-        round_mod.forward(eng, &rd, ch, caches, rings, eh, seq[0..have], rows, pool_window, .{ .ctx = &rc, .at = RoundCheck.at }) catch |err| {
+        round_mod.forward(eng, &rd, ch, caches, rings, eh, seq[0 .. p0 + ids.len], rows, pool_window, .{ .ctx = &rc, .at = RoundCheck.at }) catch |err| {
             if (err == error.RoundMismatch) return false;
             try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, k, @errorName(err) });
             try w_out.flush();
             return false;
         };
-        next = try argmax(run, rd.logits + (ids.len - 1) * vocab * 4, vocab);
+        for (0..ids.len) |j| targets[j] = try argmax(run, rd.logits + j * vocab * 4, vocab);
+        @memcpy(prev_ids[0..ids.len], ids);
+        prev_n = ids.len;
+        prev_pos = pos[0];
         after = rp.call;
     }
     return run.ok;
