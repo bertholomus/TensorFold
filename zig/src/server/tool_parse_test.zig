@@ -118,3 +118,36 @@ test "a call to a tool the request did not declare stays text" {
     try std.testing.expectEqualStrings("lookup", offered.calls.?[0].get("function").?.get("name").?.string);
     try std.testing.expect((try parse(a, "{\"name\":\"launch\",\"arguments\":{}}", tools, null)).calls == null);
 }
+
+test "DeepSeek-V4.1's DSML calls, read as the served lane reads them" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"weather\"}},{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    // two invokes, string and JSON values, prose before the block
+    const two = "Checking.\n\n<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"weather\">\n<" ++ D ++ " parameter name=\"city\" string=\"true\">Oslo</" ++ D ++ " parameter>\n<" ++ D ++ " parameter name=\"days\" string=\"false\">3</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n<" ++ D ++ " invoke name=\"LOOKUP\">\n<" ++ D ++ " parameter name=\"q\" string=\"false\">{\"a\": [1, 2.5, null]}</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    const r = try parse(a, two, tools, null);
+    try std.testing.expectEqualStrings("Checking.", r.content);
+    try std.testing.expectEqual(@as(usize, 2), r.calls.?.len);
+    try std.testing.expectEqualStrings("weather", r.calls.?[0].get("function").?.get("name").?.string);
+    try std.testing.expectEqualStrings("{\"city\":\"Oslo\",\"days\":3}", r.calls.?[0].get("function").?.get("arguments").?.string);
+    try std.testing.expectEqualStrings("lookup", r.calls.?[1].get("function").?.get("name").?.string);
+    try std.testing.expectEqualStrings("{\"q\":{\"a\":[1,2.5,null]}}", r.calls.?[1].get("function").?.get("arguments").?.string);
+    // one call a reply: the second invoke drops out
+    const single = try parse(a, two, tools, 1);
+    try std.testing.expectEqual(@as(usize, 1), single.calls.?.len);
+    // JSON that does not parse is the string; no string attribute is a string
+    const loose = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\"weather\"><" ++ D ++ " parameter name=\"x\" string=\"false\">not json</" ++ D ++ " parameter><" ++ D ++ " parameter name=\"y\">7</" ++ D ++ " parameter></" ++ D ++ " invoke></" ++ D ++ " calls>";
+    try std.testing.expectEqualStrings("{\"x\":\"not json\",\"y\":\"7\"}", (try parse(a, loose, tools, null)).calls.?[0].get("function").?.get("arguments").?.string);
+    // a tool the request did not offer: the lane's rewritten block stays the reply's text
+    const other = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"launch\">\n<" ++ D ++ " parameter name=\"when\" string=\"true\">now</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    const kept = try parse(a, other, tools, null);
+    try std.testing.expect(kept.calls == null);
+    try std.testing.expectEqualStrings("<tool_call>{\"name\": \"launch\", \"arguments\": {\"when\": \"now\"}}</tool_call>", kept.content);
+    try std.testing.expectEqualStrings("", (try parse(a, other, tools, 1)).content);
+    // a block with no invoke goes; an unclosed block stays text
+    try std.testing.expectEqualStrings("Hi.", (try parse(a, "Hi.<" ++ D ++ " calls>\n</" ++ D ++ " calls>", tools, null)).content);
+    const open = "Hi.<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"weather\">";
+    try std.testing.expectEqualStrings(open, (try parse(a, open, tools, null)).content);
+}
