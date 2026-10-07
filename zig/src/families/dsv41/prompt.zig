@@ -2,8 +2,8 @@
 //! build's kernels: the streams of the chunk's tokens (embed_init), then a layer at a time the attention mixes (hc_pre, or
 //! hc_pre_pf with the previous layer's gathered MoE partials posted first), attention (attention_k), the gather of its
 //! partials, the FFN mixes with that post fused in (hc_pre_pf), the MoE and its gather, whose post goes into the next
-//! layer's mixes (switch "hc_pf2"). So far window-only layers (compress ratio 0) without Engram; the others return
-//! error.NotPortedYet.
+//! layer's mixes (switch "hc_pf2"); before an Engram layer's mixes, its Engram (engram_apply). So far window-only
+//! layers (compress ratio 0); the others return error.NotPortedYet.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -19,6 +19,8 @@ const exl3_experts = @import("exl3_experts.zig");
 const ops = @import("ops.zig");
 const cublas = @import("cublas.zig");
 const comm = @import("comm.zig");
+const engram = @import("engram.zig");
+const engram_io = @import("engram_io.zig");
 
 /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
 pub const ring_extra = 16;
@@ -116,6 +118,11 @@ pub const Chunk = struct {
     pm: u64, // fp32 [cap, D]: the MoE partial
     gm: u64, // fp32 [world, cap, D]: its gather (the pending post)
     xs: exl3_experts.Scratch,
+    // Engram (zero when no layer has it)
+    eb: u64 = 0, // bf16 [cap, cols * engram_head_dim]: the rows read
+    ek: u64 = 0, // fp32 [cap, hc * D + D]: their projection, this rank's columns
+    ekg: u64 = 0, // fp32 [world, cap, hc * D + D]: its gather
+    kv: u64 = 0, // bf16 [cap, hc * D + D]: the ranks' sum
     ws: exl3_prefill.Workspace,
     blas_ws: u64, // cuBLAS workspace
     pending: bool = false, // gm holds a MoE gather whose post is not in h yet
@@ -168,6 +175,14 @@ pub const Chunk = struct {
         ch.wts = try a.take(cap * sl * 4);
         ch.pm = try a.take(cap * d * 4);
         ch.gm = try a.take(e.world * cap * d * 4);
+        for (e.w.layers) |lay| {
+            const ew = lay.engram_wkv orelse continue;
+            ch.eb = try a.take(cap * ew.k * 2);
+            ch.ek = try a.take(cap * ew.n * 4);
+            ch.ekg = try a.take(e.world * cap * ew.n * 4);
+            ch.kv = try a.take(cap * ew.n * 2);
+            break;
+        }
         const sz = exl3_experts.Scratch.sizes(cap, sl, ex.dims, ex.width, ex.count);
         var xs: exl3_experts.Scratch = undefined;
         xs.rows = cap;
@@ -176,12 +191,26 @@ pub const Chunk = struct {
             @field(xs, f) = try a.take(sz[j]);
         }
         ch.xs = xs;
-        // prefill.Workspace: the largest call's rotated input and W_q (fp16), and the Hadamard
+        // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard
         var max_xk: usize = 0;
         var max_kn: usize = 0;
-        for ([_]weights.Linear{ l0.wq_a, l0.wkv, l0.wq_b, l0.wo_a[0], l0.wo_b }) |l| {
-            max_xk = @max(max_xk, l.k);
-            max_kn = @max(max_kn, @as(usize, l.k) * l.n);
+        for (e.w.layers) |lay| {
+            var ls: [16]?weights.Linear = @splat(null);
+            ls[0] = lay.wq_a;
+            ls[1] = lay.wkv;
+            ls[2] = lay.wq_b;
+            ls[3] = lay.wo_b;
+            for (lay.wo_a, 0..) |wo, g| ls[4 + g] = wo;
+            ls[8] = lay.comp_wkv;
+            ls[9] = lay.comp_wgate;
+            ls[10] = lay.idx_wq_b;
+            ls[11] = lay.idx_wk;
+            ls[12] = lay.engram_wkv;
+            for (ls) |ol| {
+                const l = ol orelse continue;
+                max_xk = @max(max_xk, l.k);
+                max_kn = @max(max_kn, @as(usize, l.k) * l.n);
+            }
         }
         ch.ws = .{ .xh = try a.take(cap * max_xk * 2), .w = try a.take(max_kn * 2), .h = try a.take(128 * 128 * 2) };
         ch.blas_ws = try a.take(cublas.Blas.workspace_bytes);
@@ -338,6 +367,76 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     const shared_id = lay.experts.count - 1;
     try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+}
+
+/// Engram on the host: the hasher (the compressed token map, the multipliers), this rank's hash columns [lo, hi) of
+/// each Engram layer's, its tables and readers, and host buffers for a chunk's rows (model.py's Engram).
+pub const EngramHost = struct {
+    hasher: engram.Hasher,
+    tables: *const engram_io.Tables,
+    pool: *engram_io.Pool,
+    lo: usize,
+    hi: usize,
+    hashes: []i64, // [cap][layers][cols]
+    flat: []i64, // [cap * (hi - lo)]
+    w: []u8, // FP8 rows
+    s: []u8, // their E8M0 scales
+    rows: []u16, // bf16 [cap, (hi - lo) * head_dim]
+
+    pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize) !EngramHost {
+        const cols = hasher.cols();
+        const lo = rank * cols / world;
+        const hi = (rank + 1) * cols / world;
+        const k = hi - lo;
+        const t = tables.layers.get(@intCast(c.engram_layers.slice()[0])) orelse return error.MissingEngramTable;
+        return .{
+            .hasher = hasher,
+            .tables = tables,
+            .pool = pool,
+            .lo = lo,
+            .hi = hi,
+            .hashes = try gpa.alloc(i64, cap * hasher.layers * cols),
+            .flat = try gpa.alloc(i64, cap * k),
+            .w = try gpa.alloc(u8, cap * k * t.row_w),
+            .s = try gpa.alloc(u8, cap * k * t.row_s),
+            .rows = try gpa.alloc(u16, cap * k * t.row_w),
+        };
+    }
+};
+
+/// Layer li's Engram on the chunk (engram_apply, no image span), as _forward_k runs it before the attention mixes: a
+/// pending MoE post into the streams first (hc_post), then the rows of each position's n-grams (hashed on the host from
+/// `seq`, the whole sequence's ids so far; read from the tables; decoded to bf16 as Engram._decode does), their
+/// projection summed over the ranks in rank order, rounded to bf16, and the gate into the streams.
+pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq: []const i32) !void {
+    const lay = e.w.layers[li];
+    const ew = lay.engram_wkv orelse return;
+    const c = e.c;
+    const n = ch.n;
+    if (ch.pending) {
+        try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
+        ch.pending = false;
+    }
+    const li32: u16 = @intCast(li);
+    const l = std.mem.indexOfScalar(u16, c.engram_layers.slice(), li32) orelse return error.NotAnEngramLayer;
+    const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    const cols = eh.hasher.cols();
+    const k = eh.hi - eh.lo;
+    eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
+    for (0..n) |r| {
+        for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+    }
+    const m = n * k;
+    try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+    for (0..m) |i| engram.decodeRow(eh.w[i * t.row_w ..][0..t.row_w], eh.s[i * t.row_s ..][0..t.row_s], eh.rows[i * t.row_w ..][0..t.row_w]);
+    if (m * t.row_w != n * ew.k) return error.EngramShape;
+    try e.d.check(e.d.api.cuMemcpyHtoD_v2(ch.eb, eh.rows.ptr, m * t.row_w * 2), "cuMemcpyHtoD");
+    try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
+    try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
+    if (e.world != 2) return error.NotPortedYet; // Comm.sum of more ranks: acc += g[r]
+    try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * ew.n * 4, ch.kv, n * ew.n);
+    try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
+    swapStreams(ch, ch.h_alt);
 }
 
 /// A layer's end: the MoE's gather is pending (the next layer's attention mixes post it) and the FFN's pre_out is the

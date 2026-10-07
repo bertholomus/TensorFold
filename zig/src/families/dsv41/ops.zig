@@ -17,6 +17,7 @@ pub const Ops = struct {
     family: cuda.Module,
     to_f32: cuda.Function,
     f16_to_f32: cuda.Function,
+    add2_bf16: cuda.Function,
     to_bf16: cuda.Function,
     strided: cuda.Function,
     gather: cuda.Function,
@@ -35,6 +36,7 @@ pub const Ops = struct {
             .family = fm,
             .to_f32 = try pw.function("tf_bf16_to_f32_kernel"),
             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
+            .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
             .to_bf16 = try pw.function("tf_f32_to_bf16_kernel"),
             .strided = try mv.function("tf_strided_copy_kernel"),
             .gather = try mv.function("tf_gather_rows_kernel"),
@@ -70,6 +72,17 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(u64, count));
         try go(o.f16_to_f32, s, blocks(count, 256), 256, &a);
+    }
+
+    /// Comm.sum of two ranks' fp32 partials then `.to(bf16)`: out = bf16(g0 + g1), one fp32 add in rank order.
+    pub fn add2Bf16(o: *const Ops, s: cuda.Stream, g0: u64, g1: u64, out: u64, count: usize) !void {
+        if (count == 0) return;
+        var a: cuda.Args = .{};
+        a.add(g0);
+        a.add(g1);
+        a.add(out);
+        a.add(@as(u64, count));
+        try go(o.add2_bf16, s, blocks(count, 256), 256, &a);
     }
 
     /// `.to(torch.bfloat16)` of `count` fp32 values (round to nearest even).
