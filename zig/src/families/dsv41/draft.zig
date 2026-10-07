@@ -28,9 +28,13 @@ const Chunk = prompt.Chunk;
 
 /// MultiDecoder's stream slots in the served lane (--parallel 4): the pool's streams.
 pub const max_streams = 4;
-/// A pass's rows this port runs: kernels.decode_rows() (16). Four streams (20 rows) take other kernels (the gate's
-/// cuBLAS matmul, one attention split): not ported.
-pub const max_rows = 16;
+/// A pass's rows at most: four streams' blocks. Past kernels.decode_rows() (16 rows: four streams) the MoE gate is a
+/// cuBLAS matmul with the plain routing and the attention one split (its pick list padded to 16 columns of -1).
+pub const max_rows = 20;
+/// kernels.decode_rows(): the row-invariant decode kernels' rows at most.
+const decode_rows = tri_norm.decode_rows;
+/// sparse_attn's pick list of a single-split call: padded with -1 to a multiple of 16 entries.
+const pick_pad = 16;
 /// dspark.py: ring_size = window + 16.
 pub const ring_extra = 16;
 /// The stages (DSpark blocks) and a stream's block rows at most.
@@ -111,7 +115,8 @@ pub const Drafter = struct {
     slots_moe: usize, // the MoE's slots a row: top-k routed and the shared expert
     taps_w: usize, // the taps' row width: taps * D
     // the pass's index rows (int64, max_rows a row: ids, positions, window positions, ring bases, zeros, -1), bidx
-    // [max_rows, n] (each row's stream's block rows), wlo int64 [1] = 0 (Model._zero)
+    // [max_rows, n] (each row's stream's block rows; a single-split pass's padded to 16 columns of -1), wlo int64 [1] =
+    // 0 (Model._zero)
     rows: u64,
     bidx: u64,
     wlo: u64,
@@ -142,6 +147,8 @@ pub const Drafter = struct {
     ga: u64,
     // MoE
     gl: u64,
+    xf: u64, // fp32 [R, D]: a wide pass's rows for the gate's cuBLAS matmul
+    gate_f: [max_stages]u64, // fp32 [experts, D]: each stage's gate widened (gate_w.float())
     pick: u64,
     mw: u64,
     pm: u64,
@@ -200,7 +207,7 @@ pub const Drafter = struct {
         dr.streams = 0;
         dr.steps = 0;
         dr.rows = try a.take(6 * R * 8);
-        dr.bidx = try a.take(R * max_block * 8);
+        dr.bidx = try a.take(R * pick_pad * 8);
         dr.wlo = try a.take(8);
         try prompt.fill(e, dr.wlo, 0, 8);
         dr.h = try a.take(R * hc * d * 2);
@@ -227,7 +234,13 @@ pub const Drafter = struct {
         dr.pa = try a.take(R * d * 4);
         dr.ga = try a.take(e.world * R * d * 4);
         const ne: usize = b0.experts.count - 1;
-        dr.gl = try a.take(16 * (d / 256) * ne * 4);
+        dr.gl = try a.take(@max(16 * (d / 256), R) * ne * 4);
+        dr.xf = try a.take(R * d * 4);
+        dr.gate_f = @splat(0);
+        for (ds.blocks, 0..) |lay, j| {
+            dr.gate_f[j] = try a.take(ne * d * 4);
+            try e.ops.f16ToF32(e.s, lay.gate_w, dr.gate_f[j], ne * d);
+        }
         dr.pick = try a.take(R * dr.slots_moe * 4);
         dr.mw = try a.take(R * dr.slots_moe * 4);
         dr.pm = try a.take(R * d * 4);
@@ -374,7 +387,8 @@ pub const Drafter = struct {
         const d = c.hidden;
         // _body's index rows: ids [token, noise ...], positions q0 + j, window positions q0 - 1, ring bases
         var hv: [6 * max_rows]i64 = @splat(0);
-        var hb: [max_rows * max_block]i64 = @splat(0);
+        var hb: [max_rows * pick_pad]i64 = @splat(-1);
+        const bw: usize = if (R > decode_rows) pick_pad else n; // the pick list's columns
         for (0..N) |i| {
             if (slots[i] < 0 or slots[i] >= pool.slots) return error.BadSlot;
             for (0..n) |j| {
@@ -385,11 +399,11 @@ pub const Drafter = struct {
                 hv[3 * max_rows + r] = slots[i] * @as(i64, @intCast(pool.ring));
                 hv[4 * max_rows + r] = 0;
                 hv[5 * max_rows + r] = -1;
-                for (0..n) |k| hb[r * n + k] = @intCast(i * n + k);
+                for (0..n) |k| hb[r * bw + k] = @intCast(i * n + k);
             }
         }
         try prompt.upload(e, dr.rows, &hv, hv.len * 8);
-        try prompt.upload(e, dr.bidx, &hb, R * n * 8);
+        try prompt.upload(e, dr.bidx, &hb, R * bw * 8);
         // the streams: every row's token embedding in each stream, pre (1, 0, 0, 0)
         try tri_basic.embedInit(t, e.w.embed, dr.row(0), dr.h, dr.pre, R, d, c.hc);
         // _stages_fused
@@ -532,13 +546,21 @@ pub const Drafter = struct {
         try prompt.groupedRotated(e, ch, R, &cb);
     }
 
-    /// Model.moe(lay, x, topk) of a pass's rows: the gate's chunk sums (rowmm_gate), the routing at the stages' top-k with
-    /// the shared expert in every row's last slot, the routed experts' decode path on the stages' own scratch.
+    /// Model.moe(lay, x, topk) of a pass's rows: the gate's chunk sums (rowmm_gate; past decode_rows rows the gate's fp32
+    /// matmul), the routing at the stages' top-k with the shared expert in every row's last slot, the routed experts'
+    /// decode path on the stages' own scratch.
     fn moe(dr: *Drafter, e: *const Engine, j: usize, R: usize) !void {
         const c = e.c;
         const lay = dr.ds.blocks[j];
         const ne: usize = lay.experts.count - 1;
-        const kc = try tri_norm.rowmmGate(e.t, dr.x, c.hidden, lay.gate_w, dr.gl, R, c.hidden, ne);
+        var kc: usize = 0;
+        if (R <= decode_rows) {
+            kc = try tri_norm.rowmmGate(e.t, dr.x, c.hidden, lay.gate_w, dr.gl, R, c.hidden, ne);
+        } else {
+            // x.float() @ gate_w.float().t() through cuBLAS, then the plain routing
+            try e.ops.toF32(e.s, dr.x, dr.xf, R * c.hidden);
+            try e.blas.xwT(dr.xf, dr.gate_f[j], dr.gl, R, c.hidden, ne);
+        }
         try tri_norm.route(e.t, dr.gl, kc, lay.gate_b, dr.topk, c.routed_scaling, lay.experts.count - 1, dr.pick, dr.mw, R, ne, dr.slots_moe);
         try exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
     }

@@ -32,6 +32,7 @@ const dsv41 = @import("dsv41");
 const prompt = dsv41.prompt;
 const round_mod = dsv41.round;
 const draft_mod = dsv41.draft;
+const sampling = dsv41.sampling;
 
 const usage = "usage: tf-dsv41-layer MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT REC_DIR [--layers N] [--chunks C] [--check-from F] [--rounds K] [--drafts B] [--engram DIR --token-map FILE] [--dump DIR]\n";
 const rope_rows = 8192; // the plain table's first rows (chunk 0's positions and more)
@@ -90,7 +91,14 @@ const Run = struct {
     rank: u32,
     out: *std.Io.Writer,
     host: []u8,
+    row: []f32 = &.{}, // a logits row on the host (argmax, the sampler)
     ok: bool = true,
+
+    /// The host row buffer for n fp32 values (made once, grown when wider).
+    fn rowBuf(r: *Run, n: usize) ![]f32 {
+        if (r.row.len < n) r.row = try r.a.alloc(f32, n); // the arena: no free
+        return r.row[0..n];
+    }
 
     /// Our buffer `dev` against fixture point `p`: the same bytes (sha256), or where they first differ.
     fn check(r: *Run, label: []const u8, p: ?*const Point, dev: u64) !bool {
@@ -205,6 +213,8 @@ pub fn main(init: std.process.Init) !u8 {
     var check_from: usize = 0;
     var rounds: usize = 0;
     var budgets: []usize = &.{}; // --drafts: each drafting request's max_tokens, in admission order (none: no drafter)
+    var seeds: []u64 = &.{}; // --seeds: each request's sampling seed, in admission order (none: greedy)
+    var smp: sampling.Sampling = .{ .seed = 0 }; // --temperature, --top-k, --top-p: the requests' sampling
     var light = false;
     var engram_dir: ?[]const u8 = null;
     var token_map: ?[]const u8 = null;
@@ -228,6 +238,17 @@ pub fn main(init: std.process.Init) !u8 {
             var it = std.mem.splitScalar(u8, val, ',');
             while (it.next()) |x| try list.append(a, try std.fmt.parseInt(usize, x, 10));
             budgets = list.items;
+        } else if (std.mem.eql(u8, key, "--seeds")) {
+            var list: std.ArrayList(u64) = .empty;
+            var it = std.mem.splitScalar(u8, val, ',');
+            while (it.next()) |x| try list.append(a, try std.fmt.parseInt(u64, x, 10));
+            seeds = list.items;
+        } else if (std.mem.eql(u8, key, "--temperature")) {
+            smp.temperature = try std.fmt.parseFloat(f64, val);
+        } else if (std.mem.eql(u8, key, "--top-k")) {
+            smp.top_k = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--top-p")) {
+            smp.top_p = try std.fmt.parseFloat(f64, val);
         } else if (std.mem.eql(u8, key, "--light")) {
             light = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--engram")) {
@@ -362,12 +383,20 @@ pub fn main(init: std.process.Init) !u8 {
         two.?.rings = &rdma_rings.?;
     }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
-    // the caches' positions: the deepest round's bucket and the widest extent the recording reaches
+    // the caches' positions: the deepest round's bucket and the widest extent the recording reaches (every row's: a
+    // concurrent round's rows are several streams')
     var tokens: usize = cache_tokens;
     for (fx.points) |*q| {
         if (!std.mem.eql(u8, q.where, "RoundDecoder.run")) continue;
-        if (std.mem.eql(u8, q.arg, "in2")) tokens = @max(tokens, round_mod.bucketFor(@as(usize, @intCast(headInt(q) catch 0)) + 1, pool_window));
-        if (std.mem.eql(u8, q.arg, "in5")) tokens = @max(tokens, @as(usize, @intCast(headInt(q) catch 0)));
+        const in2 = std.mem.eql(u8, q.arg, "in2");
+        if (!in2 and !std.mem.eql(u8, q.arg, "in5")) continue;
+        var most: i64 = headInt(q) catch 0;
+        if (q.file) |name| {
+            const bytes = try std.Io.Dir.cwd().readFileAllocOptions(io, try std.fs.path.join(a, &.{ rank_dir, "layers", name }), a, .limited(1 << 20), .@"8", null);
+            for (std.mem.bytesAsSlice(i64, bytes)) |v| most = @max(most, v);
+        }
+        const m: usize = @intCast(@max(most, 0));
+        tokens = @max(tokens, if (in2) round_mod.bucketFor(m + 1, pool_window) else m);
     }
     var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, tokens);
     // a drafting recording's pool: MultiDecoder's slots (each stream's window rings and positional stores)
@@ -420,7 +449,7 @@ pub fn main(init: std.process.Init) !u8 {
 
     var run: Run = .{ .a = a, .io = io, .d = &driver, .s = stream, .fx = &fx, .rank = rank, .out = w_out, .host = try a.alloc(u8, 2 * chunk_rows * cfg.hidden * 4) };
     if (light and budgets.len > 0) {
-        const ok = try runDrafted(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, budgets, sp);
+        const ok = try runDrafted(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, budgets, seeds, smp, sp);
         try w_out.print("{{\"rank\": {d}, \"light\": true, \"drafted\": true, \"all_equal\": {}}}\n", .{ rank, ok });
         try w_out.flush();
         return if (ok) 0 else 1;
@@ -519,7 +548,7 @@ fn vocabOf(eng: *const prompt.Engine) usize {
 /// The index of the first largest of n fp32 values on the device (torch.argmax's choice).
 fn argmax(run: *Run, dev: u64, n: usize) !usize {
     try run.s.synchronize();
-    const host = try run.a.alloc(f32, n);
+    const host = try run.rowBuf(n);
     try run.d.check(run.d.api.cuMemcpyDtoH_v2(host.ptr, dev, n * 4), "cuMemcpyDtoH");
     var best: usize = 0;
     for (host, 0..) |v, i| {
@@ -568,6 +597,15 @@ const DraftCheck = struct {
         return ok;
     }
 };
+
+/// sample_rows of one row of n fp32 logits on the device at absolute position `position` (sampling.zig).
+fn sampleDev(run: *Run, dev: u64, n: usize, position: usize, s: sampling.Sampling) !i64 {
+    if (s.temperature <= 0) return @intCast(try argmax(run, dev, n));
+    try run.s.synchronize();
+    const host = try run.rowBuf(n);
+    try run.d.check(run.d.api.cuMemcpyDtoH_v2(host.ptr, dev, n * 4), "cuMemcpyDtoH");
+    return sampling.sampleRow(host, position, s);
+}
 
 /// The recorded decode rounds after the prompt: each RoundDecoder.run's rows (ids, positions, the stream's extent) through
 /// round.zig with every point checked. A round's rows are its window: the pending token and the drafts it verifies (one
@@ -959,6 +997,7 @@ const DStream = struct {
     done: bool = false,
     rounds: usize = 0,
     tokens: []i64, // the reply: the first token, then each round's new tokens
+    smp: sampling.Sampling, // temperature 0: greedy
     // this round's window: its rows in the round, from row `row`
     want: usize = 0,
     win: [round_mod.max_rows]i64 = undefined,
@@ -981,8 +1020,9 @@ fn findBefore(fx: *const Fixtures, after: u64, before: u64, where: []const u8, a
 /// recorded round's, the round through every layer (every recorded point checked); each stream's targets (greedy), the
 /// drafts kept while equal to them, the target after them, the end of its budget; every window's taps absorbed. A
 /// round the recording holds and the scheduling does not make (or the other way) fails the run. `budgets`: each
-/// request's max_tokens in admission order.
-fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, a: std.mem.Allocator, arena: *prompt.Arena, budgets: []const usize, sp: dsv41.plan.Split) !bool {
+/// request's max_tokens in admission order; `seeds` each request's sampling seed (with `smp`'s temperature, top_k and
+/// top_p: the served sampler, sampling.zig, every target checked against the recorded DsEngine._sample's), none: greedy.
+fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, a: std.mem.Allocator, arena: *prompt.Arena, budgets: []const usize, seeds: []const u64, smp: sampling.Sampling, sp: dsv41.plan.Split) !bool {
     const fx = run.fx;
     const w_out = run.out;
     const c = eng.c;
@@ -1046,7 +1086,12 @@ fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *
                 }
             }
             const st = try streams.addOne(a);
-            st.* = .{ .req = req, .slot = slot, .base = base, .end = end, .seq = try a.alloc(i32, len + budgets[req] + R_max), .budget = budgets[req], .tokens = try a.alloc(i64, budgets[req]) };
+            var ss = smp;
+            if (seeds.len > 0) {
+                if (req >= seeds.len) return error.MoreRequestsThanSeeds;
+                ss.seed = seeds[req];
+            } else ss.temperature = 0;
+            st.* = .{ .req = req, .slot = slot, .base = base, .end = end, .seq = try a.alloc(i32, len + budgets[req] + R_max), .budget = budgets[req], .tokens = try a.alloc(i64, budgets[req]), .smp = ss };
             var at: usize = 0;
             for (chunks.items) |cp| for (try ints(run, cp)) |id| {
                 st.seq[at] = @intCast(id);
@@ -1075,7 +1120,7 @@ fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *
             }
             try dr.absorb(eng, ch, &pool, slot, dr.at, ch.n, ch.start);
             st.len = len;
-            st.pending = @intCast(try argmax(run, ch.head_g, vocab));
+            st.pending = try sampleDev(run, ch.head_g, vocab, len, st.smp);
             st.tokens[0] = st.pending;
             st.out = 1;
             if (st.pending == c.eos or st.out >= st.budget) st.done = true;
@@ -1203,9 +1248,20 @@ fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *
         var items: [draft_mod.max_streams]draft_mod.Item = undefined;
         for (live[0..nl], 0..) |st, wi| items[wi] = .{ .slot = st.slot, .taps = rd.taps + st.row * dr.taps_w * 2, .n = st.n, .start = st.len };
         try dr.absorbMany(eng, ch, &pool, items[0..nl]); // (its rows: the round's taps, checked)
+        var sample_after = rp.call;
         for (live[0..nl]) |st| {
             var targets: [R_max]i64 = undefined;
-            for (0..st.n) |jj| targets[jj] = @intCast(try argmax(run, rd.logits + (st.row + jj) * vocab * 4, vocab));
+            for (0..st.n) |jj| targets[jj] = try sampleDev(run, rd.logits + (st.row + jj) * vocab * 4, vocab, st.len + 1 + jj, st.smp);
+            // the served sampler's tokens for this window (a recording with sampler points)
+            if (fx.find(sample_after, "DsEngine._sample", null, "out")) |sq| {
+                const want = try ints(run, sq);
+                if (!std.mem.eql(i64, want, targets[0..st.n])) {
+                    try w_out.print("{{\"rank\": {d}, \"round_call\": {d}, \"stream\": {d}, \"sample_call\": {d}, \"samples_equal\": false}}\n", .{ run.rank, rp.call, st.req, sq.call });
+                    try w_out.flush();
+                    return false;
+                }
+                sample_after = sq.call;
+            }
             var acc: usize = 0;
             while (acc + 1 < st.n and st.win[acc + 1] == targets[acc]) acc += 1;
             st.len += acc + 1;
