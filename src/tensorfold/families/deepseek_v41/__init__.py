@@ -41,6 +41,14 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 2, rank: 
                 master_port: int = 29551, no_drafts: bool = False, mtp_drafts: int | None = None, **options: Any):
     import os
 
+    # fp32 GEMMs stay fp32 (GitHub #6): NVIDIA's PyTorch containers set TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1, which runs
+    # every fp32 cuBLAS GEMM in TF32, here the prompt chunks' router logits, indexer weights and mHC mixes: other prompt
+    # bits than the reference and the gates, and so other replies for a seed. torch reads the switch at its first cuBLAS
+    # handle, after this; fp32_gemms() checks that it took.
+    if os.environ.get("TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "0") not in ("", "0"):
+        print("[tensorfold] TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 (NVIDIA's PyTorch container default) set to 0: "
+              f"{TITLE}'s fp32 GEMMs stay fp32", flush=True)
+    os.environ["TORCH_ALLOW_TF32_CUBLAS_OVERRIDE"] = "0"
     from .cuda.engine import DsEngine
 
     if int(tp) not in (1, 2):
@@ -49,10 +57,25 @@ def cuda_engine(model_dir: str | Path, *, drafter: str = "", tp: int = 2, rank: 
     if int(tp) > 1 and not master:
         raise ValueError(f"--tp {tp} needs --master: rank 0's address on the link between the machines")
     drafts = 0 if no_drafts else (3 if mtp_drafts is None else int(mtp_drafts))
-    return DsEngine(Path(model_dir), rank=int(rank), world=int(tp), master=master, port=int(master_port),
-                    drafts=drafts, context=options.get("context"), engram_dir=os.environ.get("TF_DS_ENGRAM") or None,
-                    vision=bool(options.get("vision")), vision_urls=bool(options.get("vision_urls")),
-                    parallel=int(options.get("parallel") or 1))
+    engine = DsEngine(Path(model_dir), rank=int(rank), world=int(tp), master=master, port=int(master_port),
+                      drafts=drafts, context=options.get("context"), engram_dir=os.environ.get("TF_DS_ENGRAM") or None,
+                      vision=bool(options.get("vision")), vision_urls=bool(options.get("vision_urls")),
+                      parallel=int(options.get("parallel") or 1))
+    fp32_gemms()
+    return engine
+
+
+def fp32_gemms() -> None:
+    """Raise when this process's fp32 cuBLAS GEMMs run in TF32 (TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1 was read before
+    cuda_engine set it to 0): 4096 terms of (1 + 2^-12)^2 sum to 4098 in fp32; TF32 rounds 1 + 2^-12 to 1 (4096)."""
+
+    import torch
+
+    a = torch.full((256, 4096), 1 + 2 ** -12, dtype=torch.float32, device="cuda")
+    got = float((a @ a[:128].t())[0, 0])
+    if got != 4098.0:
+        raise RuntimeError(f"fp32 GEMMs run in TF32 in this process (the check summed to {got}, fp32 gives 4098.0): "
+                           "start the server with TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=0")
 
 
 def __getattr__(name: str) -> Any:
