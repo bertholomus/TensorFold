@@ -15,6 +15,11 @@ pub const DType = enum(c_int) { f16 = 0, bf16 = 1, f32 = 2 };
 
 /// (K splits, warps a program) for a K x N layer (linear.py plan): the shape's alone, so a layer keeps one reduction
 /// for every row count.
+/// The N a layer's plan is made for: its own, or the TP2 slice's a 2D column part keeps (weights.Linear.plan_n).
+fn planN(l: weights.Linear) usize {
+    return if (l.plan_n != 0) l.plan_n else l.n;
+}
+
 pub fn plan(k: usize, n: usize) struct { sk: u32, wk: u32 } {
     const blocks = 192;
     const min_tiles = 8;
@@ -163,13 +168,13 @@ pub fn glinear(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: u
     var done: [gmax]bool = @splat(false);
     for (calls, 0..) |first, i| {
         if (done[i]) continue;
-        const pf = plan(first.layer.k, first.layer.n);
+        const pf = plan(first.layer.k, planN(first.layer));
         var a: GArgs = .{ .M = @intCast(m) };
         var blocks: usize = 0;
         var zoff: u64 = 0;
         var any_z = false;
         for (calls[i..], i..) |c, j| {
-            const pj = plan(c.layer.k, c.layer.n);
+            const pj = plan(c.layer.k, planN(c.layer));
             if (done[j] or c.layer.k2 != first.layer.k2 or pj.wk != pf.wk) continue;
             done[j] = true;
             const s = strides(c.layer);
@@ -196,7 +201,7 @@ pub fn glinear(k: *const Kernels, stream: cuda.Stream, calls: []const Call, m: u
 pub fn zFloats(layers: []const weights.Linear, m: usize) usize {
     var n: usize = 0;
     for (layers) |l| {
-        const p = plan(l.k, l.n);
+        const p = plan(l.k, planN(l));
         if (p.sk > 1) n += p.sk * m * l.n;
     }
     return n;
@@ -230,4 +235,12 @@ test "plans and strides equal every recorded glinear layer of the served build" 
         try std.testing.expectEqual(@as(i64, r[5]), s[0]);
         try std.testing.expectEqual(@as(i64, r[6]), s[1]);
     }
+}
+
+test "a 2D node's column part keeps its TP2 slice's plan" {
+    // wq_b of a pair: 8,192 of the rank's 16,384 columns, planned as the 16,384 the TP2 rank launches
+    const part: weights.Linear = .{ .words = 0, .suh = 0, .svh = 0, .k = 1024, .n = 8192, .k2 = 2, .plan_n = 16384 };
+    try std.testing.expectEqual(plan(1024, 16384), plan(part.k, planN(part)));
+    const whole: weights.Linear = .{ .words = 0, .suh = 0, .svh = 0, .k = 1024, .n = 16384, .k2 = 2 };
+    try std.testing.expectEqual(plan(1024, 16384), plan(whole.k, planN(whole)));
 }

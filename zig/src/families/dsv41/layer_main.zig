@@ -416,7 +416,8 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
         prompt.head(eng, ch) catch |err| return report(w_out, rank, li, "head", err);
         const hg = fx.find(after, "Comm.gather", null, "in1") orelse return report(w_out, rank, li, "head fixture", error.NoLayerFixture);
         if (checked) {
-            if (!try run.check("head columns", hg, ch.head_l)) return false;
+            // (2D: the columns here are a quarter of the rank's; the gather holds both ranks' halves)
+            if (eng.two == null and !try run.check("head columns", hg, ch.head_l)) return false;
             if (!try run.check("head gather", fx.find(after, "Comm.gather", null, "out"), ch.head_g)) return false;
             if (!try run.check("prompt logits", fx.find(call - 1, "Model.forward", null, "out"), ch.head_g)) return false;
         }

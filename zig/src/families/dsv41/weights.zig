@@ -9,7 +9,9 @@ const rank_cache = @import("rank_cache.zig");
 const checkpoint = @import("checkpoint.zig");
 
 /// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
-pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32 };
+/// plan_n: the N its decode plan is made for, when not n: a 2D node's column part of a TP2 slice keeps that slice's
+/// plan (linear.py pinned plans), so its columns sum in the slice's K order.
+pub const Linear = struct { words: u64, suh: u64, svh: u64, k: u32, n: u32, k2: u32, plan_n: u32 = 0 };
 
 /// A layer's routed experts and its shared expert (the last entry), as exl3_experts.prepare lays them out. On a 2D node
 /// (exl3/experts2d.py prepare) gate / up hold its intermediate blocks (width of the half's down_k) and down its
@@ -323,6 +325,11 @@ const Loader = struct {
         for (0..ga[1]) |g| lay.wo_a[g] = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wo_a.slice.{d}", .{ p, ga[0] + g }), null, null);
         lay.groups = @intCast(ga[1]);
         lay.wo_b = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.wo_b", .{p}), s.woBCols(c), s.range(gl * c.o_lora));
+        if (s.pair != null) {
+            // the 2D column parts keep their TP2 slices' decode plans
+            lay.wq_b.plan_n = @intCast(s.heads(c) * c.head_dim);
+            lay.wo_b.plan_n = @intCast(c.hidden);
+        }
         if (c.kv_sources.has(i)) {
             lay.comp_wkv = try L.linear(try std.fmt.bufPrint(&nb, "{s}.attn.compressor.wkv", .{p}), null, null);
             lay.comp_norm = try L.plain(try std.fmt.bufPrint(&nb, "{s}.attn.compressor.norm.weight", .{p}), null);
@@ -352,6 +359,7 @@ const Loader = struct {
         lay.experts = try L.experts(p, n_experts, xp.half, xp.gu, xp.dcols, c.hidden);
         if (c.engram_layers.has(i)) {
             lay.engram_wkv = try L.linear(try std.fmt.bufPrint(&nb, "{s}.engram.wkv", .{p}), s.engramCols(c), s.range(s.engramRows(c)));
+            if (s.pair != null) lay.engram_wkv.?.plan_n = @intCast((c.hc + 1) * c.hidden);
             var kb: [256]u8 = undefined;
             const q = try L.gpa.dupe(u8, try L.entry(try plan.plainKey(&kb, try std.fmt.bufPrint(&nb, "{s}.engram.q_weight", .{p}), .f32)));
             defer L.gpa.free(q);
@@ -382,6 +390,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
     w.norm = try L.plain("norm.weight", null);
     const vr = s.headCols(c);
     w.head = try L.linear("head", vr, null);
+    if (s.pair != null) w.head.plan_n = @intCast(s.vocab(c)); // the vocabulary half's plan
     w.vocab_lo = vr[0];
     w.vocab_hi = vr[1];
     w.layers = try gpa.alloc(Layer, c.layers);
