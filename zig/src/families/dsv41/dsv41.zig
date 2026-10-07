@@ -5,6 +5,7 @@ pub const native = @import("native.zig");
 pub const rank_cache = @import("rank_cache.zig");
 pub const plan = @import("plan.zig");
 pub const engram = @import("engram.zig");
+pub const checkpoint = @import("checkpoint.zig");
 
 test {
     _ = @import("config.zig");
@@ -12,4 +13,5 @@ test {
     _ = rank_cache;
     _ = plan;
     _ = engram;
+    _ = checkpoint;
 }
