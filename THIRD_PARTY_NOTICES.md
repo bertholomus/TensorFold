@@ -94,6 +94,47 @@ positions interleaved over the ranks (p % 4), each rank's top-2048 merged into t
 rank, all-gathered absorbed queries, every rank attending all heads over its own keys, and log-sum-exp partials merged
 in rank order. It is restated for this fork's kernels and cache formats.
 
+GLM-5.3 TP4's prefill pieces ported from TensorFold PR #159 by drowzeys (branch prefill159-e3290a0), restated
+for this fork where noted:
+
+- `cuda/exl3/prefill.py` `UnpackCache` (commits 1da2529 + 8b97845): a prompt chunk's second micro-batch reuses the
+  first's decoded dense weights, LRU past `TF_GLM_UNPACK_CACHE_MB` (384 MiB), entries weakref keyed by layer id
+  and deq mode (this fork dequantizes the unpack in place, so entries hold the post-dequant W).
+- `families/glm_moe_dsa/cuda/select.py` `_scores` and `dcp.py` `_scores_dcp` (commit f0f382d): the indexer scoring
+  tiles of 128 keys, 2 warps, 2 stages — bit-identical to the previous 64/4/3 by per-token independence.
+- `families/glm_moe_dsa/cuda/engine.py` `prompt_chunk_rows` (commit f20913a): 4,096-row prompt chunks while a prompt
+  is under 3 chunks; off by default here (`TF_GLM_PROMPT_ROWS_SHORT`), since without the chunk-invariant prompt path
+  it moves prompt bits.
+
+GLM-5.3 TP4's decode-context-parallelism prompt path ports from MiaAI-Lab's
+[GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold](https://github.com/MiaAI-Lab/GLM-5.3-EXL3-3x-DGX-Sparks-TensorFold)
+(patches against TensorFold v0.6.0, Apache-2.0, head eb6414b), adapted from her `glm5_next` family to this fork's
+`glm_moe_dsa` and restated for its kernels and cache formats:
+
+- `families/glm_moe_dsa/cuda/dcp.py` `owner_rows`, `_threshold`, `_keep`, `owner_select` and `pipe_attention`
+  (patch 0131, glm-full-cp-prompt-pipe): the prompt chunks' selection candidates go to the row owners (her
+  `select_threshold` / `select_keep` radix select on our candidate keys, flipped to the uint64 order), and the
+  query all-gather and the partials' owner exchange run in parts on the comm stream beside the attention (her
+  `cp_prompt`, a ring of two buffers, first and last parts half as long). The same kernels over the same rows:
+  the prompt chunks' bits are the lane's (`TF_GLM_DCP_PIPE`, on).
+- `dcp.py` `PROMPT_TILES` (patch 0129, glm-full-cp-prompt-msa): the prompt chunks' DCP attention scores
+  `mla_pe.PROMPT_KT` keys a tile instead of the decode windows' 32 (her prompt chunks through her faster
+  sparse-attention kernel). Moves the prompt chunks' bits: `TF_GLM_DCP_PROMPT_TILES`, off by default.
+- `dcp.py` `kvg_row_bytes`, `_gathered_like`, `_gather_views`, `kvg_buffers`, `kvg_gather`, `owner_lists`,
+  `kvg_select`, `kvg_all_visible`, `kvg_attend` and the `engine.py` estimate term (patch 0141,
+  glm-full-cp-kv-gather): prompt chunks gather every rank's latent and rope rows of the positions they see and
+  attend their own heads over each row's whole top-k (her gathered planes, `owner_lists`, and
+  `cp_kvg_all_visible`). Moves the prompt chunks' bits: `TF_GLM_DCP_KV_GATHER`, off by default.
+
+Patches 0127 (overlapped MoE exchange) and 0135 (raw queries) are covered by this fork's existing prompt path
+(micro-batch collectives on the comm stream; the row-share reduce) or superseded by 0141, and patch 0128's
+expert prefetch is not ported yet.
+
+The concurrency rule of TensorFold PR #159 by drowzeys (commit b1f9694, "chunks under 2048 rows fill whole while
+others decode") is adapted to this fork's pacing gate: `families/glm_moe_dsa/cuda/multi.py` `_fill_choice`
+returns a stream whose remaining prompt is under `TF_GLM_FILL_MIN_ROWS` (2048, his default) before the
+`DECODE_SHARE` pacing. This fork fills whole chunks already (no layer steps), so only the wait is his.
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from
@@ -128,3 +169,10 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+## Flash Next CUDA image integration
+
+The multimodal rotary and image-feature integration is adapted from MiaAI-Lab's
+[Flash Next vision patch 0008](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/blob/a3aa89835022c55ca8e55008c37785954834e04f/patches/0008-flash-next-vision.patch),
+MIT License, Copyright (c) 2026 MiaAI-Lab. The license is included in `LICENSES/MiaAI-Lab-MIT.txt`.
+The port preserves the v0.5 CUDA execution APIs and adds an offline EXL3 vision adapter.

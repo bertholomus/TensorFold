@@ -472,9 +472,9 @@ def test_engine_world_plumbing_via_stubbed_init(monkeypatch, tmp_path):
         def all_gather(self, x):
             return [x] * world_seen["nccl"][1]
 
-    # engine.py imports NCCL inside __init__ from tensorfold.cuda.comm: stub that module entry
+    # engine.py imports open_comm inside __init__ from tensorfold.cuda.comm: stub that module entry
     monkeypatch.setitem(sys.modules, "tensorfold.cuda.comm",
-                        SimpleNamespace(NCCL=FakeComm))
+                        SimpleNamespace(NCCL=FakeComm, open_comm=FakeComm))
     monkeypatch.setattr(torch.cuda, "set_device", lambda *a: None)
 
     import tensorfold.cuda.capacity as capacity
@@ -522,8 +522,9 @@ def test_engine_setting_mismatch_rejected_across_world(monkeypatch, tmp_path):
         def barrier(self):
             pass
 
-    # engine.py imports NCCL inside __init__ from tensorfold.cuda.comm: stub that module entry
-    monkeypatch.setitem(sys.modules, "tensorfold.cuda.comm", SimpleNamespace(NCCL=lambda *a: FakeComm()))
+    # engine.py imports open_comm inside __init__ from tensorfold.cuda.comm: stub that module entry
+    monkeypatch.setitem(sys.modules, "tensorfold.cuda.comm", SimpleNamespace(NCCL=lambda *a: FakeComm(),
+                                                                             open_comm=lambda *a: FakeComm()))
     monkeypatch.setattr(torch.cuda, "set_device", lambda *a: None)
     import tensorfold.cuda.capacity as capacity
     monkeypatch.setattr(capacity, "admit", lambda *a, **kw: {

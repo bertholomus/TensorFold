@@ -154,13 +154,47 @@ def _mm_f32(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor) -> None:
     torch.mm(x, w, out_dtype=torch.float32, out=out)
 
 
-class Workspace:
-    """One decoded W_q and one rotated input, grown to the largest call and reused (calls run in order on one stream)."""
+class UnpackCache:
+    """Decoded dense W kept per layer for the next calls (e.g. a prompt chunk's second micro-batch), least recently
+    used out first past ``nbytes``. The weights never change, so a kept copy is the decode's own bits; workspaces that
+    share one must run on one stream (stream order keeps an evicted buffer's readers before its reuse). ``build``:
+    the caller's decode of one fresh tensor — our prefill path dequantizes the unpack in place, so (differing from
+    the port's raw-unpack entries) the cache holds the post-dequant W and the key carries the deq mode."""
 
-    def __init__(self) -> None:
+    def __init__(self, nbytes: int) -> None:
+        from collections import OrderedDict
+
+        self.limit, self.used, self.kept = nbytes, 0, OrderedDict()
+
+    def get(self, layer, device, mode: str, build) -> torch.Tensor:
+        import weakref
+
+        key = (id(layer), mode)          # ids come back once a layer is freed: an entry counts only for its own layer
+        hit = self.kept.get(key)
+        if hit is not None and hit[0]() is layer:
+            self.kept.move_to_end(key)
+            return hit[1]
+        if hit is not None:                                    # a freed layer's entry under a reused id
+            del self.kept[key]
+            self.used -= hit[1].numel() * hit[1].element_size()
+        t = build()
+        self.kept[key] = (weakref.ref(layer), t)
+        self.used += t.numel() * t.element_size()
+        while self.used > self.limit and len(self.kept) > 1:
+            _, (_, old) = self.kept.popitem(last=False)
+            self.used -= old.numel() * old.element_size()
+        return t
+
+
+class Workspace:
+    """One decoded W_q and one rotated input, grown to the largest call and reused (calls run in order on one stream).
+    ``cache``: an UnpackCache shared with other workspaces on the same stream (decoded weights reused across calls)."""
+
+    def __init__(self, cache: "UnpackCache | None" = None) -> None:
         self.w: torch.Tensor | None = None
         self.xh: torch.Tensor | None = None
         self.h: torch.Tensor | None = None
+        self.cache = cache
 
     def _grow(self, name: str, numel: int, device) -> torch.Tensor:
         t = getattr(self, name)
@@ -196,11 +230,21 @@ def matmul(layer: Exl3Linear, x: torch.Tensor, out: torch.Tensor, ws: Workspace,
         mode = "bf16" if out.dtype == torch.bfloat16 and layer.bias is None else "fp16"
     ext = _ext()
     if mode != "0":
-        wq = ws._grow("w", k * n, x.device)[:k * n].view(k, n)
-        ext.unpack(layer.words, wq, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
-        wd = wq.view(torch.bfloat16) if mode == "bf16" else wq
-        _dequant[(k // 128, n // 128)](wq, wd, ws.hadamard(x.device), layer.suh, layer.svh, N=n, SCALE=DEQ_SCALE,
-                                       num_warps=8)
+        if ws.cache is not None:
+            def _decode() -> torch.Tensor:
+                t = torch.empty((k, n), dtype=torch.float16, device=x.device)
+                ext.unpack(layer.words, t, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
+                wdt = t.view(torch.bfloat16) if mode == "bf16" else t
+                _dequant[(k // 128, n // 128)](t, wdt, ws.hadamard(x.device), layer.suh, layer.svh, N=n,
+                                               SCALE=DEQ_SCALE, num_warps=8)
+                return wdt
+            wd = ws.cache.get(layer, x.device, mode, _decode)
+        else:
+            wq = ws._grow("w", k * n, x.device)[:k * n].view(k, n)
+            ext.unpack(layer.words, wq, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
+            wd = wq.view(torch.bfloat16) if mode == "bf16" else wq
+            _dequant[(k // 128, n // 128)](wq, wd, ws.hadamard(x.device), layer.suh, layer.svh, N=n, SCALE=DEQ_SCALE,
+                                           num_warps=8)
         if x.stride(1) != 1:
             x = x.contiguous()
         if mode == "bf16" and layer.bias is None and x.dtype == torch.bfloat16:

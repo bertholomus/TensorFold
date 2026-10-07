@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,16 +89,23 @@ def _prep_kernel(QKV, QN, KN, COS, SIN, QO, KO, VO, L, stride, eps,
 @triton.jit
 def _dattn_kernel(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.constexpr, NH: tl.constexpr,
                   HD: tl.constexpr, CAP: tl.constexpr, BK: tl.constexpr, CAUSAL: tl.constexpr,
-                  RING: tl.constexpr = False, SKIP: tl.constexpr = True):
-    """Each KV head attends its queries to the window's tiles (masked tiles skipped, same bits) and the block's keys."""
+                  RING: tl.constexpr = False, SKIP: tl.constexpr = True, MP: tl.constexpr = 0,
+                  PAD: tl.constexpr = False):
+    """Each KV head attends its queries to the window's tiles (masked tiles skipped, same bits) and the block's keys.
+    ``PAD``: G x N query rows that are not a power of two run as MP rows, the extra ones masked (a drafter whose query
+    heads a KV head are not a power of two on this many ranks, e.g. 48 over 8 KV heads on four)."""
 
     kvh = tl.program_id(0)
-    M: tl.constexpr = G * N
+    M: tl.constexpr = MP if PAD else G * N
     m = tl.arange(0, M)
     qh = kvh * G + m // N
     qr = m % N
     d = tl.arange(0, HD)
-    q = tl.load(Q + (qh[:, None] * N + qr[:, None]) * HD + d[None, :])
+    if PAD:
+        live = m < G * N
+        q = tl.load(Q + (qh[:, None] * N + qr[:, None]) * HD + d[None, :], mask=live[:, None], other=0.0)
+    else:
+        q = tl.load(Q + (qh[:, None] * N + qr[:, None]) * HD + d[None, :])
     s = tl.load(POS).to(tl.int32)
     klen = s + N
     qpos = s + qr
@@ -128,7 +136,11 @@ def _dattn_kernel(Q, K, V, OUT, POS, window, scale, N: tl.constexpr, G: tl.const
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         m_i = m_new
     out = acc / l_i[:, None]
-    tl.store(OUT + qr[:, None] * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16))
+    if PAD:
+        tl.store(OUT + qr[:, None] * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16),
+                 mask=live[:, None])
+    else:
+        tl.store(OUT + qr[:, None] * (NH * HD) + qh[:, None] * HD + d[None, :], out.to(tl.bfloat16))
 
 
 def _dconv(x: torch.Tensor, dyn: torch.Tensor, base: torch.Tensor, branch: int, group_size: int,
@@ -173,9 +185,14 @@ class DraftLayer:
 class Drafter:
     """Draft one sequence from position-indexed context using device lengths and static buffers shared by eager execution and CUDA graphs."""
 
+    # read the drafter's tensors as the checkpoint loader does (O_DIRECT, pinned uploads) instead of memory-mapped and
+    # copied from pageable memory (GLM-5.3's ranks stalled in such copies at startup, beside the RDMA gather)
+    DIRECT_READ = False
+
     def __init__(self, draft_dir: str | Path, w: Weights, *, block: int | None = None, capacity: int = 2560,
-                 ring: bool = False) -> None:
-        """``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and block, the same drafts."""
+                 ring: bool = False, bits: int = 4) -> None:
+        """``ring`` (TF_GLM_DRAFT_RING): the context in a ring of the window and block, the same drafts. ``bits``: the
+        linears as 4-bit copies (4) or as stored in BF16 (0)."""
 
         path = Path(draft_dir)
         cfg = json.loads((path / "config.json").read_text())
@@ -210,18 +227,29 @@ class Drafter:
         def gpu(t: torch.Tensor) -> torch.Tensor:
             return t.to(dev, torch.bfloat16).contiguous()
 
-        quantize4 = _quantize4
+        if int(bits) not in (0, 4, 16):
+            raise ValueError(f"a DFlash2 drafter's linears run in 4 bits or BF16 (0), not {bits}")
+        quantize4 = _quantize4 if int(bits) == 4 else qmm.make_b16
 
-        with safe_open(str(path / "model.safetensors"), framework="pt", device="cpu") as f:
-            def get(name: str) -> torch.Tensor:
+        direct = bool(self.DIRECT_READ)
+        if direct:
+            from tensorfold.cuda.direct_read import SafeTensors
+
+            opened = contextlib.closing(SafeTensors([path / "model.safetensors"]))
+        else:
+            opened = safe_open(str(path / "model.safetensors"), framework="pt", device="cpu")
+        with opened as f:
+            def get(name: str, host: bool = False) -> torch.Tensor:
+                if direct:                     # O_DIRECT reads, uploaded through pinned pieces (the checkpoint's path)
+                    return f.get(name, "cpu" if host else dev)
                 return f.get_tensor(name)
 
             self.fc = quantize4(gpu(get("fc.weight")))
             self.hidden_norm = gpu(get("hidden_norm.weight"))
             self.norm = gpu(get("norm.weight"))
             self.hproj = gpu(get("candidate_selector.hidden_projection.weight"))
-            self.pred = get("candidate_selector.predecessor_codebook").float().numpy().copy()
-            self.succ = get("candidate_selector.successor_codebook").float().numpy().copy()
+            self.pred = get("candidate_selector.predecessor_codebook", host=True).float().numpy().copy()
+            self.succ = get("candidate_selector.successor_codebook", host=True).float().numpy().copy()
             self.layers: list[DraftLayer] = []
             for i in range(int(cfg["num_hidden_layers"])):
                 p = f"layers.{i}."
@@ -281,6 +309,15 @@ class Drafter:
         self.context_end = 0
         self.pos_dev.zero_()
 
+    def skip_to(self, position: int) -> None:
+        """Start the context at ``position`` (later than its end) without the taps before it: the block passes read
+        only the window before the block, so a prompt's earlier rows never change a draft once the window is past them."""
+
+        if position < self.context_end or position > self.capacity:
+            raise ValueError("the drafter's context skips forward, within its capacity")
+        self.context_end = position
+        self.pos_dev.fill_(position)
+
     def _slots(self, n: int) -> torch.Tensor:
         """Where the rows at positions context_end .. context_end + n - 1 go: those positions, modulo the ring."""
 
@@ -288,6 +325,16 @@ class Drafter:
         return idx % self.ring if self.ring else idx
 
     # -- pieces -------------------------------------------------------------------------------------------------
+    def _embed(self, x: torch.Tensor) -> None:
+        """The block's token rows (the pending token, then mask ids) from the target's embedding, into x."""
+
+        glue.embed(self.ids, self.w.embed, self.D, 1, x)
+
+    def _head(self, h: torch.Tensor, hs: torch.Tensor) -> tuple[torch.Tensor, int]:
+        """This rank's logits of the block's draft rows over the target's head, and the first token id they cover."""
+
+        return _mm(h, self.w.draft_head if self.w.draft_head is not None else self.w.head, hs), self.w.vocab_offset
+
     def _rotary(self, rows: int) -> tuple[torch.Tensor, torch.Tensor]:
         pos = (self.pos_dev + self.ar[:rows]).to(torch.float32)
         phase = pos[:, None] * self.inv_freq[None, :]
@@ -333,9 +380,11 @@ class Drafter:
         self.kc[i].index_copy_(1, idx, k)
         self.vc[i].index_copy_(1, idx, v)
         out = torch.empty((rows, self.heads * self.hd), dtype=torch.bfloat16, device=self.dev)
+        G = self.heads // self.kvh
+        mp = triton.next_power_of_2(G * rows)
         _dattn_kernel[(self.kvh,)](q, self.kc[i], self.vc[i], out, self.pos_dev, self.window, self.hd ** -0.5,
-                                   N=rows, G=self.heads // self.kvh, NH=self.heads, HD=self.hd, CAP=self.cap, BK=64,
-                                   CAUSAL=self.causal, RING=bool(self.ring), num_warps=4)
+                                   N=rows, G=G, NH=self.heads, HD=self.hd, CAP=self.cap, BK=64,
+                                   CAUSAL=self.causal, RING=bool(self.ring), MP=mp, PAD=mp != G * rows, num_warps=4)
         x = _dconv(self._row(out, L.o), dyn, L.a_base, 1, self.gs, x)
         normed, xs = self._norm(x, L.post_norm)
         dyn = _mm(normed, L.m_kp, xs)
@@ -379,15 +428,15 @@ class Drafter:
 
         n = self.block
         x = torch.empty((n, self.D), dtype=torch.bfloat16, device=self.dev)
-        glue.embed(self.ids, self.w.embed, self.D, 1, x)
+        self._embed(x)
         cos, sin = self._rotary(n)
         idx = self._slots(n)
         for i in range(len(self.layers)):
             x = self._layer(i, x, cos, sin, idx)
         h, hs = self._norm(x[1:], self.norm)
-        logits = _mm(h, self.w.draft_head if self.w.draft_head is not None else self.w.head, hs)
+        logits, offset = self._head(h, hs)
         vals, local = torch.topk(logits.float(), self.top_k, dim=-1)
-        gids = (local + self.w.vocab_offset).to(torch.int32)
+        gids = (local + offset).to(torch.int32)
         packed = torch.cat([vals, gids.view(torch.float32)], dim=1).contiguous()
         if self.world > 1 and self.w.comm is not None:
             got = torch.empty((self.world * packed.numel(),), dtype=torch.float32, device=self.dev)

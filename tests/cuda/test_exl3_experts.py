@@ -469,3 +469,35 @@ def test_lane_map_extracts_every_window():
                         off = end(p_last, k2) - end(p, k2)
                         assert off + 16 <= 64, (k2, lane, g, j, off)
                         assert (mm >> off) & 0xFFFF == state(p), (k2, lane, g, j)
+
+
+def test_prompt_scratch_grows_to_the_rows_a_call_needs():
+    """A prompt Scratch (prompt=True) makes y and gate / up's rotated rows on first use, sized for the call (a power
+    of two from 16 rows) and grown for a wider one: a prompt's short last chunk (the one-tile path, under EXACT_ROWS)
+    no longer makes them for every row of a chunk (3.4 GB at GLM-5.3's 8,192 rows). Every call's output is the full,
+    preallocated scratch's, bit for bit."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    name, cb, kfun = MIXED[2]
+    E, D, I, TOPK = 24, 512, 256, 6
+    ex, _ = _layer(E, D, I, [kfun(e) for e in range(E)], cb, seed=17 + cb)
+    g = torch.Generator().manual_seed(5)
+    ROWS = 600
+    x = torch.randn((ROWS, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _picks(E, ROWS, TOPK, g, shared=True)
+    full = experts.Scratch(ex, ROWS, TOPK + 1)
+    lazy = experts.Scratch(ex, ROWS, TOPK + 1, prompt=True)
+    assert lazy.y is None and lazy.xg is None and lazy.xu is None
+    grown = []
+    for R in (20, 3, 40, 64, 600, 33):
+        p, wr = sel[:R].contiguous(), w[:R].contiguous()
+        for wts in (wr, None):
+            ref = experts.routed(x[:R], p, wts, ex, full, None, R).clone()
+            out = experts.routed(x[:R], p, wts, ex, lazy, None, R).clone()
+            assert torch.equal(out.view(torch.int32), ref.view(torch.int32)), (R, wts is None)
+        grown.append((R, None if lazy.y is None else lazy.y.shape[0] // (TOPK + 1),
+                      None if lazy.xg is None else lazy.xg.shape[0] // (TOPK + 1)))
+    # 20 rows -> 32, 3 fit, 40 -> 64, 64 fit, 600 -> 600 (the scratch's rows), 33 fit
+    assert [y for _, y, _ in grown] == [32, 32, 64, 64, 600, 600], grown
+    assert all(xg is None or xg == y for _, y, xg in grown), grown

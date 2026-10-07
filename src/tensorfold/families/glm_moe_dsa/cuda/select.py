@@ -333,6 +333,8 @@ def sparse_buckets(capacity: int, dense_limit: int, G: int = 1) -> list[int]:
         bucket *= 2
 
 
+BT = 128                  # indexer: keys per scoring program (128 keys / 2 warps / 2 stages: the same bits as
+                          # 64 / 4 / 3, ~1.14x on GB10; Ported-from ashhart/TensorFold#159 f0f382d (drowzeys))
 SELECT_BYTES = 96 << 20     # a selection's scores and sort keys held at once: a prompt chunk selects in row blocks
 TRIM = os.environ.get("TF_GLM_SELECT_TRIM", "1") != "0"   # prompt chunks score up to their last visible token only
 RADIX_ROWS = 16             # blocks of this many rows or more select with _radix_topk (a program a row), fewer rows
@@ -399,9 +401,9 @@ def _select(qi: torch.Tensor, wts: torch.Tensor, keys, R: int, topk: int, pos_de
             qi, wts, wts.stride(0), ik, isc, hq, scores, pos_dev, R, np_max, D ** -0.5, wscale, H=H, HP=HP, D=D, BT=64,
             RB=SPAN_RB, TS=SPAN_TS, KV8=kv8, QB=qb, num_warps=4)
     else:
-        _scores[(triton.cdiv(R, rb), triton.cdiv(np_max, 64))](qi, wts, wts.stride(0), ik, isc, hq, scores, pos_dev, R,
-                                                               np_max, D ** -0.5, wscale, H=H, HP=HP, D=D, BT=64,
-                                                               RB=rb, KV8=kv8, QB=qb, num_warps=4)
+        _scores[(triton.cdiv(R, rb), triton.cdiv(np_max, BT))](qi, wts, wts.stride(0), ik, isc, hq, scores, pos_dev,
+                                                               R, np_max, D ** -0.5, wscale, H=H, HP=HP, D=D, BT=BT,
+                                                               RB=rb, KV8=kv8, QB=qb, num_warps=2, num_stages=2)
     width = tokens.shape[1]
     k = min(topk, np_max)
     if wide and tokens.stride(1) == 1:

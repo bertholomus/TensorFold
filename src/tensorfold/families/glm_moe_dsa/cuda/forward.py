@@ -253,7 +253,10 @@ class Buffers(FlashBuffers):
         self.iw = torch.empty((rows, c.index_heads), dtype=bf, device=dev)        # indexer head weights per token
         # no hyper-connections: x holds one stream
         self.x = torch.empty((rows, c.hidden), dtype=bf, device=dev)
-        del self.taps, self.tap_at
+        # a DFlash2 drafter's taps (``set_taps``): the residual after chosen layers, the last tap_rows rows a forward
+        self.taps: list[torch.Tensor] = []
+        self.tap_at: dict[int, list[int]] = {}
+        self.tap_rows = 0
         # kv_a's output is the latent then the shared rope key (kv_lora + qk_rope): Flash's buffer has no rope part
         self.lat = torch.empty((rows, c.kv_lora + c.qk_rope), dtype=bf, device=dev)
         # EXL3 groups (attention, MLPs, MTP, head) share one scratch; the routed experts run on the universal kernel
@@ -272,6 +275,9 @@ class Buffers(FlashBuffers):
         # dcp (TF_GLM_DCP): every head's absorbed query and the partials exchanged between the ranks
         self.dcp = (dcp_mod.Scratch(rows, share(c.heads, w.world, w.rank), c.kv_lora, c.qk_rope, w.world, dev)
                     if w.meta.get("dcp", 1) > 1 else None)
+        # TF_GLM_DCP_KV_GATHER: the gathered planes of one layer (every rank's rows), made at the first
+        # prompt chunk (dcp.kvg_buffers) and reused by every layer and chunk
+        self.cp_kvg = None
         # prompt chunks over a quantized latent: a layer's visible slots as fp16 tiles (mla_pe.unpack_q), flat so the
         # micro-batch views leave it whole
         self.qscr = (torch.empty((qscratch_slots(capacity, w.meta.get("dcp", 1)) * c.kv_lora,), dtype=torch.float16,
@@ -281,6 +287,47 @@ class Buffers(FlashBuffers):
             from tensorfold.cuda.exl3 import experts as x3experts
 
             self.moe = x3experts.Scratch(first.ex, rows, c.top_k + 1, device=dev, prompt=prefill)
+
+    def set_taps(self, layers: tuple[int, ...], hidden: int, rows: int | None = None) -> None:
+        """Tap the residual after each of ``layers`` (a layer's output, as Hugging Face's hidden_states[i + 1]) into
+        buffers of ``rows`` rows (default every row): a forward of R rows keeps its last min(R, rows)."""
+
+        self.tap_at = {}
+        for i, layer in enumerate(layers):
+            self.tap_at.setdefault(int(layer), []).append(i)
+        self.tap_rows = min(self.rows, int(rows)) if rows else self.rows
+        self.taps = [torch.empty((self.tap_rows, hidden), dtype=torch.bfloat16, device=self.ids.device)
+                     for _ in layers]
+
+    def tapped(self, R: int) -> int:
+        """Rows a forward of R rows leaves in the taps (its last ones)."""
+
+        return min(R, self.tap_rows)
+
+
+def tap(b, layer: int, R: int, pend=None, lo: int = 0, chunk: int | None = None) -> None:
+    """The residual after ``layer`` into its tap buffers: rows lo .. lo + R of a forward of ``chunk`` rows (default R)
+    whose last b.tap_rows rows are kept. ``pend``: the layer's last branch not yet added to x (a prompt chunk's
+    micro-batch, prompt_layers), added on the way (x + branch, residual's arithmetic; x itself is left as it is)."""
+
+    slots = b.tap_at.get(layer)
+    if not slots:
+        return
+    full = getattr(b, "full", b)                  # a micro-batch's views write the whole chunk's tap rows
+    chunk = R if chunk is None else chunk
+    first = chunk - min(chunk, full.tap_rows)     # the chunk's first kept row
+    a, z = max(lo, first), lo + R
+    if a >= z:
+        return
+    src = b.x[a - lo:z - lo]
+    for slot in slots:
+        dst = full.taps[slot][a - first:z - first]
+        if pend is None:
+            dst.copy_(src)
+        elif isinstance(pend, Rows):
+            residual(src, dst, Rows(pend.bg[a - lo:z - lo], pend.done))
+        else:
+            residual(src, dst, pend[:, a - lo:z - lo].contiguous())     # (glue.residual_add reads [world, n, D])
 
 
 class State(FlashState):
@@ -387,12 +434,6 @@ def write_rows(rows: torch.Tensor, cache, pos_dev: torch.Tensor, G: int = 1, ran
         latent_mod.latent_write(rows, cache, pos_dev)
 
 
-def held_rows(p, lo: int, hi: int):
-    """Rows [lo, hi) of a cache plane: a concurrent stream's slot (views; an FP8 or quantized plane's own)."""
-
-    return p[lo:hi] if isinstance(p, torch.Tensor) else p.rows(lo, hi)
-
-
 def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, R: int,
               nch: int | None, index, host_pos: int | None,
               sparse_np: int | None = None, pc: torch.Tensor | None = None, reuse: bool = False) -> torch.Tensor:
@@ -412,12 +453,8 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
     G = w.meta.get("dcp", 1)                 # dcp: the cache's positions interleaved over G ranks
     inv = invariant.INVARIANT and b.prefill and G == 1   # the chunk-invariant prompt path (invariant.py)
     t = getattr(b, "rows_t", None)           # a concurrent round (rows.Tables): every row its own stream's position
-    if t is not None and reuse:
-        raise ValueError("a concurrent round runs without MTP index reuse")
-    # dcp in a concurrent round: each stream's rows over its slot's planes (the rows this rank holds of them)
-    segs = t.segments if t is not None and G > 1 else None
-    if segs is not None and sum(n for _, n, _, _, _ in segs) != R:
-        raise ValueError("a concurrent round with decode context parallelism needs every stream's slot (rows.Tables)")
+    if t is not None and (G > 1 or reuse):
+        raise ValueError("a concurrent round runs neither with decode context parallelism nor MTP index reuse")
 
     def keys(sc: X3Scratch | None) -> None:
         """This window's latent, rope key and (full layers) indexer key, into their caches at the window's slots."""
@@ -429,11 +466,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         with prof.timed("dsa: rope"):
             rope_mod.apply_key(b.lat[:R, c.kv_lora:], b.cos[:R], b.sin[:R], c)
         with prof.timed("dsa: latent write"):
-            if segs is not None:             # dcp: each stream's rows into its slot, the positions this rank holds
-                for r0, n, lo, hi, _ in segs:
-                    write_rows(b.lat[r0:r0 + n, :c.kv_lora], held_rows(lc, lo, hi), t.pos[r0:r0 + 1], G, w.rank)
-                    write_rows(b.lat[r0:r0 + n, c.kv_lora:], held_rows(pc, lo, hi), t.pos[r0:r0 + 1], G, w.rank)
-            elif t is not None:              # a concurrent round: each row at its own stream's slot
+            if t is not None:                # a concurrent round: each row at its own stream's slot
                 rows_mod.write(b.lat[:R, :c.kv_lora], lc, t)
                 rows_mod.write(b.lat[:R, c.kv_lora:], pc, t)
             else:
@@ -445,10 +478,7 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
                 mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ik[:R])
                 glue.layernorm(b.ik[:R], ix.ln_w, ix.ln_b, c.eps, b.ik[:R])
                 rope_mod.apply_index(b.ik[:R], b.cos[:R], b.sin[:R], c, 1)
-                if segs is not None:
-                    for r0, n, lo, hi, _ in segs:
-                        write_rows(b.ik[r0:r0 + n], held_rows(index, lo, hi), t.pos[r0:r0 + 1], G, w.rank)
-                elif t is not None:
+                if t is not None:
                     rows_mod.write(b.ik[:R], index, t)
                 elif host_pos is not None and isinstance(index, torch.Tensor) and G == 1:
                     index[host_pos:host_pos + R].copy_(b.ik[:R])
@@ -480,27 +510,6 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
         qp = mla_pe.gather_pe(b.q[:R], c.qk_nope, b.qp[:R])
     ol = s.ol[:R]
     scale = c.qk_dim ** -0.5
-    if segs is not None:
-        # dcp in a concurrent round: each stream's window through the single-stream dcp selection and attention over its
-        # slot's planes, every rank taking the streams in the same order (the exchanges pair up). A row's keys, chunks
-        # and merges are its solo window's (rows never meet), so a row keeps the solo dcp bits.
-        sel = long_ctx and a.index is not None
-        if sel and any(p0 + n - 1 >= c.dense_limit for _, n, _, _, p0 in segs):
-            with prof.timed("dsa: select tokens"):
-                index_inputs(w, b, a.index, R)
-        with prof.timed("dsa: attention (dcp)"):
-            for r0, n, lo, hi, p0 in segs:
-                pv = t.pos[r0:r0 + 1]
-                if sel and p0 + n - 1 >= c.dense_limit:
-                    dcp_mod.select(w, b.qi[r0:r0 + n], b.iw[r0:r0 + n], held_rows(index, lo, hi), None, n,
-                                   c.index_topk, pv, tokens=b.tokens[r0:r0 + n], counts=b.counts[r0:r0 + n],
-                                   bucket=select_mod.sparse_bucket(p0, n, G))
-                dcp_mod.attention(w, qa[r0:r0 + n], qp[r0:r0 + n], held_rows(lc, lo, hi), held_rows(pc, lo, hi),
-                                  b.tokens[r0:r0 + n], b.counts[r0:r0 + n], pv, ol[r0:r0 + n], scale, b.dcp,
-                                  c.index_topk)
-        with prof.timed("dsa: expand"):
-            o = mla_pe.expand_v(ol, a.absorb, b.vn[:R], exact=True).view(R, HL * c.v_dim)
-        return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
     if t is not None:
         # a concurrent round: rows below the dense limit attend densely, rows past it their selection (each row's
         # keys are its own stream's; the kernels and their order are the single-stream ones)
@@ -519,14 +528,30 @@ def dsa_block(layer: LayerW, w: Weights, lc, pos_dev: torch.Tensor, b: Buffers, 
             o = mla_pe.expand_v(ol, a.absorb, b.vn[:R], exact=True).view(R, HL * c.v_dim)
         return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
     if G > 1:
-        # dcp: rows below the dense limit read every key a rank holds, later rows its share of the global selection
+        # dcp: rows below the dense limit read every key a rank holds, later rows its share of the global selection.
+        # TF_GLM_DCP_KV_GATHER (0141, off): prompt chunks gather every rank's plane rows instead and attend their
+        # own heads over each row's whole top-k (moves the prompt chunks' bits: it would need a new reference).
+        kvg = (dcp_mod.KVG and b.prefill and host_pos is not None and sparse_np is None and not reuse
+               and getattr(b, "comm_stream", None) is not None)
+        if kvg:
+            gl, gr, ev = dcp_mod.kvg_gather(w, lc, pc, b, R, host_pos)
         if sparse_rows and a.index is not None and not reuse:
             with prof.timed("dsa: select tokens"):
                 index_inputs(w, b, a.index, R)
-                dcp_mod.select(w, b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev, tokens=b.tokens[:R],
-                               counts=b.counts[:R], bucket=sparse_np)
+                if kvg:
+                    dcp_mod.kvg_select(w, b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev,
+                                       tokens=b.tokens[:R], counts=b.counts[:R])
+                else:
+                    dcp_mod.select(w, b.qi[:R], b.iw[:R], index, host_pos, R, c.index_topk, pos_dev,
+                                   tokens=b.tokens[:R], counts=b.counts[:R], bucket=sparse_np)
         with prof.timed("dsa: attention (dcp)"):
-            dcp_mod.attention(w, qa, qp, lc, pc, b.tokens[:R], b.counts[:R], pos_dev, ol, scale, b.dcp, c.index_topk)
+            if kvg:
+                dcp_mod.kvg_attend(w, qa, qp, gl, gr, ev, b, R, ol, scale, c.index_topk,
+                                   selected=bool(sparse_rows and a.index is not None and not reuse),
+                                   within=host_pos + R <= c.index_topk, host_pos=host_pos)
+            else:
+                dcp_mod.attention(w, qa, qp, lc, pc, b.tokens[:R], b.counts[:R], pos_dev, ol, scale, b.dcp,
+                                  c.index_topk, stream=getattr(b, "comm_stream", None))
         with prof.timed("dsa: expand"):
             o = mla_pe.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
         return out_proj(w, b, o, a.o, qmm_sums(b, o, R), R)
@@ -716,6 +741,8 @@ def prompt_layers(w: Weights, st: State, b: Buffers, R: int, nch: int | None, ho
             pend[i] = attn_part(layer, w, st, v, r, nch, hp, sparse_np, pos, pre=pend[i])
         for i, (v, r, pos, hp) in enumerate(mbs):
             pend[i] = ffn_part(layer, w, v, r, pre=pend[i])
+            if b.tap_at:
+                tap(v, layer.index, r, pend[i], lo=0 if i == 0 else h, chunk=R)
     for i, (v, r, pos, hp) in enumerate(mbs):
         residual(v.x[:r], v.x[:r], pend[i])
 
@@ -777,6 +804,8 @@ def compute(w: Weights, st: State, b: Buffers, R: int, *, logits: bool = True, n
     else:
         for layer in w.layers:
             layer_forward(layer, w, st, b, R, nch, host_pos, sparse_np)
+            if b.tap_at:
+                tap(b, layer.index, R)
     if not logits:
         return None
     glue.rmsnorm(b.x[:R], w.norm, c.eps, b.fnormed[:R], b.fxs[:R])

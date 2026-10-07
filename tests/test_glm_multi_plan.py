@@ -118,11 +118,14 @@ def test_short_prompts_fill_together_and_quick_ones_before_the_round(monkeypatch
 
     monkeypatch.setattr(multi, "FILL_ROWS", 128)
     monkeypatch.setattr(multi, "QUICK_ROWS", 1024)
+    monkeypatch.setattr(multi, "FILL_MIN_ROWS", 2048)
     assert _planner([(20, 0)] * 4, decoding=2)._fill_choice() == [0, 1, 2, 3]
     assert _planner([(60, 0)] * 3)._fill_choice() == [0, 1]                    # a batched fill holds 128 rows
     assert _planner([(20, 0), (500, 0), (30, 0)], decoding=3)._fill_choice() == [0, 1, 2]
     assert _planner([(600, 0), (600, 0)], decoding=1)._fill_choice() == [0]     # quick ones up to 1,024 rows a step
-    assert _planner([(2000, 0)], decoding=1)._fill_choice() is None             # past QUICK_ROWS: paced
+    assert _planner([(2000, 0)], decoding=1)._fill_choice() == 0                # a short rest fills whole now
+    assert _planner([(2500, 0)], decoding=1)._fill_choice() is None             # past FILL_MIN_ROWS: paced
+    assert _planner([(20000, 18900)], decoding=1)._fill_choice() == 0        # a short rest of a long prompt
     assert _planner([(9000, 8192)], decoding=1)._fill_choice() == [0]           # a long prompt's last chunk is quick
     assert _planner([(20, 0)], tiny=0)._fill_choice() == [0]                    # no batched fills: quick
 
@@ -334,33 +337,6 @@ def test_the_draft_cut_ends_unlikely_chains_under_concurrency(monkeypatch, strea
         assert ss[0].draft_probs == [0.9, 0.45] and len(ss[1].draft_probs) == 3
         # the step that drafted the cut token ran (its MTP row goes back next round, as a rejected draft's does)
         assert ss[0].st.st.mtp_drafted == 2 and ss[1].st.st.mtp_drafted == 2
-
-
-def test_dcp_rounds_address_each_stream_by_its_slots_local_rows():
-    """Decode context parallelism over 4 ranks: a slot holds its positions' local rows of the pool on every rank (fixed
-    slots and extents alike), and a round's tables keep each stream's (first row, rows, local rows, first position)
-    for the attention's single-stream dcp calls; without dcp the tables keep no segments."""
-    from tensorfold.families.glm_moe_dsa.cuda import multi
-    from tensorfold.families.glm_moe_dsa.cuda.dcp import local_slots
-    from tensorfold.families.glm_moe_dsa.cuda.rows import Tables
-
-    m = multi.MultiDecoder.__new__(multi.MultiDecoder)
-    m.dcp = 4
-    held = local_slots(65536, 4)                       # 16,385 rows a slot on each rank
-    fixed = multi.Slot(1, held * 4, None, 65536)       # slot 1 of fixed slots
-    assert m.held(fixed) == (held, 2 * held)
-    assert m.window(fixed, 700, 4) == (held, 700, 4, held)
-    ext = multi.Slot(2, 6144, None, 4096)              # an extent at pool row 6,144 (global), 4,096 rows
-    assert m.held(ext) == (1536, 1536 + local_slots(4096, 4))
-    t = Tables(16, 4, None)
-    R = t.fill([m.window(fixed, 700, 4), m.window(ext, 30000, 3)], 2048)
-    assert R == 7 and t.segments == [(0, 4, held, 2 * held, 700), (4, 3, 1536, 1536 + 1025, 30000)]
-    assert t.pos_host[:7].tolist() == [700, 701, 702, 703, 30000, 30001, 30002]
-    assert t.dense and t.sparse
-    t.fill([(0, 5, 2)], 2048)
-    assert t.segments == []
-    m.dcp = 1
-    assert m.window(fixed, 700, 4) == (fixed.base, 700, 4)
 
 
 def test_warm_up_precaptures_every_dense_round_and_draft_step_shape():

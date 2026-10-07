@@ -13,6 +13,22 @@ MAX_ROWS = 8                          # the widest verify window (a pending toke
 # a prompt chunk's rows (TF_GLM_PREFILL_ROWS): 8,192 runs each micro-batch's experts on 4,096 rows, twice the rows a
 # weight read of 2,048-row chunks (32.5k-token prefill on TP4: 32.0 s against 35.9 at 4,096 and ~40 at 2,048)
 PROMPT_ROWS = int(os.environ.get("TF_GLM_PREFILL_ROWS") or 8192)
+# prompts under 3 x PROMPT_ROWS take this many rows a chunk instead (Ported-from ashhart/TensorFold#159 f20913a,
+# drowzeys: one or two big chunks lose the cross-chunk overlap; their 4 Sparks: 8K 1087 tok/s at 4096 vs 1003 at
+# 8192, 32K 1036 vs 1124, 128K 946 vs 972, 16384 worse everywhere). OFF here by default: without the chunk-invariant
+# prompt path a row's bits move with its chunk (cuBLAS picks its kernel by the row count), so this moves prompt bits
+# for prompts under 3 x PROMPT_ROWS and stays off until a new reference is adopted; their default was 4096.
+PROMPT_ROWS_SHORT = int(os.environ.get("TF_GLM_PROMPT_ROWS_SHORT") or 0)
+
+
+def prompt_chunk_rows(total: int, rows: int) -> int:
+    """A prompt of ``total`` rows fills in chunks of ``rows``, or ``PROMPT_ROWS_SHORT`` while that is under
+    3 x ``rows`` (f20913a's rule; the short size 0: always ``rows``)."""
+    if not PROMPT_ROWS_SHORT or total >= 3 * rows:
+        return rows
+    return min(rows, PROMPT_ROWS_SHORT)
+
+
 # the prompt buffers' bytes a row past geometry's 2,048 (measured on TP4: torch allocated 82.6 GiB at 8,192 rows
 # against 77.7 at 2,048, 64k context, before the rotated expert rows went lazy), counted by the startup estimate
 PROMPT_ROW_BYTES = 860_000
@@ -33,6 +49,7 @@ class GlmEngine:
 
         import torch
 
+        from tensorfold.cuda.boot import boot_mark
         from tensorfold.cuda.capacity import admit
         from tensorfold.cuda.comm import NCCL
         from tensorfold.cuda.geometry import PREFILL_ROWS, mla_geometry, split_weights
@@ -57,8 +74,12 @@ class GlmEngine:
             os.environ.setdefault("NCCL_GRAPH_MIXING_SUPPORT", "0")
             # one channel: a prompt chunk's row-share reductions run beside the other micro-batch's compute, and with
             # fewer NCCL blocks (and less staging traffic at once) more of them hide (26k-token prefill on TP4 with two
-            # micro-batches: 41.0 s at 1 channel, 41.4 at 2, 41.8 at 4); decode partials go over RDMA (rdma.py)
-            os.environ.setdefault("NCCL_MAX_NCHANNELS", "1")
+            # micro-batches: 41.0 s at 1 channel, 41.4 at 2, 41.8 at 4); decode partials go over RDMA (rdma.py).
+            # Decode context parallelism (TF_GLM_DCP > 1) runs no micro-batches: its prompt chunks' exchanges are
+            # tens of MB to every peer (dcp.pipe_attention), and one channel keeps them on one RoCE function, so it
+            # takes TF_GLM_DCP_CHANNELS (default 4) channels; transport only, the same bytes and bits
+            os.environ.setdefault("NCCL_MAX_NCHANNELS",
+                                  "1" if dcp_mod.DCP <= 1 else os.environ.get("TF_GLM_DCP_CHANNELS") or "4")
             comm = NCCL(rank, world, master, port, gather=os.environ.get("TF_NCCL_GATHER") or "p2p")
             from tensorfold.families.glm_moe_dsa.cuda.weights import Config
 
@@ -69,6 +90,7 @@ class GlmEngine:
             comm = _rdma(comm, rank, world, most)
         self.comm = comm
         self.comm.barrier()
+        boot_mark("nccl ready", rank)
         from tensorfold.families.glm_moe_dsa.cuda.weights import Config, draft_vocab, embed_split, embed_transform
 
         cfg = Config.read(model_dir)
@@ -81,27 +103,61 @@ class GlmEngine:
         # each rank holds its vocabulary span of the embedding (weights.embed_span), not the whole table
         rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
         streams = max(1, int(parallel))
+        if streams > 1 and G > 1:
+            raise ValueError("--parallel and TF_GLM_DCP (decode context parallelism) do not run together yet")
+        from . import dflash
+
+        draft_cfg = None
+        if drafter is not None and not serial_only:
+            if streams > 1:
+                raise ValueError("a DFlash2 drafter (--drafter) drafts one request at a time on GLM-5.3: start without "
+                                 "--parallel, or without --drafter for MTP drafts")
+            draft_cfg = dflash.check(drafter, cfg, world)
+        else:
+            drafter = None
+        draft_kw = {}
+        if drafter is not None:
+            from tensorfold.cuda.capacity import Geometry
+            from tensorfold.cuda.geometry import dflash2_geometry
+
+            # the drafter's context and block, plus its taps: a prompt chunk's last window + block rows and the
+            # decode windows', bf16 a tapped layer
+            tap_bytes = (len(draft_cfg["dflash_config"]["target_layer_ids"]) * cfg.hidden * 2
+                         * (min(rows, dflash.need_rows(draft_cfg)) + MAX_ROWS))
+
+            def draft_geometry(text):
+                g = dflash2_geometry(text, world, MAX_ROWS, ring=True)
+                return Geometry(lambda slots: g.bytes_at(slots) + tap_bytes, g.reserve)
+
+            draft_kw = dict(draft_dir=drafter, draft_weights=lambda d: dflash.weights_estimate(d, world),
+                            draft_geometry=draft_geometry)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
                                    lambda text: self._geometry(text, world, dcp=G, rows=rows, streams=streams),
                                    embed_transform(split_weights(rule, world), cfg.vocab, world, rank),
-                                   rank=rank, world=world, gather=self._gather_ints)
+                                   rank=rank, world=world, gather=self._gather_ints, **draft_kw)
+        boot_mark("estimate done", rank)
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
         prefill_rows = PROMPT_ROWS if prefill_rows is None else int(prefill_rows)
         from .decode import DEPTH_COST
-        from .multi import CUT_STREAMS, DRAFT_CUT, EXTENTS, FILL_ROWS, KEEP, QUICK_ROWS
+        from .multi import CUT_STREAMS, DRAFT_CUT, EXTENTS, FILL_MIN_ROWS, FILL_ROWS, KEEP, QUICK_ROWS
 
         mine = [int(drafter is not None), capacity, int(long_context), int(serial_only), int(latent.ENABLED),
                 prefill_rows, int(embed_split()), kv8.mode_code(kv8.MODE), draft_vocab(), G, streams,
-                FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, int(DEPTH_COST * 1e6),
-                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS]
+                FILL_ROWS if streams > 1 else 0, QUICK_ROWS if streams > 1 else 0, FILL_MIN_ROWS,
+                int(DEPTH_COST * 1e6),
+                int(KEEP), int(EXTENTS), int(DRAFT_CUT * 1e6), CUT_STREAMS, dflash.BITS, dflash.DEPTH,
+                int(dflash.CONF * 1e6), _digest(drafter), int(dcp_mod.PIPE), dcp_mod.PART_ROWS,
+                int(dcp_mod.PROMPT_TILES), int(dcp_mod.KVG)]
         both = self._gather_ints(mine)
         if any(row != both[0] for row in both):
             raise RuntimeError("the ranks were started with different settings (draft model, context, TF_GLM_LATENT,"
                                " TF_GLM_EMBED_SPLIT, TF_GLM_KV, TF_GLM_DRAFT_VOCAB, TF_GLM_DCP, --parallel, "
-                               "TF_GLM_FILL_ROWS, TF_GLM_QUICK_ROWS, TF_GLM_DEPTH_COST, TF_GLM_KEEP_SLOTS, "
-                               "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT, TF_GLM_DRAFT_CUT_STREAMS):"
+                               "TF_GLM_FILL_ROWS, TF_GLM_QUICK_ROWS, TF_GLM_FILL_MIN_ROWS, TF_GLM_DEPTH_COST, "
+                               "TF_GLM_KEEP_SLOTS, "
+                               "TF_GLM_EXTENTS, TF_GLM_DRAFT_CUT, TF_GLM_DRAFT_CUT_STREAMS, TF_GLM_DRAFTER_BITS, "
+                               "TF_GLM_DCP_PIPE, TF_GLM_DCP_PART_ROWS, TF_GLM_DCP_PROMPT_TILES, TF_GLM_DCP_KV_GATHER, the drafter's config):"
                                f" rank 0 {both[0]} vs {both[1:]}; give every rank the same flags")
         if rank == 0 and kv8.parse(kv8.MODE) != ("bf16", "bf16"):
             lat, idx = kv8.parse(kv8.MODE)
@@ -117,7 +173,8 @@ class GlmEngine:
         w.meta["long_context"] = long_context
         w.meta["dcp"] = G
         self.comm.barrier()
-        if w.mtp is None and not serial_only:
+        boot_mark("weights loaded", rank)
+        if w.mtp is None and not serial_only and drafter is None:
             print("[tensorfold] this checkpoint has no MTP layer: every round decodes one token", flush=True)
             self.policy = "0"
         self.w = w
@@ -147,11 +204,47 @@ class GlmEngine:
                 print(f"[tensorfold] up to {streams} requests decode together, each with a {self.limit}-token window "
                       f"({pool}); {depth} MTP drafts a round", flush=True)
         else:
+            taps = tuple(int(i) for i in draft_cfg["dflash_config"]["target_layer_ids"]) if drafter is not None else ()
+            rows = GRAPH_ROWS
+            if taps:
+                # a drafter's windows up to its depth + 1 rows as graphs (TF_GLM_DFLASH_DEPTH): every dense and sparse-bucket
+                # graph holds its own memory; at 1,048,576 on TP4 the lane with 7- and 8-row graphs loaded with ~7 GiB less
+                # MemAvailable a rank than MTP-3's and fell under the 9 GiB line at its first request
+                most = min(MAX_ROWS, (dflash.DEPTH or int(draft_cfg["dflash_config"]["block_size"]) - 1) + 1)
+                rows = tuple(range(1, max(GRAPH_ROWS[-1], most) + 1))
             self.e = Decoder(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
-                             graph_rows=GRAPH_ROWS, long_context=long_context)
+                             graph_rows=rows, long_context=long_context,
+                             taps=taps, prompt_taps=dflash.need_rows(draft_cfg) if taps else None)
+            graphs = self.e.graphs
+            boot_mark("graphs captured: " + (str(len(graphs.main) + len(graphs.mtp) + len(graphs.sparse) + len(graphs.sparse_mtp)) if graphs is not None else "none"), rank)
+        self.drafter = None
+        if drafter is not None:
+            self.drafter = dflash.GlmDrafter(drafter, w, self.e.buf, capacity=capacity)
+            # the drafter's 4-bit linears load their CUDA extension on first use, inside the capture; every rank loads
+            # (or builds) it here, before the barrier, so no rank enters the capture's RDMA gathers while another still
+            # compiles (that race ends in "RDMA completion: transport retry counter exceeded" on the ranks ahead)
+            from tensorfold.cuda.kernels import qmm
+
+            qmm._ext()
+            self.comm.barrier()
+            self.drafter.capture()
+            boot_mark("drafter loaded", rank)
+            if rank == 0:
+                d = self.drafter
+                print(f"[tensorfold] DFlash2 drafter {drafter}: taps after layers {list(d.tap_layers)}, block "
+                      f"{d.block}, window {d.window + 1}, {'4-bit' if dflash.BITS == 4 else 'BF16'} linears "
+                      f"({d.nbytes() / 2 ** 30:.2f} GiB a rank); up to {d.depth} drafts a round"
+                      + (f" while their chance holds {d.confidence}" if d.confidence > 0 else "")
+                      + "; the MTP head stays idle", flush=True)
         self.eos = tuple(w.cfg.eos)
         self.model_dir = Path(model_dir)
         self.request = threading.local()    # the calling request's policy and stop-at-EOS (``app.GlmApp``)
+        from .multi import KEEP
+
+        # cache_salt (the server's App): rows are kept across requests only with TF_GLM_KEEP_SLOTS=1; the single-stream
+        # engine keeps one prompt and fills from row 0 when the salt changes; the --parallel slots cannot tell salts apart
+        self.prompt_cache, self.salt_scoped = KEEP, self.scheduler is None
+        self.kept_salt: str | None = None
         self.cache = []                     # kept conversations (decode.Snapshot), least recently used first
         self.live: list[int] = []
 
@@ -170,7 +263,7 @@ class GlmEngine:
 
         from tensorfold.cuda.geometry import PREFILL_ROWS, Geometry, mla_geometry
 
-        from . import kv8
+        from . import dcp as dcp_mod, kv8
         from .forward import qscratch_slots
         from .select import SELECT_BYTES
 
@@ -190,6 +283,7 @@ class GlmEngine:
         lo, hi = 1 << 20, 1 << 21                      # Flash's bytes a slot past its dense window
         flash_slot = (flash.bytes_at(hi) - flash.bytes_at(lo)) / (hi - lo)
         extra = 0
+        kvg_row = 0
         if dcp > 1:
             own = own / dcp
             hl = int(text["num_attention_heads"]) // world
@@ -197,18 +291,22 @@ class GlmEngine:
             r = prompt_rows                            # the prompt buffers' qpack, qall, send and recv; ~20 MiB decode
             extra = r * hl * ((lw + pw) * 2 * (1 + dcp) + (lw // 2 + 1) * 4 * 2 * dcp) + (24 << 20)
             extra += 2 * r * dcp * 2048 * 8            # a prompt block's gathered selection candidates
+            if dcp_mod.KVG:
+                # the gathered planes of ONE layer (dcp.kvg_buffers: one pair reused by every layer):
+                # every rank's rows of the window, kvg_row_bytes a row
+                kvg_row = dcp_mod.kvg_row_bytes(lw, pw, kv or kv8.MODE)
         extra += max(0, prompt_rows - PREFILL_ROWS) * PROMPT_ROW_BYTES      # chunks wider than geometry's 2,048 rows
         qs_row = 2 * int(text["kv_lora_rank"])
         if streams > 1:
-            from .multi import EXTENTS, FILL_ROW_BYTES, FILL_ROWS
+            from .multi import EXTENTS, FILL_MIN_ROWS, FILL_ROW_BYTES, FILL_ROWS
 
             own = own if EXTENTS else own * streams    # extents: one window's pool for every stream
             extra += 1 << 30                           # the rounds' buffers (every stream's rows), graphs' pool
             extra += FILL_ROWS * FILL_ROW_BYTES        # short prompts' batched fills
 
         def bytes_at(slots: int) -> int:
-            return (int(flash.bytes_at(slots) + (own - flash_slot) * slots) + 3 * SELECT_BYTES + extra
-                    + qscratch_slots(slots, dcp, kv) * qs_row)
+            return (int(flash.bytes_at(slots) + (own - flash_slot) * slots + kvg_row * (slots + dcp))
+                    + 3 * SELECT_BYTES + extra + qscratch_slots(slots, dcp, kv) * qs_row)
 
         return Geometry(bytes_at, flash.reserve, flash.minimum_slots)
 
@@ -235,7 +333,7 @@ class GlmEngine:
 
     # -- the server-facing surface --------------------------------------------------------------------------------
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None, **_: Any) -> dict[str, Any]:
+                 constraint=None, cache_salt: str | None = None, **_: Any) -> dict[str, Any]:
         """One request end to end; identical keyed sampling on every rank, verified drafts propose only."""
 
         from tensorfold.engine.grammar import pack
@@ -249,9 +347,13 @@ class GlmEngine:
                                          stop_eos=stop_eos)
         spec = getattr(self.request, "policy", None) or self.policy
         stop_eos = bool(getattr(self.request, "stop_eos", True))
-        code = [1 if spec not in ("", "0") else 0, min(int(spec) if str(spec).isdigit() else 3, MAX_ROWS - 1), 0, 0]
+        mtp = str(spec)[1:] if str(spec)[:1] == "m" else str(spec)      # "mN": MTP drafts, also beside a drafter
+        code = [1 if mtp not in ("", "0") else 0, min(int(mtp) if mtp.isdigit() else 3, MAX_ROWS - 1),
+                *self._drafter_code(spec)]
         seed = (sampling.seed if sampling else 0) & 0xFFFFFFFFFFFFFFFF
-        header = [max_tokens, int(stop_eos), int(draft), 0, seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF,
+        fresh = int(cache_salt != self.kept_salt)       # rows kept under another salt (or none) are never resumed
+        self.kept_salt = cache_salt
+        header = [max_tokens, int(stop_eos), int(draft), fresh, seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF,
                   seed >> 62, *_f64_ints(sampling.temperature if sampling else 0.0),
                   int(sampling.top_k) if sampling else 0, *_f64_ints(sampling.top_p if sampling else 1.0),
                   *_f64_ints(sampling.min_p if sampling else 0.0), int(constraint is not None)] + code
@@ -259,7 +361,22 @@ class GlmEngine:
         self._share(list(prompt))
         if constraint is not None:                     # the request's grammar: every rank compiles the same
             self._share(pack(constraint))
-        return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, draft)
+        return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, draft, fresh=bool(fresh))
+
+    def _drafter_code(self, spec) -> list[int]:
+        """A request's DFlash2 drafts as two ints: at most N drafts a round and the chance C they hold (millionths) from
+        a policy "N" or "N:C" (tf_policy, model@N:C); [0, 0]: the drafter's own (TF_GLM_DFLASH_DEPTH / _CONF);
+        [-1, 0]: "mN", the MTP head's N drafts instead (the same lane, for comparisons)."""
+
+        head, _, tail = str(spec).partition(":")
+        if self.drafter is not None and head[:1] == "m" and head[1:].isdigit():
+            return [-1, 0]
+        if self.drafter is None or not head.isdigit() or head == "0":
+            return [0, 0]
+        conf = float(tail) if tail else 0.0
+        if not 0.0 <= conf < 1.0:
+            raise ValueError(f"draft policy {spec!r}: the chance after the colon is from 0 to 1")
+        return [min(int(head), self.drafter.block - 1), int(round(conf * 1e6))]
 
     def follow(self) -> None:
         """Follower rank: mirror every request rank 0 serves, forever."""
@@ -272,7 +389,7 @@ class GlmEngine:
             self.multi.follow(Link(_store(self.comm), rank=self.rank, world=self.world, host=self.master))
             return
         while True:
-            (max_tokens, stop_eos, draft, _cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi,
+            (max_tokens, stop_eos, draft, fresh, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi,
              shaped, kind, most, _a, _b) = self._share(None)
             prompt = self._share(None)
             constraint = None
@@ -287,22 +404,25 @@ class GlmEngine:
             sampling = (Sampling(seed, temperature, top_k, _ints_f64(p_lo, p_hi), _ints_f64(m_lo, m_hi))
                         if temperature > 0 else None)
             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None,
-                      [kind, most, 0, 0], bool(draft), constraint)
+                      [kind, most, _a, _b], bool(draft), constraint, fresh=bool(fresh))
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
-             on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool, constraint=None) -> dict[str, Any]:
+             on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool, constraint=None,
+             fresh: bool = False) -> dict[str, Any]:
         self.e.constraint, self.e.window = constraint, None       # every rank walks and masks the same rows
         try:
-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, draft)
+            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, draft, fresh)
         finally:
             self.e.constraint = self.e.window = None
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
-                  on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool) -> dict[str, Any]:
-        from .decode import DEPTH_COST, AcceptPolicy, DepthPolicy, mtp_decode, prefill, serial_decode
+                  on_tokens: Callable[[list[int]], Any], code: list[int], draft: bool,
+                  fresh: bool = False) -> dict[str, Any]:
+        from .decode import DEPTH_COST, AcceptPolicy, DepthPolicy, dflash_decode, mtp_decode, prefill, serial_decode
 
+        drafter = self.drafter if self.drafter is not None and code[0] and draft and code[2] >= 0 else None
         t0 = time.perf_counter()
-        first = prefill(self.e, prompt, sampling)
+        first = prefill(self.e, prompt, sampling, fresh=fresh, drafter=drafter)
         stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0, "cached": getattr(self.e, "cached", 0)}
         on_tokens([first])
         if max_tokens <= 1 or (stop_eos and first in self.eos):
@@ -310,16 +430,32 @@ class GlmEngine:
         policy = None
         if code[0]:
             policy = AcceptPolicy(code[1]) if DEPTH_COST > 0 else DepthPolicy(code[1], fixed=True)
-        res = (serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
-               if policy is None or self.w.mtp is None or not draft
-               else mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
-                               on_tokens=on_tokens))
+        if drafter is not None:
+            most, conf = (code[2], code[3] / 1e6) if code[2] else (drafter.depth, drafter.confidence)
+            res = dflash_decode(self.e, drafter, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens,
+                                policy=DepthPolicy(most, fixed=True, confidence=conf))
+        else:
+            res = (serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+                   if policy is None or self.w.mtp is None or not draft
+                   else mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
+                                   on_tokens=on_tokens))
         stats.update(decode_s=res.seconds, rounds=res.rounds, tokens_per_second=round(res.tokens_per_second, 3),
+                     drafted=res.drafted, accepted=res.accepted,
                      sha256=__import__("hashlib").sha256(json.dumps(res.tokens).encode()).hexdigest()[:16])
         if self.w.comm is None or self.w.rank == 0:
             print(f"[tensorfold] decode {len(res.tokens)} tok {res.tokens_per_second:.2f} tok/s rounds {res.rounds}"
                   f" drafted {res.drafted} accepted {res.accepted}", flush=True)
         return stats
+
+
+def _digest(drafter) -> int:
+    """A drafter's config.json as a 31-bit number (0: none), so every rank checks it loads the same drafter."""
+
+    if drafter is None:
+        return 0
+    import hashlib
+
+    return int.from_bytes(hashlib.sha256((Path(drafter) / "config.json").read_bytes()).digest()[:4], "little") >> 1
 
 
 def _store(comm):

@@ -125,6 +125,7 @@ def fake_runtime(monkeypatch):
     monkeypatch.setattr(torch, "tensor", cpu(original_tensor))
     monkeypatch.setattr(torch, "empty", cpu(original_empty))
     monkeypatch.setattr(torch.cuda, "set_device", lambda *a: None)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (12, 1))
     monkeypatch.setattr(capacity, "available_bytes", lambda t: 16 * capacity.GIB)
     monkeypatch.setattr(capacity, "total_bytes", lambda t: 128 * capacity.GIB)       # a GB10: 4096-row prompt chunks
     calls = []
@@ -134,7 +135,7 @@ def fake_runtime(monkeypatch):
     def both(send, recv):
         recv.view(-1).copy_(torch.cat([send.view(-1), send.view(-1)]))
     comm = SimpleNamespace(barrier=lambda: None, ready=lambda *a, **k: None, all_gather=both)
-    monkeypatch.setitem(sys.modules, "tensorfold.cuda.comm", SimpleNamespace(NCCL=lambda *a: comm))
+    monkeypatch.setitem(sys.modules, "tensorfold.cuda.comm", SimpleNamespace(open_comm=lambda *a, **k: comm))
     for family in ("qwen3_5", "qwen4_exp", "glm5_next"):
         prefix = f"tensorfold.families.{family}.cuda"
         weights = SimpleNamespace(load=load, draft_token_ids=lambda *a: None,
@@ -146,6 +147,8 @@ def fake_runtime(monkeypatch):
     monkeypatch.setattr(dist, "init_process_group", lambda *a, **kw: None)
     monkeypatch.setattr(dist, "all_gather_into_tensor", lambda recv, send: both(send, recv))
     monkeypatch.setitem(sys.modules, "tensorfold.families.qwen3_5.cuda.distributed", SimpleNamespace(split_weights=None))
+    from tensorfold.families.qwen4_exp.cuda import engine as flash_engine
+    monkeypatch.setattr(flash_engine, "build_kernels", lambda **kw: None)     # no CUDA extension builds here
     return calls, capacity
 
 
@@ -291,7 +294,7 @@ def test_actual_distributed_startup_agrees_on_smaller_rank_before_loading(tmp_pa
     checkpoint(tmp_path, small_config(), HEAD)
     calls, capacity = fake_runtime
     geom = (mla_geometry(small_config(), 2, 8, latent=LATENT) if family == "mla" else
-            gdn_geometry(small_config(), 2, 1, indexed=True) if family == "indexed" else
+            gdn_geometry(small_config(), 2, 1, indexed=True, kept=5) if family == "indexed" else
             gdn_geometry(small_config(), 2, 12, rows=12, prompt=4096))     # the 27B engine's, prompt chunks on a GB10
     transform = split_weights(rule) if family == "mla" else indexed_weights(2, False) if family == "indexed" else linear_weights
     weights = capacity.estimate_weights(tmp_path, transform)

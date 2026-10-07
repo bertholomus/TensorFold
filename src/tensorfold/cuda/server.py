@@ -6,6 +6,7 @@ import inspect
 import json
 import threading
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -16,7 +17,9 @@ from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.probabilities import TokenBytes, probability_options
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
-from tensorfold.server.stopping import stop_options
+from tensorfold.server.stopping import matched_stop, stop_options
+from tensorfold.server.thinking_notes import unanswered
+from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
 from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
 from tensorfold.engine.tool_draft import ToolCallStreamer
@@ -27,6 +30,7 @@ from tensorfold.cuda.chat_template import ChatTemplate
 from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
 from tensorfold.cuda.turns import Turns, Yield
 from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 
 
 # -- requests --------------------------------------------------------------------------------
@@ -48,6 +52,18 @@ class PreparedRequest:
     vision: Any = None
     grammar: Any = None     # (spec, compiled grammar) of the request's response_format, or None
     think_budget: int = 0   # reply tokens before the server closes a think block the reply leaves open (0: no limit)
+    cache_salt: str | None = None   # the request's cache_salt: no prompt rows kept under another salt (or none) are reused
+
+
+def cache_salt_of(body: dict[str, Any]) -> str | None:
+    """A request's ``cache_salt`` (vLLM's field): a non-empty string, or None when absent; RequestError otherwise."""
+
+    salt = body.get("cache_salt")
+    if salt is None:
+        return None
+    if not isinstance(salt, str) or not salt:
+        raise RequestError("cache_salt must be a non-empty string")
+    return salt
 
 
 def _native_context(model_dir: Path) -> int:
@@ -68,13 +84,19 @@ class App:
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
                  context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
-                 aliases: tuple[str, ...] | list[str] = ()):
+                 aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
+                 vision_image_tokens: int | None = None,
+                 background_ids: tuple[str, ...] | frozenset[str] = ()):
         from tokenizers import Tokenizer
 
         self.engine = engine
         self.vision = getattr(engine, "vision", None)
+        self.image_limits = DEFAULT_LIMITS if vision_max_images is None and vision_image_tokens is None else \
+            ImageLimits(**({} if vision_max_images is None else {"max_images": vision_max_images}),
+                        **({} if vision_image_tokens is None else {"max_visual_tokens": vision_image_tokens}))
         self.served = served
         self.aliases = tuple(str(alias).strip() for alias in aliases if str(alias).strip())
+        self.background_ids = frozenset(background_ids)   # --name-priority ID=background: a default for this id
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
         self.template = ChatTemplate(model_dir)
@@ -121,6 +143,8 @@ class App:
         if problem is None and grammar.request_spec(body) and "constraint" not in inspect.signature(
                 self.engine.generate).parameters:
             problem = "this model's engine does not enforce structured output"
+        if problem is None and grammar.request_spec(body) and getattr(self.engine, "refuses_structured_output", None):
+            problem = self.engine.refuses_structured_output       # e.g. Flash Next on two ranks with --parallel
         return problem
 
     def _grammars(self) -> grammar.Grammars:
@@ -155,6 +179,59 @@ class App:
 
         return self._context_limit()
 
+    def decisions(self, body: dict[str, Any]) -> dict[str, Any]:
+        """Answer typed questions from next-token label logits. No text is generated."""
+
+        from jinja2.exceptions import TemplateError
+
+        from tensorfold.server.decisions import DecisionError, build_response, prompts_for
+
+        if not hasattr(self.engine, "score_labels"):
+            raise RequestError("this model's CUDA engine does not score decision labels")
+
+        def render(content: str) -> str:
+            try:
+                return self.template.render([{"role": "user", "content": content}], tools=None, enable_thinking=False)
+            except TemplateError as exc:
+                raise DecisionError(f"the chat template failed: {exc}") from exc
+
+        def encode(text: str) -> list[int]:
+            return [int(token) for token in self.tok.encode(text, add_special_tokens=False).ids]
+
+        try:
+            prepared = prompts_for(body, render, encode, context_len=self.effective_context_window)
+        except DecisionError as exc:
+            raise RequestError(str(exc)) from exc
+        turns = self._turns()
+        turns.take(False)
+        try:
+            many = getattr(self.engine, "score_labels_many", None)
+            if many is not None and len(prepared) > 1:   # the questions' prompts fill together
+                try:
+                    scored = many([(item.prompt_ids, item.label_ids) for item in prepared])
+                except ValueError as exc:
+                    raise RequestError(f"questions: {exc}") from exc
+                return build_response(body, prepared, scored)
+            scored = []
+            for item in prepared:
+                try:
+                    scored.append(self.engine.score_labels(item.prompt_ids, item.label_ids))
+                except ValueError as exc:
+                    raise RequestError(f"question {item.id!r}: {exc}") from exc
+            return build_response(body, prepared, scored)
+        finally:
+            turns.give()
+
+    def _cache_salt(self, body: dict[str, Any]) -> str | None:
+        """The request's cache_salt, refused where the engine keeps prompt rows it cannot keep apart by salt."""
+
+        salt = cache_salt_of(body)
+        if salt is not None and getattr(self.engine, "prompt_cache", True) and not getattr(self.engine, "salt_scoped",
+                                                                                           False):
+            raise RequestError("cache_salt is not supported here: this engine keeps prompt rows across requests and "
+                               "cannot keep them apart by salt")
+        return salt
+
     def _requested_tokens(self, body: dict[str, Any]) -> int:
         for name in ("max_tokens", "max_completion_tokens"):
             value = body.get(name)
@@ -170,6 +247,7 @@ class App:
 
         validate_modalities(body)
         ToolCallPolicy(body)
+        salt = self._cache_salt(body)
         ignore_eos, stop = stop_options(body)
         max_tokens = self._requested_tokens(body)
         try:
@@ -217,21 +295,70 @@ class App:
             if has_images(body["messages"]):
                 rendered = prepare_images(self.vision, body["messages"],
                                           lambda messages: render(messages, allow_images=True),
-                                          context_limit=self._context_limit())
+                                          context_limit=self._context_limit(),
+                                          limits=getattr(self, "image_limits", DEFAULT_LIMITS))
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
-                                       vision=rendered.vision, grammar=compiled, think_budget=budget)
+                                       vision=rendered.vision, grammar=compiled, think_budget=budget,
+                                       cache_salt=salt)
             text = render(body["messages"])
+            prompt = self.tok.encode(text, add_special_tokens=False).ids
+        elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
+            prompt = self.token_ids(body["prompt"])
         else:
             text = body.get("prompt")
             if not isinstance(text, str):
-                raise RequestError("prompt must be a string")
-        prompt = self.tok.encode(text, add_special_tokens=False).ids
+                raise RequestError("prompt must be a string or a list of token ids")
+            prompt = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", False)).ids
         if not prompt:
             raise RequestError("rendered prompt is empty")
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
-                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+                               ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget,
+                               cache_salt=salt)
+
+    def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
+        """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
+        vocabulary."""
+
+        size = getattr(self.tok, "get_vocab_size", None)
+        return token_ids(value, size(with_added_tokens=True) if size is not None else None, field)
+
+    def tokenize(self, body: dict[str, Any]) -> dict[str, Any]:
+        """vLLM's ``/tokenize`` (``server.token_routes``): a prompt's ids (``add_special_tokens``, default true, as
+        vLLM's), or ``messages``' as the chat route renders them (``add_generation_prompt``, default true)."""
+
+        if not isinstance(body, dict):
+            raise RequestError("the request body must be a JSON object")
+        strings = flag(body, "return_token_strs", False)
+        if "messages" in body:
+            fields = dict(body)
+            if "add_generation_prompt" in body:
+                kwargs = body.get("chat_template_kwargs")
+                kwargs = {} if kwargs is None else kwargs
+                if not isinstance(kwargs, dict):
+                    raise RequestError("chat_template_kwargs must be a JSON object or null")
+                fields["chat_template_kwargs"] = {**kwargs,
+                                                  "add_generation_prompt": flag(body, "add_generation_prompt", True)}
+            ids = self._prepare(fields, True).prompt
+        else:
+            text = body.get("prompt")
+            if not isinstance(text, str):
+                raise RequestError("prompt must be a string (or send messages)")
+            ids = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", True)).ids
+        limit = self._context_limit()
+        reply: dict[str, Any] = {"count": len(ids), "tokens": [int(t) for t in ids],
+                                 "max_model_len": limit if limit is not None else self.native_context_window}
+        if strings:
+            reply["token_strs"] = [self.tok.id_to_token(t) for t in reply["tokens"]]
+        return reply
+
+    def detokenize(self, body: dict[str, Any]) -> dict[str, Any]:
+        """vLLM's ``/detokenize``: the text of ``tokens``, special tokens included."""
+
+        if not isinstance(body, dict):
+            raise RequestError("the request body must be a JSON object")
+        return {"prompt": self.tok.decode(self.token_ids(body.get("tokens"), "tokens"), skip_special_tokens=False)}
 
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Why the request cannot run, or None; rendered before a stream's headers are sent."""
@@ -382,11 +509,14 @@ class App:
             options["probabilities"] = probabilities
         if takes_stop_eos:
             options["stop_eos"] = not prepared.ignore_eos
+        if "cache_salt" in inspect.signature(self.engine.generate).parameters:
+            options["cache_salt"] = prepared.cache_salt       # every request, so an unsalted one is kept apart too
         shaped = prepared.grammar is not None or prepared.think_budget > 0
         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
         budget = self._think_budget(prepared, think_end)
-        # priority "background" (or a session-title request): after the others, as on the Mac
-        background = body.get("priority") == "background" or (chat and is_title_request(body.get("messages"), tools))
+        # background: the request's own priority, else --name-priority's default for its id; title requests always
+        by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
+        background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
         concurrent = getattr(self.engine, "concurrent", False)
         turns = None if concurrent else self._turns()
         if concurrent and background and "background" in inspect.signature(self.engine.generate).parameters:
@@ -442,7 +572,8 @@ class App:
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:
             final["reasoning_content"] = reasoning[sent["reasoning"]:]
-        text = stops.visible(self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False))
+        raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
+        text = stops.visible(raw_text)
         raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
         content = policy.content(content) if tools else content
@@ -450,6 +581,10 @@ class App:
         if tail:
             final["content"] = tail
         finish = "tool_calls" if calls else ("stop" if stopped["stop"] or (out and out[-1] in ends) else "length")
+        warning = unanswered(finish, chat and thinking, content, calls)
+        if warning:
+            print(warning, flush=True)
+        print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
@@ -457,6 +592,7 @@ class App:
         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
         streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
+                "stop_sequence": matched_stop(raw_text, stops.strings),
                 **({"logprobs": logprobs} if logprobs is not None else {}),
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
@@ -513,6 +649,21 @@ def token_sha(tokens: list[int]) -> str:
     """A reply's token ids, hashed as the Mac server does: drafted and ``"draft": false`` replies must match."""
 
     return hashlib.sha256(",".join(str(int(t)) for t in tokens).encode()).hexdigest()[:12]
+
+
+def print_done(prompt: int, cached: int, thinking: bool, out: list[int], finish: str, stats: dict[str, Any],
+               request: Any) -> None:
+    """The Mac server's ``done`` line for a finished reply; tok/s runs from the first token to the last."""
+
+    ended = time.perf_counter()
+    first, started = getattr(request, "first", None), getattr(request, "started", ended)
+    decode = ended - first if first is not None else 0.0
+    rate = (len(out) - 1) / decode if decode > 0 and len(out) > 1 else 0.0
+    print(f"[tensorfold] done req-{uuid.uuid4().hex[:12]} prompt={prompt} cached={cached} thinking={thinking} "
+          f"tokens={len(out)} sha={token_sha(out)} finish={finish} tok/s={rate:.1f} "
+          f"ttft={(first - started) if first is not None else -1:.2f}s prefill={stats.get('prefill_s', -1):.2f}s "
+          f"rounds={stats.get('rounds', 0)} accepted={stats.get('accepted', 0)}/{stats.get('drafted', 0)}",
+          flush=True)
 
 
 from tensorfold.cuda.http import Server, make_handler, serve, usage_of  # noqa: E402,F401  (the HTTP side)

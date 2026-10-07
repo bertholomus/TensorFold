@@ -1,10 +1,18 @@
-"""Prometheus text for GET /metrics. Both servers scrape one module; gauges are read at scrape time."""
+"""Prometheus text for GET /metrics. Both servers scrape one module; gauges are read at scrape time.
+
+Each reading is taken on its own, not as one atomic snapshot. vLLM-named families carry an identical reading of the
+same state under the name a vLLM dashboard already knows, so a dashboard copied from vLLM fills its panels by
+swapping the ``tensorfold:`` prefix for the name alone. A family the server cannot count honestly is left out,
+never emitted at a fabricated zero.
+"""
 
 from __future__ import annotations
 
 import threading
 import time
 from typing import Any
+
+from tensorfold.server.memory_budget import process_footprint
 
 PREFIX = "tensorfold:"
 # Request and time-to-first-token histograms share these upper edges. +Inf is added when rendered.
@@ -49,9 +57,11 @@ class Metrics:
         self.accepted = 0
         self.latency = Histogram()
         self.ttft = Histogram()
+        self.decode = Histogram()
+        self.http_requests: dict[tuple[str, int], int] = {}
 
     def add(self, *, prompt: int, generation: int, drafted: int, accepted: int,
-            latency: float | None, ttft: float | None) -> None:
+            latency: float | None, ttft: float | None, decode: float | None = None) -> None:
         with self.lock:
             self.prompt += int(prompt)
             self.generation += int(generation)
@@ -61,6 +71,8 @@ class Metrics:
                 self.latency.observe(latency)
             if ttft is not None:
                 self.ttft.observe(ttft)
+            if decode is not None:
+                self.decode.observe(decode)
 
 
 def of(app: Any) -> Metrics:
@@ -74,13 +86,22 @@ def of(app: Any) -> Metrics:
 
 
 def note(app: Any, *, prompt: int = 0, generation: int = 0, drafted: int = 0, accepted: int = 0,
-         latency: float | None = None, ttft: float | None = None) -> None:
+         latency: float | None = None, ttft: float | None = None, decode: float | None = None) -> None:
     """Fold one finished request. A missing app is a no-op."""
 
     if app is None:
         return
     of(app).add(prompt=prompt, generation=generation, drafted=drafted, accepted=accepted,
-                latency=latency, ttft=ttft)
+                latency=latency, ttft=ttft, decode=decode)
+
+
+def http_request(app: Any, key: str, status: int) -> None:
+    """Authentication labels count HTTP replies, including refusals, once."""
+
+    counters = of(app)
+    with counters.lock:
+        pair = (key, int(status))
+        counters.http_requests[pair] = counters.http_requests.get(pair, 0) + 1
 
 
 def begin(app: Any, prompt: int, started: float) -> None:
@@ -120,11 +141,14 @@ def finish_request() -> None:
     _local.armed = False
     job = _local.job
     stream = getattr(job, "stream", None) if job is not None else None
+    ended = time.perf_counter()
     ttft = (_local.first - _local.started) if _local.first else None
+    # Decode runs from the first generated token to the end; a request that generated nothing has none.
+    decode = max(0.0, ended - _local.first) if _local.first else None
     note(_local.app, prompt=_local.prompt, generation=_local.generation,
          drafted=int(getattr(stream, "drafted", 0) or 0),
          accepted=int(getattr(stream, "accepted", 0) or 0),
-         latency=max(0.0, time.perf_counter() - _local.started), ttft=ttft)
+         latency=max(0.0, ended - _local.started), ttft=ttft, decode=decode)
 
 
 def render(app: Any) -> str:
@@ -134,9 +158,15 @@ def render(app: Any) -> str:
     with metrics.lock:
         prompt, generation = metrics.prompt, metrics.generation
         drafted, accepted = metrics.drafted, metrics.accepted
-        latency, ttft = metrics.latency.copy(), metrics.ttft.copy()
+        latency, ttft, decode = metrics.latency.copy(), metrics.ttft.copy(), metrics.decode.copy()
+        requests = dict(metrics.http_requests)
     running, waiting = _requests(app)
+    pools = _pools(app)
     lines: list[str] = []
+    if requests:
+        _family(lines, "requests_total", "counter", "HTTP replies by API key label and status.",
+                [f'{PREFIX}requests_total{{key="{key}",status="{status}"}} {count}'
+                 for (key, status), count in sorted(requests.items())])
     _family(lines, "requests_running", "gauge", "Requests in prefill or decode.",
             [f"{PREFIX}requests_running {running}"])
     _family(lines, "requests_waiting", "gauge", "Requests queued or held until a lane is free.",
@@ -147,13 +177,51 @@ def render(app: Any) -> str:
             [f"{PREFIX}generation_tokens_total {generation}"])
     _family(lines, "kv_cache_usage_ratio", "gauge",
             "Tokens in a stream cache divided by that stream's context window.",
-            [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}' for pool, ratio in _pools(app)])
+            [f'{PREFIX}kv_cache_usage_ratio{{pool="{pool}"}} {_num(ratio)}' for pool, ratio in pools])
     _family(lines, "mtp_drafted_total", "counter", "Draft tokens verified on finished requests.",
             [f"{PREFIX}mtp_drafted_total {drafted}"])
     _family(lines, "mtp_accepted_total", "counter", "Draft tokens kept on finished requests.",
             [f"{PREFIX}mtp_accepted_total {accepted}"])
     _histogram(lines, "request_latency_seconds", "Seconds from arrival to the reply leaving.", latency)
     _histogram(lines, "time_to_first_token_seconds", "Seconds from arrival to the first generated token.", ttft)
+    _histogram(lines, "request_decode_seconds",
+               "Seconds a finished request spent decoding. Its sum over generation_tokens_total is the decode rate.",
+               decode)
+    # the process's own footprint, where the platform counts it (macOS): weights, caches and streams as one number
+    footprint = process_footprint()
+    if footprint is not None:
+        _family(lines, "process_footprint_bytes", "gauge",
+                "This process's physical footprint as the OS counts it, Metal buffers included; "
+                "only where the platform reports one (macOS).",
+                [f"{PREFIX}process_footprint_bytes {footprint}"])
+    # vLLM names, identical values: a vLLM dashboard needs only the "tensorfold:" prefix swapped.
+    _family(lines, "num_requests_running", "gauge",
+            "Requests in prefill or decode. A mirror of tensorfold:requests_running.",
+            [f"{PREFIX}num_requests_running {running}"])
+    _family(lines, "num_requests_waiting", "gauge",
+            "Requests queued or held until a lane is free. A mirror of tensorfold:requests_waiting.",
+            [f"{PREFIX}num_requests_waiting {waiting}"])
+    _family(lines, "kv_cache_usage_perc", "gauge",
+            "A stream's cache occupancy under vLLM's name; same streams and ratios as tensorfold:kv_cache_usage_ratio.",
+            [f'{PREFIX}kv_cache_usage_perc{{stream="{pool}"}} {_num(ratio)}' for pool, ratio in pools])
+    _family(lines, "spec_decode_num_draft_tokens_total", "counter",
+            "Draft tokens verified on finished requests, this server's single draft counter.",
+            [f"{PREFIX}spec_decode_num_draft_tokens_total {drafted}"])
+    _family(lines, "spec_decode_num_accepted_tokens_total", "counter", "Draft tokens kept on finished requests.",
+            [f"{PREFIX}spec_decode_num_accepted_tokens_total {accepted}"])
+    _histogram(lines, "e2e_request_latency_seconds",
+               "Seconds from arrival to the reply leaving, under vLLM's name.", latency)
+    _histogram(lines, "request_decode_time_seconds",
+               "Seconds a finished request spent decoding, under vLLM's name.", decode)
+    # per-request event counts; a family is left out where this server doesn't count the event, never a fake zero
+    disconnects, preempted = _endings(app)
+    if disconnects is not None:
+        _family(lines, "client_disconnections_total", "counter",
+                "Requests a client left before the reply left the server.",
+                [f"{PREFIX}client_disconnections_total {disconnects}"])
+    if preempted is not None:
+        _family(lines, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.",
+                [f"{PREFIX}preemptions_total {preempted}"])
     return "\n".join(lines) + "\n"
 
 
@@ -218,6 +286,31 @@ def _requests(app: Any) -> tuple[int, int]:
         return running, 0
     parked = getattr(turns, "parked", None)
     return running, int(parked if parked is not None else getattr(turns, "waiting", 0) or 0)
+
+
+def _endings(app: Any) -> tuple[int | None, int | None]:
+    """(client disconnections, preemptions) at scrape time, or None where nothing counts them.
+
+    The Mac scheduler counts cancelled requests and preempted background jobs per request. The CUDA
+    scheduler raises RequestCancelled without counting disconnects and counts lane yields (requeued
+    background streams) in ``yields``; neither server counts per-request failures.
+    """
+
+    scheduler = getattr(app, "scheduler", None)
+    if scheduler is not None and hasattr(scheduler, "active") and hasattr(scheduler, "waiting"):
+        return (_count(scheduler, "cancelled"), _count(scheduler, "preemptions"))
+    engine = getattr(app, "engine", None)
+    sched = getattr(engine, "scheduler", None) if engine is not None else None
+    if sched is not None and hasattr(sched, "yields"):
+        return (None, _count(sched, "yields"))
+    return (None, None)
+
+
+def _count(owner: Any, name: str) -> int | None:
+    """A scheduler's own count, or None where this server keeps no such count."""
+
+    value = getattr(owner, name, None)
+    return None if value is None else max(0, int(value))
 
 
 def _pools(app: Any) -> list[tuple[str, float]]:

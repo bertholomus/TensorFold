@@ -184,7 +184,8 @@ class Scratch:
     """Buffers for up to ``rows`` rows of ``slots`` slots; slots whose pick is not a routed expert are left to the caller.
 
     ``prompt``: buffers for prompt chunks, whose combine adds nothing for non-routed slots and keeps no per-slot outputs
-    (``y`` is allocated on first use by a one-tile call: the A/B against the decode-once path).
+    (``y`` is allocated on first use by a one-tile call: the A/B against the decode-once path; it and gate / up's
+    rotated rows grow to the rows a call needs, see ``grown``).
     """
 
     def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda",
@@ -209,6 +210,12 @@ class Scratch:
         # prompt chunks pad an expert's members to whole program groups (up to 8 tiles of 16)
         self.members_buf = torch.full((maxu * -(-rows // 128) * 128,), -1, dtype=torch.int32, device=device)
         self.rows, self.slots, self.count_experts = rows, slots, ex.count
+
+    def grown(self, R: int) -> int:
+        """Rows for a prompt buffer made on first use: R up to a power of two (from 16), at most ``rows``. A prompt's
+        short last chunk takes the one-tile path; buffers for every row of a chunk would hold GBs for a few rows."""
+
+        return min(self.rows, max(16, 1 << (R - 1).bit_length()))
 
     def window(self, R: int):
         """(ids, members) sized for R rows: the grids only span what R rows can use."""
@@ -272,17 +279,17 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
             ext.group2(pick, ids, s.count, members, R, slots, E)
         else:
             ext.group(pick, ids, s.count, members, R, slots, E)
-    if s.y is None and not (fast and wts is not None):        # prompt buffers: the one-tile path's per-slot outputs
-        s.y = torch.zeros((s.rows * slots, D), dtype=torch.float32, device=x.device)
+    if (s.y is None or s.y.shape[0] < P) and not (fast and wts is not None):   # prompt buffers: the one-tile
+        s.y = torch.zeros((s.grown(R) * slots, D), dtype=torch.float32, device=x.device)   # path's per-slot outputs
     kern = PROMPT_KERNEL if kernel is None else kernel
     mma2 = (fast and kern in ("mma2", "mma3") and I % 256 == 0 and D % 256 == 0 and
             max(ex.k2_gu[1], ex.k2_d[1]) <= 10)
     mma3 = (mma2 and kern == "mma3" and x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.stride(0) % 4 == 0
             and ex.k2_gu[1] <= 8)
     if not mma3:                     # mma3 rotates gate/up's rows from x inside its programs
-        if s.xg is None:
-            s.xg = torch.zeros((s.rows * slots, D), dtype=torch.float16, device=x.device)
-            s.xu = torch.zeros((s.rows * slots, D), dtype=torch.float16, device=x.device)
+        if s.xg is None or s.xg.shape[0] < P:
+            s.xg = torch.zeros((s.grown(R) * slots, D), dtype=torch.float16, device=x.device)
+            s.xu = torch.zeros((s.grown(R) * slots, D), dtype=torch.float16, device=x.device)
         ext.rot_in(x, x.stride(0), pick, ex.suh_g, ex.suh_u, s.xg, s.xu, R, D, slots, E)
     nt, w, sk, pf = s.cfg_gu
     mma = not mma2 and fast and kern in ("mma", "mma2", "mma3") and I % 64 == 0 and D % 64 == 0 and all(

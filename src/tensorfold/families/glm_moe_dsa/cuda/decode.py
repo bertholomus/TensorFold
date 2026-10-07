@@ -80,22 +80,28 @@ def resume_cut(kept: Sequence[int] | None, prompt: Sequence[int], step: int, sho
 
 
 @torch.no_grad()
-def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
-    """Commit the prompt in prompt chunks (this family's forward and state; no KDA, no taps) and sample its first token.
+def prefill(e: "Engine", prompt: Sequence[int], sampling, fresh: bool = False, *, drafter=None, **_) -> int:
+    """Commit the prompt in prompt chunks (this family's forward and state; no KDA) and sample its first token.
 
     MTP: the prompt's rows are absorbed into the MTP head's cache chunk by chunk, as Flash does, when the
     checkpoint has the head (``--no-drafts`` serves still absorb nothing: the MTP cache stays unused).
-    A prompt that extends the last one resumes after the chunks they share (``resume_cut``; e.cached).
+    ``drafter`` (a DFlash2 drafter, dflash.GlmDrafter): it drafts instead of the MTP head, so the MTP cache is left
+    alone and the drafter's context takes the taps of the prompt's last rows its window reads (dflash.prompt_from).
+    A prompt that extends the last one resumes after the chunks they share (``resume_cut``; e.cached), unless
+    ``fresh`` (a request under another cache_salt than the kept prompt's: it fills from row 0).
     """
 
-    from . import forward as fwd, invariant
+    from . import forward as fwd, heat, invariant
     from .multi import tiny_rows
 
     if not prompt:
         raise ValueError("prefill requires at least one token")
     w, st, b = e.w, e.st, e.pbuf
     short = tiny_rows(w) if invariant.INVARIANT else 0   # a whole prompt this short: the decode kernels (as batched)
-    cut = resume_cut(getattr(e, "kept", None), prompt, e.prefill_rows, short)
+    from .engine import prompt_chunk_rows
+
+    rows = prompt_chunk_rows(len(prompt), e.prefill_rows)
+    cut = 0 if fresh else resume_cut(getattr(e, "kept", None), prompt, rows, short)
     e.kept = None                                    # (set again once this prompt is whole)
     e.reset()
     if cut:
@@ -103,13 +109,23 @@ def prefill(e: "Engine", prompt: Sequence[int], sampling, **_) -> int:
         st.set_mtp_len(cut)
     e.cached = cut
     last = None
-    use_mtp = w.mtp is not None and not getattr(e, "serial_only", False)
+    use_mtp = w.mtp is not None and not getattr(e, "serial_only", False) and drafter is None
+    if drafter is not None:
+        from .dflash import prompt_from
+
+        drafter.reset()
+        tap_from = prompt_from(drafter, len(prompt))   # the first prompt position the drafter's window can read
+        drafter.skip_to(max(tap_from, cut))
     with invariant.suspended(cut == 0 and len(prompt) <= short):
-        for start in range(cut, len(prompt), e.prefill_rows):
-            chunk = list(prompt[start:start + e.prefill_rows])
+        for start in range(cut, len(prompt), rows):
+            # TF_GLM_HEAT_PACE: every rank waits here while the hottest GPU cools (the same chunks, later)
+            heat.pace(w.comm, w.world, w.rank, first=start == cut)
+            chunk = list(prompt[start:start + rows])
             R = fwd.stage(w, st, b, chunk)
             last = fwd.compute(w, st, b, R, nch=fwd.chunks_for(st, R), host_pos=st.pos).clone()
             e.last_hidden = b.fnormed[R - 1:R].clone()
+            if drafter is not None and start + R > drafter.context_end:
+                drafter.add_taps(e.tap_rows(start + R - drafter.context_end, b, R))   # the rows past its context
             if use_mtp:
                 nxt = list(prompt[start + 1:start + R + 1])
                 if nxt:
@@ -256,6 +272,66 @@ def mtp_decode(e: "Engine", pending: int, count: int, sampling, *, policy: Depth
     return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
 
 
+@torch.no_grad()
+def dflash_decode(e: "Engine", drafter, pending: int, count: int, sampling, *, policy: DepthPolicy | None = None,
+                  stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+    """Flash's DFlash2 verify loop (pending + the drafter's block drafts, kept through the first mismatch; the kept
+    rows' taps join the drafter's context) over this family's commit, as mtp_decode restates Flash's MTP loop. Drafts
+    only propose: every kept token is the serial sample."""
+
+    import time
+
+    from . import forward as fwd
+
+    w, st, b = e.w, e.st, e.buf
+    policy = policy or DepthPolicy(drafter.block - 1, fixed=True)
+    out = [pending]
+    stages = dict(draft=0.0, forward=0.0, sample=0.0, commit=0.0)
+    rounds = drafted = accepted = 0
+    depths: list[int] = []
+    keeps: list[int] = []
+    torch.cuda.synchronize()
+    start = time.perf_counter()
+    depth = min(policy.next(0, 0), count - len(out))
+    while len(out) < count and not (stop_eos and out[-1] in w.cfg.eos):
+        t0 = time.perf_counter()
+        drafts = drafter.propose(out[-1], depth, sampling, policy.confidence) if depth > 0 else []
+        t1 = time.perf_counter()
+        tokens = e.verify_window([out[-1]] + drafts)
+        drafts = tokens[1:]
+        R = len(tokens)
+        logits = e.forward(tokens)
+        torch.cuda.synchronize()
+        t2 = time.perf_counter()
+        sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+        keep = 1
+        for i, d in enumerate(drafts):
+            if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
+                break
+            keep += 1
+        t3 = time.perf_counter()
+        fwd.commit(w, st, b, R, keep)
+        t4 = time.perf_counter()
+        drafter.add_taps(e.tap_rows(keep))
+        t5 = time.perf_counter()
+        rounds += 1
+        drafted += len(drafts)
+        accepted += keep - 1
+        depths.append(len(drafts))
+        keeps.append(keep)
+        e.follow(sampled[:keep])
+        out.extend(sampled[:keep])
+        if on_tokens is not None:
+            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+        stages["draft"] += (t1 - t0) + (t5 - t4)
+        stages["forward"] += t2 - t1
+        stages["sample"] += t3 - t2
+        stages["commit"] += t4 - t3
+        depth = min(policy.next(len(drafts), keep - 1), count - len(out))
+    torch.cuda.synchronize()
+    return DecodeResult(out[:count], time.perf_counter() - start, rounds, drafted, accepted, stages, depths, keeps)
+
+
 class Engine:
     """Weights, one sequence's state, buffers for decode windows (main model and MTP head) and prompt chunks.
 
@@ -266,7 +342,9 @@ class Engine:
 
     def __init__(self, w, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int | None = None,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
-                 taps: tuple[int, ...] = ()) -> None:
+                 taps: tuple[int, ...] = (), prompt_taps: int | None = None) -> None:
+        """``taps``: the layers a DFlash2 drafter reads (dflash.GlmDrafter.tap_layers), tapped by every forward; a prompt
+        chunk keeps the taps of its last ``prompt_taps`` rows (default all)."""
         from tensorfold.cuda.geometry import PREFILL_ROWS
         from tensorfold.families.glm5_next.cuda import latent
 
@@ -279,6 +357,9 @@ class Engine:
         self.pbuf = fwd.Buffers(w, self.prefill_rows, capacity, prefill=True)
         self.mbuf = fwd.Buffers(w, max_rows, capacity) if w.mtp is not None else None
         self.st = fwd.State(w, capacity, max_rows)
+        if taps:                                        # before any graph capture
+            self.buf.set_taps(tuple(taps), w.cfg.hidden)
+            self.pbuf.set_taps(tuple(taps), w.cfg.hidden, prompt_taps)
         self.last_hidden: torch.Tensor | None = None
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it
         self.draft_n = (w.head if w.draft_head is None else w.draft_head).n
@@ -337,8 +418,19 @@ class Engine:
         if self.constraint is not None:
             self.constraint.advance(tokens)
 
-    def tap_rows(self, n: int, b=None) -> torch.Tensor:
-        raise ValueError("GLM-5.3 has no hyper-connection taps: a DFlash2 drafter cannot attach")
+    def tap_rows(self, n: int, b=None, R: int | None = None) -> torch.Tensor:
+        """The last forward's taps of n rows, concatenated in the drafter's layer order: [n, taps x D]. A decode window
+        (R None): its first n rows; a prompt chunk of R rows: its last n."""
+
+        b = b or self.buf
+        if not b.taps:
+            raise ValueError("this engine taps no layers: start it with the DFlash2 drafter (--drafter)")
+        if R is None:
+            return torch.cat([t[:n] for t in b.taps], dim=1)
+        k = b.tapped(R)
+        if n > k:
+            raise ValueError(f"a prompt chunk keeps the taps of its last {k} rows, not {n}")
+        return torch.cat([t[k - n:k] for t in b.taps], dim=1)
 
     def main_hidden(self, rows: slice) -> torch.Tensor:
         """The final-normed main-model rows that the MTP head reads after a forward with logits."""

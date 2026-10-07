@@ -1,5 +1,5 @@
 """GLM-5.3's concurrent decoding (``--parallel N``): up to N requests on the lane at once, every live stream's verify
-window in one forward a round, each reply exactly its solo run (pipeline/CONCURRENCY-DESIGN.md).
+window in one forward a round, each reply exactly its solo run.
 
 - **Pool.** One cache plane a layer holds every slot: rows [s * cap, (s + 1) * cap) are slot s. A stream's prompt
   fills its slot through the single-stream path on the slot's views (``forward.State`` over view planes), in the solo
@@ -20,12 +20,7 @@ window in one forward a round, each reply exactly its solo run (pipeline/CONCURR
   each (``Link``) before running it; every rank checks the step's digest with one small all-gather before its model
   collectives (``OutOfStep``: the step fails on every rank at the same point, nobody waits on anybody).
 
-- **Decode context parallelism** (TF_GLM_DCP): each slot's positions interleave over the ranks as the single-stream
-  mode's do (dcp.py), a slot holding its local rows of the pool on every rank; a round runs each stream's window
-  through the single-stream dcp selection and attention over its slot (forward.dsa_block), so a stream's rows keep
-  their solo dcp bits. These rounds run eager and fill every prompt through the single-stream path.
-
-Grammars (structured output) and logprobs are not served with ``--parallel`` yet.
+Grammars (structured output), logprobs and DCP are not served with ``--parallel`` yet.
 """
 
 from __future__ import annotations
@@ -76,6 +71,12 @@ FILL_ROWS = int(os.environ.get("TF_GLM_FILL_ROWS") or 128)
 # a prompt whose rest fits in this many tokens fills before the next round, several up to this many rows a step
 # (TF_GLM_QUICK_ROWS; 0: every chunk paced by DECODE_SHARE)
 QUICK_ROWS = int(os.environ.get("TF_GLM_QUICK_ROWS") or 1024)
+# a rest under this many rows fills whole now even while others decode (no pacing wait): a short
+# prompt in paced steps waited ~10 decode rounds and queued fills stacked (drowzeys b1f9694: 4
+# streams at 32K, TTFT 4.2-4.9 -> 0.8-1.3 s, 62.4 -> 75.0 chat / 83.3 -> 96.4 code aggregate). Our
+# fills are whole chunks already (no layer steps), so this is his rule on our pacing gate: the same
+# solo chunk fill would happen later, so no bits move (TF_GLM_FILL_MIN_ROWS)
+FILL_MIN_ROWS = int(os.environ.get("TF_GLM_FILL_MIN_ROWS") or 2048)
 FILL_ROW_BYTES = 1_700_000       # a batched fill's buffers a row (round kernels' scratch, split-K partials, experts)
 # TF_GLM_KEEP_SLOTS=1: a finished stream's slot (the single-stream engine: its state) stays warm with its prompt's
 # rows, and a later prompt that extends that prompt resumes after the longest prefix both share, cut down to a
@@ -370,13 +371,12 @@ def _rows_view(p, lo: int, hi: int):
     return p[lo:hi] if isinstance(p, torch.Tensor) else p.rows(lo, hi)
 
 
-def slot_state(pool: fwd.State, lo: int, hi: int, capacity: int | None = None) -> fwd.State:
-    """A single-stream State over pool rows [lo, hi): view planes, its own positions (``capacity``: its window, with
-    decode context parallelism larger than the rows it holds)."""
+def slot_state(pool: fwd.State, lo: int, hi: int) -> fwd.State:
+    """A single-stream State over pool rows [lo, hi): view planes, its own positions."""
 
     v = copy.copy(pool)
     dev = pool.pos_dev.device
-    v.capacity = hi - lo if capacity is None else int(capacity)
+    v.capacity = hi - lo
     v.pos, v.mtp_len, v.mtp_drafted = 0, 0, 0
     v.pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
     v.mtp_pos_dev = torch.zeros((1,), dtype=torch.int32, device=dev)
@@ -405,13 +405,12 @@ class Slot:
 class MultiDecoder:
     """Rounds over the live streams; ``slots`` streams at most, each with ``slot_cap`` cache rows."""
 
-    dcp = 1                                              # decode context parallelism's ranks (w.meta["dcp"])
-
     def __init__(self, w, *, slots: int, slot_cap: int, depth: int, prefill_rows: int, graphs: bool = True) -> None:
         from .decode import Engine
 
+        if w.meta.get("dcp", 1) > 1:
+            raise ValueError("--parallel and decode context parallelism (TF_GLM_DCP) do not run together yet")
         dev = w.device
-        self.dcp = int(w.meta.get("dcp", 1))             # dcp: a slot holds its positions' local rows on each rank
         self.w, self.depth, self.slot_cap, self.prefill_rows = w, int(depth), int(slot_cap), int(prefill_rows)
         self.eos = tuple(w.cfg.eos)
         width = self.depth + 1                           # a stream's window: its pending token and its drafts
@@ -421,13 +420,6 @@ class MultiDecoder:
             self.pool = fwd.State(w, slot_cap, width)
             self.extents = Extents(slot_cap)
             self.slots = [Slot(i, 0, None) for i in range(slots)]
-        elif self.dcp > 1:                               # slot s: local rows [s * held, (s + 1) * held) of the pool
-            from .dcp import local_slots
-
-            held = local_slots(slot_cap, self.dcp)
-            self.pool = fwd.State(w, slots * held * self.dcp, width)
-            self.slots = [Slot(i, i * held * self.dcp, slot_state(self.pool, i * held, (i + 1) * held, slot_cap),
-                               slot_cap) for i in range(slots)]
         else:
             self.pool = fwd.State(w, slots * slot_cap, width)
             self.slots = [Slot(i, i * slot_cap, slot_state(self.pool, i * slot_cap, (i + 1) * slot_cap), slot_cap)
@@ -457,7 +449,7 @@ class MultiDecoder:
         one.replays = {"main": 0, "sparse": 0, "mtp": 0, "sparse_mtp": 0, "eager": 0}
         # fresh short prompts' batched fills: round kernels over FILL_ROWS rows (its MTP rows reuse the buffers)
         self.short = tiny_rows(w)                        # whole prompts this short fill with the decode kernels
-        self.tiny = min(self.short, FILL_ROWS) if self.dcp == 1 else 0      # (dcp: every prompt fills alone)
+        self.tiny = min(self.short, FILL_ROWS)
         self.fbuf = None
         if self.tiny > 0:
             fb = self.fbuf = fwd.Buffers(w, FILL_ROWS, self.tiny)
@@ -471,7 +463,7 @@ class MultiDecoder:
         self.next_id = 0
         self.kept_n = 0                                  # warm slots kept so far (each slot's ``used`` stamp)
         self.chunk_s, self.since_fill = 0.0, 0.0         # rank 0's fill pacing: the last chunk's time, decoding since
-        self.graphs = {} if graphs and dev.type == "cuda" and self.dcp == 1 else None     # (dcp rounds: eager)
+        self.graphs = {} if graphs and dev.type == "cuda" else None
         self.mtp_graphs = {} if self.graphs is not None and MTP_GRAPHS else None
         self.graph_pool = torch.cuda.graph_pool_handle() if self.graphs is not None else None
         self.link: Link | None = None                    # rank 0 with followers: each step goes to them first
@@ -484,24 +476,6 @@ class MultiDecoder:
         # (acceptance, commits), draft (_draft_all), emit (take), between (the host from one round's end to the next)
         self.stage_s = {k: 0.0 for k in ("plan", "forward", "sample", "keep", "draft", "emit", "between")}
         self.round_end = None
-
-    def held(self, slot: Slot) -> tuple[int, int]:
-        """The pool rows ``slot`` holds on this rank: [base, base + size), with dcp its positions' local rows."""
-
-        if self.dcp == 1:
-            return slot.base, slot.base + slot.size
-        from .dcp import local_slots
-
-        lo = slot.base // self.dcp
-        return lo, lo + local_slots(slot.size, self.dcp)
-
-    def window(self, slot: Slot, pos: int, n: int) -> tuple[int, ...]:
-        """A stream's entry in a round's tables (rows.Tables.fill): with dcp its slot's local rows too."""
-
-        if self.dcp == 1:
-            return slot.base, pos, n
-        lo, hi = self.held(slot)
-        return lo, pos, n, hi - lo
 
     # -- the scheduler's interface ------------------------------------------------------------------------------------
     def live(self) -> int:
@@ -584,9 +558,11 @@ class MultiDecoder:
         else a slot never kept, else the one kept longest ago. Every rank picks the same (the slots' states are the
         same everywhere)."""
 
+        from .engine import prompt_chunk_rows
+
         best, cut = None, 0
         if KEEP:
-            step = self.prefill_rows
+            step = prompt_chunk_rows(len(prompt), self.prefill_rows)
             for i in self.free:
                 ids = self.slots[i].kept
                 if not ids or (self.extents is not None and self.slots[i].size < need):
@@ -617,8 +593,7 @@ class MultiDecoder:
             kept[0].size, kept[0].kept, kept[0].st = 0, None, None
             start = ext.take(need)
         slot.base, slot.size = start, ext.size(need)
-        lo, hi = self.held(slot)
-        slot.st = slot_state(self.pool, lo, hi) if self.dcp == 1 else slot_state(self.pool, lo, hi, slot.size)
+        slot.st = slot_state(self.pool, start, start + slot.size)
 
     def _fill(self, s: Stream) -> list[Stream]:
         """One prompt chunk of ``s`` on its slot's views: decode.prefill's steps for that chunk, in its chunks. The last
@@ -633,8 +608,10 @@ class MultiDecoder:
         e.st = st = s.st.st
         b = e.pbuf
         t0 = time.perf_counter()
+        from .engine import prompt_chunk_rows
+
         start = s.filled
-        chunk = list(s.prompt[start:start + self.prefill_rows])
+        chunk = list(s.prompt[start:start + prompt_chunk_rows(len(s.prompt), self.prefill_rows)])
         with invariant.suspended(start == 0 and len(s.prompt) <= self.short):
             R = fwd.stage(w, st, b, chunk)
             last = fwd.compute(w, st, b, R, nch=fwd.chunks_for(st, R), host_pos=st.pos)
@@ -688,6 +665,9 @@ class MultiDecoder:
         if first:
             return first
         decoding = any(not s.done for s in self.streams.values())
+        s0 = self.filling[0]
+        if decoding and len(s0.prompt) - s0.filled < FILL_MIN_ROWS:
+            return s0.sid                      # a short rest fills whole now, whatever the pacing says
         if not decoding or self.since_fill * (1 - DECODE_SHARE) >= self.chunk_s * DECODE_SHARE:
             return self.filling[0].sid
         return None
@@ -814,7 +794,7 @@ class MultiDecoder:
         w, b = self.w, self.buf
         windows = [[s.out[-1]] + list(s.drafts) for s in live]
         t = b.rows_t
-        R = t.fill([self.window(s.st, s.st.st.pos, len(tok)) for s, tok in zip(live, windows)], w.cfg.dense_limit)
+        R = t.fill([(s.st.base, s.st.st.pos, len(tok)) for s, tok in zip(live, windows)], w.cfg.dense_limit)
         b.staged.synchronize()
         b.ids_host[:R].numpy()[:] = [x for tok in windows for x in tok]
         b.ids[:R].copy_(b.ids_host[:R], non_blocking=True)
@@ -1068,7 +1048,7 @@ class MultiDecoder:
                 st.set_mtp_len(st.mtp_len - st.mtp_drafted)
                 st.mtp_drafted = 0
         # the absorb: each stream's kept main rows (its final-normed hidden rows) with the tokens that follow them
-        n = mb.rows_t.fill([self.window(s.st, s.st.st.mtp_len, keep) for s, _, keep, _ in todo], w.cfg.dense_limit)
+        n = mb.rows_t.fill([(s.st.base, s.st.st.mtp_len, keep) for s, _, keep, _ in todo], w.cfg.dense_limit)
         mb.hin[:n].copy_(torch.cat([b.fnormed[a0:a0 + keep] for _, a0, keep, _ in todo]))
         heads, r = [], 0
         for _, _, keep, _ in todo:
@@ -1099,7 +1079,7 @@ class MultiDecoder:
             if not nxt:
                 return
             # the next step: one row a stream, its last draft and the head's own output row
-            n = mb.rows_t.fill([self.window(s.st, s.st.st.mtp_len, 1) for _, s, _ in nxt], w.cfg.dense_limit)
+            n = mb.rows_t.fill([(s.st.base, s.st.st.mtp_len, 1) for _, s, _ in nxt], w.cfg.dense_limit)
             picked = torch.tensor([i for i, _, _ in nxt], dtype=torch.int64, device=mb.hin.device)
             mb.hin[:n].copy_(torch.index_select(mb.fnormed, 0, picked))
             logits = self._mtp(n, [d for _, _, d in nxt], list(range(n)))

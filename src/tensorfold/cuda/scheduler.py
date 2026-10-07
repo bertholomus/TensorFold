@@ -25,6 +25,20 @@ class Waiting(queue.PriorityQueue):
     def get(self, block: bool = True, timeout: float | None = None):
         return super().get(block, timeout)[2]
 
+    def put_many(self, items) -> None:
+        """Publish a group before waking the worker, preserving arrival and background priority."""
+
+        with self.not_empty:
+            for item in items:
+                self._put((1 if item[0].background else 0, next(self._order), item))
+                self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def stop(self) -> None:
+        """Wake an idle worker to stop: None comes after every waiting request."""
+
+        super().put((2, next(self._order), None))
+
     def foreground(self) -> bool:
         """Whether a foreground request waits."""
 
@@ -40,8 +54,17 @@ class Scheduler:
         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
         self.boxes: dict[int, queue.Queue] = {}
         self.yields = 0                              # background streams that gave up their lane
+        if hasattr(decoder, "arrived"):              # a decoder filling prompts lets a new request in between passes
+            decoder.arrived = self.waiting.foreground
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
+
+    def close(self) -> None:
+        """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now)."""
+
+        self.waiting.stop()
+        self.thread.join()
+        self.decoder = None
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
@@ -63,6 +86,33 @@ class Scheduler:
                 raise value
             else:
                 return value
+
+    def submit_many(self, requests: list[dict]) -> list[dict]:
+        """Queue isolated one-shot requests atomically and return ordered stats, draining errors too."""
+
+        boxes = []
+        for r in requests:
+            box: queue.Queue = queue.Queue()
+            stream = Stream(list(r["prompt"]), max(1, r["count"]), r["sampling"], draft=r.get("draft", True),
+                            stop_eos=r.get("stop_eos", True), probabilities=r.get("probabilities"))
+            stream.emit = lambda new: False
+            boxes.append((stream, box))
+        self.waiting.put_many(boxes)
+        results, error = [], None
+        for _, box in boxes:
+            while True:
+                kind, value = box.get()
+                if kind == "tokens":
+                    continue
+                if kind == "error":
+                    error = error or value
+                    results.append(None)
+                else:
+                    results.append(value)
+                break
+        if error is not None:
+            raise error
+        return results
 
     def _admit(self, first=None) -> list[Stream]:
         done = []
@@ -117,7 +167,10 @@ class Scheduler:
         while True:
             self._yield()
             idle = not self.decoder.live() and self.held is None
-            done = self._admit(self.waiting.get() if idle else None)                  # idle: wait for a request
+            first = self.waiting.get() if idle else None                              # idle: wait for a request
+            if idle and first is None:
+                return                                                                # close()
+            done = self._admit(first)
             try:
                 done += self.decoder.round()
             except Exception as exc:                 # noqa: BLE001  (the live requests fail)

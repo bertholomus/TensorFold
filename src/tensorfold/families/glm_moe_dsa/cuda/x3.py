@@ -27,13 +27,20 @@ PROMPT_TILES = __import__("os").environ.get("TF_GLM_PROMPT_TILES", "1") != "0"
 # input rotation, no epilogue H128: TP4 prefill at 35.7k 36.9 -> 35.1 s, KL against BF16 0.1124 -> 0.1113) or "0" (the
 # rotated rows, the prompt bits before; TF_GLM_PROMPT_DEQ)
 PROMPT_DEQ = __import__("os").environ.get("TF_GLM_PROMPT_DEQ") or "auto"
+# a prompt chunk's second micro-batch reuses the first's decoded dense W (exl3.prefill.UnpackCache; Ported-from
+# ashhart/TensorFold#159 1da2529 + 8b97845 (drowzeys)): same bits, half the unpacks of a chunk's dense linears.
+# Off by default with decode context parallelism (TF_GLM_DCP set past 1): its prompt chunks run as one batch
+# (forward.compute takes the micro-batches only at dcp 1), so no call reuses an entry - every one misses and the
+# cache only holds 384 MiB a rank. A set TF_GLM_UNPACK_CACHE_MB wins either way.
+_DCP_SET = (__import__("os").environ.get("TF_GLM_DCP") or "1").strip() not in ("0", "1")
+UNPACK_CACHE_MB = int(__import__("os").environ.get("TF_GLM_UNPACK_CACHE_MB") or (0 if _DCP_SET else 384))
 
 
 class X3Scratch:
     """Shared fp16 input rotations, fp32 K-split partials and staging blocks for every X3 of a model."""
 
     def __init__(self, users: list, device, *, prefill: bool) -> None:
-        from tensorfold.cuda.exl3.prefill import Workspace
+        from tensorfold.cuda.exl3.prefill import UnpackCache, Workspace
 
         xh = z = tmp = 1
         for u in users:
@@ -48,7 +55,8 @@ class X3Scratch:
         self.tmp = {torch.float32: torch.empty((tmp,), dtype=torch.float32, device=device),
                     torch.bfloat16: torch.empty((tmp,), dtype=torch.bfloat16, device=device)}
         self.big: dict = {}                  # prompt-chunk staging (cropped groups only), grown on first use
-        self.prefill = Workspace() if prefill else None
+        cache = UnpackCache(UNPACK_CACHE_MB << 20) if UNPACK_CACHE_MB > 0 else None
+        self.prefill = Workspace(cache) if prefill else None
 
     def staging(self, dtype: torch.dtype, rows: int, n: int) -> torch.Tensor:
         if rows <= ROWS:

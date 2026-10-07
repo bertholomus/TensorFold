@@ -27,15 +27,25 @@ class Cancellation:
             raise RequestCancelled("request cancelled")
 
 
+def _readable(connection: socket.socket) -> bool:
+    """Whether a read would not block; ``poll`` where available, since ``select`` refuses descriptors past 1023."""
+
+    if hasattr(select, "poll"):
+        p = select.poll()
+        p.register(connection, select.POLLIN | select.POLLPRI)
+        return bool(p.poll(0))
+    ready, _, _ = select.select([connection], [], [], 0)
+    return bool(ready)
+
+
 def socket_cancellation(connection: socket.socket) -> Cancellation:
     def disconnected() -> bool:
         try:
             if connection.fileno() < 0:
                 return True
-            ready, _, _ = select.select([connection], [], [], 0)
-            if not ready:
+            if not _readable(connection):
                 return False
-            return connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT) == b""
+            return connection.recv(1, socket.MSG_PEEK | getattr(socket, "MSG_DONTWAIT", 0)) == b""
         except BlockingIOError:
             return False
         except OSError:
@@ -50,6 +60,7 @@ class PrefillGuard:
     def __init__(self, cancellation: Cancellation, memory: Any = None, *, wide: bool = True):
         self.cancellation, self.memory = cancellation, memory
         self.wide = bool(wide)          # whether this fill step may take several plan chunks in one forward
+        self.refused = False                    # one reason line per fill once memory refuses a copy (issue #155)
 
     def pass_width(self, cache: Any, sizes: list[int]) -> int:
         """How many of these consecutive plan chunks one forward may take: 1 unless wide, then what memory fits."""
@@ -78,3 +89,14 @@ class PrefillGuard:
     def allow_checkpoint(self, cache: Any) -> bool:
         self.cancellation.check()
         return self.memory is None or self.memory.allow_checkpoint(cache)
+
+    def refuse(self, boundary: int, cache: Any) -> None:
+        """Memory refused this prompt's checkpoint copy: log the reason once per fill (#155)."""
+
+        if self.refused or self.memory is None or not hasattr(self.memory, "refusal_reason"):
+            return
+        reason = self.memory.refusal_reason(cache)
+        if reason:
+            self.refused = True
+            print(f"[tensorfold] kept nothing at {boundary} tokens: {reason}; a turn reusing this prefix "
+                  "re-prefills it", flush=True)

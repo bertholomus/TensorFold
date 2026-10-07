@@ -35,7 +35,7 @@ def test_two_gpus_need_a_master_before_anything_loads(tmp_path):
     with pytest.raises(ValueError, match="--master"):
         cli._serve_cuda(args, family, tmp_path)
     args.tp, args.rank = 1, 1
-    with pytest.raises(ValueError, match="--rank 1 needs --tp 2"):
+    with pytest.raises(ValueError, match="--rank 1 needs --tp greater than 1"):
         cli._serve_cuda(args, family, tmp_path)
     assert not called
 
@@ -198,7 +198,6 @@ def test_kv_dtype_reaches_only_the_families_that_declare_it(tmp_path, monkeypatc
     (["--kv-dtype", "int8"], "cuda", "nemotron_h", "KV cache, not --kv-dtype int8"),
     (["--mtp-confidence", "0.6"], "mlx", "qwen4_exp", "on MLX has no such rule"),
     (["--mtp-confidence", "0.6"], "cuda", "glm5_next", "on CUDA has no such rule"),
-    (["--mtp-confidence", "0.6"], "cuda", "nemotron_h", "on CUDA has no such rule"),
     (["--mtp-confidence", "1.5"], "cuda", "qwen4_exp", "probability from 0 to 1"),
     (["--mtp-confidence", "-0.1"], "cuda", "qwen4_exp", "probability from 0 to 1"),
     (["--prefill-fp8"], "mlx", "qwen3_5", "Qwen3.8 dense on MLX has none"),
@@ -388,3 +387,16 @@ def test_27b_cuda_engine_takes_the_checkpoint_slots_as_its_kept_states(tmp_path,
     options = {"parallel": 2} | ({"checkpoint_slots": slots} if slots is not None else {})
     qwen3_5.cuda_engine(tmp_path, drafter=str(tmp_path), **options)
     assert made[-1]["keep"] == keep and made[-1]["streams"] == 2
+
+
+@pytest.mark.parametrize("flags,backend,message", [
+    (["--vision-offload"], "cuda", "--vision-offload needs --vision"),
+    (["--vision", "--vision-offload"], "mlx", "--vision-offload is for the CUDA backend"),
+])
+def test_vision_offload_is_a_cuda_option_that_needs_vision(tmp_path, flags, backend, message):
+    from tensorfold.families import qwen3_5
+
+    args = cli.build_parser().parse_args(["serve", str(tmp_path)] + flags)
+    family = SimpleNamespace(title=qwen3_5.TITLE, package=qwen3_5, model_type="qwen3_5")
+    with pytest.raises(ValueError, match=message):
+        cli._check_serve_options(args, family, backend)
