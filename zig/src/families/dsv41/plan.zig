@@ -44,10 +44,53 @@ pub const Split = struct {
         return if (s.pair.? == 0) .{ r[0], mid } else .{ mid, r[1] };
     }
     /// The pair's part of `r` on a 2D split, else `r` (the plain TP slice).
-    fn part(s: Split, r: [2]usize, first: ?usize) [2]usize {
+    pub fn part(s: Split, r: [2]usize, first: ?usize) [2]usize {
         return if (s.pair != null) s.cut(r, first) else r;
     }
+
+    // -- each split tensor's ranges here (the loader's and the key list's) ------------------------------------------
+
+    /// wq_b's output columns: the rank's heads (a 2D node: its pair's half of them).
+    pub fn wqB(s: Split, c: Config) [2]usize {
+        return s.part(s.range(s.heads(c) * c.head_dim), null);
+    }
+    /// The heads here, (first, count): wq_b's columns in heads (the sinks' slice, the attention's heads).
+    pub fn headSpan(s: Split, c: Config) [2]usize {
+        const q = s.wqB(c);
+        return .{ q[0] / c.head_dim, (q[1] - q[0]) / c.head_dim };
+    }
+    /// wo_a's groups here, (first, count) (split2d.py wo_a_groups: a 2D node holds its pair's half of the rank's).
+    pub fn woAGroups(s: Split, c: Config) [2]usize {
+        const gl = s.groups(c);
+        return if (s.pair) |p| .{ s.rank * gl + p * (gl / 2), gl / 2 } else .{ s.rank * gl, gl };
+    }
+    /// wo_b's output columns (null: all of them; its input rows are the rank's groups either way).
+    pub fn woBCols(s: Split, c: Config) ?[2]usize {
+        return if (s.pair != null) s.cut(.{ 0, c.hidden }, null) else null;
+    }
+    /// The experts' parts: the rank's intermediate half, gate / up's columns of it here (TF_DS_2D_GU=first: whole
+    /// 128-blocks, pair 0 the larger part), down's output columns (null: all; TF_DS_2D_DOWN = down0 blocks for pair 0).
+    pub fn expertParts(s: Split, c: Config) ExpertParts {
+        const half = s.range(s.inter(c));
+        return .{ .half = half, .gu = s.part(half, null), .dcols = if (s.pair != null) s.cut(.{ 0, c.hidden }, s.down0) else null };
+    }
+    /// Engram wkv's output columns (null: all; its input rows are the rank's hash columns either way).
+    pub fn engramCols(s: Split, c: Config) ?[2]usize {
+        return if (s.pair != null) s.cut(.{ 0, (c.hc + 1) * c.hidden }, null) else null;
+    }
+    /// The head's vocabulary columns here.
+    pub fn headCols(s: Split, c: Config) [2]usize {
+        return s.part(s.range(s.vocab(c)), null);
+    }
+    /// The same split at pair `p` (a 2D node's partner in its column pair: the same TP2 rank, the other pair).
+    pub fn atPair(s: Split, p: u32) Split {
+        var o = s;
+        o.pair = p;
+        return o;
+    }
 };
+
+pub const ExpertParts = struct { half: [2]usize, gu: [2]usize, dcols: ?[2]usize };
 
 /// One tensor a rank loads: the loader's key, the dtype it is stored in (null: the checkpoint's own), and for an EXL3
 /// trellis its K / 16 and N / 16 when the split fixes them.
@@ -105,7 +148,6 @@ const Builder = struct {
 /// One block, a target layer (`layers.i`) or a DSpark stage (`mtp.j`, i = layers + j), as load_block takes it.
 fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usize) !void {
     const d = c.hidden;
-    const hl = s.heads(c);
     const gl = s.groups(c);
     for ([_][]const u8{ "hc_attn", "hc_ffn" }) |hc| for ([_][]const u8{ "fn", "scale", "base" }) |part| {
         try b.plain(try b.fmt("{s}.{s}_{s}", .{ p, hc, part }), .f32);
@@ -114,17 +156,16 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
     try b.plain(try b.fmt("{s}.ffn_norm.weight", .{p}), null);
     try b.exl3(try b.fmt("{s}.attn.wq_a", .{p}), null, null, d, c.q_lora);
     try b.plain(try b.fmt("{s}.attn.q_norm.weight", .{p}), null);
-    try b.exl3(try b.fmt("{s}.attn.wq_b", .{p}), s.part(s.range(hl * c.head_dim), null), null, c.q_lora, null);
+    try b.exl3(try b.fmt("{s}.attn.wq_b", .{p}), s.wqB(c), null, c.q_lora, null);
     try b.exl3(try b.fmt("{s}.attn.wkv", .{p}), null, null, d, c.head_dim);
     try b.plain(try b.fmt("{s}.attn.kv_norm.weight", .{p}), null);
     try b.plain(try b.fmt("{s}.attn.attn_sink", .{p}), .f32);
     // 2D: the pair's half of its rank's groups (split2d.py wo_a_groups)
-    const g0 = s.rank * gl + if (s.pair) |pp| pp * (gl / 2) else 0;
-    for (g0..g0 + if (s.pair != null) gl / 2 else gl) |g| {
+    const ga = s.woAGroups(c);
+    for (ga[0]..ga[0] + ga[1]) |g| {
         try b.exl3(try b.fmt("{s}.attn.wo_a.slice.{d}", .{ p, g }), null, null, c.heads / c.o_groups * c.head_dim, c.o_lora);
     }
-    const wo_b_cols: ?[2]usize = if (s.pair != null) s.cut(.{ 0, d }, null) else null;
-    try b.exl3(try b.fmt("{s}.attn.wo_b", .{p}), wo_b_cols, s.range(gl * c.o_lora), null, d);
+    try b.exl3(try b.fmt("{s}.attn.wo_b", .{p}), s.woBCols(c), s.range(gl * c.o_lora), null, d);
     if (c.kv_sources.has(i)) {
         try b.exl3(try b.fmt("{s}.attn.compressor.wkv", .{p}), null, null, d, null);
         try b.plain(try b.fmt("{s}.attn.compressor.norm.weight", .{p}), null);
@@ -140,18 +181,16 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
     }
     try b.plain(try b.fmt("{s}.ffn.gate.weight", .{p}), .f16);
     try b.plain(try b.fmt("{s}.ffn.gate.bias", .{p}), .f32);
-    const half = s.range(s.inter(c));
-    const gate_up = s.part(half, null); // 2D: blocks 0-4 (pair 0) or 5-8 (pair 1) of the rank's 9 (TF_DS_2D_GU=first)
-    const down_cols: ?[2]usize = if (s.pair != null) s.cut(.{ 0, d }, s.down0) else null;
+    // 2D: gate / up blocks 0-4 (pair 0) or 5-8 (pair 1) of the rank's 9 (TF_DS_2D_GU=first), down by output columns
+    const xp = s.expertParts(c);
     for (0..experts + 1) |e| {
         const ep = if (e < experts) try b.fmt("{s}.ffn.experts.{d}", .{ p, e }) else try b.fmt("{s}.ffn.shared_experts", .{p});
-        try b.exl3(try b.fmt("{s}.w1", .{ep}), gate_up, null, d, null);
-        try b.exl3(try b.fmt("{s}.w3", .{ep}), gate_up, null, d, null);
-        try b.exl3(try b.fmt("{s}.w2", .{ep}), down_cols, half, null, d);
+        try b.exl3(try b.fmt("{s}.w1", .{ep}), xp.gu, null, d, null);
+        try b.exl3(try b.fmt("{s}.w3", .{ep}), xp.gu, null, d, null);
+        try b.exl3(try b.fmt("{s}.w2", .{ep}), xp.dcols, xp.half, null, d);
     }
     if (c.engram_layers.has(i)) {
-        const engram_cols: ?[2]usize = if (s.pair != null) s.cut(.{ 0, 5 * d }, null) else null;
-        try b.exl3(try b.fmt("{s}.engram.wkv", .{p}), engram_cols, s.range(s.engramRows(c)), null, null);
+        try b.exl3(try b.fmt("{s}.engram.wkv", .{p}), s.engramCols(c), s.range(s.engramRows(c)), null, null);
         try b.plain(try b.fmt("{s}.engram.q_weight", .{p}), .f32);
         try b.plain(try b.fmt("{s}.engram.k_weight", .{p}), .f32);
     }
@@ -162,7 +201,7 @@ pub fn wants(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
     var b: Builder = .{ .a = a };
     try b.plain("embed.weight", null);
     try b.plain("norm.weight", null);
-    try b.exl3("head", s.part(s.range(s.vocab(c)), null), null, c.hidden, null);
+    try b.exl3("head", s.headCols(c), null, c.hidden, null);
     for (0..c.layers) |i| try block(&b, c, s, try b.fmt("layers.{d}", .{i}), i, c.experts);
     if (dspark and c.dspark_block > 0) {
         // DSpark stays TP2 inside the pair on a 2D split (weights.py _load_2d: load_block at world 2)
@@ -203,6 +242,35 @@ test "a rank's tensors in load order: the split's ranges, keys as Python prints 
     try std.testing.expect(seen_wq_b and seen_down and seen_engram);
     try std.testing.expectEqual(@as(usize, 4), wo_a);
     try std.testing.expectEqualStrings("mtp.2.confidence_head.proj.weight|None", w[w.len - 1].key);
+}
+
+test "each split tensor's ranges: TP2's slices, a 2D node's pair parts of them" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var why: @import("config.zig").Why = .{};
+    const c = try @import("config.zig").parse(arena.allocator(), @import("config.zig").test_config, &why);
+    const eq = std.testing.expectEqual;
+    // TP2 rank 1: the plain slices
+    const t: Split = .{ .rank = 1, .world = 2 };
+    try eq([2]usize{ 16384, 32768 }, t.wqB(c));
+    try eq([2]usize{ 32, 32 }, t.headSpan(c));
+    try eq([2]usize{ 4, 4 }, t.woAGroups(c));
+    try eq(@as(?[2]usize, null), t.woBCols(c));
+    try eq(ExpertParts{ .half = .{ 1152, 2304 }, .gu = .{ 1152, 2304 }, .dcols = null }, t.expertParts(c));
+    try eq(@as(?[2]usize, null), t.engramCols(c));
+    try eq([2]usize{ 64640, 129280 }, t.headCols(c));
+    // node 3 = rank 1 of pair 1: the second part of each, pair 0 the larger one of an odd block count
+    const n3: Split = .{ .rank = 1, .world = 2, .pair = 1 };
+    try eq([2]usize{ 24576, 32768 }, n3.wqB(c));
+    try eq([2]usize{ 48, 16 }, n3.headSpan(c));
+    try eq([2]usize{ 6, 2 }, n3.woAGroups(c));
+    try eq(@as(?[2]usize, .{ 2560, 5120 }), n3.woBCols(c));
+    try eq(ExpertParts{ .half = .{ 1152, 2304 }, .gu = .{ 1792, 2304 }, .dcols = .{ 2560, 5120 } }, n3.expertParts(c));
+    try eq(@as(?[2]usize, .{ 12800, 25600 }), n3.engramCols(c));
+    try eq([2]usize{ 97024, 129280 }, n3.headCols(c));
+    // its column partner, node 1
+    try eq(ExpertParts{ .half = .{ 1152, 2304 }, .gu = .{ 1152, 1792 }, .dcols = .{ 0, 2560 } }, n3.atPair(0).expertParts(c));
+    try eq([2]usize{ 4, 2 }, n3.atPair(0).woAGroups(c));
 }
 
 test "the 2D split: node 2 (rank 0 of pair 1) keeps pair 1's blocks, DSpark stays TP2" {
