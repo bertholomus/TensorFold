@@ -22,6 +22,7 @@ const tri_attn = @import("tri_attn.zig");
 const tri_markov = @import("tri_markov.zig");
 const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_experts = @import("exl3_experts.zig");
+const exl3_experts2d = @import("exl3_experts2d.zig");
 const ops = @import("ops.zig");
 const cublas = @import("cublas.zig");
 const comm = @import("comm.zig");
@@ -382,7 +383,7 @@ pub const Chunk = struct {
 /// -1 (made at the first window under 64 rows and never replaced).
 pub fn decodeScratch(e: *const Engine, a: *Arena, ex: weights.Experts, slots: usize) !exl3_experts.DecodeScratch {
     const rows = exl3_experts.exact_rows;
-    const sz = try exl3_experts.DecodeScratch.sizes(rows, slots, ex.dims, ex.width, ex.count);
+    const sz = if (e.two != null) try exl3_experts2d.decodeSizes(rows, slots, ex) else try exl3_experts.DecodeScratch.sizes(rows, slots, ex.dims, ex.width, ex.count); // 2D: this node's widths
     var sc: exl3_experts.DecodeScratch = undefined;
     sc.rows = rows;
     sc.slots = slots;

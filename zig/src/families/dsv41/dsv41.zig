@@ -35,6 +35,7 @@ pub const prompt2d = @import("prompt2d.zig");
 pub const ring2d = @import("ring2d.zig");
 pub const text = @import("text.zig");
 pub const round = @import("round.zig");
+pub const round2d = @import("round2d.zig");
 
 test {
     // every declaration of every file, so functions no test calls are still compiled
@@ -74,4 +75,5 @@ test {
     refAll(ring2d);
     refAll(text);
     refAll(round);
+    refAll(round2d);
 }

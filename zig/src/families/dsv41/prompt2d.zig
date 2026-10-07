@@ -7,7 +7,8 @@
 //! switch: slots P6, P7b), each as one all-gather of every node's part then copies into place: the bytes Comm2D's
 //! NCCL paths (gather4, _p2p) put there.
 //!
-//! prompt.zig takes it through thin hooks behind Engine.two; a TP2 engine has none and runs as before.
+//! prompt.zig takes it through thin hooks behind Engine.two; a TP2 engine has none and runs as before. The decode
+//! rounds' part is round2d.zig's, on this node state.
 const std = @import("std");
 const cuda = @import("cuda");
 const Config = @import("config.zig").Config;
@@ -15,6 +16,7 @@ const plan = @import("plan.zig");
 const prompt = @import("prompt.zig");
 const weights = @import("weights.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
+const round_rows = @import("round.zig").max_rows;
 const Link = @import("link.zig").Link;
 const Comm = @import("comm.zig").Comm;
 
@@ -82,7 +84,8 @@ fn len(r: ?[2]usize) usize {
     return x[1] - x[0];
 }
 
-/// A 2D node's part of the prompt path: the pairs' widths of each split output and the exchange buffers.
+/// A 2D node's part of the prompt path and the decode rounds: the pairs' widths of each split output and the exchange
+/// buffers.
 pub const Two = struct {
     r: usize,
     p: usize,
@@ -98,8 +101,9 @@ pub const Two = struct {
     part_bytes: usize, // the largest part a node sends
     u_full: u64, // bf16 [cap, uw0 + uw1]: the rank's wo_a output, pair 0's groups then pair 1's
     xd_full: u64, // fp16 [cap * slots, gu0 + gu1]: the rank's expert intermediate, pair 0's blocks then pair 1's
+    own: u64, // fp16 [round rows, uw[p]]: a round's half of wo_b's rotated input rows (wo_a's epilogue, round2d.woRot)
 
-    /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows from `a`.
+    /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
         const pp = s.pair orelse return error.NotA2DSplit;
         const s0 = s.atPair(0);
@@ -130,7 +134,8 @@ pub const Two = struct {
         t.parts = try a.take(4 * biggest);
         t.pad = try a.take(biggest);
         t.u_full = try a.take(cap * (t.uw[0] + t.uw[1]) * 2);
-        t.xd_full = try a.take(cap * slots * (t.gu[0] + t.gu[1]) * 2);
+        t.xd_full = try a.take(@max(cap, round_rows) * slots * (t.gu[0] + t.gu[1]) * 2);
+        t.own = try a.take(round_rows * t.uw[pp] * 2);
         return t;
     }
 
