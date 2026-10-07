@@ -63,6 +63,29 @@ def jit_table() -> dict:
     return out
 
 
+def rope_tables(cfg: Cfg, out: str, rows: int = 17 << 16) -> dict:
+    """Both RoPE kinds' (cos, sin) fp32 tables as the engine builds them (ops.rope_cs on the CPU: torch's own pow and
+    polar, whose last bits the Zig side cannot recompute), `rows` rows each, as raw little-endian files with digests."""
+
+    import torch
+
+    from tensorfold.families.deepseek_v41.ops import RopeTables, rope_cs
+
+    rt = RopeTables(cfg, device="cpu")
+    doc = {"rows": rows, "half": cfg.rope_dim // 2}
+    for kind, compressed in (("plain", False), ("compressed", True)):
+        cos, sin = rope_cs(cfg.rope_dim, rows, *rt.args(compressed), device="cpu")
+        for part, t in (("cos", cos), ("sin", sin)):
+            raw = t.contiguous().view(torch.uint8).numpy().tobytes()
+            name = f"rope-{kind}-{part}.f32"
+            with open(os.path.join(out, name), "wb") as f:
+                f.write(raw)
+            doc[name] = hashlib.sha256(raw).hexdigest()
+    with open(os.path.join(out, "rope.json"), "w") as f:
+        json.dump(doc, f, indent=1)
+    return doc
+
+
 def main() -> None:
     model_dir, map_path, out = sys.argv[1:4]
     os.makedirs(out, exist_ok=True)
@@ -84,10 +107,12 @@ def main() -> None:
            "cases": cases}
     with open(os.path.join(out, "engram.json"), "w") as f:
         json.dump(doc, f)
+    rope = rope_tables(cfg, out)
     jit = jit_table()
     with open(os.path.join(out, "jit.json"), "w") as f:
         json.dump(jit, f, indent=1)
-    print(json.dumps({"engram_cases": len(cases), "multipliers": doc["multipliers"], "jit_functions": len(jit)}))
+    print(json.dumps({"engram_cases": len(cases), "multipliers": doc["multipliers"], "jit_functions": len(jit),
+                      "rope_rows": rope["rows"]}))
 
 
 if __name__ == "__main__":
