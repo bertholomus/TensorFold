@@ -32,7 +32,9 @@ const Chunk = prompt.Chunk;
 const Caches = prompt.Caches;
 
 /// kernels.ROUND_ROWS (TF_DS_ROUND_ROWS unset: TF_DS_DECODE_ROWS, 16): a round's rows at most.
-pub const max_rows = 16;
+pub const max_rows = 48; // the most rows any round-row setting (Engine.round_rows) gives a round
+/// The served round-row bound when TF_DS_ROUND_ROWS is unset (kernels.DECODE_ROWS); the four-node lane serves 48.
+pub const default_rows = 16;
 /// graph.py BUCKET_MIN (TF_DS_BUCKET_MIN unset).
 pub const bucket_min = 1024;
 /// The window ring's rows a slot (model.py: window + RING_EXTRA).
@@ -189,7 +191,8 @@ pub const Round = struct {
     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
         const c = e.c;
         const w = e.w;
-        const R = max_rows;
+        const R = e.round_rows;
+        if (R < default_rows or R > max_rows) return error.BadRoundRows;
         const d = c.hidden;
         const hc = c.hc;
         const hd = c.head_dim;
@@ -201,7 +204,7 @@ pub const Round = struct {
         rd.bucket = 0;
         rd.has_cand = false;
         rd.kk = 0;
-        rd.glue = try a.take(glue_n * R * 8);
+        rd.glue = try a.take(glue_n * max_rows * 8); // glue rows at max_rows apart
         rd.inputs = try a.take(5 * R * 8);
         rd.ids = rd.inputs;
         rd.pos = rd.inputs;
@@ -753,7 +756,7 @@ pub const PhaseTimer = struct {
         t.gpa.free(t.events);
     }
 
-    fn mark(t: *PhaseTimer, s: cuda.Stream, p: Phase) !void {
+    pub fn mark(t: *PhaseTimer, s: cuda.Stream, p: Phase) !void {
         if (t.n == max_marks) return;
         try t.events[t.n].record(s);
         t.phase[t.n] = p;
@@ -847,8 +850,12 @@ pub const Graphs = struct {
 pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, pool_cap: usize, probe: ?Probe, graphs: ?*Graphs) !void {
     const w = e.w;
     const R = rows.ids.len;
-    if (R == 0 or R > max_rows or rows.pos.len != R) return error.BadRound;
+    if (R == 0 or R > e.round_rows or rows.pos.len != R) return error.BadRound;
     rd.r = R;
+    // kernels.round_rows(): up to the round's bound its rows take the row-invariant decode kernels
+    const bound = tri.decode_rows;
+    tri.decode_rows = e.round_rows;
+    defer tri.decode_rows = bound;
     var deepest: usize = 0;
     for (rows.pos) |p| deepest = @max(deepest, @as(usize, @intCast(p)) + 1);
     rd.bucket = bucketFor(deepest, pool_cap);

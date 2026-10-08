@@ -32,6 +32,8 @@ const rdma = @import("rdma.zig");
 pub const chunk_rows = 2048;
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
+/// The pool's streams when unset (--parallel 4).
+pub const max_streams_default = draft.default_streams;
 /// The RDMA ring's slot (the served 4.25 MiB: a 16-row round's logits half fits).
 pub const ring_bytes = 4456448;
 
@@ -56,6 +58,9 @@ pub const Options = struct {
     prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
     engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
     arena_bytes: usize = 0, // the device arena's first block (0: it grows from 256 MiB blocks as the buffers ask)
+    round_rows: usize = round.default_rows, // a round's rows at most (TF_DS_ROUND_ROWS; the four-node lane's 48)
+    streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
+    round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
 };
 
 pub const Model = struct {
@@ -67,6 +72,8 @@ pub const Model = struct {
     cfg: Config,
     rank: u32,
     world: u32,
+    streams: usize, // the pool's streams (Options.streams)
+    round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
     pool_cap: usize,
     cache_dir: std.Io.Dir,
     cache_file: std.Io.File,
@@ -111,6 +118,7 @@ pub const Model = struct {
     // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
     prof: bool = false,
     timer: ?*round.PhaseTimer = null, // a profile's GPU time by phase (eager rounds)
+    ptimer: ?*round.PhaseTimer = null, // the same for prompt chunks (fills), a chunk a 'round'
     t_enqueue: u64 = 0, // the host's time to issue the forward (the GPU idle before it)
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
@@ -133,10 +141,15 @@ pub const Model = struct {
         m.ctx = ctx;
         m.rank = o.rank;
         m.world = o.world;
+        if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
+        m.streams = o.streams;
+        m.round_ms = o.round_ms orelse &draft.round_ms;
+        if (m.round_ms.len == 0) return error.BadRoundMs;
         m.pool_cap = o.pool;
         m.fill_slot = 0;
         m.prof = false;
         m.timer = null;
+        m.ptimer = null;
         m.t_enqueue = 0;
         m.t_forward = 0;
         m.t_absorb = 0;
@@ -243,16 +256,17 @@ pub const Model = struct {
             }
         }
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
+        m.eng.round_rows = o.round_rows;
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
-        m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, max_streams);
+        m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
         m.eng.blas = &m.blas;
         m.rings = try a.alloc(u64, c.layers);
         m.ring_view = try a.alloc(u64, c.layers);
         for (m.rings) |*r| {
-            r.* = try m.arena.take(max_streams * m.eng.ringBytes());
-            try d.check(d.api.cuMemsetD8Async(r.*, 0, max_streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
+            r.* = try m.arena.take(m.streams * m.eng.ringBytes());
+            try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
         m.amax = try m.arena.take(round.max_rows * 4);
@@ -260,7 +274,7 @@ pub const Model = struct {
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
         if (o.drafts) {
-            m.dpool = try draft.Pool.init(&m.eng, &m.arena, max_streams);
+            m.dpool = try draft.Pool.init(&m.eng, &m.arena, m.streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
             if (o.graphs) {
                 m.pgraphs = draft.PassGraphs.init(gpa);
@@ -285,7 +299,8 @@ pub const Model = struct {
             m.epool = try engram_io.Pool.init(gpa, io, 64);
             m.eh = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
             if (o.engram_aio) {
-                m.aio = try engram_aio.Aio.init(gpa, io, 1024);
+                // a round's reads, 2 x 12 x its rows at most: 1,024 slots for each 16 rows of the round-row setting
+                m.aio = try engram_aio.Aio.init(gpa, io, 1024 * ((o.round_rows + 15) / 16));
                 m.eh.?.aio = m.aio;
             }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
@@ -302,6 +317,10 @@ pub const Model = struct {
         if (m.graphs) |*g| g.deinit();
         if (m.pgraphs) |*g| g.deinit();
         if (m.timer) |t| {
+            t.deinit();
+            m.gpa.destroy(t);
+        }
+        if (m.ptimer) |t| {
             t.deinit();
             m.gpa.destroy(t);
         }
@@ -381,7 +400,7 @@ pub const Model = struct {
 
     /// A stream's prompt is about to fill pool slot `slot`, its compressed rows in its extent from position `base`.
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
-        if (slot >= max_streams) return error.BadSlot;
+        if (slot >= m.streams) return error.BadSlot;
         m.view = try m.caches.view(&m.eng, slot, base);
         for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
         m.fill_slot = slot;
@@ -398,7 +417,10 @@ pub const Model = struct {
         const ch = &m.ch;
         for (0..n) |j| m.ids64[j] = seq[start + j];
         var shared: prompt.Shared = .{};
+        const pt = m.ptimer;
+        if (pt) |t| try t.mark(m.stream, .start);
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
+        if (pt) |t| try t.mark(m.stream, .embed);
         const taps = m.dr != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
@@ -406,23 +428,34 @@ pub const Model = struct {
             if (li == c.layers / 2) {
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
                     try m.stream.synchronize();
+                    if (pt) |t| try t.finish();
                     return false; // encoder-only
                 }
                 floor = replay;
                 kv_done = li;
             }
-            if (e.w.layers[li].engram_wkv != null) try prompt.engramApply(e, ch, if (m.eh) |*x| x else return error.NoEngramTables, li, seq);
+            if (e.w.layers[li].engram_wkv != null) {
+                try prompt.engramApply(e, ch, if (m.eh) |*x| x else return error.NoEngramTables, li, seq);
+                if (pt) |t| try t.mark(m.stream, .engram);
+            }
             // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
             if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
             try prompt.attnMixes(e, ch, li);
+            if (pt) |t| try t.mark(m.stream, .mix_attn);
             try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
+            if (pt) |t| try t.mark(m.stream, .attn);
             try prompt.gather(e, ch, ch.pa, ch.ga);
+            if (pt) |t| try t.mark(m.stream, .gather_a);
             try prompt.ffnMixes(e, ch, li);
+            if (pt) |t| try t.mark(m.stream, .mix_ffn);
             try prompt.moe(e, ch, li);
+            if (pt) |t| try t.mark(m.stream, .moe);
             try prompt.gather(e, ch, ch.pm, ch.gm);
+            if (pt) |t| try t.mark(m.stream, .gather_m);
             prompt.endLayer(ch);
         }
         try prompt.head(e, ch);
+        if (pt) |t| try t.mark(m.stream, .head);
         if (m.dr) |*dr| {
             // its taps (the tap layers side by side) into the slot's drafter rings
             const dw = c.hidden;
@@ -430,7 +463,12 @@ pub const Model = struct {
             try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
         }
         // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
-        // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize
+        // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize.
+        // The profile (--profile 2) times a chunk to its end, so it alone waits.
+        if (pt) |t| {
+            try m.stream.synchronize();
+            try t.finish();
+        }
         return true;
     }
 
@@ -477,6 +515,10 @@ pub const Model = struct {
         errdefer m.gpa.destroy(t);
         t.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
         m.timer = t;
+        const pt = try m.gpa.create(round.PhaseTimer);
+        errdefer m.gpa.destroy(pt);
+        pt.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
+        m.ptimer = pt;
         m.rd.timer = t;
     }
 

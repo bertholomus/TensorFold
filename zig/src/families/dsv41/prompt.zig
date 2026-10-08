@@ -122,6 +122,7 @@ pub const Engine = struct {
     world: usize,
     plain: Rope,
     compressed: Rope,
+    round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
 
@@ -744,7 +745,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const kk = sh.kk orelse return error.NoIndexerSelection;
         comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
         n_idx = kk;
-        if (kk % 16 != 0 and n > tri_attn.decode_rows) {
+        if (kk % 16 != 0 and n > tri.decode_rows) {
             // sparse_attn: a prompt chunk's pick list padded with -1 to whole 16-column tiles (F.pad), read from there
             const kp = (kk + 15) / 16 * 16;
             try fill(e, ch.cidxp, 0xff, n * kp * 8);
@@ -882,7 +883,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
     // switch "idx": fp4_qd's bytes in one launch
     try tri_attn.fp4QdP2(e.t, ch.iq, ch.iq4, n * ih * id);
-    if (n <= tri_index.decode_rows) {
+    if (n <= tri.decode_rows) {
         // a decode-sized chunk: the row-invariant matmul of the fp16 projection (rowmm2)
         try tri_norm.rowmm2(e.t, ch.x, c.hidden, lay.idx_proj_h, ch.wl, n, c.hidden, ih);
     } else {
@@ -974,7 +975,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     const d = c.hidden;
     const sl = e.slots();
     const shared_id = lay.experts.count - 1;
-    if (n <= tri_norm.decode_rows) {
+    if (n <= tri.decode_rows) {
         // a decode-sized chunk: the row-invariant gate (rowmm_gate's chunk sums) and its routing
         const kc = try tri_norm.rowmmGate(e.t, ch.x, d, lay.gate_w, ch.gl, n, d, c.experts);
         try tri_norm.route(e.t, ch.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);

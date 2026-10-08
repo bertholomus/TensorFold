@@ -82,7 +82,7 @@ pub fn ropeHeads(t: Tri, x: u64, cos: u64, sin: u64, pos: u64, rd: usize, invers
 pub fn rowmm2(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: usize, n: usize) !void {
     // a narrow layer: one output (one warp) a program
     const bn: usize = if (n > 64) 4 else 1;
-    if (rows > rowmm2_rows and rowmm_rb > 0 and k % 256 == 0 and rows <= decode_rows) {
+    if (rows > rowmm2_rows and rowmm_rb > 0 and k % 256 == 0 and rows <= tri.decode_rows) {
         const rb = @min(rowmm_rb, rows);
         return t.run("_rowmm2r", .{ tri.cdiv(rows, rb), tri.cdiv(n, bn), 1 }, &.{
             p("X", "*bf16", x), aot.int("xs", @intCast(xs)), p("W", "*fp16", w), p("OUT", "*fp32", out), aot.float("scale", 1.0), aot.int("rows", @intCast(rows)),
@@ -120,7 +120,7 @@ pub fn rowmmGate(t: Tri, x: u64, xs: usize, w: u64, out: u64, rows: usize, k: us
     const tile = rpTile(rows);
     const kc = k / 256;
     // switch "rowmm_parts" (on in the served build); the wrapper's dtype check (x bf16, w fp16) holds by these pointer types
-    if (!(rowmm_parts_min <= rows and rows <= decode_rows and k % 256 == 0 and kc % tile.cpg == 0 and n >= 32)) {
+    if (!(rowmm_parts_min <= rows and rows <= tri.decode_rows and k % 256 == 0 and kc % tile.cpg == 0 and n >= 32)) {
         try rowmm2(t, x, xs, w, out, rows, k, n);
         return 0;
     }

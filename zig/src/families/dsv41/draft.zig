@@ -17,6 +17,7 @@ const plan = @import("plan.zig");
 const tri_basic = @import("tri_basic.zig");
 const tri_hc = @import("tri_hc.zig");
 const tri_norm = @import("tri_norm.zig");
+const tri = @import("tri.zig");
 const tri_attn = @import("tri_attn.zig");
 const tri_markov = @import("tri_markov.zig");
 const exl3_linear = @import("exl3_linear.zig");
@@ -28,12 +29,13 @@ const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
 
 /// MultiDecoder's stream slots in the served lane (--parallel 4): the pool's streams.
-pub const max_streams = 4;
-/// A pass's rows at most: four streams' blocks. Past kernels.decode_rows() (16 rows: four streams) the MoE gate is a
+pub const max_streams = 16; // the most streams any stream setting (Model.streams) gives the pool
+/// The served pool's streams when unset (--parallel 4); the four-node lane serves 16.
+pub const default_streams = 4;
+/// A pass's rows at most: every stream's block (four streams: 20). Past kernels.decode_rows() (16 rows: four streams) the MoE gate is a
 /// cuBLAS matmul with the plain routing and the attention one split (its pick list padded to 16 columns of -1).
-pub const max_rows = 20;
+pub const max_rows = max_streams * 5; // every stream of the pool, a five-row block each
 /// kernels.decode_rows(): the row-invariant decode kernels' rows at most.
-const decode_rows = tri_norm.decode_rows;
 /// sparse_attn's pick list of a single-split call: padded with -1 to a multiple of 16 entries.
 const pick_pad = 16;
 /// dspark.py: ring_size = window + 16.
@@ -42,7 +44,7 @@ pub const ring_extra = 16;
 pub const max_stages = 4;
 pub const max_block = 8;
 /// absorb_many's rows at most: every drafting stream's verify window (16 rows a round).
-pub const max_absorb = 16;
+pub const max_absorb = 48; // a round's drafting rows at most (round.max_rows)
 
 /// DraftPool: one ring plane a stage, bf16 [slots * ring, head_dim]; slot s's rows [s * ring, (s + 1) * ring). Positions
 /// below `absorbed[s]` are in slot s's rings.
@@ -198,6 +200,7 @@ pub const Drafter = struct {
     pm: u64,
     gm: u64,
     xsd: exl3_experts.DecodeScratch,
+    xs: exl3_experts.Scratch, // a pass of EXACT_ROWS rows or more (13+ streams): the chunk path on a scratch of its own (d48)
     // the head
     xc: u64, // bf16 [R, D]: the collapsed streams (pre-norm: the confidence head reads them)
     xn: u64,
@@ -294,6 +297,15 @@ pub const Drafter = struct {
         dr.gm = try a.take(e.world * R * d * 4);
         // Model._moe_scratch(("moe", top-k + 1, the stages' experts, decode)): one decode scratch of their own
         dr.xsd = try prompt.decodeScratch(e, a, b0.experts, dr.slots_moe);
+        {
+            const ex = b0.experts;
+            const sz = exl3_experts.Scratch.sizes(R, dr.slots_moe, ex.dims, ex.width, ex.count);
+            dr.xs.rows = R;
+            dr.xs.slots = dr.slots_moe;
+            inline for (.{ "xg", "xu", "xd", "z", "no_y", "ids", "count", "counts", "members", "work_gu", "work_d" }, 0..) |f, j| {
+                @field(dr.xs, f) = try a.take(sz[j]);
+            }
+        }
         dr.xc = try a.take(R * d * 2);
         dr.xn = try a.take(R * d * 2);
         dr.local = try a.take(R * e.w.head.n * 4);
@@ -432,7 +444,7 @@ pub const Drafter = struct {
         // _body's index rows: ids [token, noise ...], positions q0 + j, window positions q0 - 1, ring bases
         var hv: [6 * max_rows]i64 = @splat(0);
         var hb: [max_rows * pick_pad]i64 = @splat(-1);
-        const bw: usize = if (R > decode_rows) pick_pad else n; // the pick list's columns
+        const bw: usize = if (R > tri.decode_rows) pick_pad else n; // the pick list's columns
         for (0..N) |i| {
             if (slots[i] < 0 or slots[i] >= pool.slots) return error.BadSlot;
             for (0..n) |j| {
@@ -611,7 +623,7 @@ pub const Drafter = struct {
         const lay = dr.ds.blocks[j];
         const ne: usize = lay.experts.count - 1;
         var kc: usize = 0;
-        if (R <= decode_rows) {
+        if (R <= tri.decode_rows) {
             kc = try tri_norm.rowmmGate(e.t, dr.x, c.hidden, lay.gate_w, dr.gl, R, c.hidden, ne);
         } else {
             // x.float() @ gate_w.float().t() through cuBLAS, then the plain routing
@@ -619,7 +631,9 @@ pub const Drafter = struct {
             try e.blas.xwT(dr.xf, dr.gate_f[j], dr.gl, R, c.hidden, ne);
         }
         try tri_norm.route(e.t, dr.gl, kc, lay.gate_b, dr.topk, c.routed_scaling, lay.experts.count - 1, dr.pick, dr.mw, R, ne, dr.slots_moe);
-        try exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
+        // routed(): fewer than EXACT_ROWS rows take the decode window's fused path, more the chunk's (13+ streams)
+        if (R < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, dr.xsd, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
+        try exl3_experts.prompt(e.ex, e.s, lay.experts, dr.xs, dr.x, c.hidden, dr.pick, dr.mw, dr.pm, R, c.swiglu_limit);
     }
 };
 

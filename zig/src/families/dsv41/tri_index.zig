@@ -69,7 +69,7 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
     const ot: []const u8 = if (keys) "*i64" else "*fp32";
     // tmax [R, cdiv(n, 64)] int64 (its maxima only with keys); without it the kernel gets out there
     const tm = p("TMAX", if (tmax != null) "*i64" else ot, tmax orelse out);
-    if (rows <= decode_rows or rowwise) {
+    if (rows <= tri.decode_rows or rowwise) {
         // base [R]: each row's first pool row (concurrent rounds); vis stands in for it and for the candidate mask
         // HAS_CAND, CB and DEAD_PAD at the kernel's defaults (index_score passes none of them)
         // SKIP_DEAD: switch "tile_skip" (served on), a tile wholly at or past vis skips its dots
@@ -95,7 +95,7 @@ pub fn indexScore(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, out: u6
 
 /// index_keys: index_score's int64 keys (decode windows), apply_candidates' mask folded in; pruned_k: topk_select_pruned's k.
 pub fn indexKeys(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, base: ?u64, cand: ?Cand, cand_block: usize, tmax: ?u64, pruned_k: usize, out: u64, rows: usize, ih: usize, id: usize) !void {
-    std.debug.assert(rows <= decode_rows);
+    std.debug.assert(rows <= tri.decode_rows);
     const nt = tri.cdiv(n, tile);
     // switch "tile_skip" (served on): dead tiles skip their dots, and write no keys when only the pruned selection reads
     const skip = true;
@@ -114,7 +114,7 @@ pub fn indexKeys(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, base: ?u
 
 /// index_keys_cand: the keys of the pool's blocks only, cblk [R, nblk] i32 (-1: none; row stride cbs) -> out [R, nblk * CB].
 pub fn indexKeysCand(t: Tri, q: u64, k: IndexK, w: u64, vis: u64, n: usize, cblk: u64, cbs: usize, nblk: usize, cand_block: usize, base: ?u64, out: u64, rows: usize, ih: usize, id: usize) !void {
-    std.debug.assert(rows <= decode_rows);
+    std.debug.assert(rows <= tri.decode_rows);
     const nout = nblk * cand_block;
     try t.run("_index_score_cand", .{ u(rows), tri.cdiv(nout, tile), 1 }, &.{
         p("Q", "*bf16", q),               p("K", k.ty(), k.codes()), p("KS", k.ty(), k.scales()), p("Wt", "*bf16", w),
