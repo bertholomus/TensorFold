@@ -55,6 +55,7 @@ pub fn main(init: std.process.Init) !u8 {
     var parallel: usize = dsv41.model.max_streams;
     var arena_gib: ?usize = null;
     var profile = false;
+    var phases = false; // --profile 2: also the rounds' GPU time by phase (eager rounds)
     var serial = false; // --serial 1: every stream without drafts (one row a round)
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
@@ -84,6 +85,7 @@ pub fn main(init: std.process.Init) !u8 {
             o.rdma_devices = val;
         } else if (std.mem.eql(u8, key, "--profile")) {
             profile = !std.mem.eql(u8, val, "0");
+            phases = std.mem.eql(u8, val, "2");
         } else if (std.mem.eql(u8, key, "--engram")) {
             o.engram_dir = val;
         } else if (std.mem.eql(u8, key, "--token-map")) {
@@ -128,6 +130,7 @@ pub fn main(init: std.process.Init) !u8 {
         ln.prof = .{};
         m.prof = true;
         if (m.eh) |*eh| eh.io = io;
+        if (phases) try m.usePhaseTimer();
     }
     var step_ns: u64 = 0;
     const rows: u32 = dsv41.round.max_rows;
@@ -202,6 +205,12 @@ pub fn main(init: std.process.Init) !u8 {
         }.f;
         try w.print("{{\"rank\": 0, \"profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"step_ms\": {d:.2}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.2}, \"forward_ms\": {d:.2}, \"absorb_ms\": {d:.2}, \"logits_ms\": {d:.2}, \"sample_ms\": {d:.2}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.2}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{ p.rounds, ms(p.rows * 1000000, p.rounds), ms(step_ns, core.steps), ms(p.send, p.rounds), ms(p.enqueue, p.rounds), ms(p.forward, p.rounds), ms(p.absorb, p.rounds), ms(p.logits, p.rounds), ms(p.sample, p.rounds), p.passes, ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes), p.prefills, ms(p.prefill, p.prefills) });
         try w.flush();
+        if (m.timer) |tm| {
+            try w.print("{{\"rank\": 0, \"phases_ms\": {{", .{});
+            for (dsv41.round.PhaseTimer.phases, 0..) |name, i| try w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, if (tm.rounds == 0) 0 else tm.ms[i] / @as(f64, @floatFromInt(tm.rounds)) });
+            try w.print("}}}}\n", .{});
+            try w.flush();
+        }
         if (m.eh) |eh| {
             try w.print("{{\"rank\": 0, \"engram\": {{\"calls_a_round\": {d:.2}, \"hash_ms\": {d:.3}, \"read_ms\": {d:.3}, \"decode_ms\": {d:.3}, \"upload_ms\": {d:.3}}}}}\n", .{ ms(eh.calls * 1000000, p.rounds), ms(eh.t_hash, p.rounds), ms(eh.t_read, p.rounds), ms(eh.t_decode, p.rounds), ms(eh.t_upload, p.rounds) });
             try w.flush();
