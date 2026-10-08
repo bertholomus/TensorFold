@@ -32,6 +32,7 @@ const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const prompt2d = @import("prompt2d.zig");
+const rdma = @import("rdma.zig");
 
 /// The indexer's [rows, n_comp] keys a row block holds at most (model.py: rb * n_comp <= 2^26 / 4 past 16 rows).
 const key_elems: usize = 1 << 24;
@@ -86,6 +87,14 @@ pub const Engine = struct {
     plain: Rope,
     compressed: Rope,
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
+    ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
+
+    /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
+    /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.
+    pub fn gatherF32(e: *const Engine, src: u64, dst: u64, count: usize) !void {
+        if (e.ring) |r| if (count % 4 == 0 and count * 4 <= r.s.max_bytes) return r.gather(e.s, src, @intCast(count / 4), dst);
+        return e.comm.allGather(src, dst, count, .f32, e.s);
+    }
 
     pub fn heads(e: *const Engine) usize {
         if (e.two) |t| return t.heads;

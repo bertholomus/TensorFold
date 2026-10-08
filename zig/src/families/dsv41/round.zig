@@ -628,7 +628,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
                 try prompt.grouped(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
                 try Probe.check(probe, .engram_proj, l, rd.ek);
                 const en = if (e.two) |tw| tw.engramWidth() else ew.n;
-                if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.comm.allGather(rd.ek, rd.ekg, R * ew.n, .f32, e.s);
+                if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.gatherF32(rd.ek, rd.ekg, R * ew.n);
                 try Probe.check(probe, .engram_gather, l, rd.ekg);
                 if (e.world != 2) return error.NotPortedYet;
                 try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * en * 4, rd.ekv, R * en);
@@ -645,14 +645,14 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
             try Probe.check(probe, .attn_in, l, rd.x);
             try attention(e, rd, ch, cs, rings, &sh, l);
             try Probe.check(probe, .attn_out, l, rd.pa);
-            if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else try e.comm.allGather(rd.pa, rd.ga, R * d, .f32, e.s);
+            if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else try e.gatherF32(rd.pa, rd.ga, R * d);
             try Probe.check(probe, .attn_gather, l, rd.ga);
             pending = rd.ga;
             h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
             try Probe.check(probe, .moe_in, l, rd.x);
             try moe(e, rd, ch, l);
             try Probe.check(probe, .moe_out, l, rd.pm);
-            if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.comm.allGather(rd.pm, rd.gm, R * d, .f32, e.s);
+            if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);
             try Probe.check(probe, .moe_gather, l, rd.gm);
             pending = rd.gm;
             std.mem.swap(u64, &pre, &pre_f);
@@ -666,7 +666,7 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     try prompt.grouped(e, ch, R, &.{w.head}, &.{rd.xc}, &.{d}, &.{rd.hl}, &.{hn}, &.{.f32});
     try Probe.check(probe, .head_cols, w.layers.len, rd.hl);
     const hh = if (e.two) |tw| tw.hw[0] + tw.hw[1] else hn; // a rank's vocabulary half (2D: both pairs' quarters)
-    if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.comm.allGather(rd.hl, rd.hg, R * hn, .f32, e.s);
+    if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);
     try Probe.check(probe, .head_gather, w.layers.len, rd.hg);
     for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hh * 4, hh * 4, rd.logits + k * hh * 4, e.world * hh * 4, hh * 4, R);
     try Probe.check(probe, .logits, w.layers.len, rd.logits);

@@ -55,6 +55,7 @@ pub fn main(init: std.process.Init) !u8 {
     var parallel: usize = dsv41.model.max_streams;
     var arena_gib: ?usize = null;
     var profile = false;
+    var serial = false; // --serial 1: every stream without drafts (one row a round)
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -69,6 +70,10 @@ pub fn main(init: std.process.Init) !u8 {
             o.drafts = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--arena-gib")) {
             arena_gib = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--serial")) {
+            serial = !std.mem.eql(u8, val, "0");
+        } else if (std.mem.eql(u8, key, "--rdma")) {
+            o.rdma_devices = val;
         } else if (std.mem.eql(u8, key, "--profile")) {
             profile = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--engram")) {
@@ -143,7 +148,7 @@ pub fn main(init: std.process.Init) !u8 {
                 .max_new = r.max_tokens,
                 .eos = &eos,
                 .sampling = if (r.temperature > 0) .{ .seed = r.seed orelse 0, .temperature = r.temperature, .top_k = r.top_k, .top_p = r.top_p } else null,
-                .drafts = true,
+                .drafts = !serial,
                 .proposer = j.proposer.proposer(),
             });
             admitted += 1;
