@@ -47,6 +47,7 @@ pub const Options = struct {
     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
     drafts: bool = true, // load the DSpark drafter
     rdma_devices: ?[]const u8 = null, // the decode gathers over the RDMA ring on these devices (comma separated), else NCCL
+    graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
     arena_bytes: usize = 5 << 30,
 };
 
@@ -83,6 +84,7 @@ pub const Model = struct {
     rings: []u64, // each layer's window rings, max_streams slots
     ring_view: []u64, // a filling stream's slot of them
     rd: round.Round,
+    graphs: ?round.Graphs = null,
     dpool: ?draft.Pool = null,
     dr: ?draft.Drafter = null,
     tables: ?engram_io.Tables = null,
@@ -129,6 +131,7 @@ pub const Model = struct {
         m.eh = null;
         m.rdma_mod = null;
         m.ring = null;
+        m.graphs = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -214,6 +217,7 @@ pub const Model = struct {
             try d.check(d.api.cuMemsetD8Async(r.*, 0, max_streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
+        if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.drafts) {
             m.dpool = try draft.Pool.init(&m.eng, &m.arena, max_streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
@@ -246,6 +250,7 @@ pub const Model = struct {
 
     pub fn close(m: *Model) void {
         m.stream.synchronize() catch {};
+        if (m.graphs) |*g| g.deinit();
         if (m.epool) |p| p.deinit(m.gpa);
         if (m.tables) |*t| t.close();
         m.blas.close();
@@ -378,7 +383,7 @@ pub const Model = struct {
         const e = &m.eng;
         if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
-        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null);
+        try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null, if (m.graphs) |*g| g else null);
         if (m.prof) {
             m.t_enqueue = m.now() - t0;
             try m.stream.synchronize();

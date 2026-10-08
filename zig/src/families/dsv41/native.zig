@@ -9,6 +9,7 @@
 //!   TF_DS_ENGRAM, TF_DS_TOKEN_MAP               the Engram tables and the compressed token map
 //!   TF_DS_ARENA_GIB                             device memory for the pool's caches and the buffers (by the context)
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
+//!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 const std = @import("std");
@@ -100,6 +101,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .engram_dir = getenv("TF_DS_ENGRAM"),
         .token_map = getenv("TF_DS_TOKEN_MAP"),
         .rdma_devices = getenv("TF_RDMA_DEVICES"),
+        .graphs = if (getenv("TF_DS_GRAPHS")) |v| !std.mem.eql(u8, v, "0") else false,
         .pool = o.context,
         .drafts = o.drafts,
         .arena_bytes = arena_gib << 30,

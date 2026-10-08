@@ -215,6 +215,7 @@ pub fn main(init: std.process.Init) !u8 {
     var seeds: []u64 = &.{}; // --seeds: each request's sampling seed, in admission order (none: greedy)
     var smp: sampling.Sampling = .{ .seed = 0 }; // --temperature, --top-k, --top-p: the requests' sampling
     var light = false;
+    var use_graphs = false; // --graphs 1: a light run's rounds as captured stretches (round.Graphs)
     var engram_dir: ?[]const u8 = null;
     var token_map: ?[]const u8 = null;
     var dump: ?[]const u8 = null;
@@ -248,6 +249,8 @@ pub fn main(init: std.process.Init) !u8 {
             smp.top_k = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--top-p")) {
             smp.top_p = try std.fmt.parseFloat(f64, val);
+        } else if (std.mem.eql(u8, key, "--graphs")) {
+            use_graphs = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--light")) {
             light = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--engram")) {
@@ -478,7 +481,13 @@ pub fn main(init: std.process.Init) !u8 {
         return if (ok) 0 else 1;
     }
     if (light) {
-        const ok = try runLight(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, rounds, tokens);
+        var gs = round_mod.Graphs.init(gpa);
+        defer gs.deinit();
+        const ok = try runLight(&run, &eng, &ch, &caches, rings, if (eh) |*x| x else null, a, &arena, rounds, tokens, if (use_graphs) &gs else null);
+        if (use_graphs) {
+            try w_out.print("{{\"rank\": {d}, \"graphs\": {d}}}\n", .{ rank, gs.count() });
+            try w_out.flush();
+        }
         try w_out.print("{{\"rank\": {d}, \"light\": true, \"all_equal\": {}}}\n", .{ rank, ok });
         try w_out.flush();
         return if (ok) 0 else 1;
@@ -762,7 +771,7 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
         }
         var rc: RoundCheck = .{ .run = run, .after = rp.call, .call = rp.call, .fwd = fcall };
         const rows: round_mod.Rows = .{ .ids = ids, .pos = pos, .base = base[0], .end = end[0] };
-        round_mod.forward(eng, &rd, ch, caches, rings, eh, seq[0 .. p0 + ids.len], rows, pool_window, .{ .ctx = &rc, .at = RoundCheck.at }) catch |err| {
+        round_mod.forward(eng, &rd, ch, caches, rings, eh, seq[0 .. p0 + ids.len], rows, pool_window, .{ .ctx = &rc, .at = RoundCheck.at }, null) catch |err| {
             if (err == error.RoundMismatch) return false;
             try w_out.print("{{\"rank\": {d}, \"round\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, k, @errorName(err) });
             try w_out.flush();
@@ -905,7 +914,7 @@ const LightCheck = struct {
 /// restored from a kept prompt (its recorded chunks start past 0: the first round's position says how many are missing)
 /// takes them from an earlier request's prompt and computes them again: the state they leave is the restored one (the
 /// same ids through the same encoder-only chunks). False on the first difference.
-fn runLight(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, a: std.mem.Allocator, arena: *prompt.Arena, max_rounds: usize, tokens: usize) !bool {
+fn runLight(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *const prompt.Caches, rings: []const u64, eh: ?*prompt.EngramHost, a: std.mem.Allocator, arena: *prompt.Arena, max_rounds: usize, tokens: usize, graphs: ?*round_mod.Graphs) !bool {
     const fx = run.fx;
     const w_out = run.out;
     const c = eng.c;
@@ -988,7 +997,7 @@ fn runLight(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
             const posv = [_]i64{pos};
             const rows: round_mod.Rows = .{ .ids = &ids, .pos = &posv, .base = 0, .end = end - base };
             const before = run.ok;
-            round_mod.forward(eng, &rd, ch, caches, rings, eh, seq[0..have], rows, pool_window, .{ .ctx = &lc, .at = LightCheck.at }) catch |err| {
+            round_mod.forward(eng, &rd, ch, caches, rings, eh, seq[0..have], rows, pool_window, .{ .ctx = &lc, .at = LightCheck.at }, graphs) catch |err| {
                 if (err != error.RoundMismatch) {
                     try w_out.print("{{\"rank\": {d}, \"request\": {d}, \"round_call\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, req, rp.call, @errorName(err) });
                     try w_out.flush();
@@ -1261,7 +1270,7 @@ fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *
         }
         var rc: RoundCheck = .{ .run = run, .after = rp.call, .call = rp.call, .fwd = fcall };
         const rows: round_mod.Rows = .{ .ids = r_ids[0..R], .pos = r_pos[0..R], .slots = r_sl[0..R], .bases = r_base[0..R], .ends = r_end[0..R], .windows = wins[0..nl] };
-        round_mod.forward(eng, &rd, ch, caches, rings, eh, &.{}, rows, pool_window, .{ .ctx = &rc, .at = RoundCheck.at }) catch |err| {
+        round_mod.forward(eng, &rd, ch, caches, rings, eh, &.{}, rows, pool_window, .{ .ctx = &rc, .at = RoundCheck.at }, null) catch |err| {
             if (err == error.RoundMismatch) return false;
             try w_out.print("{{\"rank\": {d}, \"round_call\": {d}, \"error\": \"{s}\"}}\n", .{ run.rank, rp.call, @errorName(err) });
             try w_out.flush();
