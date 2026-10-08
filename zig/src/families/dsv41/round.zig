@@ -783,13 +783,16 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     rd.kk = 0;
     try setGlue(e, rd, rows);
     var cy: Carry = .{ .h = rd.h, .spare = rd.h_alt, .pre = rd.pre, .pre_f = rd.pre_f };
+    // the round's Engram reads, every layer's at once (AIO) ahead of the stretches
+    var ah: Ahead = .{};
+    if (e.c.engram_layers.slice().len > 0) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
     // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on), its rows read on the host before it
     var li: usize = 0;
     var sn: u32 = 0;
     while (li < w.layers.len) : (sn += 1) {
         var end = li + 1;
         while (end < w.layers.len and w.layers[end].engram_wkv == null) end += 1;
-        if (w.layers[li].engram_wkv != null) try engramRows(e, rd, eh orelse return error.NoEngramTables, li, seq, rows);
+        if (w.layers[li].engram_wkv != null) try engramLand(e, rd, eh orelse return error.NoEngramTables, &ah, li);
         if (graphs) |g| {
             try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn }, e, rd, ch, cs, rings, &cy, li, end);
         } else try stretch(e, rd, ch, cs, rings, &cy, li, end, probe);
@@ -891,18 +894,24 @@ fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params
     return tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, null, rd.sink, R, c.hidden);
 }
 
-/// Layer li's Engram rows of the round's rows (Engram.hashes of each row's stream's ids through the row, this rank's
-/// columns, the tables' FP8 rows decoded to bf16 as Engram._decode does) into rd.e_in.
-fn engramRows(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, li: usize, seq: []const i32, rows: Rows) !void {
+/// A round's Engram reads, ahead of the stretches that use them: every window's n-grams hashed once (all the Engram
+/// layers), each layer's ids in its own part of the host buffers (two layers in flight); with AIO every layer's reads
+/// go out at the round's start, else each layer's when its stretch comes (the reader pool).
+const Ahead = struct { ids: [2]u64 = .{ 0, 0 }, aio: bool = false, R: usize = 0 };
+
+/// Layer slot j's first row in the Engram host's buffers (a round's rows of each Engram layer apart).
+fn aheadRow(j: usize) usize {
+    return j * max_rows;
+}
+
+fn engramAhead(e: *const Engine, eh: *prompt.EngramHost, seq: []const i32, rows: Rows, ah: *Ahead) !void {
     const c = e.c;
     const R = rows.ids.len;
-    const li32: u16 = @intCast(li);
-    const l = std.mem.indexOfScalar(u16, c.engram_layers.slice(), li32) orelse return error.NotAnEngramLayer;
-    const tbl = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
     const cols = eh.hasher.cols();
     const k = eh.hi - eh.lo;
     const one = [_]Window{.{ .row = 0, .n = R, .seq = seq }};
     const windows = rows.windows orelse &one;
+    if (c.engram_layers.slice().len > 2 or eh.flat.len < 2 * max_rows * k) return error.EngramShape;
     const t0 = stamp(eh);
     for (windows) |w| {
         const start: usize = @intCast(rows.pos[w.row]);
@@ -910,18 +919,39 @@ fn engramRows(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, li: usize, s
         const per = eh.hasher.layers * cols;
         eh.hasher.hashes(w.seq, start, w.n, eh.hashes[w.row * per .. (w.row + w.n) * per]);
     }
-    for (0..R) |r| {
-        for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+    ah.* = .{ .aio = eh.aio != null, .R = R };
+    for (c.engram_layers.slice(), 0..) |li, j| {
+        const tbl = eh.tables.layers.get(li) orelse return error.MissingEngramTable;
+        const f0 = aheadRow(j) * k;
+        for (0..R) |r| {
+            for (0..k) |q| eh.flat[f0 + r * k + q] = eh.hashes[(r * eh.hasher.layers + j) * cols + eh.lo + q];
+        }
+        if (eh.aio) |aio| ah.ids[j] = try aio.start(tbl, eh.flat[f0..][0 .. R * k], eh.w[f0 * tbl.row_w ..][0 .. R * k * tbl.row_w], eh.s[f0 * tbl.row_s ..][0 .. R * k * tbl.row_s]);
     }
-    const m = R * k;
+    if (eh.io != null) eh.t_hash += stamp(eh) - t0;
+}
+
+/// Layer li's Engram rows of the round's rows (Engram.hashes of each row's stream's ids through the row, this rank's
+/// columns, the tables' FP8 rows decoded to bf16 as Engram._decode does) into rd.e_in: their reads landed (or made
+/// now), decoded, uploaded.
+fn engramLand(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, ah: *const Ahead, li: usize) !void {
+    const c = e.c;
+    const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)) orelse return error.NotAnEngramLayer;
+    const tbl = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    const k = eh.hi - eh.lo;
+    const f0 = aheadRow(j) * k;
+    const m = ah.R * k;
     const t1 = stamp(eh);
-    try eh.pool.gather(tbl, eh.flat[0..m], eh.w[0 .. m * tbl.row_w], eh.s[0 .. m * tbl.row_s]);
+    if (ah.aio) {
+        try eh.aio.?.wait(ah.ids[j]);
+    } else try eh.pool.gather(tbl, eh.flat[f0..][0..m], eh.w[f0 * tbl.row_w ..][0 .. m * tbl.row_w], eh.s[f0 * tbl.row_s ..][0 .. m * tbl.row_s]);
     const t2 = stamp(eh);
-    for (0..m) |i| engram.decodeRow(eh.w[i * tbl.row_w ..][0..tbl.row_w], eh.s[i * tbl.row_s ..][0..tbl.row_s], eh.rows[i * tbl.row_w ..][0..tbl.row_w]);
+    const w0 = f0 * tbl.row_w;
+    const s0 = f0 * tbl.row_s;
+    for (0..m) |i| engram.decodeRow(eh.w[w0 + i * tbl.row_w ..][0..tbl.row_w], eh.s[s0 + i * tbl.row_s ..][0..tbl.row_s], eh.rows[w0 + i * tbl.row_w ..][0..tbl.row_w]);
     const t3 = stamp(eh);
-    try prompt.upload(e, rd.e_in, eh.rows.ptr, m * tbl.row_w * 2);
+    try prompt.upload(e, rd.e_in, eh.rows[w0..].ptr, m * tbl.row_w * 2);
     if (eh.io != null) {
-        eh.t_hash += t1 - t0;
         eh.t_read += t2 - t1;
         eh.t_decode += t3 - t2;
         eh.t_upload += stamp(eh) - t3;

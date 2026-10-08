@@ -44,6 +44,8 @@ const max_chunks = 8;
 var side_on = false;
 /// --prefetch 1: the rounds' paced L2 prefetch (round.Round.usePrefetch).
 var prefetch_on = false;
+/// --aio 1: the rounds' Engram reads by Linux AIO on O_DIRECT (engram_aio.zig).
+var aio_on = false;
 
 /// One fixture line of layers.jsonl.
 const Point = struct {
@@ -253,6 +255,8 @@ pub fn main(init: std.process.Init) !u8 {
             smp.top_k = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--top-p")) {
             smp.top_p = try std.fmt.parseFloat(f64, val);
+        } else if (std.mem.eql(u8, key, "--aio")) {
+            aio_on = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--prefetch")) {
             prefetch_on = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--side")) {
@@ -457,6 +461,8 @@ pub fn main(init: std.process.Init) !u8 {
     var pool: ?*dsv41.engram_io.Pool = null;
     defer if (pool) |p| p.deinit(gpa);
     defer if (eh != null) tables.close();
+    var aio: ?*dsv41.engram_aio.Aio = null;
+    defer if (aio) |x| x.deinit();
     if (engram_dir) |edir| {
         const map_text = try std.Io.Dir.cwd().readFileAlloc(io, token_map orelse return error.NoTokenMap, a, .limited(1 << 26));
         const map = try std.json.parseFromSliceLeaky([]i32, a, map_text, .{});
@@ -470,6 +476,10 @@ pub fn main(init: std.process.Init) !u8 {
         tables = try dsv41.engram_io.Tables.open(gpa, io, edir);
         pool = try dsv41.engram_io.Pool.init(gpa, io, 64);
         eh = try prompt.EngramHost.init(a, &cfg, dsv41.engram.Hasher.init(cfg, map, mult), &tables, pool.?, sp.rank, sp.world, chunk_rows);
+        if (aio_on) {
+            aio = try dsv41.engram_aio.Aio.init(gpa, io, 1024);
+            eh.?.aio = aio;
+        }
     }
     // the whole sequence's ids (Engram hashes n-grams across chunk boundaries)
     const seq = try a.alloc(i32, total + rounds * round_mod.max_rows);

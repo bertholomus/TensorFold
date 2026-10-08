@@ -16,6 +16,7 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
+const engram_aio = @import("engram_aio.zig");
 const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
@@ -50,6 +51,7 @@ pub const Options = struct {
     graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
     side: bool = false, // the mixes' side work on a stream of its own (round.Round.useSide)
     prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
+    engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
     arena_bytes: usize = 5 << 30,
 };
 
@@ -91,6 +93,7 @@ pub const Model = struct {
     dr: ?draft.Drafter = null,
     tables: ?engram_io.Tables = null,
     epool: ?*engram_io.Pool = null,
+    aio: ?*engram_aio.Aio = null,
     eh: ?prompt.EngramHost = null,
     host_pos: []i64,
     ids64: []i64,
@@ -130,6 +133,7 @@ pub const Model = struct {
         m.dr = null;
         m.tables = null;
         m.epool = null;
+        m.aio = null;
         m.eh = null;
         m.rdma_mod = null;
         m.ring = null;
@@ -243,6 +247,10 @@ pub const Model = struct {
             m.tables = try engram_io.Tables.open(gpa, io, edir);
             m.epool = try engram_io.Pool.init(gpa, io, 64);
             m.eh = try prompt.EngramHost.init(a, c, engram.Hasher.init(c.*, map, mult), &m.tables.?, m.epool.?, sp.rank, sp.world, chunk_rows);
+            if (o.engram_aio) {
+                m.aio = try engram_aio.Aio.init(gpa, io, 1024);
+                m.eh.?.aio = m.aio;
+            }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
 
         m.host_pos = try a.alloc(i64, chunk_rows);
@@ -257,6 +265,7 @@ pub const Model = struct {
         if (m.graphs) |*g| g.deinit();
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
+        if (m.aio) |x| x.deinit();
         if (m.epool) |p| p.deinit(m.gpa);
         if (m.tables) |*t| t.close();
         m.blas.close();
