@@ -1013,6 +1013,24 @@ pub const EngramHost = struct {
     t_decode: u64 = 0,
     t_upload: u64 = 0,
     calls: u64 = 0,
+    // a prompt chunk's rows read ahead on a thread (engramReadAhead): Engram layer j's rows of the chunk at
+    // [ahead_start, ahead_start + ahead_n), ready when ahead_ready[j]
+    ahead_w: [2][]u8 = .{ &.{}, &.{} },
+    ahead_s: [2][]u8 = .{ &.{}, &.{} },
+    ahead_rows: [2][]u16 = .{ &.{}, &.{} },
+    ahead_flat: [2][]i64 = .{ &.{}, &.{} },
+    ahead_ready: [2]bool = .{ false, false },
+    ahead_start: usize = 0,
+    ahead_n: usize = 0,
+    ahead_err: ?anyerror = null,
+    // a profile's prompt Engram split (ns summed, the stream synchronized at each cut): the rows ready on the host,
+    // their upload, the projection, the quarters' exchange, the sum and gate
+    p_rows: u64 = 0,
+    p_upload: u64 = 0,
+    p_mm: u64 = 0,
+    p_x: u64 = 0,
+    p_gate: u64 = 0,
+    p_calls: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize) !EngramHost {
         const cols = hasher.cols();
@@ -1020,7 +1038,22 @@ pub const EngramHost = struct {
         const hi = (rank + 1) * cols / world;
         const k = hi - lo;
         const t = tables.layers.get(@intCast(c.engram_layers.slice()[0])) orelse return error.MissingEngramTable;
+        var aw: [2][]u8 = .{ &.{}, &.{} };
+        var as: [2][]u8 = .{ &.{}, &.{} };
+        var ar: [2][]u16 = .{ &.{}, &.{} };
+        var af: [2][]i64 = .{ &.{}, &.{} };
+        for (0..@min(2, c.engram_layers.slice().len)) |j| {
+            const tj = tables.layers.get(@intCast(c.engram_layers.slice()[j])) orelse return error.MissingEngramTable;
+            aw[j] = try gpa.alloc(u8, cap * k * tj.row_w);
+            as[j] = try gpa.alloc(u8, cap * k * tj.row_s);
+            ar[j] = try gpa.alloc(u16, cap * k * tj.row_w);
+            af[j] = try gpa.alloc(i64, cap * k);
+        }
         return .{
+            .ahead_w = aw,
+            .ahead_s = as,
+            .ahead_rows = ar,
+            .ahead_flat = af,
             .hasher = hasher,
             .tables = tables,
             .pool = pool,
@@ -1034,6 +1067,41 @@ pub const EngramHost = struct {
         };
     }
 };
+
+/// A prompt chunk's Engram layer j rows ahead of its layer, on a thread of the caller's while the GPU runs the layers
+/// before it: the n-grams hashed (j 0: every layer's at once), the rows read and decoded into ahead_rows[j], exactly
+/// as engramApply would at the layer. Errors land in ahead_err.
+pub fn engramReadAhead(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize) void {
+    engramAhead1(eh, c, seq, start, n, j) catch |err| {
+        eh.ahead_err = err;
+    };
+}
+
+/// The next chunk's rows of both Engram layers (fillChunk starts it once this chunk's last Engram layer is applied).
+pub fn engramReadAheadAll(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize) void {
+    for (0..@min(2, c.engram_layers.slice().len)) |j| {
+        engramAhead1(eh, c, seq, start, n, j) catch |err| {
+            eh.ahead_err = err;
+            return;
+        };
+    }
+}
+
+fn engramAhead1(eh: *EngramHost, c: *const Config, seq: []const i32, start: usize, n: usize, j: usize) !void {
+    const li = c.engram_layers.slice()[j];
+    const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
+    const cols = eh.hasher.cols();
+    const k = eh.hi - eh.lo;
+    if (j == 0) eh.hasher.hashes(seq, start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
+    for (0..n) |r| {
+        for (0..k) |q| eh.ahead_flat[j][r * k + q] = eh.hashes[(r * eh.hasher.layers + j) * cols + eh.lo + q];
+    }
+    const m = n * k;
+    // by AIO on the prompt's ring when it is open (the main thread reads by it only after joining this one)
+    if (eh.paio) |aio| try aioGather(aio, t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]) else try eh.pool.gather(t, eh.ahead_flat[j][0..m], eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s]);
+    engram.decodeRows(eh.ahead_w[j][0 .. m * t.row_w], eh.ahead_s[j][0 .. m * t.row_s], eh.ahead_rows[j][0 .. m * t.row_w], m, t.row_w, t.row_s, 8);
+    eh.ahead_ready[j] = true;
+}
 
 /// Layer li's Engram on the chunk (engram_apply, no image span), as _forward_k runs it before the attention mixes: a
 /// pending MoE post into the streams first (hc_post), then the rows of each position's n-grams (hashed on the host from
@@ -1053,23 +1121,59 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     const t = eh.tables.layers.get(@intCast(li)) orelse return error.MissingEngramTable;
     const cols = eh.hasher.cols();
     const k = eh.hi - eh.lo;
-    eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
-    for (0..n) |r| {
-        for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
-    }
     const m = n * k;
-    if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
-    for (0..m) |i| engram.decodeRow(eh.w[i * t.row_w ..][0..t.row_w], eh.s[i * t.row_s ..][0..t.row_s], eh.rows[i * t.row_w ..][0..t.row_w]);
+    const prof = eh.io != null;
+    var tq = if (prof) pstamp(e, eh) else 0;
+    // the rows read ahead (fillChunk's thread) when they are this chunk's, else read here
+    var rows: []u16 = eh.rows;
+    if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) {
+        rows = eh.ahead_rows[l];
+        eh.ahead_ready[l] = false;
+    } else {
+        eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
+        for (0..n) |r| {
+            for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
+        }
+        if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+        engram.decodeRows(eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s], eh.rows[0 .. m * t.row_w], m, t.row_w, t.row_s, 8); // the rows on 8 threads
+    }
     if (m * t.row_w != n * ew.k) return error.EngramShape;
-    try upload(e, ch.eb, eh.rows.ptr, m * t.row_w * 2);
+    if (prof) eh.p_rows += lap(e, eh, &tq);
+    try upload(e, ch.eb, rows.ptr, m * t.row_w * 2);
+    if (prof) eh.p_upload += lap(e, eh, &tq);
     try mm(e, ch, ew, ch.eb, ew.k, ch.ek, .fp32, ew.n);
+    if (prof) eh.p_mm += lap(e, eh, &tq);
     // 2D (model.py esum): this node's columns of its rank's projection; the quarters give both ranks' whole ones
     const en = if (e.two) |two| two.engramWidth() else ew.n;
-    if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
-    if (e.world != 2) return error.NotPortedYet; // Comm.sum of more ranks: acc += g[r]
-    try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
+    // 2D chunks past the rings: the pair's sum then the pairs' bf16 halves (Two.engramSum), the same bits
+    const psum = if (e.two) |two| two.rings == null or n >= 64 else false;
+    if (psum) {
+        try e.two.?.engramSum(e, ch.ek, ch.ekg, ch.kv, n);
+        if (prof) eh.p_x += lap(e, eh, &tq);
+    } else {
+        if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
+        if (prof) eh.p_x += lap(e, eh, &tq);
+        if (e.world != 2) return error.NotPortedYet; // Comm.sum of more ranks: acc += g[r]
+        try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
+    }
     try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
     swapStreams(ch, ch.h_alt);
+    if (prof) {
+        eh.p_gate += lap(e, eh, &tq);
+        eh.p_calls += 1;
+    }
+}
+
+/// A profile's clock after the stream drains (prompt Engram split).
+fn pstamp(e: *const Engine, eh: *const EngramHost) u64 {
+    e.s.synchronize() catch {};
+    return @intCast(std.Io.Timestamp.now(eh.io.?, .awake).nanoseconds);
+}
+
+fn lap(e: *const Engine, eh: *const EngramHost, t: *u64) u64 {
+    const now = pstamp(e, eh);
+    defer t.* = now;
+    return now - t.*;
 }
 
 /// A chunk's rows `ids` of table `t` by AIO (the pool's bytes, at ~0.07 s for 24,576 rows where the pool's preads take

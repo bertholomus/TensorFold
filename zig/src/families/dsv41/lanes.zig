@@ -347,6 +347,11 @@ pub const Lanes = struct {
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         var head = false;
+        m.fill_seq = seq.items;
+        defer {
+            m.joinAhead();
+            m.fill_seq = &.{};
+        }
         while (start < len) {
             if (start > 0 and s.isCancelled()) return error.Cancelled;
             const n = @min(model.chunk_rows, len - start);
@@ -556,6 +561,9 @@ fn refused(err: anyerror) void {
     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
 }
 
+/// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
+pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 0 } = .{};
+
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
@@ -582,6 +590,11 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
         };
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
+        // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
+        if (kind != .fill_chunk) {
+            m.joinAhead();
+            m.fill_seq = &.{};
+        }
         switch (kind) {
             .fill_begin => {
                 slot = try r.int(u32);
@@ -589,6 +602,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (slot >= max_streams) return error.BadSlot;
                 try r.ids(gpa, &seqs[slot]);
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                m.fill_seq = seqs[slot].items;
             },
             .fill_chunk => {
                 const start: usize = @intCast(try r.int(u64));
@@ -612,6 +626,11 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
                 m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
+                if (m.prof) {
+                    follow_prof.rounds += 1;
+                    follow_prof.enqueue += m.t_enqueue;
+                    follow_prof.forward += m.t_forward;
+                }
             },
             .pass => {
                 const n = try r.int(u32);

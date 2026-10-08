@@ -42,4 +42,14 @@ pub const Comm = struct {
     pub fn allGather(c: Comm, send: u64, recv: u64, count: usize, dtype: nccl.DataType, stream: cuda.Stream) !void {
         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, dtype, c.comm, stream.handle), "ncclAllGather");
     }
+
+    /// `count` elements of `dtype` to rank `peer` and `rcount` from it, in one NCCL group (point to point).
+    pub fn exchange(c: Comm, send: u64, count: usize, recv: u64, rcount: usize, dtype: nccl.DataType, peer: u32, stream: cuda.Stream) !void {
+        try c.lib.check(c.lib.api.ncclGroupStart(), "ncclGroupStart");
+        const s = c.lib.api.ncclSend(send, count, dtype, @intCast(peer), c.comm, stream.handle);
+        const r = c.lib.api.ncclRecv(recv, rcount, dtype, @intCast(peer), c.comm, stream.handle);
+        try c.lib.check(c.lib.api.ncclGroupEnd(), "ncclGroupEnd");
+        try c.lib.check(s, "ncclSend");
+        try c.lib.check(r, "ncclRecv");
+    }
 };

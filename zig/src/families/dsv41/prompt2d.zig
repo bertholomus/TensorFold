@@ -221,6 +221,27 @@ pub const Two = struct {
         try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
     }
 
+    /// Engram's projection summed over the TP2 ranks and cast, kv [n, ew0 + ew1] bf16 = bf16(g0 + g1) (model.py esum
+    /// then .to(bf16)), from this node's fp32 columns `src` [n, ew[p]] with less traffic than the quarters: the row
+    /// partner's columns over NCCL send / recv, one fp32 add (two operands: the same bits in either order) cast to
+    /// bf16, then the column partner's bf16 sums the same way. `tmp` holds n * (ew[p] * 6 + ew[1 - p] * 2) bytes.
+    pub fn engramSum(t: *const Two, e: *const prompt.Engine, src: u64, tmp: u64, kv: u64, n: usize) !void {
+        const w = t.ew;
+        const mine = n * w[t.p];
+        const other = tmp;
+        const half = tmp + mine * 4;
+        const their = half + mine * 2;
+        const g: u32 = @intCast(t.r + 2 * t.p);
+        try e.comm.exchange(src, mine, other, mine, .f32, g ^ 1, e.s);
+        try e.ops.add2Bf16(e.s, src, other, half, mine);
+        try e.comm.exchange(half, mine, their, n * w[1 - t.p], .bf16, g ^ 2, e.s);
+        const row = (w[0] + w[1]) * 2;
+        for (0..2) |pg| {
+            const from = if (pg == t.p) half else their;
+            try e.ops.copyRows(e.s, from, w[pg] * 2, kv + pg * w[0] * 2, row, w[pg] * 2, n);
+        }
+    }
+
     /// Engram's projection summed over the ranks from its column quarters (model.py esum): the gathered width.
     pub fn engramWidth(t: *const Two) usize {
         return t.ew[0] + t.ew[1];

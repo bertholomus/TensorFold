@@ -115,6 +115,10 @@ pub const Model = struct {
     amax_host: [round.max_rows]u32 = undefined,
     // the stream a fill is running: its slot and its view of the caches (its extent from base)
     fill_slot: usize = 0,
+    // the prompt a fill's chunks come from (the caller's, set for the fill) and the thread reading the next chunk's
+    // Engram rows during this one (fillChunk), joined before the prompt can change (joinAhead)
+    fill_seq: []const i32 = &.{},
+    ahead: ?std.Thread = null,
     view: prompt.Caches = undefined,
     // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
     prof: bool = false,
@@ -318,6 +322,7 @@ pub const Model = struct {
     }
 
     pub fn close(m: *Model) void {
+        m.joinAhead();
         m.stream.synchronize() catch {};
         if (m.graphs) |*g| g.deinit();
         if (m.pgraphs) |*g| g.deinit();
@@ -405,6 +410,12 @@ pub const Model = struct {
     // -- the primitives (both ranks, in the same order) ----------------------------------------------------------
 
     /// A stream's prompt is about to fill pool slot `slot`, its compressed rows in its extent from position `base`.
+    /// Wait for the next chunk's Engram read-ahead, if one runs (before the prompt it reads changes or goes).
+    pub fn joinAhead(m: *Model) void {
+        if (m.ahead) |th| th.join();
+        m.ahead = null;
+    }
+
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
         if (slot >= m.streams) return error.BadSlot;
         m.view = try m.caches.view(&m.eng, slot, base);
@@ -430,6 +441,25 @@ pub const Model = struct {
         const taps = m.dr != null;
         var floor: usize = 0;
         var kv_done: ?usize = null;
+        // Engram rows read ahead on a thread while the GPU runs the layers before them (the served reader pool's
+        // overlap): this chunk's both layers' during the chunk before it (m.ahead), else the first layer's from the
+        // chunk's start and the next's once the first is applied
+        var ahead: ?std.Thread = m.ahead;
+        m.ahead = null;
+        defer if (ahead) |th| th.join();
+        if (m.eh) |*eh| {
+            if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
+                ahead.?.join();
+                ahead = null;
+            }
+            if (ahead == null) {
+                eh.ahead_start = start;
+                eh.ahead_n = n;
+                eh.ahead_ready = .{ false, false };
+                eh.ahead_err = null;
+                ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+            }
+        }
         for (0..c.layers) |li| {
             if (li == c.layers / 2) {
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
@@ -445,7 +475,27 @@ pub const Model = struct {
                 kv_done = li;
             }
             if (e.w.layers[li].engram_wkv != null) {
-                try prompt.engramApply(e, ch, if (m.eh) |*x| x else return error.NoEngramTables, li, seq);
+                const eh = if (m.eh) |*x| x else return error.NoEngramTables;
+                if (ahead) |th| {
+                    th.join();
+                    ahead = null;
+                }
+                if (eh.ahead_err) |err| return err;
+                try prompt.engramApply(e, ch, eh, li, seq);
+                const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
+                const ne = @min(2, c.engram_layers.slice().len);
+                if (j + 1 < ne) {
+                    if (!eh.ahead_ready[j + 1])
+                        ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
+                } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
+                    // the next chunk's rows while this one's layers run
+                    const nn = @min(chunk_rows, m.fill_seq.len - start - n);
+                    eh.ahead_start = start + n;
+                    eh.ahead_n = nn;
+                    eh.ahead_ready = .{ false, false };
+                    eh.ahead_err = null;
+                    m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
+                }
                 if (pt) |t| try t.mark(m.stream, .engram);
             }
             // a DSpark tap reads the streams after the layer's Engram (_forward_k's order)
