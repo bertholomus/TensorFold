@@ -184,7 +184,7 @@ const ring = 1024;
 pub const Lanes = struct {
     gpa: std.mem.Allocator,
     m: *Model,
-    peer: ?link.Link, // rank 1 (null: one rank)
+    peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
     step: u64 = 0,
     wire: Wire = .{},
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -274,9 +274,10 @@ pub const Lanes = struct {
         };
     }
 
-    /// The frame being built goes to rank 1 (after `begin` and the fields).
+    /// The frame being built goes to rank 1 (after `begin` and the fields), or to ranks 1-3 on the four-node split.
     fn flush(self: *Lanes) !void {
-        if (self.peer) |p| try p.send(self.wire.buf.items);
+        if (self.peer == null) return;
+        for (self.m.followers()) |l| try l.?.send(self.wire.buf.items);
     }
 
     fn begin(self: *Lanes, kind: Kind) !bool {
@@ -521,7 +522,7 @@ pub const Lanes = struct {
     }
 };
 
-/// Rank 1: the primitives rank 0 sends, run in order until it says done.
+/// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
