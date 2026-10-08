@@ -46,24 +46,59 @@ pub const ring_extra = 16;
 /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
 pub const raw_rows = 64;
 
-/// Device memory carved from one allocation in 256-byte aligned pieces, freed together.
+/// Device memory carved in 256-byte aligned pieces from blocks allocated as it grows, all freed together: the first
+/// block init's size, then blocks of `block` bytes; a piece of `own` bytes or more takes a block of its own (the
+/// pool's caches), so a pool of any size costs what its pieces take plus at most one block. `used`: the pieces'
+/// bytes; `reserved`: the blocks'.
 pub const Arena = struct {
-    buf: cuda.DeviceBuffer,
+    d: *const cuda.Driver,
+    blocks: [max_blocks]cuda.DeviceBuffer = undefined,
+    n: usize = 0,
+    cur: ?usize = null, // the block small pieces come from
+    at: usize = 0, // its next free byte
     used: usize = 0,
+    reserved: usize = 0,
+
+    const max_blocks = 1024;
+    const block: usize = 256 << 20;
+    const own: usize = 64 << 20;
 
     pub fn init(d: *const cuda.Driver, bytes: usize) !Arena {
-        return .{ .buf = try cuda.DeviceBuffer.alloc(d, bytes) };
+        var a: Arena = .{ .d = d };
+        if (bytes > 0) {
+            a.cur = try a.grow(bytes);
+            a.at = 0;
+        }
+        return a;
+    }
+
+    fn grow(a: *Arena, bytes: usize) !usize {
+        if (a.n == max_blocks) return error.ArenaFull;
+        a.blocks[a.n] = try cuda.DeviceBuffer.alloc(a.d, bytes);
+        a.reserved += bytes;
+        a.n += 1;
+        return a.n - 1;
     }
 
     pub fn deinit(a: *Arena) void {
-        a.buf.free();
+        for (a.blocks[0..a.n]) |*b| b.free();
+        a.n = 0;
     }
 
     pub fn take(a: *Arena, bytes: usize) !u64 {
-        const at = std.mem.alignForward(usize, a.used, 256);
-        if (at + bytes > a.buf.len) return error.ArenaFull;
-        a.used = at + bytes;
-        return a.buf.ptr + at;
+        if (bytes >= own) {
+            const i = try a.grow(std.mem.alignForward(usize, bytes, 256));
+            a.used += bytes;
+            return a.blocks[i].ptr;
+        }
+        var at = std.mem.alignForward(usize, a.at, 256);
+        if (a.cur == null or at + bytes > a.blocks[a.cur.?].len) {
+            a.cur = try a.grow(block);
+            at = 0;
+        }
+        a.at = at + bytes;
+        a.used += bytes;
+        return a.blocks[a.cur.?].ptr + at;
     }
 };
 

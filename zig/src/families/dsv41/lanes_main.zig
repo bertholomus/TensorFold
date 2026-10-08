@@ -100,7 +100,7 @@ pub fn main(init: std.process.Init) !u8 {
         } else return error.BadArgument;
     }
     if (parallel == 0 or parallel > dsv41.model.max_streams) return error.BadArgument;
-    o.arena_bytes = (arena_gib orelse dsv41.native.defaultArenaGib(o.pool)) << 30; // (rank 1 of a server: the server's)
+    o.arena_bytes = (arena_gib orelse 0) << 30; // (0: the arena grows as the buffers ask)
 
     var out_buf: [1 << 14]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);
@@ -113,7 +113,7 @@ pub fn main(init: std.process.Init) !u8 {
     const t0 = std.Io.Timestamp.now(io, .awake);
     const m = try dsv41.model.Model.open(gpa, io, &ctx, o);
     defer m.close();
-    try w.print("{{\"rank\": {d}, \"loaded_s\": {d:.1}, \"pool\": {d}, \"drafts\": {}, \"arena_used\": {d}}}\n", .{ o.rank, seconds(t0, io), o.pool, m.drafting(), m.arena.used });
+    try w.print("{{\"rank\": {d}, \"loaded_s\": {d:.1}, \"pool\": {d}, \"drafts\": {}, \"arena_used\": {d}, \"arena_reserved\": {d}}}\n", .{ o.rank, seconds(t0, io), o.pool, m.drafting(), m.arena.used, m.arena.reserved });
     try w.flush();
 
     if (o.rank != 0) {

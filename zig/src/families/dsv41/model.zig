@@ -55,7 +55,7 @@ pub const Options = struct {
     side: bool = false, // the mixes' side work on a stream of its own (round.Round.useSide)
     prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
     engram_aio: bool = false, // a round's Engram reads by Linux AIO on O_DIRECT (else the reader pool)
-    arena_bytes: usize = 5 << 30,
+    arena_bytes: usize = 0, // the device arena's first block (0: it grows from 256 MiB blocks as the buffers ask)
 };
 
 pub const Model = struct {
