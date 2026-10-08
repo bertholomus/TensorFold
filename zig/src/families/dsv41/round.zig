@@ -89,7 +89,7 @@ pub const Window = struct { row: usize, n: usize, seq: []const i32 };
 
 /// The index tensors rounds.py's _ix makes from a round's inputs, by row (int64 [R] each, gi [R, 2]).
 const Glue = enum(u8) { wslot, wbase, cbase1, ctarget1, gpos1, vis1, cbase2, ctarget2, gpos2, vis2, rslot, gi };
-const glue_n = @as(usize, @intFromEnum(Glue.gi)) + 2; // gi (the last) takes two
+const glue_n = @as(usize, @backingInt(Glue.gi)) + 2; // gi (the last) takes two
 
 /// A round's buffers for up to max_rows rows (Python allocates them a round; their contents never carry over).
 pub const Round = struct {
@@ -294,7 +294,7 @@ pub const Round = struct {
     }
 
     fn g(rd: *const Round, k: Glue) u64 {
-        return rd.glue + @as(u64, @intFromEnum(k)) * max_rows * 8;
+        return rd.glue + @as(u64, @backingInt(k)) * max_rows * 8;
     }
 };
 
@@ -308,7 +308,7 @@ fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
         const p = rows.pos[i];
         const at = struct {
             fn f(buf: []i64, k: Glue, r: usize) *i64 {
-                return &buf[@as(usize, @intFromEnum(k)) * max_rows + r];
+                return &buf[@as(usize, @backingInt(k)) * max_rows + r];
             }
         }.f;
         const slot = rows.slotOf(i);
@@ -331,7 +331,7 @@ fn setGlue(e: *const Engine, rd: *Round, rows: Rows) !void {
         at(&hg, .vis2, i).* = @divFloor(p + 1, 2);
         // rslot = slot * RAW + pos % RAW; gi = rbase + (groups * 2 + [0, 1]) % RAW, rbase = slot * RAW
         at(&hg, .rslot, i).* = slot * raw + @mod(p, raw);
-        const gi0 = @as(usize, @intFromEnum(Glue.gi)) * max_rows;
+        const gi0 = @as(usize, @backingInt(Glue.gi)) * max_rows;
         hg[gi0 + 2 * i] = slot * raw + @mod(groups * 2, raw);
         hg[gi0 + 2 * i + 1] = slot * raw + @mod(groups * 2 + 1, raw);
     }
@@ -709,6 +709,7 @@ fn engramRows(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, li: usize, s
     const k = eh.hi - eh.lo;
     const one = [_]Window{.{ .row = 0, .n = R, .seq = seq }};
     const windows = rows.windows orelse &one;
+    const t0 = stamp(eh);
     for (windows) |w| {
         const start: usize = @intCast(rows.pos[w.row]);
         if (w.row + w.n > R or w.seq.len < start + w.n) return error.ShortSequence;
@@ -719,9 +720,25 @@ fn engramRows(e: *const Engine, rd: *Round, eh: *prompt.EngramHost, li: usize, s
         for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
     }
     const m = R * k;
+    const t1 = stamp(eh);
     try eh.pool.gather(tbl, eh.flat[0..m], eh.w[0 .. m * tbl.row_w], eh.s[0 .. m * tbl.row_s]);
+    const t2 = stamp(eh);
     for (0..m) |i| engram.decodeRow(eh.w[i * tbl.row_w ..][0..tbl.row_w], eh.s[i * tbl.row_s ..][0..tbl.row_s], eh.rows[i * tbl.row_w ..][0..tbl.row_w]);
+    const t3 = stamp(eh);
     try prompt.upload(e, rd.e_in, eh.rows.ptr, m * tbl.row_w * 2);
+    if (eh.io != null) {
+        eh.t_hash += t1 - t0;
+        eh.t_read += t2 - t1;
+        eh.t_decode += t3 - t2;
+        eh.t_upload += stamp(eh) - t3;
+        eh.calls += 1;
+    }
+}
+
+/// The host clock (ns) when the Engram host keeps time (0 when it does not).
+fn stamp(eh: *const prompt.EngramHost) u64 {
+    const io = eh.io orelse return 0;
+    return @intCast(std.Io.Timestamp.now(io, .awake).nanoseconds);
 }
 
 test "context buckets as graph.py makes them" {

@@ -958,6 +958,13 @@ pub const EngramHost = struct {
     w: []u8, // FP8 rows
     s: []u8, // their E8M0 scales
     rows: []u16, // bf16 [cap, (hi - lo) * head_dim]
+    // the rounds' Engram host time (ns, summed; a profile reads it): hashing, the table reads, the decode, the upload
+    io: ?std.Io = null,
+    t_hash: u64 = 0,
+    t_read: u64 = 0,
+    t_decode: u64 = 0,
+    t_upload: u64 = 0,
+    calls: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, c: *const Config, hasher: engram.Hasher, tables: *const engram_io.Tables, pool: *engram_io.Pool, rank: usize, world: usize, cap: usize) !EngramHost {
         const cols = hasher.cols();

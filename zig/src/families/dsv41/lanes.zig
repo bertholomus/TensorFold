@@ -151,6 +151,7 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
 /// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
 pub const Profile = struct {
     send: u64 = 0,
+    enqueue: u64 = 0,
     forward: u64 = 0,
     absorb: u64 = 0,
     logits: u64 = 0,
@@ -417,6 +418,7 @@ pub const Lanes = struct {
         const t3 = m.now();
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
+            p.enqueue += m.t_enqueue;
             p.forward += m.t_forward;
             p.absorb += m.t_absorb;
             p.logits += t3 - t2;
