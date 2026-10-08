@@ -586,13 +586,82 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
 }
 
+/// What a stretch of a round leaves the next on the host: the stream buffers' roles, the taps written, the latest kv
+/// source and selection, the indexer's pool flags and k. Every round starts from the same roles (the buffers' contents
+/// never carry over), so a stretch's launches and what it leaves depend on its rows and bucket alone.
+const Carry = struct {
+    h: u64,
+    spare: u64,
+    pre: u64,
+    pre_f: u64,
+    ntap: usize = 0,
+    sh: prompt.Shared = .{},
+    kk: usize = 0,
+    has_cand: bool = false,
+    has_cblk: bool = false,
+};
+
+/// The rounds' stretches as CUDA graphs (the served graph.py: one capture a rows and context bucket, the round cut
+/// before each Engram layer, whose rows the host reads between the stretches): a stretch is captured the first time
+/// its (rows, bucket, stretch) comes up and replayed after, with what it leaves. The same launches with the same
+/// arguments as the eager round, so the same bytes.
+pub const Graphs = struct {
+    gpa: std.mem.Allocator,
+    map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
+
+    pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
+    const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
+
+    pub fn init(gpa: std.mem.Allocator) Graphs {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(g: *Graphs) void {
+        var it = g.map.valueIterator();
+        while (it.next()) |en| en.exec.deinit();
+        g.map.deinit(g.gpa);
+        g.* = undefined;
+    }
+
+    /// The captured stretches.
+    pub fn count(g: *const Graphs) usize {
+        return g.map.count();
+    }
+
+    fn run(g: *Graphs, key: Key, e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, cy: *Carry, li: usize, end: usize) !void {
+        if (g.map.getPtr(key)) |en| {
+            if (!std.meta.eql(en.start, cy.*)) return error.GraphStateMismatch;
+            try en.exec.launchOn(e.s);
+            cy.* = en.end;
+            rd.kk = cy.kk;
+            rd.has_cand = cy.has_cand;
+            rd.has_cblk = cy.has_cblk;
+            return;
+        }
+        const start = cy.*;
+        try cuda.graph.beginCapture(e.s, .thread_local);
+        stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
+            if (cuda.graph.endCapture(e.s)) |got| {
+                var x = got;
+                x.deinit();
+            } else |_| {}
+            return err;
+        };
+        var graph = try cuda.graph.endCapture(e.s);
+        defer graph.deinit();
+        var exec = try graph.instantiate();
+        errdefer exec.deinit();
+        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* });
+        try exec.launchOn(e.s);
+    }
+};
+
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
 /// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
-/// hashed from `seq`, the whole sequence's ids through the rows').
-pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, pool_cap: usize, probe: ?Probe) !void {
-    const c = e.c;
+/// hashed from `seq`, the whole sequence's ids through the rows'). With `graphs` each stretch runs as its graph and a
+/// probe sees only the round's end (its logits and taps).
+pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, eh: ?*prompt.EngramHost, seq: []const i32, rows: Rows, pool_cap: usize, probe: ?Probe, graphs: ?*Graphs) !void {
     const w = e.w;
-    const t = e.t;
     const R = rows.ids.len;
     if (R == 0 or R > max_rows or rows.pos.len != R) return error.BadRound;
     rd.r = R;
@@ -601,65 +670,85 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     rd.bucket = bucketFor(deepest, pool_cap);
     rd.has_cand = false;
     rd.has_cblk = false;
+    rd.kk = 0;
     try setGlue(e, rd, rows);
-    const d = c.hidden;
-    try tri_basic.embedInit(t, w.embed, rd.ids, rd.h, rd.pre, R, d, c.hc);
-    var sh: prompt.Shared = .{};
-    var h = rd.h;
-    var spare = rd.h_alt;
-    var pre = rd.pre;
-    var pre_f = rd.pre_f;
-    var ntap: usize = 0;
-    // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on)
+    var cy: Carry = .{ .h = rd.h, .spare = rd.h_alt, .pre = rd.pre, .pre_f = rd.pre_f };
+    // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on), its rows read on the host before it
     var li: usize = 0;
-    while (li < w.layers.len) {
+    var sn: u32 = 0;
+    while (li < w.layers.len) : (sn += 1) {
         var end = li + 1;
         while (end < w.layers.len and w.layers[end].engram_wkv == null) end += 1;
-        var pending: ?u64 = null;
-        for (li..end) |l| {
-            const lay = w.layers[l];
-            if (lay.engram_wkv) |ew| {
-                if (pending) |gp| {
-                    try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
-                    pending = null;
-                }
-                const ehost = eh orelse return error.NoEngramTables;
-                try engramRows(e, rd, ehost, l, seq, rows);
-                try prompt.grouped(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
-                try Probe.check(probe, .engram_proj, l, rd.ek);
-                const en = if (e.two) |tw| tw.engramWidth() else ew.n;
-                if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.gatherF32(rd.ek, rd.ekg, R * ew.n);
-                try Probe.check(probe, .engram_gather, l, rd.ekg);
-                if (e.world != 2) return error.NotPortedYet;
-                try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * en * 4, rd.ekv, R * en);
-                try tri_basic.engramGate(t, h, rd.ekv, lay.engram_qk, spare, c.eps, R, d);
-                std.mem.swap(u64, &h, &spare);
-            }
-            // the attention mixes, the pending post fused in (pre_mix)
-            h = try mix(e, rd, h, &spare, &pending, lay.hc_attn, pre, lay.attn_norm, rd.pre_a, R);
-            if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(l)) != null) {
-                // one launch a tap, straight into its block of the taps buffer
-                try tri_basic.tap(t, h, rd.taps + ntap * d * 2, c.dspark_taps.slice().len * d, R, d);
-                ntap += 1;
-            }
-            try Probe.check(probe, .attn_in, l, rd.x);
-            try attention(e, rd, ch, cs, rings, &sh, l);
-            try Probe.check(probe, .attn_out, l, rd.pa);
-            if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else try e.gatherF32(rd.pa, rd.ga, R * d);
-            try Probe.check(probe, .attn_gather, l, rd.ga);
-            pending = rd.ga;
-            h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
-            try Probe.check(probe, .moe_in, l, rd.x);
-            try moe(e, rd, ch, l);
-            try Probe.check(probe, .moe_out, l, rd.pm);
-            if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);
-            try Probe.check(probe, .moe_gather, l, rd.gm);
-            pending = rd.gm;
-            std.mem.swap(u64, &pre, &pre_f);
-        }
-        if (pending) |gp| try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
+        if (w.layers[li].engram_wkv != null) try engramRows(e, rd, eh orelse return error.NoEngramTables, li, seq, rows);
+        if (graphs) |g| {
+            try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn }, e, rd, ch, cs, rings, &cy, li, end);
+        } else try stretch(e, rd, ch, cs, rings, &cy, li, end, probe);
         li = end;
     }
+    if (graphs != null) {
+        try Probe.check(probe, .logits, w.layers.len, rd.logits);
+        if (cy.ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
+    }
+}
+
+/// Layers li .. end of a round (the first stretch starts with the rows' streams, the last ends with the head), from
+/// what the stretch before left (cy), which it updates. No host step: the Engram rows are in rd.e_in already.
+fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, cy: *Carry, li: usize, end: usize, probe: ?Probe) !void {
+    const c = e.c;
+    const w = e.w;
+    const t = e.t;
+    const R = rd.r;
+    const d = c.hidden;
+    if (li == 0) try tri_basic.embedInit(t, w.embed, rd.ids, cy.h, cy.pre, R, d, c.hc);
+    var sh = cy.sh;
+    var h = cy.h;
+    var spare = cy.spare;
+    var pre = cy.pre;
+    var pre_f = cy.pre_f;
+    var ntap = cy.ntap;
+    var pending: ?u64 = null;
+    for (li..end) |l| {
+        const lay = w.layers[l];
+        if (lay.engram_wkv) |ew| {
+            if (pending) |gp| {
+                try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
+                pending = null;
+            }
+            try prompt.grouped(e, ch, R, &.{ew}, &.{rd.e_in}, &.{ew.k}, &.{rd.ek}, &.{ew.n}, &.{.f32});
+            try Probe.check(probe, .engram_proj, l, rd.ek);
+            const en = if (e.two) |tw| tw.engramWidth() else ew.n;
+            if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.gatherF32(rd.ek, rd.ekg, R * ew.n);
+            try Probe.check(probe, .engram_gather, l, rd.ekg);
+            if (e.world != 2) return error.NotPortedYet;
+            try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * en * 4, rd.ekv, R * en);
+            try tri_basic.engramGate(t, h, rd.ekv, lay.engram_qk, spare, c.eps, R, d);
+            std.mem.swap(u64, &h, &spare);
+        }
+        // the attention mixes, the pending post fused in (pre_mix)
+        h = try mix(e, rd, h, &spare, &pending, lay.hc_attn, pre, lay.attn_norm, rd.pre_a, R);
+        if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(l)) != null) {
+            // one launch a tap, straight into its block of the taps buffer
+            try tri_basic.tap(t, h, rd.taps + ntap * d * 2, c.dspark_taps.slice().len * d, R, d);
+            ntap += 1;
+        }
+        try Probe.check(probe, .attn_in, l, rd.x);
+        try attention(e, rd, ch, cs, rings, &sh, l);
+        try Probe.check(probe, .attn_out, l, rd.pa);
+        if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else try e.gatherF32(rd.pa, rd.ga, R * d);
+        try Probe.check(probe, .attn_gather, l, rd.ga);
+        pending = rd.ga;
+        h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
+        try Probe.check(probe, .moe_in, l, rd.x);
+        try moe(e, rd, ch, l);
+        try Probe.check(probe, .moe_out, l, rd.pm);
+        if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);
+        try Probe.check(probe, .moe_gather, l, rd.gm);
+        pending = rd.gm;
+        std.mem.swap(u64, &pre, &pre_f);
+    }
+    if (pending) |gp| try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
+    cy.* = .{ .h = h, .spare = spare, .pre = pre, .pre_f = pre_f, .ntap = ntap, .sh = sh, .kk = rd.kk, .has_cand = rd.has_cand, .has_cblk = rd.has_cblk };
+    if (end < w.layers.len) return;
     // the head on every row: the logits, the ranks' columns in rank order (g.permute(1, 0, 2))
     try tri_basic.collapseNorm(t, h, pre, w.norm, rd.xc, c.eps, R, d);
     const hn: usize = w.head.n;
@@ -671,11 +760,6 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hh * 4, hh * 4, rd.logits + k * hh * 4, e.world * hh * 4, hh * 4, R);
     try Probe.check(probe, .logits, w.layers.len, rd.logits);
     if (ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
-    // keep the round's streams where the next round's buffers expect nothing: every buffer is rewritten a round
-    rd.h = h;
-    rd.h_alt = spare;
-    rd.pre = pre;
-    rd.pre_f = pre_f;
 }
 
 /// rounds.py pre_mix: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare buffer,
