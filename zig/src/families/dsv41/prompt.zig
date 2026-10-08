@@ -28,6 +28,7 @@ const cublas = @import("cublas.zig");
 const comm = @import("comm.zig");
 const engram = @import("engram.zig");
 const engram_io = @import("engram_io.zig");
+const engram_aio = @import("engram_aio.zig");
 const exact = @import("exact.zig");
 const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
@@ -967,6 +968,7 @@ pub const EngramHost = struct {
     w: []u8, // FP8 rows
     s: []u8, // their E8M0 scales
     rows: []u16, // bf16 [cap, (hi - lo) * head_dim]
+    aio: ?*engram_aio.Aio = null, // a round's reads by Linux AIO on the tables' O_DIRECT descriptors (else the pool)
     // the rounds' Engram host time (ns, summed; a profile reads it): hashing, the table reads, the decode, the upload
     io: ?std.Io = null,
     t_hash: u64 = 0,
