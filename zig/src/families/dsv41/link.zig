@@ -1,5 +1,5 @@
 //! Rank 0 to rank 1 over TCP (the fabric addresses): length-prefixed frames for each round's step and NCCL's id, as
-//! multi.py's Link sends them. One connection, TCP_NODELAY, blocking reads.
+//! multi.py's Link sends them. One connection, TCP_NODELAY, SO_BUSY_POLL, blocking reads (recvSpin polls first).
 const std = @import("std");
 const c = std.c;
 
@@ -9,9 +9,18 @@ pub const Link = struct {
     fn socket() !c.fd_t {
         const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
         if (fd < 0) return error.SocketFailed;
-        const one: c_int = 1;
-        _ = c.setsockopt(fd, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
+        tune(fd);
         return fd;
+    }
+
+    /// TCP_NODELAY, and SO_BUSY_POLL: a read polls the NIC's receive queue itself (up to 50 us) instead of waiting for
+    /// its interrupt, whose core may be leaving a deep idle state (rank 0 to rank 1, 64-byte frames: round trip 1.0 ms
+    /// blocking, 0.72 ms polling the socket, 11 us with SO_BUSY_POLL).
+    fn tune(fd: c.fd_t) void {
+        const one: c_int = 1;
+        const busy_us: c_int = 50;
+        _ = c.setsockopt(fd, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
+        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.BUSY_POLL, std.mem.asBytes(&busy_us), @sizeOf(c_int));
     }
 
     fn addr(ip: [4]u8, port: u16) c.sockaddr.in {
@@ -30,7 +39,7 @@ pub const Link = struct {
         const peer = c.accept(fd, null, null);
         if (peer < 0) return error.AcceptFailed;
         _ = c.close(fd);
-        _ = c.setsockopt(peer, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
+        tune(peer);
         return .{ .fd = peer };
     }
 
