@@ -7,7 +7,8 @@
 //!   TF_DS_KIT                                   cubins/ (the served extension cubins), the served RoPE tables
 //!                                               (rope-*.f32, as many rows as the context) and engram.json
 //!   TF_DS_ENGRAM, TF_DS_TOKEN_MAP               the Engram tables and the compressed token map
-//!   TF_DS_ARENA_GIB                             device memory for the pool's caches and the buffers (by the context)
+//!   TF_DS_ARENA_GIB                             a first block of device memory for the buffers (unset: they take what
+//!                                               they need, the pool's caches by the context)
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
 //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
 //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
@@ -86,12 +87,6 @@ pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
     return st.size;
 }
 
-/// Device memory for the pool's caches and every buffer at a pool of `context` positions: about 3.4 GiB a 262,144
-/// positions (measured: 3.37 GB at 262,144 with four slots and the drafter), and 2 GiB to spare.
-pub fn defaultArenaGib(context: usize) usize {
-    return 2 + (context * 7 + (1 << 19) - 1) / (1 << 19);
-}
-
 /// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds `o.context`
 /// positions. Needs `ctx` current.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
@@ -99,7 +94,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (world != 2 and world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split
     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
-    const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else defaultArenaGib(o.context);
+    const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.gpa = gpa;
@@ -157,9 +152,4 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "--parallel 4") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
-}
-
-test "the arena grows with the pool" {
-    try std.testing.expectEqual(@as(usize, 6), defaultArenaGib(262144));
-    try std.testing.expectEqual(@as(usize, 16), defaultArenaGib(1 << 20));
 }
