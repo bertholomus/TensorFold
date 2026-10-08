@@ -38,6 +38,8 @@ pub const Experts = struct {
     down_k: u32, // down's K: the rank's whole intermediate (width but on a 2D node)
     down_n: u32, // down's output columns here (dims but on a 2D node)
     shared_gate: [2]u64 = .{ 0, 0 }, // the shared expert's gate trellis: its first byte and length (the paced L2 prefetch)
+    shared_up: [2]u64 = .{ 0, 0 }, // its up and down trellises the same way (the served "moe" fork reads all three)
+    shared_down: [2]u64 = .{ 0, 0 },
 };
 
 pub const Layer = struct {
@@ -262,6 +264,8 @@ const Loader = struct {
         var x: Experts = undefined;
         x.trellis = buf.ptr;
         x.shared_gate = .{ ptrs[n], sizes[n] }; // j = 0 (gate), e = n (the shared expert)
+        x.shared_up = .{ ptrs[e_count + n], sizes[e_count + n] };
+        x.shared_down = .{ ptrs[2 * e_count + n], sizes[2 * e_count + n] };
         x.count = @intCast(e_count);
         x.dims = @intCast(d);
         x.width = @intCast(width);
