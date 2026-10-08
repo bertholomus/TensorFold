@@ -74,8 +74,12 @@ pub const Config = struct {
 };
 
 /// cuLaunchKernel for plain launches, cuLaunchKernelEx when a cluster, PDL or cooperative attribute is set.
+/// Kernel launches so far in this process (a profile's count by phase).
+pub var count: u64 = 0;
+
 pub fn launch(f: Function, cfg: Config, stream: Stream, args: *Args) Error!void {
     try cfg.validate();
+    count += 1;
     const d = f.d;
     const g = cfg.grid;
     const b = cfg.block;

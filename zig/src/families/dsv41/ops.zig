@@ -36,6 +36,7 @@ pub const Ops = struct {
     gather: cuda.Function,
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
+    gpu_clock: cuda.Function,
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -66,6 +67,7 @@ pub const Ops = struct {
             .gather = try mv.function("tf_gather_rows_kernel"),
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
+            .gpu_clock = try fm.function("tf_ds_clock_kernel"),
         };
     }
 
@@ -282,6 +284,16 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(n)));
         a.add(out);
         try go(o.argmax_rows, s, rows, 1024, &a);
+    }
+
+    /// The GPU clock (ns) into buf[i] when the stream reaches it (a profile).
+    pub fn gpuClock(o: *const Ops, s: cuda.Stream, buf: u64, tag: u32, reset: bool, cap: u32) !void {
+        var a: cuda.Args = .{};
+        a.add(buf);
+        a.add(tag);
+        a.add(@as(u32, @intFromBool(reset)));
+        a.add(cap);
+        try go(o.gpu_clock, s, 1, 32, &a);
     }
 
     /// dst row i = src row idx[i] (int64 indices, rows of `bytes` bytes); an index outside [0, src_rows) sets the
