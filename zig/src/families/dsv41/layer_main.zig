@@ -40,6 +40,10 @@ const cache_tokens = 4096; // the compressed caches' positions at least (the rec
 /// The served pool's window (--context): the bucket rule's cap (graph.py bucket_for).
 const pool_window = 1 << 20;
 const max_chunks = 8;
+/// --side 1: the rounds' mixes' side work on a stream of its own (round.Round.useSide).
+var side_on = false;
+/// --prefetch 1: the rounds' paced L2 prefetch (round.Round.usePrefetch).
+var prefetch_on = false;
 
 /// One fixture line of layers.jsonl.
 const Point = struct {
@@ -249,6 +253,10 @@ pub fn main(init: std.process.Init) !u8 {
             smp.top_k = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--top-p")) {
             smp.top_p = try std.fmt.parseFloat(f64, val);
+        } else if (std.mem.eql(u8, key, "--prefetch")) {
+            prefetch_on = !std.mem.eql(u8, val, "0");
+        } else if (std.mem.eql(u8, key, "--side")) {
+            side_on = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--graphs")) {
             use_graphs = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--light")) {
@@ -654,6 +662,10 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
     const vocab = vocabOf(eng);
     const R_max = round_mod.max_rows;
     var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
+    if (side_on) try rd.useSide(eng);
+    defer rd.dropSide(eng);
+    if (prefetch_on) try rd.usePrefetch(eng);
+    defer rd.dropPrefetch();
     var targets: [R_max]usize = undefined;
     targets[0] = try argmax(run, ch.head_g, vocab); // greedy from the prompt's logits
     var prev_ids: [R_max]i64 = undefined;
@@ -921,6 +933,10 @@ fn runLight(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
     const pts = fx.points;
     const vocab = vocabOf(eng);
     var rd = try round_mod.Round.init(eng, arena, a, tokens);
+    if (side_on) try rd.useSide(eng);
+    defer rd.dropSide(eng);
+    if (prefetch_on) try rd.usePrefetch(eng);
+    defer rd.dropPrefetch();
     const seq = try a.alloc(i32, tokens + 16);
     const host_pos = try a.alloc(i64, chunk_rows);
     var prompts: std.ArrayList([]const i32) = .empty; // the earlier requests' prompts (kept prompts' prefixes)
@@ -1063,6 +1079,10 @@ fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *
     const R_max = round_mod.max_rows;
     const most = 5; // the engine's drafts (--mtp-drafts 5)
     var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
+    if (side_on) try rd.useSide(eng);
+    defer rd.dropSide(eng);
+    if (prefetch_on) try rd.usePrefetch(eng);
+    defer rd.dropPrefetch();
     var pool = try draft_mod.Pool.init(eng, arena, draft_mod.max_streams);
     var dr = try draft_mod.Drafter.init(eng, arena, sp);
     var streams: std.ArrayList(DStream) = .empty;

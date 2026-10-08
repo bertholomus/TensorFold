@@ -25,6 +25,7 @@ const exl3_experts = @import("exl3_experts.zig");
 const round2d = @import("round2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
+const ops_mod = @import("ops.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -174,6 +175,15 @@ pub const Round = struct {
     // wo_a's suh concatenated a layer (wo_a_rot: torch.cat of the slices' suh, cached on the layer)
     wo_suh: []u64,
     sink: tri_hc.Sink,
+    // the mixes' side work (their dots and the Sinkhorn: useSide) on a stream of its own, joined at the next mix
+    side: ?cuda.Stream = null,
+    join: ?cuda.Event = null,
+    side_out: bool = false,
+    // the paced L2 prefetch (usePrefetch): the next kernels' weights touched into L2 on a stream of its own
+    pf: ?cuda.Stream = null,
+    pf_fork: ?cuda.Event = null,
+    pf_join: ?cuda.Event = null,
+    pf_out: bool = false,
 
     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
         const c = e.c;
@@ -288,9 +298,90 @@ pub const Round = struct {
         }
         var ev = try cuda.Event.init(e.d, false);
         errdefer ev.deinit();
-        // the Sinkhorn half's side stream is this stream: its launches keep their order and plain (no-PDL) launches
+        // the Sinkhorn half's side stream is this stream (useSide gives it one of its own): its launches keep their
+        // order and plain (no-PDL) launches
         rd.sink = .{ .s = e.s, .fork = ev };
+        rd.side = null;
+        rd.join = null;
+        rd.side_out = false;
+        rd.pf = null;
+        rd.pf_fork = null;
+        rd.pf_join = null;
+        rd.pf_out = false;
         return rd;
+    }
+
+    /// The mixes' side work (the dots of the stored streams and the Sinkhorn) on a stream of its own, as the served
+    /// build runs it: forked behind each mix's finish, joined before the next mix reads what it wrote. Its kernels and
+    /// their inputs are the same, so the bytes are.
+    pub fn useSide(rd: *Round, e: *const Engine) !void {
+        if (rd.side != null) return;
+        var s = try cuda.Stream.init(e.d, true);
+        errdefer s.deinit();
+        rd.join = try cuda.Event.init(e.d, false);
+        rd.side = s;
+        rd.sink.s = s;
+    }
+
+    pub fn dropSide(rd: *Round, e: *const Engine) void {
+        if (rd.join) |*j| j.deinit();
+        if (rd.side) |*s| s.deinit();
+        rd.join = null;
+        rd.side = null;
+        rd.sink.s = e.s;
+    }
+
+    /// The paced L2 prefetch, as the served build's trace shows it: three launches a layer on a stream of its own, each
+    /// touching the next kernels' weights into L2 while the current ones run (after the q/kv linears: wo_a and wo_b;
+    /// after wo_b: the router; after the experts: the next layer's input linears). It writes nothing.
+    pub fn usePrefetch(rd: *Round, e: *const Engine) !void {
+        if (rd.pf != null) return;
+        var s = try cuda.Stream.init(e.d, true);
+        errdefer s.deinit();
+        rd.pf_fork = try cuda.Event.init(e.d, false);
+        rd.pf_join = try cuda.Event.init(e.d, false);
+        rd.pf = s;
+    }
+
+    pub fn dropPrefetch(rd: *Round) void {
+        if (rd.pf_fork) |*x| x.deinit();
+        if (rd.pf_join) |*x| x.deinit();
+        if (rd.pf) |*s| s.deinit();
+        rd.pf_fork = null;
+        rd.pf_join = null;
+        rd.pf = null;
+    }
+
+    /// These ranges touched into L2 behind the work queued so far, on the prefetch stream.
+    fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64) !void {
+        const s = rd.pf orelse return;
+        var a: ops_mod.Prefetch = .{};
+        for (ranges) |r| {
+            if (r[1] == 0 or a.n == 16) continue;
+            a.ptr[@intCast(a.n)] = r[0];
+            a.bytes[@intCast(a.n)] = r[1];
+            a.n += 1;
+        }
+        if (a.n == 0) return;
+        try rd.pf_fork.?.record(e.s);
+        try s.wait(rd.pf_fork.?);
+        try e.ops.l2Prefetch(s, a);
+        try rd.pf_join.?.record(s);
+        rd.pf_out = true;
+    }
+
+    /// The main stream waits for the prefetches forked so far (a stretch ends joined: its graph's every stream).
+    fn joinPrefetch(rd: *Round, e: *const Engine) !void {
+        if (!rd.pf_out) return;
+        try e.s.wait(rd.pf_join.?);
+        rd.pf_out = false;
+    }
+
+    /// The main stream waits for the side work forked so far.
+    fn joinSide(rd: *Round, e: *const Engine) !void {
+        if (!rd.side_out) return;
+        try e.s.wait(rd.join.?);
+        rd.side_out = false;
     }
 
     fn g(rd: *const Round, k: Glue) u64 {
@@ -430,6 +521,13 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         }
         try tri_norm.qKvNorm(t, rd.qa, lay.wq_a.n, lay.q_norm, c.eps, rot[0..n], rd.ykv, lay.kv_norm, rope.cos, rope.sin, pos, ring, ring_rows, rd.g(.wslot), true, rd_dim, rd.qr, rd.kout, R, lay.wq_a.n, hd);
         try prompt.groupedRotated(e, ch, R, calls[0..n]);
+    }
+    // the prefetch: this layer's wo_a and wo_b behind q's linears
+    {
+        var r: [5][2]u64 = @splat(.{ 0, 0 });
+        for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
+        r[4] = linearBytes(lay.wo_b);
+        try rd.prefetch(e, &r);
     }
     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
     var comp: tri_attn.Comp = .none;
@@ -571,6 +669,8 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     if (e.two) |tw| try round2d.woExchange(tw, e, rd.xb, R); // 2D: the column partner's half of wo_b's input rows
     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
     try prompt.groupedRotated(e, ch, R, &cb_call);
+    // the prefetch: the router behind wo_b
+    try rd.prefetch(e, &.{.{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }});
 }
 
 /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
@@ -584,6 +684,16 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
     if (e.two) |tw| return round2d.experts(tw, e, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit); // 2D: around the intermediate's exchange
     try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
+    // the prefetch: the next layer's input linears behind the experts
+    if (li + 1 < e.w.layers.len) {
+        const nx = e.w.layers[li + 1];
+        try rd.prefetch(e, &.{ linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 } });
+    }
+}
+
+/// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
+fn linearBytes(l: weights.Linear) [2]u64 {
+    return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 
 /// What a stretch of a round leaves the next on the host: the stream buffers' roles, the taps written, the latest kv
@@ -746,6 +856,8 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
         pending = rd.gm;
         std.mem.swap(u64, &pre, &pre_f);
     }
+    try rd.joinSide(e); // (a stretch ends joined: the post reads the side work's post and comb)
+    try rd.joinPrefetch(e);
     if (pending) |gp| try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
     cy.* = .{ .h = h, .spare = spare, .pre = pre, .pre_f = pre_f, .ntap = ntap, .sh = sh, .kk = rd.kk, .has_cand = rd.has_cand, .has_cblk = rd.has_cblk };
     if (end < w.layers.len) return;
@@ -766,6 +878,10 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
 /// which becomes the streams), the Sinkhorn half deferred to the side stream (this one); returns the streams.
 fn mix(e: *const Engine, rd: *Round, h: u64, spare: *u64, pending: *?u64, params: [3]u64, pre_in: u64, norm: u64, pre_out: u64, R: usize) !u64 {
     const c = e.c;
+    try rd.joinSide(e);
+    defer if (rd.side) |s| if (rd.join.?.record(s)) {
+        rd.side_out = true;
+    } else |_| {};
     if (pending.*) |gp| {
         const out = try tri_hc.hcPre2(e.t, h, params[0], params[1], params[2], pre_in, norm, c.eps, c.hc_eps, c.hc_iters, rd.x, pre_out, rd.post, rd.comb, rd.part, .{ .gathered = gp, .world = e.world, .h_out = spare.* }, rd.sink, R, c.hidden);
         pending.* = null;

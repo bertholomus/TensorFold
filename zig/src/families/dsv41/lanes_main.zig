@@ -70,6 +70,10 @@ pub fn main(init: std.process.Init) !u8 {
             o.drafts = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--arena-gib")) {
             arena_gib = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--prefetch")) {
+            o.prefetch = !std.mem.eql(u8, val, "0");
+        } else if (std.mem.eql(u8, key, "--side")) {
+            o.side = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--graphs")) {
             o.graphs = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--serial")) {
