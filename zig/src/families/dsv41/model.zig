@@ -25,6 +25,7 @@ const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
 const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
+const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
@@ -47,7 +48,9 @@ pub const Options = struct {
     token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
     drafts: bool = true, // load the DSpark drafter
-    rdma_devices: ?[]const u8 = null, // the decode gathers over the RDMA ring on these devices (comma separated), else NCCL
+    rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated), else NCCL: TP2's
+    // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
+    rdma_kernels: ?[]const u8 = null, // world 4: the rings' kernels' image (rdma_gather.cu's fatbin; null: the embedded one)
     graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
     side: bool = false, // the mixes' side work on a stream of its own (round.Round.useSide)
     prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
@@ -71,7 +74,7 @@ pub const Model = struct {
     w: weights.Weights,
     fan: prompt2d.Fan,
     comm: comm_mod.Comm,
-    rdma_mod: ?cuda.Module = null,
+    rdma_mod: ?cuda.Module = null, // the RDMA kernels (TP2's ring or world 4's rings)
     ring: ?*rdma.Ring = null,
     set: cuda.aot.Set,
     pf: exl3_prefill.Kernels,
@@ -108,11 +111,14 @@ pub const Model = struct {
     t_enqueue: u64 = 0, // the host's time to issue the forward (the GPU idle before it)
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
+    // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
+    two: ?prompt2d.Two = null,
+    rdma_rings: ?ring2d.Rings = null,
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
     pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, o: Options) !*Model {
-        if (o.world != 2) return error.NotPortedYet; // TP2 here; the four-node split is TP4's (prompt2d.zig)
+        if (o.world != 2 and o.world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split (prompt2d.zig)
         const m = try gpa.create(Model);
         errdefer gpa.destroy(m);
         m.* = undefined;
@@ -140,6 +146,8 @@ pub const Model = struct {
         m.rdma_mod = null;
         m.ring = null;
         m.graphs = null;
+        m.two = null;
+        m.rdma_rings = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -164,8 +172,9 @@ pub const Model = struct {
         errdefer m.fan.close();
         m.comm = try m.fan.comm(o.rank, o.world);
         errdefer m.comm.deinit();
-        // the decode gathers' RDMA ring (both ranks connect before either returns)
-        if (o.rdma_devices) |list| {
+        // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
+        if (sp.pair == null and o.rdma_devices != null) {
+            const list = o.rdma_devices.?;
             if (!cuda.kernels.available) return error.NoKernelImages;
             m.rdma_mod = try cuda.Module.load(d, cuda.kernels.dsv41_rdma);
             var devices: std.ArrayList([]const u8) = .empty;
@@ -212,7 +221,24 @@ pub const Model = struct {
 
         m.arena = try prompt.Arena.init(d, o.arena_bytes);
         errdefer m.arena.deinit();
-        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring };
+        // world 4 (layer_main's setup): the 2D exchanges' buffers, and with rdma_devices their rings (whose infos go
+        // round over NCCL world 4)
+        errdefer if (m.rdma_rings) |*x| x.close(gpa);
+        if (sp.pair != null) {
+            m.two = try prompt2d.Two.init(c, &m.w, &m.arena, sp, chunk_rows);
+            if (o.rdma_devices) |devs| {
+                const image: []const u8 = if (o.rdma_kernels) |path|
+                    try std.Io.Dir.cwd().readFileAllocOptions(io, path, a, .limited(1 << 26), .@"16", null)
+                else if (cuda.kernels.available) cuda.kernels.dsv41_rdma else return error.NoRdmaKernels;
+                m.rdma_mod = try cuda.Module.load(d, image);
+                var devices: std.ArrayList([]const u8) = .empty;
+                var dit = std.mem.splitScalar(u8, devs, ',');
+                while (dit.next()) |x| try devices.append(a, x);
+                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
+                m.two.?.rings = &m.rdma_rings.?;
+            }
+        }
+        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, max_streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
@@ -257,7 +283,7 @@ pub const Model = struct {
 
         m.host_pos = try a.alloc(i64, chunk_rows);
         m.ids64 = try a.alloc(i64, chunk_rows);
-        m.vocab = sp.world * m.w.head.n;
+        m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
         return m;
     }
@@ -274,6 +300,7 @@ pub const Model = struct {
         if (m.aio) |x| x.deinit();
         if (m.epool) |p| p.deinit(m.gpa);
         if (m.tables) |*t| t.close();
+        if (m.rdma_rings) |*r| r.close(m.gpa);
         m.blas.close();
         m.arena.deinit();
         m.rope_buf.free();
@@ -329,6 +356,11 @@ pub const Model = struct {
     /// The link to the other rank (rank 0's to rank 1, rank 1's to rank 0).
     pub fn peer(m: *const Model) link.Link {
         return m.fan.links[0].?;
+    }
+
+    /// Rank 0's links to its followers: rank 1's, or ranks 1-3's on the four-node split.
+    pub fn followers(m: *const Model) []const ?link.Link {
+        return m.fan.links[0 .. m.world - 1];
     }
 
     pub fn drafting(m: *const Model) bool {

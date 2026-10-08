@@ -1,8 +1,10 @@
 //! tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P]
-//!   [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE]: the lane gate of the Zig port. TensorFold 1.0's
-//! lane core (core/lanes: its round loop, depth rule, window planning, copies, acceptance) serves the requests through
-//! the port's Backend (lanes.zig) on both ranks: rank 0 runs the core and admits up to N requests at a time (the host's
-//! SuffixLookup proposer on each, min_match 4), rank 1 follows. Each reply's token_sha (sha256 of its comma-joined ids,
+//!   [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN]: the lane
+//! gate of the Zig port. TensorFold 1.0's lane core (core/lanes: its round loop, depth rule, window planning, copies,
+//! acceptance) serves the requests through the port's Backend (lanes.zig) on every rank: rank 0 runs the core and
+//! admits up to N requests at a time (the host's SuffixLookup proposer on each, min_match 4), rank 1 follows (WORLD 4:
+//! the four nodes of the 2D split, ranks 1-3 following; --rdma: its decode-size exchanges over the RDMA rings, as the
+//! layer gate's, their kernels from --rdma-kernels or the embedded image). Each reply's token_sha (sha256 of its comma-joined ids,
 //! the served server's) against the served reply's: the drafted, concurrent reply must be the served one. One JSON
 //! line a request, then the summary. FILE: zrec_lanereq.py's requests (prompt ids, max_tokens, sampling, expect_sha).
 //! KIT_DIR: a gate dir's aot/, cubins/, RoPE tables (as many rows as the pool) and engram.json.
@@ -11,7 +13,7 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
 
-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE]\n";
+const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN]\n";
 
 const Request = struct {
     name: []const u8 = "",
@@ -90,6 +92,8 @@ pub fn main(init: std.process.Init) !u8 {
             o.engram_dir = val;
         } else if (std.mem.eql(u8, key, "--token-map")) {
             o.token_map = val;
+        } else if (std.mem.eql(u8, key, "--rdma-kernels")) {
+            o.rdma_kernels = val;
         } else return error.BadArgument;
     }
     if (parallel == 0 or parallel > dsv41.model.max_streams) return error.BadArgument;
