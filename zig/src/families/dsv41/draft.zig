@@ -103,7 +103,7 @@ const MarkovGather = struct {
 
     fn run(ctx: *anyopaque, send: u64, rows: usize) anyerror!u64 {
         const g: *MarkovGather = @ptrCast(@alignCast(ctx));
-        try g.e.comm.allGather(send, g.dst, rows * 4, .f32, g.e.s);
+        try g.e.gatherF32(send, g.dst, rows * 4);
         return g.dst;
     }
 };
@@ -419,14 +419,14 @@ pub const Drafter = struct {
             try Probe.check(probe, .attn_ring, j, pool.rings[j]);
             try dr.attention(e, ch, pool, j, R);
             try Probe.check(probe, .attn_out, j, dr.pa);
-            if (e.two) |tw| try tw.pairGather(e, dr.pa, dr.ga, R, d, 4) else try e.comm.allGather(dr.pa, dr.ga, R * d, .f32, e.s);
+            if (e.two) |tw| try tw.pairGather(e, dr.pa, dr.ga, R, d, 4) else try e.gatherF32(dr.pa, dr.ga, R * d);
             try Probe.check(probe, .attn_gather, j, dr.ga);
             pending = dr.ga;
             h = try dr.mix(e, h, &spare, &pending, lay.hc_ffn, dr.pre_a, lay.ffn_norm, pre_f, R);
             try Probe.check(probe, .moe_in, j, dr.x);
             try dr.moe(e, j, R);
             try Probe.check(probe, .moe_out, j, dr.pm);
-            if (e.two) |tw| try tw.pairGather(e, dr.pm, dr.gm, R, d, 4) else try e.comm.allGather(dr.pm, dr.gm, R * d, .f32, e.s);
+            if (e.two) |tw| try tw.pairGather(e, dr.pm, dr.gm, R, d, 4) else try e.gatherF32(dr.pm, dr.gm, R * d);
             try Probe.check(probe, .moe_gather, j, dr.gm);
             pending = dr.gm;
             std.mem.swap(u64, &pre, &pre_f);

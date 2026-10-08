@@ -408,6 +408,19 @@ pub fn main(init: std.process.Init) !u8 {
         two.?.rings = &rdma_rings.?;
     }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
+    // TP2 with --rdma: the decode gathers over the RDMA ring (the served lane's), their bytes checked as NCCL's were
+    var tp2_mod: ?cuda.Module = null;
+    defer if (tp2_mod) |*mm| mm.unload();
+    var tp2_ring: ?*dsv41.rdma.Ring = null;
+    defer if (tp2_ring) |r| r.destroy(gpa);
+    if (two == null and rdma_devices != null) {
+        tp2_mod = try cuda.Module.load(&driver, cuda.kernels.dsv41_rdma);
+        var devices: std.ArrayList([]const u8) = .empty;
+        var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
+        while (dit.next()) |dv| try devices.append(a, dv);
+        tp2_ring = try dsv41.model.Model.openRing(gpa, &driver, try dsv41.rdma.Kernels.load(tp2_mod.?), devices.items, rank, &comm, stream);
+        eng.ring = tp2_ring;
+    }
     var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, tokens);
     // a drafting recording's pool: MultiDecoder's slots (each stream's window rings and positional stores)
     const slots: usize = if (budgets.len > 0) draft_mod.max_streams else 1;

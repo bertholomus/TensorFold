@@ -24,11 +24,14 @@ const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
 const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
+const rdma = @import("rdma.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
+/// The RDMA ring's slot (the served 4.25 MiB: a 16-row round's logits half fits).
+pub const ring_bytes = 4456448;
 
 pub const Options = struct {
     model_dir: []const u8, // config.json
@@ -43,6 +46,7 @@ pub const Options = struct {
     token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
     drafts: bool = true, // load the DSpark drafter
+    rdma_devices: ?[]const u8 = null, // the decode gathers over the RDMA ring on these devices (comma separated), else NCCL
     arena_bytes: usize = 5 << 30,
 };
 
@@ -62,6 +66,8 @@ pub const Model = struct {
     w: weights.Weights,
     fan: prompt2d.Fan,
     comm: comm_mod.Comm,
+    rdma_mod: ?cuda.Module = null,
+    ring: ?*rdma.Ring = null,
     set: cuda.aot.Set,
     pf: exl3_prefill.Kernels,
     lg: exl3_linear.Kernels,
@@ -121,6 +127,8 @@ pub const Model = struct {
         m.tables = null;
         m.epool = null;
         m.eh = null;
+        m.rdma_mod = null;
+        m.ring = null;
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -145,6 +153,17 @@ pub const Model = struct {
         errdefer m.fan.close();
         m.comm = try m.fan.comm(o.rank, o.world);
         errdefer m.comm.deinit();
+        // the decode gathers' RDMA ring (both ranks connect before either returns)
+        if (o.rdma_devices) |list| {
+            if (!cuda.kernels.available) return error.NoKernelImages;
+            m.rdma_mod = try cuda.Module.load(d, cuda.kernels.dsv41_rdma);
+            var devices: std.ArrayList([]const u8) = .empty;
+            var it = std.mem.splitScalar(u8, list, ',');
+            while (it.next()) |dev| try devices.append(a, dev);
+            m.ring = try openRing(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, &m.comm, m.stream);
+        }
+        errdefer if (m.ring) |r| r.destroy(gpa);
+        errdefer if (m.rdma_mod) |*x| x.unload();
 
         // kernels: the recorded Triton set, the served extension cubins, the torch-op images
         m.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, o.aot_dir orelse try std.fs.path.join(a, &.{ o.kit_dir, "aot" }));
@@ -182,7 +201,7 @@ pub const Model = struct {
 
         m.arena = try prompt.Arena.init(d, o.arena_bytes);
         errdefer m.arena.deinit();
-        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c };
+        m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring };
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, max_streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
@@ -238,6 +257,11 @@ pub const Model = struct {
         m.lg.unload();
         m.pf.unload();
         m.set.deinit();
+        if (m.ring) |r| {
+            r.stop();
+            r.destroy(m.gpa);
+        }
+        if (m.rdma_mod) |*x| x.unload();
         m.comm.deinit();
         m.fan.close();
         m.w.deinit();
@@ -247,6 +271,29 @@ pub const Model = struct {
         m.stream.deinit();
         m.host.deinit();
         m.gpa.destroy(m);
+    }
+
+    /// TP2's RDMA ring for the decode gathers: created on both ranks, the queue-pair infos exchanged over NCCL,
+    /// connected, and started once both are (an all-gather as the barrier).
+    pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
+        if (comm.world != 2) return error.NotTwoRanks;
+        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 5 });
+        errdefer r.destroy(gpa);
+        const per = @sizeOf(rdma.Info);
+        const mine = [2]rdma.Info{ r.info(0), r.info(1) };
+        var dev = try cuda.DeviceBuffer.alloc(d, 3 * 2 * per);
+        defer dev.free();
+        try dev.upload(0, std.mem.sliceAsBytes(&mine));
+        try comm.allGather(dev.ptr, dev.ptr + 2 * per, 2 * per, .u8, stream);
+        try stream.synchronize();
+        var all: [2][2]rdma.Info = undefined;
+        try dev.download(2 * per, std.mem.sliceAsBytes(&all));
+        try r.connect(&.{ all[0][rank], all[1][rank] });
+        // every queue pair ready on both ranks before either sends
+        try comm.allGather(dev.ptr, dev.ptr + 2 * per, 1, .u8, stream);
+        try stream.synchronize();
+        try r.start();
+        return r;
     }
 
     fn readKit(a: std.mem.Allocator, io: std.Io, kit: []const u8, name: []const u8) ![]const u8 {
