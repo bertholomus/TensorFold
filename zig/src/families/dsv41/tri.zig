@@ -5,6 +5,10 @@ const cuda = @import("cuda");
 const aot = cuda.aot;
 
 /// Where launches go: the captured set on a stream, or (tests) a log compared with the recorded launches.
+/// kernels.decode_rows(): the most rows a call takes the row-invariant decode kernels with now: 16 (DECODE_ROWS), or a
+/// concurrent round's row bound while round.forward runs one (kernels.round_rows(), Engine.round_rows).
+pub var decode_rows: usize = 16;
+
 pub const Tri = struct {
     set: ?*const aot.Set = null,
     stream: cuda.Stream = undefined,

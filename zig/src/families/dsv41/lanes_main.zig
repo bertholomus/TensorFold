@@ -13,7 +13,7 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
 
-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K]\n";
+const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S]\n";
 
 const Request = struct {
     name: []const u8 = "",
@@ -54,7 +54,7 @@ pub fn main(init: std.process.Init) !u8 {
         .kit_dir = args[7],
     };
     var requests_file: ?[]const u8 = null;
-    var parallel: usize = dsv41.model.max_streams;
+    var parallel: ?usize = null; // default: every stream of the pool
     var arena_gib: ?usize = null;
     var profile = false;
     var phases = false; // --profile 2: also the rounds' GPU time by phase (eager rounds)
@@ -68,6 +68,12 @@ pub fn main(init: std.process.Init) !u8 {
             requests_file = val;
         } else if (std.mem.eql(u8, key, "--parallel")) {
             parallel = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--round-rows")) {
+            o.round_rows = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--round-ms")) {
+            o.round_ms = try dsv41.lanes.parseMs(a, val);
+        } else if (std.mem.eql(u8, key, "--streams")) {
+            o.streams = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--pool")) {
             o.pool = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--drafts")) {
@@ -99,7 +105,8 @@ pub fn main(init: std.process.Init) !u8 {
             o.rdma_kernels = val;
         } else return error.BadArgument;
     }
-    if (parallel == 0 or parallel > dsv41.model.max_streams) return error.BadArgument;
+    const par = parallel orelse o.streams;
+    if (par == 0 or par > o.streams or o.streams > dsv41.model.max_streams) return error.BadArgument;
     o.arena_bytes = (arena_gib orelse 0) << 30; // (0: the arena grows as the buffers ask)
 
     var out_buf: [1 << 14]u8 = undefined;
@@ -141,7 +148,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (phases) try m.usePhaseTimer();
     }
     var step_ns: u64 = 0;
-    const rows: u32 = dsv41.round.max_rows;
+    const rows: u32 = @intCast(m.eng.round_rows);
     var cfg = try lanes.Config.init(gpa, ln.facts(), rows, rows - 1);
     defer cfg.deinit(gpa);
     var clock: lanes.backend.WallClock = .{ .io = io };
@@ -157,7 +164,7 @@ pub fn main(init: std.process.Init) !u8 {
     const started = std.Io.Timestamp.now(io, .awake);
     while (finished < reqs.len) {
         // admit while a lane is free (the host's admission: one prompt pass at a time, before the rounds)
-        while (admitted < reqs.len and core.activeCount() < parallel) {
+        while (admitted < reqs.len and core.activeCount() < par) {
             const r = &reqs[admitted];
             const j = &jobs[admitted];
             j.* = .{ .req = r, .index = admitted, .proposer = try lanes.SuffixLookup.init(gpa, .{ .min_match = 4 }), .stream = undefined, .began = std.Io.Timestamp.now(io, .awake) };
@@ -213,6 +220,11 @@ pub fn main(init: std.process.Init) !u8 {
         }.f;
         try w.print("{{\"rank\": 0, \"profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"step_ms\": {d:.2}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.2}, \"forward_ms\": {d:.2}, \"absorb_ms\": {d:.2}, \"logits_ms\": {d:.2}, \"sample_ms\": {d:.2}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.2}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{ p.rounds, ms(p.rows * 1000000, p.rounds), ms(step_ns, core.steps), ms(p.send, p.rounds), ms(p.enqueue, p.rounds), ms(p.forward, p.rounds), ms(p.absorb, p.rounds), ms(p.logits, p.rounds), ms(p.sample, p.rounds), p.passes, ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes), p.prefills, ms(p.prefill, p.prefills) });
         try w.flush();
+        if (m.ptimer) |tm| {
+            try w.print("{{\"rank\": 0, \"prefill_phases_ms\": {{", .{});
+            for (dsv41.round.PhaseTimer.phases, 0..) |name, i| try w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, if (tm.rounds == 0) 0 else tm.ms[i] / @as(f64, @floatFromInt(tm.rounds)) });
+            try w.print("}}, \"chunks\": {d}}}\n", .{tm.rounds});
+        }
         if (m.timer) |tm| {
             try w.print("{{\"rank\": 0, \"phases_ms\": {{", .{});
             for (dsv41.round.PhaseTimer.phases, 0..) |name, i| try w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, if (tm.rounds == 0) 0 else tm.ms[i] / @as(f64, @floatFromInt(tm.rounds)) });

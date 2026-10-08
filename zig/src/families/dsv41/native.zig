@@ -9,6 +9,10 @@
 //!   TF_DS_ENGRAM, TF_DS_TOKEN_MAP               the Engram tables and the compressed token map
 //!   TF_DS_ARENA_GIB                             a first block of device memory for the buffers (unset: they take what
 //!                                               they need, the pool's caches by the context)
+//!   TF_DS_ROUND_MS                              the lane core's round costs by rows (ms, comma separated; the
+//!                                               served ROUND_MS unless set: a four-node lane's rounds cost less)
+//!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
+//!                                               streams (4; its 16): --parallel at most the streams
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
 //!   TF_DS_GRAPHS=1                              the rounds' stretches as CUDA graphs
 //!   TF_DS_HC_SIDE=1                             the mixes' side work on a stream of its own
@@ -118,12 +122,15 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .pool = o.context,
         .drafts = o.drafts,
         .arena_bytes = arena_gib << 30,
+        .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
+        .round_ms = if (getenv("TF_DS_ROUND_MS")) |v| lanes_mod.parseMs(std.heap.page_allocator, v) catch return error.BadRoundMs else null,
+        .streams = if (getenv("TF_DS_STREAMS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadStreams else model.max_streams_default,
     });
     errdefer st.m.close();
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     // the pool is the model's (preallocated): a stream takes no device memory of its own
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = round.max_rows, .stream_bytes = 0, .ctx = st, .deinit = deinitFn };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn };
 }
 
 fn deinitFn(ptr: *anyopaque) void {
@@ -141,7 +148,9 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoRdmaKernels => "TF_RDMA_DEVICES at world 4 needs TF_DS_RDMA_KERNELS (rdma_gather.cu's fatbin) in a build without the kernel images",
         error.NoRankCache => "set TF_DS_RANK_CACHE to the lane's per-rank weight files",
         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
-        error.NoFreeSlot => "this engine serves 4 streams at once: --parallel 4",
+        error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
+        error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
+        error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         else => null,
@@ -150,6 +159,6 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 
 test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
-    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "--parallel 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
 }

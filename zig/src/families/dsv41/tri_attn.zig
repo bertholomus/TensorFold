@@ -83,7 +83,7 @@ pub fn sparseAttn(t: Tri, a: Attn) !void {
     const csc: u64 = if (pack) a.comp.fp4.scales else a.wsrc;
     const ct: []const u8 = if (pack) "*u8" else "*bf16";
     var n_idx: usize = if (has) a.n_idx else 0;
-    const sp: usize = if (a.rows <= decode_rows) attn_splits else 1;
+    const sp: usize = if (a.rows <= tri.decode_rows) attn_splits else 1;
     const groups = a.h / hb;
     const final = sp == 1;
     var picks: usize = if (has) tri.cdiv(n_idx, bn) else 0;

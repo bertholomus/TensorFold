@@ -166,6 +166,15 @@ pub const Profile = struct {
     prefills: u64 = 0,
 };
 
+/// A round-cost table "30.0,35.2,..." (TF_DS_ROUND_MS's form): ms by rows from 1.
+pub fn parseMs(a: std.mem.Allocator, text: []const u8) ![]const f64 {
+    var out: std.ArrayList(f64) = .empty;
+    var it = std.mem.splitScalar(u8, text, ',');
+    while (it.next()) |x| try out.append(a, try std.fmt.parseFloat(f64, std.mem.trim(u8, x, " ")));
+    if (out.items.len == 0) return error.BadRoundMs;
+    return out.items;
+}
+
 /// A stream's place in the pool and the drafts it holds.
 const Lane = struct {
     slot: usize,
@@ -189,6 +198,8 @@ pub const Lanes = struct {
     step: u64 = 0,
     wire: Wire = .{},
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
+    wc: [window_rows]lanes.config.Cost = undefined, // the window costs (init)
+    sc: [max_rows]lanes.config.Cost = undefined, // the shared forwards' costs (init)
     used: [max_streams]bool = @splat(false),
     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
     built: Built = .{},
@@ -198,7 +209,12 @@ pub const Lanes = struct {
     next: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
-        return .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+        var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+        // the round costs by rows: ROUND_MS[min(rows, len) - 1] (the served table, or TF_DS_ROUND_MS)
+        const t = m.round_ms;
+        for (&ln.wc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
+        for (&ln.sc, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = t[@min(i, t.len - 1)] };
+        return ln;
     }
 
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
@@ -234,29 +250,17 @@ pub const Lanes = struct {
             .speculate = drafting,
             .speculate_early = false,
             .drafts = if (self.m.dr) |dr| @intCast(dr.n) else 1,
-            .window_costs = window_costs[0..],
+            .window_costs = self.wc[0..],
             .mtp_step_ms = draft.draft_ms,
             .streams_exact = true,
             .hidden_rows = true,
-            .batch_rows = max_rows,
-            .max_streams = max_streams,
-            .shared_costs = shared_costs[0..],
+            .batch_rows = @intCast(self.m.eng.round_rows),
+            .max_streams = @intCast(self.m.streams),
+            .shared_costs = self.sc[0..self.m.eng.round_rows],
             .draft_probabilities = drafting,
             .draft_streams = drafting,
         };
     }
-
-    /// The served ROUND_MS table as the round loop's costs (it learns its own from the rounds it times).
-    const window_costs = blk: {
-        var out: [window_rows]lanes.config.Cost = undefined;
-        for (&out, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = draft.round_ms[i] };
-        break :blk out;
-    };
-    const shared_costs = blk: {
-        var out: [max_rows]lanes.config.Cost = undefined;
-        for (&out, 0..) |*c, i| c.* = .{ .width = @intCast(i + 1), .ms = draft.round_ms[i] };
-        break :blk out;
-    };
 
     fn of(ptr: *anyopaque) *Lanes {
         return @ptrCast(@alignCast(ptr));
@@ -309,10 +313,10 @@ pub const Lanes = struct {
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
-        const size = std.mem.alignForward(usize, len + s.max_new + max_rows + 2, model.chunk_rows);
+        const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
         if (size > m.pool_cap) return error.PromptTooLong;
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
-        const slot = std.mem.indexOfScalar(bool, &self.used, false) orelse return error.NoFreeSlot;
+        const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;
         var nt: usize = 0;
         var it = self.streams.valueIterator();

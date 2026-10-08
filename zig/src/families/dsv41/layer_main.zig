@@ -438,7 +438,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, tokens);
     // a drafting recording's pool: MultiDecoder's slots (each stream's window rings and positional stores)
-    const slots: usize = if (budgets.len > 0) draft_mod.max_streams else 1;
+    const slots: usize = if (budgets.len > 0) draft_mod.default_streams else 1;
     const caches = try prompt.Caches.init(&eng, &arena, tokens, slots);
     blas_ws_ptr = ch.blas_ws;
     var blas = try dsv41.cublas.Blas.open(stream, blas_ws_ptr);
@@ -670,7 +670,7 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
     const w_out = run.out;
     const c = eng.c;
     const vocab = vocabOf(eng);
-    const R_max = round_mod.max_rows;
+    const R_max = round_mod.default_rows; // the recordings' round bound
     var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
     if (side_on) try rd.useSide(eng);
     defer rd.dropSide(eng);
@@ -693,7 +693,7 @@ fn runRounds(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *c
     var pool: draft_mod.Pool = undefined;
     var dr: draft_mod.Drafter = undefined;
     if (drafts > 0) {
-        pool = try draft_mod.Pool.init(eng, arena, draft_mod.max_streams);
+        pool = try draft_mod.Pool.init(eng, arena, draft_mod.default_streams);
         dr = try draft_mod.Drafter.init(eng, arena, sp);
         const d = c.hidden;
         for (0..c.dspark_taps.slice().len) |j| try eng.ops.copyRows(eng.s, prompt.tapRows(eng, ch, j), d * 2, dr.at + j * d * 2, dr.taps_w * 2, d * 2, ch.n);
@@ -1086,14 +1086,14 @@ fn runDrafted(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *
     const c = eng.c;
     const pts = fx.points;
     const vocab = vocabOf(eng);
-    const R_max = round_mod.max_rows;
+    const R_max = round_mod.default_rows; // the recordings' round bound
     const most = 5; // the engine's drafts (--mtp-drafts 5)
     var rd = try round_mod.Round.init(eng, arena, a, ch.max_comp);
     if (side_on) try rd.useSide(eng);
     defer rd.dropSide(eng);
     if (prefetch_on) try rd.usePrefetch(eng);
     defer rd.dropPrefetch();
-    var pool = try draft_mod.Pool.init(eng, arena, draft_mod.max_streams);
+    var pool = try draft_mod.Pool.init(eng, arena, draft_mod.default_streams);
     var dr = try draft_mod.Drafter.init(eng, arena, sp);
     var streams: std.ArrayList(DStream) = .empty;
     const host_pos = try a.alloc(i64, chunk_rows);
