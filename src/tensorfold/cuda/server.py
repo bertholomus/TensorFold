@@ -384,7 +384,7 @@ class App:
     def sampling_for(self, body: dict[str, Any], prompt: list[int]):
         """Keyed sampling (the seed, else one drawn from the prompt), or None for greedy; RequestError if malformed."""
 
-        from tensorfold.engine.exact_sampling import Sampling, seed_for
+        from tensorfold.engine.exact_sampling import Sampling, default_seed
 
         fields = parse_numbers({k: body[k] for k in _SAMPLING_FIELDS if body.get(k) is not None})
         temp = float(fields.get("temperature", self.sampling["temperature"]))
@@ -394,7 +394,7 @@ class App:
         top_k = fields.get("top_k", self.sampling["top_k"])
         top_p = fields.get("top_p", self.sampling["top_p"])
         min_p = fields.get("min_p", self.sampling.get("min_p", 0.0))
-        return Sampling(int(seed) if seed is not None else seed_for(prompt), temp, int(top_k), float(top_p),
+        return Sampling(default_seed(prompt, seed), temp, int(top_k), float(top_p),
                         float(min_p))
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,

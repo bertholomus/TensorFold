@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import math
 import os
+import random
 from typing import Any, Sequence
 
 import numpy as np
@@ -44,6 +45,27 @@ def _salt_from_env() -> int:
 
 
 SEED_SALT = _salt_from_env()
+
+SEED_MODE = os.environ.get("TF_SEED", "prompt").strip().lower()
+if SEED_MODE not in ("prompt", "random"):
+    raise ValueError(f"TF_SEED={SEED_MODE!r}: 'prompt' (the default) or 'random'")
+
+
+def seed_random() -> int:
+    """``TF_SEED=random``: a fresh seed per request, same range as seed_for. An agent harness that
+    re-sends an unchanged history otherwise replays the identical trajectory (seed_for is a function
+    of the prompt); a random draw makes every request — and every retry — its own re-roll."""
+
+    return random.getrandbits(63)
+
+
+def default_seed(prompt: Sequence[int], seed: Any = None) -> int:
+    """The seed a request with no explicit one gets: ``TF_SEED=random`` draws fresh per request,
+    the default (prompt) keys it to the prompt. One function so the serve paths can't drift."""
+
+    if seed is not None:
+        return int(seed)
+    return seed_random() if SEED_MODE == "random" else seed_for(prompt)
 
 
 def seed_for(tokens: Sequence[int], salt: int | None = None) -> int:
@@ -200,5 +222,5 @@ def _nucleus_rows(logits: Any, positions: Sequence[int], s: Sampling) -> list[in
     return out if any(token is not None for token in out) else None
 
 
-__all__ = ["MARGIN", "Sampling", "choose", "choose_rows", "sample_rows", "seed_for", "top_candidates", "uniform",
-           "uniform_rows"]
+__all__ = ["MARGIN", "SEED_MODE", "Sampling", "choose", "choose_rows", "default_seed", "sample_rows", "seed_for",
+           "seed_random", "top_candidates", "uniform", "uniform_rows"]
