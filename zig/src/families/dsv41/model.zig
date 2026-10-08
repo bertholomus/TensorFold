@@ -92,6 +92,7 @@ pub const Model = struct {
     ring_view: []u64, // a filling stream's slot of them
     rd: round.Round,
     graphs: ?round.Graphs = null,
+    pgraphs: ?draft.PassGraphs = null, // the drafter pass as CUDA graphs (with graphs)
     dpool: ?draft.Pool = null,
     dr: ?draft.Drafter = null,
     tables: ?engram_io.Tables = null,
@@ -102,6 +103,8 @@ pub const Model = struct {
     ids64: []i64,
     vocab: usize,
     logits: []f32, // round.max_rows rows of logits on the host
+    amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
+    amax_host: [round.max_rows]u32 = undefined,
     // the stream a fill is running: its slot and its view of the caches (its extent from base)
     fill_slot: usize = 0,
     view: prompt.Caches = undefined,
@@ -146,6 +149,7 @@ pub const Model = struct {
         m.rdma_mod = null;
         m.ring = null;
         m.graphs = null;
+        m.pgraphs = null;
         m.two = null;
         m.rdma_rings = null;
         const d = ctx.d;
@@ -251,12 +255,17 @@ pub const Model = struct {
             try d.check(d.api.cuMemsetD8Async(r.*, 0, max_streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
+        m.amax = try m.arena.take(round.max_rows * 4);
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
         if (o.drafts) {
             m.dpool = try draft.Pool.init(&m.eng, &m.arena, max_streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
+            if (o.graphs) {
+                m.pgraphs = draft.PassGraphs.init(gpa);
+                m.dr.?.graphs = &m.pgraphs.?;
+            }
         }
         try m.stream.synchronize();
         try d.check(d.api.cuCtxSynchronize(), "cuCtxSynchronize"); // the setup's legacy-stream copies too
@@ -291,6 +300,7 @@ pub const Model = struct {
     pub fn close(m: *Model) void {
         m.stream.synchronize() catch {};
         if (m.graphs) |*g| g.deinit();
+        if (m.pgraphs) |*g| g.deinit();
         if (m.timer) |t| {
             t.deinit();
             m.gpa.destroy(t);
@@ -475,6 +485,15 @@ pub const Model = struct {
     }
 
     /// The round's logits, R rows of the vocabulary, on the host (after verify).
+    /// The round's greedy tokens, R rows (the device's argmax of the round's logits, as sampling.argmax), on the host.
+    pub fn roundArgmax(m: *Model, R: usize) ![]const u32 {
+        const d = m.ctx.d;
+        try m.ops.argmaxRows(m.stream, m.rd.logits, m.vocab, m.vocab, R, m.amax);
+        try m.stream.synchronize();
+        try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
+        return m.amax_host[0..R];
+    }
+
     pub fn roundLogits(m: *Model, R: usize) ![]const f32 {
         const d = m.ctx.d;
         try m.stream.synchronize();

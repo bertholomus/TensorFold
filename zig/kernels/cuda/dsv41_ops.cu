@@ -284,3 +284,61 @@ extern "C" __global__ void tf_ds_apply_pool_kernel(float* score, long long ss, i
         if (!mask[(long long)r * ms + j / bsize]) score[(long long)r * ss + j] = ninf;
     }
 }
+
+// Rows of n16 16-byte words: dst row r = src row r (row strides in words). torch_ops' tf_strided_copy takes a block a
+// row and a byte a thread; this one a word a thread over grid (ceil(n16 / blockDim), rows). Every pointer, stride and
+// row length a multiple of 16 bytes (ops.copyRows checks).
+extern "C" __global__ void tf_ds_copy_rows16_kernel(const uint4* src, unsigned long long src_ld, uint4* dst,
+                                                    unsigned long long dst_ld, unsigned long long n16) {
+    const unsigned long long r = blockIdx.y;
+    const unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n16) dst[r * dst_ld + i] = src[r * src_ld + i];
+}
+
+// A greedy row's token as sampling.argmax takes it on the host (best = 0; best = i where row[i] > row[best]): the
+// first index of the largest value, a NaN never larger, and 0 when the row's first value is NaN. logits [rows, n] fp32
+// (row stride ld), out [rows] u32; a row a block (1024 threads).
+extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(const float* logits, unsigned long long ld,
+                                                                             int n, unsigned* out) {
+    const float* row = logits + (unsigned long long)blockIdx.x * ld;
+    const float ninf = -__int_as_float(0x7f800000);
+    float bv = ninf;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = row[i];
+        if (v == v && (v > bv || (v == bv && i < bi))) {
+            bv = v;
+            bi = i;
+        }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+        const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    __shared__ float sv[32];
+    __shared__ int si[32];
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    if (lane == 0) {
+        sv[warp] = bv;
+        si[warp] = bi;
+    }
+    __syncthreads();
+    if (warp != 0) return;
+    const int nw = (blockDim.x + 31) >> 5;
+    bv = lane < nw ? sv[lane] : ninf;
+    bi = lane < nw ? si[lane] : 0x7fffffff;
+    for (int off = 16; off > 0; off >>= 1) {
+        const float ov = __shfl_down_sync(0xffffffffu, bv, off);
+        const int oi = __shfl_down_sync(0xffffffffu, bi, off);
+        if (ov > bv || (ov == bv && oi < bi)) {
+            bv = ov;
+            bi = oi;
+        }
+    }
+    if (lane == 0) out[blockIdx.x] = row[0] != row[0] ? 0u : (unsigned)bi;
+}
