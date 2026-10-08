@@ -559,7 +559,9 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     var step: u64 = 0;
     var slot: usize = 0;
     while (true) {
-        var r: Reader = .{ .b = try peer.recv(buf) };
+        // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
+        // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
+        var r: Reader = .{ .b = try peer.recvSpin(buf, 20 * std.time.ns_per_ms) };
         const kind: Kind = switch (try r.int(u8)) {
             1 => .fill_begin,
             2 => .fill_chunk,

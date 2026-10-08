@@ -84,6 +84,43 @@ pub const Link = struct {
         try l.writeAll(bytes);
     }
 
+    /// recv, polling the socket without blocking for up to `spin_ns` first: a frame that comes within it is read
+    /// without the receiving thread's sleep and wake-up (a core's deepest idle state takes 433 us to leave on GB10; the
+    /// follower's frames come a fraction of a millisecond after its GPU goes idle), and after it the read blocks.
+    pub fn recvSpin(l: Link, buf: []u8, spin_ns: u64) ![]u8 {
+        var len: [4]u8 = undefined;
+        var got: usize = 0;
+        const t0 = monotonicNs();
+        var polls: u32 = 0;
+        while (got < len.len) {
+            const n = c.recv(l.fd, @as([*]u8, &len) + got, len.len - got, c.MSG.DONTWAIT);
+            if (n > 0) {
+                got += @intCast(n);
+                continue;
+            }
+            if (n == 0) return error.PeerDown;
+            switch (c.errno(n)) {
+                .AGAIN => {},
+                .INTR => continue,
+                else => return error.PeerDown,
+            }
+            polls +%= 1;
+            if (polls % 64 == 0 and monotonicNs() -% t0 > spin_ns) break;
+            std.atomic.spinLoopHint();
+        }
+        if (got < len.len) try l.readAll(len[got..]);
+        const n = std.mem.readInt(u32, &len, .little);
+        if (n > buf.len) return error.FrameTooLong;
+        try l.readAll(buf[0..n]);
+        return buf[0..n];
+    }
+
+    fn monotonicNs() u64 {
+        var ts: c.timespec = undefined;
+        _ = c.clock_gettime(c.CLOCK.MONOTONIC, &ts);
+        return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    }
+
     /// The next frame into `buf` (a frame longer than `buf` is refused); its bytes.
     pub fn recv(l: Link, buf: []u8) ![]u8 {
         var len: [4]u8 = undefined;
@@ -118,6 +155,8 @@ test "frames cross a loopback link in order" {
             defer l.close();
             l.send("step 1") catch return;
             l.send(&.{}) catch return;
+            l.send("polled") catch return;
+            l.send("late") catch return;
         }
     };
     const t = try std.Thread.spawn(.{}, Peer.run, .{port});
@@ -126,5 +165,7 @@ test "frames cross a loopback link in order" {
     var buf: [64]u8 = undefined;
     try std.testing.expectEqualStrings("step 1", try l.recv(&buf));
     try std.testing.expectEqual(@as(usize, 0), (try l.recv(&buf)).len);
+    try std.testing.expectEqualStrings("polled", try l.recvSpin(&buf, 1000 * std.time.ns_per_ms));
+    try std.testing.expectEqualStrings("late", try l.recvSpin(&buf, 0));
     t.join();
 }
