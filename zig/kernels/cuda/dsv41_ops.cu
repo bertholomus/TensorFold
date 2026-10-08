@@ -178,6 +178,17 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_indices_kernel(con
     for (int i = threadIdx.x; i < k; i += blockDim.x) o[i] = cols[i] < v ? cols[i] : -1;
 }
 
+// The indexer's selection when its top-k takes every key it scans (nb <= index_topk): kernels.topk_indices of all nb
+// keys is 0 .. nb - 1 whatever the scores, then the visible mask: out[r, j] = j if j < vis[r] else -1. vis [rows] int64,
+// out [rows, nb] int64; grid (blocks, rows).
+extern "C" __global__ void tf_ds_iota_vis_kernel(const long long* vis, long long* out, int nb) {
+    const int r = blockIdx.y;
+    const long long v = vis[r];
+    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < nb; j += gridDim.x * blockDim.x) {
+        out[(long long)r * nb + j] = j < v ? (long long)j : -1;
+    }
+}
+
 // rounds.py _candidates_fast where the pool takes every block (contexts up to nblocks * bsize keys): a row's block mask
 // (torch's bool, as u8) = the block's maximum (amax: a NaN wins) above -inf, or the block is the row's newest,
 // (vis - 1) // bsize (floor division). score [rows, nb * bsize] fp32 (row stride ss), vis [rows], out [rows, nb] (row
