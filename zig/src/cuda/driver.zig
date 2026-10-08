@@ -13,11 +13,18 @@ pub const Driver = struct {
         return openPath("libcuda.so.1");
     }
 
-    /// Resolves every field of `abi.Api` by its exact name; a missing symbol refuses the whole driver.
+    /// Resolves every field of `abi.Api` by its exact name; a missing symbol refuses the whole driver. cuInit runs
+    /// first, so a profiler's injection (Nsight Systems' CUPTI, loaded by cuInit) is in place when the entry points are
+    /// resolved. TF_CUDA_PROC_ADDRESS=1: the launches (cuLaunchKernel, cuLaunchKernelEx, cuGraphLaunch) through
+    /// cuGetProcAddress at CUDA 12.0's versions, the table such an injection hooks.
     pub fn openPath(path: []const u8) Error!Driver {
         var lib = std.DynLib.open(path) catch return error.DriverUnavailable;
         errdefer lib.close();
         var api: abi.Api = undefined;
+        api.cuInit = lib.lookup(@TypeOf(api.cuInit), "cuInit") orelse return error.MissingSymbol;
+        api.cuGetErrorName = lib.lookup(@TypeOf(api.cuGetErrorName), "cuGetErrorName") orelse return error.MissingSymbol;
+        api.cuGetErrorString = lib.lookup(@TypeOf(api.cuGetErrorString), "cuGetErrorString") orelse return error.MissingSymbol;
+        try (Driver{ .lib = lib, .api = api }).check(api.cuInit(0), "cuInit");
         const info = @typeInfo(abi.Api).@"struct";
         inline for (info.field_names, info.field_types) |name, T| {
             @field(api, name) = lib.lookup(T, name) orelse {
@@ -25,9 +32,16 @@ pub const Driver = struct {
                 return error.MissingSymbol;
             };
         }
-        const d: Driver = .{ .lib = lib, .api = api };
-        try d.check(api.cuInit(0), "cuInit");
-        return d;
+        if (std.c.getenv("TF_CUDA_PROC_ADDRESS")) |v| if (v[0] == '1') {
+            const GetProc = *const fn ([*:0]const u8, *?*anyopaque, c_int, u64, ?*c_int) callconv(.c) abi.Result;
+            const get = lib.lookup(GetProc, "cuGetProcAddress_v2") orelse return error.MissingSymbol;
+            inline for (.{ "cuLaunchKernel", "cuLaunchKernelEx", "cuGraphLaunch" }) |name| {
+                var p: ?*anyopaque = null;
+                var status: c_int = 0;
+                if (get(name, &p, 12000, 0, &status) == abi.success and status == 0 and p != null) @field(api, name) = @ptrCast(@alignCast(p.?));
+            }
+        };
+        return .{ .lib = lib, .api = api };
     }
 
     pub fn close(self: *Driver) void {
