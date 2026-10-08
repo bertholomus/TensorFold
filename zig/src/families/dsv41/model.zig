@@ -104,6 +104,7 @@ pub const Model = struct {
     view: prompt.Caches = undefined,
     // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
     prof: bool = false,
+    timer: ?*round.PhaseTimer = null, // a profile's GPU time by phase (eager rounds)
     t_enqueue: u64 = 0, // the host's time to issue the forward (the GPU idle before it)
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
@@ -126,6 +127,7 @@ pub const Model = struct {
         m.pool_cap = o.pool;
         m.fill_slot = 0;
         m.prof = false;
+        m.timer = null;
         m.t_enqueue = 0;
         m.t_forward = 0;
         m.t_absorb = 0;
@@ -263,6 +265,10 @@ pub const Model = struct {
     pub fn close(m: *Model) void {
         m.stream.synchronize() catch {};
         if (m.graphs) |*g| g.deinit();
+        if (m.timer) |t| {
+            t.deinit();
+            m.gpa.destroy(t);
+        }
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
         if (m.aio) |x| x.deinit();
@@ -403,6 +409,7 @@ pub const Model = struct {
             m.t_enqueue = m.now() - t0;
             try m.stream.synchronize();
             m.t_forward = m.now() - t0;
+            if (m.timer) |t| try t.finish();
         }
         const t1 = m.now();
         if (m.dr) |*dr| {
@@ -418,6 +425,16 @@ pub const Model = struct {
         }
         try m.stream.synchronize();
         if (m.prof) m.t_absorb = m.now() - t1;
+    }
+
+    /// The rounds' GPU time by phase (eager rounds; --profile 2): a timer on the round.
+    pub fn usePhaseTimer(m: *Model) !void {
+        if (m.timer != null) return;
+        const t = try m.gpa.create(round.PhaseTimer);
+        errdefer m.gpa.destroy(t);
+        t.* = try round.PhaseTimer.init(m.gpa, m.ctx.d);
+        m.timer = t;
+        m.rd.timer = t;
     }
 
     /// The monotonic clock (ns).

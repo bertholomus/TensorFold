@@ -184,6 +184,7 @@ pub const Round = struct {
     pf_fork: ?cuda.Event = null,
     pf_join: ?cuda.Event = null,
     pf_out: bool = false,
+    timer: ?*PhaseTimer = null, // eager rounds' GPU time by phase (a profile)
 
     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
         const c = e.c;
@@ -308,6 +309,7 @@ pub const Round = struct {
         rd.pf_fork = null;
         rd.pf_join = null;
         rd.pf_out = false;
+        rd.timer = null;
         return rd;
     }
 
@@ -375,6 +377,10 @@ pub const Round = struct {
         if (!rd.pf_out) return;
         try e.s.wait(rd.pf_join.?);
         rd.pf_out = false;
+    }
+
+    fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
+        if (rd.timer) |t| try t.mark(e.s, p);
     }
 
     /// The main stream waits for the side work forked so far.
@@ -696,6 +702,55 @@ fn linearBytes(l: weights.Linear) [2]u64 {
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 
+/// A round's GPU time by phase (tf-dsv41-lanes --profile 2): a timing event on the main stream at each phase's end,
+/// the elapsed times read after the round. Eager rounds only (in a graph the events would be captured).
+pub const PhaseTimer = struct {
+    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head };
+    pub const phases = @typeInfo(Phase).@"enum".field_names;
+    const max_marks = 1024;
+    events: []cuda.Event,
+    phase: [max_marks]Phase = undefined,
+    n: usize = 0,
+    ms: [phases.len]f64 = @splat(0),
+    rounds: u64 = 0,
+    gpa: std.mem.Allocator,
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver) !PhaseTimer {
+        const ev = try gpa.alloc(cuda.Event, max_marks);
+        var made: usize = 0;
+        errdefer {
+            for (ev[0..made]) |*x| x.deinit();
+            gpa.free(ev);
+        }
+        for (ev) |*x| {
+            x.* = try cuda.Event.init(d, true);
+            made += 1;
+        }
+        return .{ .events = ev, .gpa = gpa };
+    }
+
+    pub fn deinit(t: *PhaseTimer) void {
+        for (t.events) |*x| x.deinit();
+        t.gpa.free(t.events);
+    }
+
+    fn mark(t: *PhaseTimer, s: cuda.Stream, p: Phase) !void {
+        if (t.n == max_marks) return;
+        try t.events[t.n].record(s);
+        t.phase[t.n] = p;
+        t.n += 1;
+    }
+
+    /// The round's marks read: each phase's time is from the mark before it to its own.
+    pub fn finish(t: *PhaseTimer) !void {
+        if (t.n == 0) return;
+        try t.events[t.n - 1].synchronize();
+        for (1..t.n) |i| t.ms[@backingInt(t.phase[i])] += try cuda.Event.elapsedMs(t.events[i - 1], t.events[i]);
+        t.n = 0;
+        t.rounds += 1;
+    }
+};
+
 /// What a stretch of a round leaves the next on the host: the stream buffers' roles, the taps written, the latest kv
 /// source and selection, the indexer's pool flags and k. Every round starts from the same roles (the buffers' contents
 /// never carry over), so a stretch's launches and what it leaves depend on its rows and bucket alone.
@@ -812,7 +867,11 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
     const t = e.t;
     const R = rd.r;
     const d = c.hidden;
-    if (li == 0) try tri_basic.embedInit(t, w.embed, rd.ids, cy.h, cy.pre, R, d, c.hc);
+    if (li == 0) {
+        try rd.mark(e, .start);
+        try tri_basic.embedInit(t, w.embed, rd.ids, cy.h, cy.pre, R, d, c.hc);
+        try rd.mark(e, .embed);
+    }
     var sh = cy.sh;
     var h = cy.h;
     var spare = cy.spare;
@@ -836,9 +895,11 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
             try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * en * 4, rd.ekv, R * en);
             try tri_basic.engramGate(t, h, rd.ekv, lay.engram_qk, spare, c.eps, R, d);
             std.mem.swap(u64, &h, &spare);
+            try rd.mark(e, .engram);
         }
         // the attention mixes, the pending post fused in (pre_mix)
         h = try mix(e, rd, h, &spare, &pending, lay.hc_attn, pre, lay.attn_norm, rd.pre_a, R);
+        try rd.mark(e, .mix_attn);
         if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(l)) != null) {
             // one launch a tap, straight into its block of the taps buffer
             try tri_basic.tap(t, h, rd.taps + ntap * d * 2, c.dspark_taps.slice().len * d, R, d);
@@ -846,15 +907,20 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
         }
         try Probe.check(probe, .attn_in, l, rd.x);
         try attention(e, rd, ch, cs, rings, &sh, l);
+        try rd.mark(e, .attn);
         try Probe.check(probe, .attn_out, l, rd.pa);
         if (e.two) |tw| try tw.quarters(e, rd.pa, rd.ga, R, tw.ow, 4) else try e.gatherF32(rd.pa, rd.ga, R * d);
+        try rd.mark(e, .gather_a);
         try Probe.check(probe, .attn_gather, l, rd.ga);
         pending = rd.ga;
         h = try mix(e, rd, h, &spare, &pending, lay.hc_ffn, rd.pre_a, lay.ffn_norm, pre_f, R);
+        try rd.mark(e, .mix_ffn);
         try Probe.check(probe, .moe_in, l, rd.x);
         try moe(e, rd, ch, l);
+        try rd.mark(e, .moe);
         try Probe.check(probe, .moe_out, l, rd.pm);
         if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);
+        try rd.mark(e, .gather_m);
         try Probe.check(probe, .moe_gather, l, rd.gm);
         pending = rd.gm;
         std.mem.swap(u64, &pre, &pre_f);
@@ -862,6 +928,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
     try rd.joinSide(e); // (a stretch ends joined: the post reads the side work's post and comb)
     try rd.joinPrefetch(e);
     if (pending) |gp| try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
+    try rd.mark(e, .post);
     cy.* = .{ .h = h, .spare = spare, .pre = pre, .pre_f = pre_f, .ntap = ntap, .sh = sh, .kk = rd.kk, .has_cand = rd.has_cand, .has_cblk = rd.has_cblk };
     if (end < w.layers.len) return;
     // the head on every row: the logits, the ranks' columns in rank order (g.permute(1, 0, 2))
@@ -873,6 +940,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
     if (e.two) |tw| try tw.quarters(e, rd.hl, rd.hg, R, tw.hw, 4) else try e.gatherF32(rd.hl, rd.hg, R * hn);
     try Probe.check(probe, .head_gather, w.layers.len, rd.hg);
     for (0..e.world) |k| try e.ops.copyRows(e.s, rd.hg + k * R * hh * 4, hh * 4, rd.logits + k * hh * 4, e.world * hh * 4, hh * 4, R);
+    try rd.mark(e, .head);
     try Probe.check(probe, .logits, w.layers.len, rd.logits);
     if (ntap > 0) try Probe.check(probe, .taps, w.layers.len, rd.taps);
 }
