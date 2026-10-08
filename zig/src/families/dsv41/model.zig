@@ -429,7 +429,8 @@ pub const Model = struct {
             for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j), dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, ch.n);
             try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
         }
-        try m.stream.synchronize();
+        // no synchronize: the next chunk's host steps (its first Engram layer's hashing, table reads and decode, ~0.14 s
+        // at 2,048 rows) run while this chunk's kernels do; readers of the results (the prompt's logits) synchronize
         return true;
     }
 

@@ -546,6 +546,12 @@ pub fn survivals(conf: []const f32, out: []f64) void {
     }
 }
 
+/// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
+/// request ends with the error), so the follower reports it and takes the next frame instead of ending.
+fn refused(err: anyerror) void {
+    std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
+}
+
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
@@ -578,14 +584,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const base = try r.int(u64);
                 if (slot >= max_streams) return error.BadSlot;
                 try r.ids(gpa, &seqs[slot]);
-                try m.fillBegin(slot, @intCast(base));
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
             },
             .fill_chunk => {
                 const start: usize = @intCast(try r.int(u64));
                 const n: usize = try r.int(u32);
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
-                _ = try m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay);
+                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
             },
             .verify => {
                 const nw = try r.int(u32);
@@ -601,7 +607,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
-                try m.verify(rows, built.absorb[0..nw]);
+                m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
             },
             .pass => {
                 const n = try r.int(u32);
@@ -615,7 +621,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     q0[i] = try r.int(i64);
                     slots[i] = try r.int(i64);
                 }
-                try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
             },
             .done => return,
         }
