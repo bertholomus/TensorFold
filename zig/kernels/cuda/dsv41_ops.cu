@@ -19,6 +19,21 @@ extern "C" __global__ void tf_ds_add2_bf16_kernel(const float* g0, const float* 
          i += uint64_t(gridDim.x) * blockDim.x) output[i] = __float2bfloat16_rn(__fadd_rn(g0[i], g1[i]));
 }
 
+// A profile's GPU clock (ns, %globaltimer) when the stream reaches it, appended with its tag: buf[0] the count (reset
+// first when `reset`), then (clock, tag) pairs, at most `cap` (round phase timing; in a graph like any kernel).
+extern "C" __global__ void tf_ds_clock_kernel(uint64_t* buf, uint32_t tag, uint32_t reset, uint32_t cap) {
+    if (threadIdx.x == 0) {
+        uint64_t t;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+        const uint64_t i = reset ? 0 : buf[0];
+        if (i < cap) {
+            buf[1 + 2 * i] = t;
+            buf[2 + 2 * i] = tag;
+            buf[0] = i + 1;
+        }
+    }
+}
+
 // torch's keys.topk(k, sorted=False).values for the indexer's int64 keys, a row a block (1024 threads): the k largest
 // values are one multiset whatever the order (the keys are unique: score bits above, inverted index below), and
 // _topk_finish sorts their indices. A radix select finds the k-th largest key (eight 8-bit digits from the top, signed

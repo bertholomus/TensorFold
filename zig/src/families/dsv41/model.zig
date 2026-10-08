@@ -125,6 +125,11 @@ pub const Model = struct {
     timer: ?*round.PhaseTimer = null, // a profile's GPU time by phase (eager rounds)
     ptimer: ?*round.PhaseTimer = null, // the same for prompt chunks (fills), a chunk a 'round'
     t_enqueue: u64 = 0, // the host's time to issue the forward (the GPU idle before it)
+    // Model.useClock: the rounds' GPU clock gaps summed (ns; gap i = clock i + 1 - clock i: the forward's start to
+    // the first stretch, then each stretch, then the wait before the next), and the rounds counted
+    clk_ph: [256]u64 = @splat(0), // by the phase of the clock that ends it
+    clk_cnt: [256]u64 = @splat(0),
+    clk_rounds: u64 = 0,
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
     // world 4: the 2D split's exchanges (prompt2d.zig, TP4's), with the RDMA rings when asked
@@ -551,6 +556,18 @@ pub const Model = struct {
             try m.stream.synchronize();
             m.t_forward = m.now() - t0;
             if (m.timer) |t| try t.finish();
+            if (m.rd.clk != 0) {
+                var h: [1 + 2 * round.Round.max_clocks]u64 = undefined;
+                const d = m.ctx.d;
+                try d.check(d.api.cuMemcpyDtoH_v2(&h, m.rd.clk, h.len * 8), "cuMemcpyDtoH");
+                const n = @min(h[0], round.Round.max_clocks);
+                for (1..n) |i| {
+                    const tag = h[2 + 2 * i] & 0xff;
+                    m.clk_ph[tag] += h[1 + 2 * i] -% h[1 + 2 * (i - 1)];
+                    m.clk_cnt[tag] += 1;
+                }
+                m.clk_rounds += 1;
+            }
         }
         const t1 = m.now();
         if (m.dr) |*dr| {
@@ -566,6 +583,13 @@ pub const Model = struct {
         }
         try m.stream.synchronize();
         if (m.prof) m.t_absorb = m.now() - t1;
+    }
+
+    /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
+    pub fn useClock(m: *Model, marks: u8) !void {
+        m.rd.clk_marks = marks == 1;
+        m.rd.clk_layers = marks == 2;
+        if (m.rd.clk == 0) m.rd.clk = try m.arena.take((1 + 2 * round.Round.max_clocks) * 8);
     }
 
     /// The rounds' GPU time by phase (eager rounds; --profile 2): a timer on the round.

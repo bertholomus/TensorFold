@@ -187,6 +187,13 @@ pub const Round = struct {
     pf_join: ?cuda.Event = null,
     pf_out: bool = false,
     timer: ?*PhaseTimer = null, // eager rounds' GPU time by phase (a profile)
+    // a profile's GPU clocks a round (Model.useClock): at the forward's start, then before and after each stretch
+    // a profile's kernel launches by the phase they end in (eager rounds: in a graph only its capture launches)
+    launches: [32]u64 = @splat(0),
+    launch_mark: u64 = 0,
+    clk_layers: bool = false, // a clock at each layer's end alone (tag 64 + the layer), TF_DS_CLOCK_MARKS=2
+    clk_marks: bool = false, // clocks at every phase mark too (Model.useClock(true)), not only around the stretches
+    clk: u64 = 0, // [1 + 2 * max_clocks] u64: the count, then each clock and its phase (PhaseTimer.Phase or clock_*)
 
     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
         const c = e.c;
@@ -387,7 +394,24 @@ pub const Round = struct {
         rd.pf_out = false;
     }
 
+    pub const max_clocks = 512;
+    pub const clock_start = 250; // the forward's start
+    pub const clock_wait = 251; // before a stretch: the GPU waiting on the host since the last clock
+    pub const clock_tail = 252; // after a stretch: its work past its last phase
+
+    /// A clock kernel on the main stream (captured into a graph like any kernel, its slot fixed by the round's order).
+    fn clock(rd: *Round, e: *const Engine, ph: u8) !void {
+        if (rd.clk == 0) return;
+        try e.ops.gpuClock(e.s, rd.clk, ph, ph == clock_start, max_clocks);
+    }
+
     fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
+        if (rd.clk != 0 and rd.clk_marks) {
+            const now = cuda.launch.count;
+            rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
+            rd.launch_mark = now;
+            try rd.clock(e, @intFromEnum(p));
+        }
         if (rd.timer) |t| try t.mark(e.s, p);
     }
 
@@ -512,6 +536,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         const ldxs = [_]usize{ c.hidden, c.hidden, c.hidden, c.hidden };
         try prompt.grouped(e, ch, R, ls[0..n], xs[0..n], ldxs[0..n], outs[0..n], lds[0..n], dts[0..n]);
     }
+    try rd.mark(e, .a_in);
     // the indexer's top-k takes every entry it scans (short contexts): its selection needs no scores
     const has_idx = ratio != 0 and lay.idx_wq_b != null;
     const nb: usize = if (ratio != 0) rd.bucket / ratio else 0;
@@ -543,6 +568,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         r[4] = linearBytes(lay.wo_b);
         try rd.prefetch(e, &r, prefetch_budget);
     }
+    try rd.mark(e, .a_q);
     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
     var comp: tri_attn.Comp = .none;
     var cbase: ?u64 = null;
@@ -644,6 +670,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         }
         comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
     }
+    try rd.mark(e, .a_idx);
     // rot_attn: the merge applies the inverse RoPE and writes wo_a's rotated input rows; wo_ab with its fold
     const gk = lay.wo_a[0].k;
     try tri_attn.sparseAttn(t, .{
@@ -669,6 +696,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         .rot = .{ .cos = rope.cos, .sin = rope.sin, .rd = rd_dim, .suh = rd.wo_suh[li], .xh = rd.xhwo, .gh = gk / hd },
         .parts = .{ .pm = rd.pm_, .pl = rd.pl_, .po = rd.po_ },
     });
+    try rd.mark(e, .a_core);
     var calls: [exl3_linear.gmax]exl3_linear.Call = undefined;
     const uw = lay.groups * lay.wo_a[0].n;
     var col: usize = 0;
@@ -680,7 +708,9 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         off += R * wo.k;
     }
     try prompt.groupedRotated(e, ch, R, calls[0..lay.groups]);
+    try rd.mark(e, .a_woa);
     if (e.two) |tw| try round2d.woExchange(tw, e, rd.xb, R); // 2D: the column partner's half of wo_b's input rows
+    try rd.mark(e, .a_x);
     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
     try prompt.groupedRotated(e, ch, R, &cb_call);
     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
@@ -696,8 +726,9 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const sl = e.slots();
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
-    if (e.two) |tw| return round2d.experts(tw, e, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit); // 2D: around the intermediate's exchange
-    try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
+    if (e.two) |tw| {
+        try round2d.experts(tw, e, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit); // 2D: around the intermediate's exchange
+    } else try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
     // the prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
     // 4 MiB of its wkv), after the last layer the head
     if (li + 1 < e.w.layers.len) {
@@ -727,7 +758,7 @@ fn hcFnBytes(c: anytype) u64 {
 /// A round's GPU time by phase (tf-dsv41-lanes --profile 2): a timing event on the main stream at each phase's end,
 /// the elapsed times read after the round. Eager rounds only (in a graph the events would be captured).
 pub const PhaseTimer = struct {
-    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head };
+    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head, a_in, a_q, a_idx, a_core, a_woa, a_x };
     pub const phases = @typeInfo(Phase).@"enum".field_names;
     const max_marks = 1024;
     events: []cuda.Event,
@@ -871,6 +902,8 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on), its rows read on the host before it
     var li: usize = 0;
     var sn: u32 = 0;
+    try rd.clock(e, Round.clock_start);
+    rd.launch_mark = cuda.launch.count;
     while (li < w.layers.len) : (sn += 1) {
         var end = li + 1;
         while (end < w.layers.len and w.layers[end].engram_wkv == null) end += 1;
@@ -879,9 +912,11 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
             ahead = true;
             try engramLand(e, rd, eh orelse return error.NoEngramTables, &ah, li);
         }
+        try rd.clock(e, Round.clock_wait);
         if (graphs) |g| {
             try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn }, e, rd, ch, cs, rings, &cy, li, end);
         } else try stretch(e, rd, ch, cs, rings, &cy, li, end, probe);
+        try rd.clock(e, Round.clock_tail);
         if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
         ahead = true;
         li = end;
@@ -954,6 +989,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
         try Probe.check(probe, .moe_out, l, rd.pm);
         if (e.two) |tw| try tw.quarters(e, rd.pm, rd.gm, R, tw.dw, 4) else try e.gatherF32(rd.pm, rd.gm, R * d);
         try rd.mark(e, .gather_m);
+        if (rd.clk_layers) try rd.clock(e, @intCast(64 + l));
         try Probe.check(probe, .moe_gather, l, rd.gm);
         pending = rd.gm;
         std.mem.swap(u64, &pre, &pre_f);
