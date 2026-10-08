@@ -1005,6 +1005,7 @@ pub const EngramHost = struct {
     s: []u8, // their E8M0 scales
     rows: []u16, // bf16 [cap, (hi - lo) * head_dim]
     aio: ?*engram_aio.Aio = null, // a round's reads by Linux AIO on the tables' O_DIRECT descriptors (else the pool)
+    paio: ?*engram_aio.Aio = null, // a prompt chunk's reads the same way, on a ring of its own (else the pool)
     // the rounds' Engram host time (ns, summed; a profile reads it): hashing, the table reads, the decode, the upload
     io: ?std.Io = null,
     t_hash: u64 = 0,
@@ -1057,7 +1058,7 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
         for (0..k) |j| eh.flat[r * k + j] = eh.hashes[(r * eh.hasher.layers + l) * cols + eh.lo + j];
     }
     const m = n * k;
-    try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
+    if (eh.paio) |aio| try aioGather(aio, t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]) else try eh.pool.gather(t, eh.flat[0..m], eh.w[0 .. m * t.row_w], eh.s[0 .. m * t.row_s]);
     for (0..m) |i| engram.decodeRow(eh.w[i * t.row_w ..][0..t.row_w], eh.s[i * t.row_s ..][0..t.row_s], eh.rows[i * t.row_w ..][0..t.row_w]);
     if (m * t.row_w != n * ew.k) return error.EngramShape;
     try upload(e, ch.eb, eh.rows.ptr, m * t.row_w * 2);
@@ -1069,6 +1070,31 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
     try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
     swapStreams(ch, ch.h_alt);
+}
+
+/// A chunk's rows `ids` of table `t` by AIO (the pool's bytes, at ~0.07 s for 24,576 rows where the pool's preads take
+/// ~0.5 s on one GB10 node): batches of a quarter of the ring's slots (two reads a row), all submitted (a submit reaps while the
+/// ring is full), then waited for in order.
+fn aioGather(aio: *engram_aio.Aio, t: engram_io.Table, ids: []const i64, out_w: []u8, out_s: []u8) !void {
+    const per = @max(aio.slots / 4, 1);
+    var batch: [64]u64 = undefined;
+    var nb: usize = 0;
+    var at: usize = 0;
+    errdefer for (batch[0..nb]) |id| aio.wait(id) catch {};
+    while (at < ids.len) : (at += per) {
+        const n = @min(per, ids.len - at);
+        if (nb == batch.len) return error.TooManyRows;
+        batch[nb] = try aio.start(t, ids[at..][0..n], out_w[at * t.row_w ..][0 .. n * t.row_w], out_s[at * t.row_s ..][0 .. n * t.row_s]);
+        nb += 1;
+    }
+    for (batch[0..nb], 0..) |id, i| {
+        aio.wait(id) catch |err| {
+            for (batch[i + 1 .. nb]) |rest| aio.wait(rest) catch {};
+            nb = 0;
+            return err;
+        };
+    }
+    nb = 0;
 }
 
 /// The decoder's bounded replay at its first layer (_forward_k's `replay`, CED's prefill): the layer's attention mixes

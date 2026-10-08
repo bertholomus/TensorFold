@@ -105,6 +105,7 @@ pub const Model = struct {
     tables: ?engram_io.Tables = null,
     epool: ?*engram_io.Pool = null,
     aio: ?*engram_aio.Aio = null,
+    paio: ?*engram_aio.Aio = null, // the prompt chunks' Engram reads, on a ring of their own
     eh: ?prompt.EngramHost = null,
     host_pos: []i64,
     ids64: []i64,
@@ -158,6 +159,7 @@ pub const Model = struct {
         m.tables = null;
         m.epool = null;
         m.aio = null;
+        m.paio = null;
         m.eh = null;
         m.rdma_mod = null;
         m.ring = null;
@@ -302,6 +304,9 @@ pub const Model = struct {
                 // a round's reads, 2 x 12 x its rows at most: 1,024 slots for each 16 rows of the round-row setting
                 m.aio = try engram_aio.Aio.init(gpa, io, 1024 * ((o.round_rows + 15) / 16));
                 m.eh.?.aio = m.aio;
+                // a prompt chunk's reads (2 x 12 x 2,048 at most): a ring of 4,096 slots (32 MiB), 1,024 rows a batch
+                m.paio = try engram_aio.Aio.init(gpa, io, 4096);
+                m.eh.?.paio = m.paio;
             }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
 
@@ -327,6 +332,7 @@ pub const Model = struct {
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
         if (m.aio) |x| x.deinit();
+        if (m.paio) |x| x.deinit();
         if (m.epool) |p| p.deinit(m.gpa);
         if (m.tables) |*t| t.close();
         if (m.rdma_rings) |*r| r.close(m.gpa);
