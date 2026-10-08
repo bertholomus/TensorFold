@@ -124,6 +124,28 @@ pub fn main(init: std.process.Init) !u8 {
     try w.flush();
 
     if (o.rank != 0) {
+        if (profile) {
+            m.prof = true;
+            if (m.eh) |*eh| eh.io = io;
+            if (phases) try m.usePhaseTimer();
+        }
+        defer if (profile) {
+            const fp = dsv41.lanes.follow_prof;
+            const r: f64 = @floatFromInt(@max(fp.rounds, 1));
+            w.print("{{\"rank\": {d}, \"follow_profile\": {{\"rounds\": {d}, \"enqueue_ms\": {d:.2}, \"forward_ms\": {d:.2}", .{ o.rank, fp.rounds, @as(f64, @floatFromInt(fp.enqueue)) / r / 1e6, @as(f64, @floatFromInt(fp.forward)) / r / 1e6 }) catch {};
+            if (m.eh) |eh| if (eh.p_calls > 0) {
+                const pc: f64 = @floatFromInt(eh.p_calls);
+                w.print(", \"prefill_engram_ms\": {{\"calls\": {d}, \"rows\": {d:.2}, \"upload\": {d:.2}, \"mm\": {d:.2}, \"exchange\": {d:.2}, \"gate\": {d:.2}}}", .{ eh.p_calls, @as(f64, @floatFromInt(eh.p_rows)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_upload)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_mm)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_x)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_gate)) / pc / 1e6 }) catch {};
+            };
+            if (m.eh) |eh| w.print(", \"engram_read_ms\": {d:.3}, \"engram_hash_ms\": {d:.3}", .{ @as(f64, @floatFromInt(eh.t_read)) / r / 1e6, @as(f64, @floatFromInt(eh.t_hash)) / r / 1e6 }) catch {};
+            w.print("}}}}\n", .{}) catch {};
+            if (m.ptimer) |tm| {
+                w.print("{{\"rank\": {d}, \"prefill_phases_ms\": {{", .{o.rank}) catch {};
+                for (dsv41.round.PhaseTimer.phases, 0..) |name, i| w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, if (tm.rounds == 0) 0 else tm.ms[i] / @as(f64, @floatFromInt(tm.rounds)) }) catch {};
+                w.print("}}, \"chunks\": {d}}}\n", .{tm.rounds}) catch {};
+            }
+            w.flush() catch {};
+        };
         dsv41.lanes.follow(gpa, m) catch |err| {
             try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });
             try w.flush();
@@ -220,6 +242,10 @@ pub fn main(init: std.process.Init) !u8 {
         }.f;
         try w.print("{{\"rank\": 0, \"profile\": {{\"rounds\": {d}, \"rows_a_round\": {d:.2}, \"step_ms\": {d:.2}, \"send_ms\": {d:.3}, \"enqueue_ms\": {d:.2}, \"forward_ms\": {d:.2}, \"absorb_ms\": {d:.2}, \"logits_ms\": {d:.2}, \"sample_ms\": {d:.2}, \"passes\": {d}, \"streams_a_pass\": {d:.2}, \"pass_ms\": {d:.2}, \"prefills\": {d}, \"prefill_ms\": {d:.1}}}}}\n", .{ p.rounds, ms(p.rows * 1000000, p.rounds), ms(step_ns, core.steps), ms(p.send, p.rounds), ms(p.enqueue, p.rounds), ms(p.forward, p.rounds), ms(p.absorb, p.rounds), ms(p.logits, p.rounds), ms(p.sample, p.rounds), p.passes, ms(p.pass_streams * 1000000, p.passes), ms(p.pass, p.passes), p.prefills, ms(p.prefill, p.prefills) });
         try w.flush();
+        if (m.eh) |eh| if (eh.p_calls > 0) {
+            const pc: f64 = @floatFromInt(eh.p_calls);
+            try w.print("{{\"rank\": 0, \"prefill_engram_ms\": {{\"calls\": {d}, \"rows\": {d:.2}, \"upload\": {d:.2}, \"mm\": {d:.2}, \"exchange\": {d:.2}, \"gate\": {d:.2}}}}}\n", .{ eh.p_calls, @as(f64, @floatFromInt(eh.p_rows)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_upload)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_mm)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_x)) / pc / 1e6, @as(f64, @floatFromInt(eh.p_gate)) / pc / 1e6 });
+        };
         if (m.ptimer) |tm| {
             try w.print("{{\"rank\": 0, \"prefill_phases_ms\": {{", .{});
             for (dsv41.round.PhaseTimer.phases, 0..) |name, i| try w.print("{s}\"{s}\": {d:.3}", .{ if (i == 0) "" else ", ", name, if (tm.rounds == 0) 0 else tm.ms[i] / @as(f64, @floatFromInt(tm.rounds)) });

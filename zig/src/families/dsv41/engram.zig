@@ -127,12 +127,45 @@ pub const Hasher = struct {
 /// One row's FP8 E4M3 values times their E8M0 scale (one a 32) rounded to bf16, as Engram._decode does on the GPU:
 /// the value exactly in fp32, times 2^(scale - 127), then round to nearest even.
 pub fn decodeRow(w: []const u8, s: []const u8, out: []u16) void {
-    for (w, 0..) |b, i| {
-        const v = e4m3(b);
-        const e: i32 = @as(i32, s[i / 32]) - 127;
-        out[i] = bf16(v * pow2(e));
+    // the same products: each byte's value from a table of e4m3, each 32's scale once
+    var i: usize = 0;
+    while (i < w.len) : (i += 32) {
+        const p = pow2(@as(i32, s[i / 32]) - 127);
+        const end = @min(w.len, i + 32);
+        for (w[i..end], out[i..end]) |b, *o| o.* = bf16(e4m3_table[b] * p);
     }
 }
+
+/// e4m3 of every byte.
+const e4m3_table: [256]f32 = blk: {
+    @setEvalBranchQuota(20000);
+    var t: [256]f32 = undefined;
+    for (&t, 0..) |*x, b| x.* = e4m3(@intCast(b));
+    break :blk t;
+};
+
+/// decodeRow over m rows (row_w values and row_s scales each, rows back to back), on `threads` threads when the rows
+/// are many (a prompt chunk's: 2,048 rows x 12 columns), else on this one.
+pub fn decodeRows(w: []const u8, s: []const u8, out: []u16, m: usize, row_w: usize, row_s: usize, threads: usize) void {
+    const Part = struct {
+        fn run(pw: []const u8, ps: []const u8, po: []u16, lo: usize, hi: usize, rw: usize, rs: usize) void {
+            for (lo..hi) |i| decodeRow(pw[i * rw ..][0..rw], ps[i * rs ..][0..rs], po[i * rw ..][0..rw]);
+        }
+    };
+    const n = if (m * row_w < 1 << 20) 1 else @min(threads, max_decode_threads);
+    if (n <= 1) return Part.run(w, s, out, 0, m, row_w, row_s);
+    var th: [max_decode_threads]?std.Thread = @splat(null);
+    const per = (m + n - 1) / n;
+    for (1..n) |k| {
+        const lo = @min(m, k * per);
+        const hi = @min(m, lo + per);
+        th[k] = std.Thread.spawn(.{}, Part.run, .{ w, s, out, lo, hi, row_w, row_s }) catch null;
+        if (th[k] == null) Part.run(w, s, out, lo, hi, row_w, row_s);
+    }
+    Part.run(w, s, out, 0, @min(m, per), row_w, row_s);
+    for (th[1..n]) |t| if (t) |x| x.join();
+}
+const max_decode_threads = 16;
 
 /// 2^e as fp32 (subnormal below 2^-126, infinity from 2^128).
 fn pow2(e: i32) f32 {
@@ -161,6 +194,31 @@ pub fn bf16(x: f32) u16 {
     if (std.math.isNan(x)) return 0x7fc0;
     const round = 0x7fff + ((u >> 16) & 1);
     return @intCast((u +% round) >> 16);
+}
+
+test "the table decode is the per-value decode for every byte and scale" {
+    var w: [64]u8 = undefined;
+    var out: [64]u16 = undefined;
+    for (0..4) |q| {
+        for (&w, 0..) |*b, i| b.* = @intCast((q * 64 + i) & 0xff);
+        for ([_]u8{ 0, 1, 100, 127, 130, 200, 254, 255 }) |sc| {
+            const s = [_]u8{ sc, sc +% 3 };
+            decodeRow(&w, &s, &out);
+            for (w, out, 0..) |b, o, i| {
+                const e: i32 = @as(i32, s[i / 32]) - 127;
+                try std.testing.expectEqual(bf16(e4m3(b) * pow2(e)), o);
+            }
+        }
+    }
+    var big_w: [40 * 512]u8 = undefined;
+    var big_s: [40 * 16]u8 = undefined;
+    var a: [40 * 512]u16 = undefined;
+    var b2: [40 * 512]u16 = undefined;
+    for (&big_w, 0..) |*x, i| x.* = @intCast((i * 37) & 0xff);
+    for (&big_s, 0..) |*x, i| x.* = @intCast(100 + (i % 50));
+    for (0..40) |r| decodeRow(big_w[r * 512 ..][0..512], big_s[r * 16 ..][0..16], a[r * 512 ..][0..512]);
+    decodeRows(&big_w, &big_s, &b2, 40, 512, 16, 4);
+    try std.testing.expectEqualSlices(u16, &a, &b2);
 }
 
 test "primes are drawn upward from the vocabulary size and never repeat" {
