@@ -91,6 +91,7 @@ pub const Model = struct {
     view: prompt.Caches = undefined,
     // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
     prof: bool = false,
+    t_enqueue: u64 = 0, // the host's time to issue the forward (the GPU idle before it)
     t_forward: u64 = 0,
     t_absorb: u64 = 0,
 
@@ -112,6 +113,7 @@ pub const Model = struct {
         m.pool_cap = o.pool;
         m.fill_slot = 0;
         m.prof = false;
+        m.t_enqueue = 0;
         m.t_forward = 0;
         m.t_absorb = 0;
         m.dpool = null;
@@ -327,9 +329,11 @@ pub const Model = struct {
     /// overwrites them). absorb[i]: window i's stream drafts.
     pub fn verify(m: *Model, rows: round.Rows, absorb: []const bool) !void {
         const e = &m.eng;
+        if (m.prof) try m.stream.synchronize(); // (the GPU idle, so the issue time shows whether the host keeps it fed)
         const t0 = m.now();
         try round.forward(e, &m.rd, &m.ch, &m.caches, m.rings, if (m.eh) |*x| x else null, &.{}, rows, m.pool_cap, null);
         if (m.prof) {
+            m.t_enqueue = m.now() - t0;
             try m.stream.synchronize();
             m.t_forward = m.now() - t0;
         }
