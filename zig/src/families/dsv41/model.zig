@@ -427,9 +427,13 @@ pub const Model = struct {
         for (0..c.layers) |li| {
             if (li == c.layers / 2) {
                 if (!try prompt.replayCut(e, ch, &m.view, &shared, li, replay, m.host_pos)) {
-                    try m.stream.synchronize();
-                    if (pt) |t| try t.finish();
-                    return false; // encoder-only
+                    // encoder-only: no synchronize either (as at the chunk's end below), so the next chunk's host steps
+                    // run while this one's last layers do; the profile alone waits
+                    if (pt) |t| {
+                        try m.stream.synchronize();
+                        try t.finish();
+                    }
+                    return false;
                 }
                 floor = replay;
                 kv_done = li;
