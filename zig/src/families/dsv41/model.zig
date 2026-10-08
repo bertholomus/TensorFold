@@ -48,6 +48,8 @@ pub const Options = struct {
     drafts: bool = true, // load the DSpark drafter
     rdma_devices: ?[]const u8 = null, // the decode gathers over the RDMA ring on these devices (comma separated), else NCCL
     graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
+    side: bool = false, // the mixes' side work on a stream of its own (round.Round.useSide)
+    prefetch: bool = false, // the paced L2 prefetch (round.Round.usePrefetch)
     arena_bytes: usize = 5 << 30,
 };
 
@@ -218,6 +220,8 @@ pub const Model = struct {
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
+        if (o.side) try m.rd.useSide(&m.eng);
+        if (o.prefetch) try m.rd.usePrefetch(&m.eng);
         if (o.drafts) {
             m.dpool = try draft.Pool.init(&m.eng, &m.arena, max_streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
@@ -251,6 +255,8 @@ pub const Model = struct {
     pub fn close(m: *Model) void {
         m.stream.synchronize() catch {};
         if (m.graphs) |*g| g.deinit();
+        m.rd.dropSide(&m.eng);
+        m.rd.dropPrefetch();
         if (m.epool) |p| p.deinit(m.gpa);
         if (m.tables) |*t| t.close();
         m.blas.close();

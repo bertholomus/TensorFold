@@ -178,6 +178,25 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_topk_indices_kernel(con
     for (int i = threadIdx.x; i < k; i += blockDim.x) o[i] = cols[i] < v ? cols[i] : -1;
 }
 
+// The next kernels' weights touched into L2 ahead of them (the served build's paced l2_prefetch, as its trace shows it:
+// a block of 128 threads on a stream of its own, up to 16 ranges a launch): every 128-byte line of each range, the
+// ranges in order. It writes nothing.
+struct TfDsPrefetch {
+    const char* ptr[16];
+    unsigned long long bytes[16];
+    int n;
+};
+extern "C" __global__ void tf_ds_l2_prefetch_kernel(TfDsPrefetch a) {
+    const unsigned long long step = (unsigned long long)blockDim.x * gridDim.x * 128ull;
+    for (int t = 0; t < a.n; ++t) {
+        const char* p = a.ptr[t];
+        const unsigned long long n = a.bytes[t];
+        for (unsigned long long off = ((unsigned long long)blockIdx.x * blockDim.x + threadIdx.x) * 128ull; off < n; off += step) {
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
+        }
+    }
+}
+
 // The indexer's selection when its top-k takes every key it scans (nb <= index_topk): kernels.topk_indices of all nb
 // keys is 0 .. nb - 1 whatever the scores, then the visible mask: out[r, j] = j if j < vis[r] else -1. vis [rows] int64,
 // out [rows, nb] int64; grid (blocks, rows).

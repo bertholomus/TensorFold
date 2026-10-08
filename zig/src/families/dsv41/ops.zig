@@ -12,6 +12,9 @@ fn blocks(count: usize, threads: usize) u32 {
     return @intCast(@min((count + threads - 1) / threads, 65535));
 }
 
+/// tf_ds_l2_prefetch_kernel's argument: up to 16 device ranges (their first byte and length).
+pub const Prefetch = extern struct { ptr: [16]u64 = @splat(0), bytes: [16]u64 = @splat(0), n: c_int = 0 };
+
 pub const Ops = struct {
     pointwise: cuda.Module,
     movement: cuda.Module,
@@ -24,6 +27,7 @@ pub const Ops = struct {
     scatter: cuda.Function,
     cand_fast: cuda.Function,
     iota_vis: cuda.Function,
+    l2_prefetch: cuda.Function,
     block_max: cuda.Function,
     pool_pick: cuda.Function,
     apply_pool: cuda.Function,
@@ -51,6 +55,7 @@ pub const Ops = struct {
             .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
             .cand_fast = try fm.function("tf_ds_cand_fast_kernel"),
             .iota_vis = try fm.function("tf_ds_iota_vis_kernel"),
+            .l2_prefetch = try fm.function("tf_ds_l2_prefetch_kernel"),
             .block_max = try fm.function("tf_ds_block_max_kernel"),
             .pool_pick = try fm.function("tf_ds_pool_pick_kernel"),
             .apply_pool = try fm.function("tf_ds_apply_pool_kernel"),
@@ -160,6 +165,14 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(c_longlong, @intCast(os)));
         try cuda.launch.launch(o.cand_fast, .{ .grid = .{ .x = blocks(nb, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// Every 128-byte line of `pf`'s ranges touched into L2 (one block of 128 threads); writes nothing.
+    pub fn l2Prefetch(o: *const Ops, s: cuda.Stream, pf: Prefetch) !void {
+        if (pf.n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(pf);
+        try cuda.launch.launch(o.l2_prefetch, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, s, &a);
     }
 
     /// The indexer's selection of every scanned key (its top-k takes all nb): out [rows, nb] int64 = j where j <
