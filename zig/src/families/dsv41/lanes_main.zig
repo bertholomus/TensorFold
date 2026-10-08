@@ -13,7 +13,7 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
 
-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN]\n";
+const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K]\n";
 
 const Request = struct {
     name: []const u8 = "",
@@ -59,6 +59,7 @@ pub fn main(init: std.process.Init) !u8 {
     var profile = false;
     var phases = false; // --profile 2: also the rounds' GPU time by phase (eager rounds)
     var serial = false; // --serial 1: every stream without drafts (one row a round)
+    var fix_k: ?usize = null; // --fix-k K: every drafted stream verifies K drafts a round (a cost measurement)
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -83,6 +84,8 @@ pub fn main(init: std.process.Init) !u8 {
             o.graphs = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--serial")) {
             serial = !std.mem.eql(u8, val, "0");
+        } else if (std.mem.eql(u8, key, "--fix-k")) {
+            fix_k = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--rdma")) {
             o.rdma_devices = val;
         } else if (std.mem.eql(u8, key, "--profile")) {
@@ -130,6 +133,7 @@ pub fn main(init: std.process.Init) !u8 {
     const reqs = (try std.json.parseFromSliceLeaky(Requests, a, text, .{ .ignore_unknown_fields = true })).requests;
     var ln = dsv41.lanes.Lanes.init(gpa, m);
     defer ln.deinit();
+    ln.fix_k = fix_k;
     if (profile) {
         ln.prof = .{};
         m.prof = true;

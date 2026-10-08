@@ -7,7 +7,8 @@
 //! absorbed into their drafter rings at once (the served eager absorb: the rows past the kept ones sit where the
 //! drafter never reads, and the next window writes over them); draft is one batched drafter pass (draft.zig) for
 //! every stream asked, the drafts held for the next round with their confidences, whose sigmoids are each draft's
-//! chance of landing (probabilities: the round loop's allocation trims the windows by them). The caches are
+//! chance of landing once the earlier ones did (probabilities: their running products, the chance that a draft and
+//! every earlier one land; the round loop's allocation trims the windows by them). The caches are
 //! positional, so keep only checks that a path is a prefix. Rank 0 runs the core; before each primitive it sends rank
 //! 1 the primitive's inputs over the ranks' link, and rank 1 (follow) runs the same primitive: both ranks issue the
 //! same kernels and collectives in the same order. The drafted reply is the serial one: every row is drawn with its
@@ -192,6 +193,7 @@ pub const Lanes = struct {
     seqs: [max_streams]std.ArrayList(i32) = @splat(.empty),
     built: Built = .{},
     prof: ?Profile = null,
+    fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
 
@@ -505,13 +507,18 @@ pub const Lanes = struct {
         }
     }
 
-    /// The confidence head's chance that each held draft lands (sigmoid of its confidence: multi.py's conf rule
-    /// counts them as the expected kept drafts).
+    /// The chance that each held draft lands with every earlier one, as the round loop's allocation reads it: the
+    /// running product of the confidences' sigmoids (multi.py's conf rule: a sigmoid is the draft's survival once
+    /// the earlier drafts survived, and the prefix survivals' sum is the expected kept drafts; draft.chooseK).
     fn probabilitiesFn(ptr: *anyopaque, s: *lanes.Stream, out: []f64) anyerror!bool {
         const self = of(ptr);
         const l = self.streams.getPtr(s) orelse return false;
         if (out.len > l.nheld) return false;
-        for (out, l.confs[0..out.len]) |*o, cf| o.* = 1.0 / (1.0 + exp(-@as(f64, cf)));
+        if (self.fix_k) |k| {
+            for (out, 0..) |*o, j| o.* = if (j < k) 1.0 else 0.0;
+            return true;
+        }
+        survivals(l.confs[0..out.len], out);
         return true;
     }
 
@@ -521,6 +528,15 @@ pub const Lanes = struct {
         self.used[kv.value.slot] = false;
     }
 };
+
+/// Prefix survivals: out[j] = the product of sigmoid(conf[i]) for i <= j, in float64 (libm's exp, as chooseK).
+pub fn survivals(conf: []const f32, out: []f64) void {
+    var surv: f64 = 1.0;
+    for (out, conf[0..out.len]) |*o, cf| {
+        surv *= 1.0 / (1.0 + exp(-@as(f64, cf)));
+        o.* = surv;
+    }
+}
 
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
@@ -594,6 +610,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             .done => return,
         }
     }
+}
+
+test "draft chances are the prefix survivals chooseK sums" {
+    var out: [3]f64 = undefined;
+    survivals(&.{ 0.0, 0.0, 2.0 }, &out);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), out[0], 1e-12);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), out[1], 1e-12);
+    try std.testing.expectApproxEqAbs(0.25 / (1.0 + @exp(@as(f64, -2.0))), out[2], 1e-12);
 }
 
 test "extents take the first chunk-aligned gap" {
