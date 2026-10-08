@@ -355,14 +355,19 @@ pub const Round = struct {
     }
 
     /// These ranges touched into L2 behind the work queued so far, on the prefetch stream.
-    fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64) !void {
+    /// One paced L2 prefetch launch on its stream: `ranges` in order, the last one cut where the launch reaches `budget`
+    /// bytes (the served launches move at most 16 MiB, 8 MiB behind wo_b).
+    fn prefetch(rd: *Round, e: *const Engine, ranges: []const [2]u64, budget: u64) !void {
         const s = rd.pf orelse return;
         var a: ops_mod.Prefetch = .{};
+        var left = budget;
         for (ranges) |r| {
-            if (r[1] == 0 or a.n == 16) continue;
+            if (r[1] == 0 or a.n == 16 or left == 0) continue;
+            const take = @min(r[1], left);
             a.ptr[@intCast(a.n)] = r[0];
-            a.bytes[@intCast(a.n)] = r[1];
+            a.bytes[@intCast(a.n)] = take;
             a.n += 1;
+            left -= take;
         }
         if (a.n == 0) return;
         try rd.pf_fork.?.record(e.s);
@@ -533,7 +538,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         var r: [5][2]u64 = @splat(.{ 0, 0 });
         for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
         r[4] = linearBytes(lay.wo_b);
-        try rd.prefetch(e, &r);
+        try rd.prefetch(e, &r, prefetch_budget);
     }
     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
     var comp: tri_attn.Comp = .none;
@@ -675,8 +680,8 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     if (e.two) |tw| try round2d.woExchange(tw, e, rd.xb, R); // 2D: the column partner's half of wo_b's input rows
     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
     try prompt.groupedRotated(e, ch, R, &cb_call);
-    // the prefetch: the router behind wo_b
-    try rd.prefetch(e, &.{.{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }});
+    // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
+    try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate }, prefetch_budget / 2);
 }
 
 /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
@@ -690,16 +695,30 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
     if (e.two) |tw| return round2d.experts(tw, e, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit); // 2D: around the intermediate's exchange
     try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
-    // the prefetch: the next layer's input linears behind the experts
+    // the prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
+    // 4 MiB of its wkv), after the last layer the head
     if (li + 1 < e.w.layers.len) {
         const nx = e.w.layers[li + 1];
-        try rd.prefetch(e, &.{ linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 } });
-    }
+        if (nx.engram_wkv) |ew| {
+            try rd.prefetch(e, &.{linearBytes(ew)}, prefetch_budget / 4);
+        } else {
+            try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, prefetch_budget);
+        }
+    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, prefetch_budget);
 }
 
 /// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
 fn linearBytes(l: weights.Linear) [2]u64 {
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
+}
+
+/// A paced prefetch launch's most bytes (the served launch trace: 16 MiB; 8 MiB behind wo_b, 4 MiB before an Engram
+/// layer).
+const prefetch_budget: u64 = 16 << 20;
+
+/// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
+fn hcFnBytes(c: anytype) u64 {
+    return 24 * @as(u64, c.hc) * c.hidden * 4;
 }
 
 /// A round's GPU time by phase (tf-dsv41-lanes --profile 2): a timing event on the main stream at each phase's end,
@@ -838,19 +857,26 @@ pub fn forward(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches
     rd.kk = 0;
     try setGlue(e, rd, rows);
     var cy: Carry = .{ .h = rd.h, .spare = rd.h_alt, .pre = rd.pre, .pre_f = rd.pre_f };
-    // the round's Engram reads, every layer's at once (AIO) ahead of the stretches
+    // the round's Engram reads, every layer's at once (AIO): hashed and submitted once the first stretch is issued
+    // (its GPU time covers the reads), landed on the host before each Engram layer's stretch
     var ah: Ahead = .{};
-    if (e.c.engram_layers.slice().len > 0) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
+    var ahead = e.c.engram_layers.slice().len == 0;
     // the stretches: cut before each Engram layer (TF_DS_ENGRAM_SPLIT on), its rows read on the host before it
     var li: usize = 0;
     var sn: u32 = 0;
     while (li < w.layers.len) : (sn += 1) {
         var end = li + 1;
         while (end < w.layers.len and w.layers[end].engram_wkv == null) end += 1;
-        if (w.layers[li].engram_wkv != null) try engramLand(e, rd, eh orelse return error.NoEngramTables, &ah, li);
+        if (w.layers[li].engram_wkv != null) {
+            if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
+            ahead = true;
+            try engramLand(e, rd, eh orelse return error.NoEngramTables, &ah, li);
+        }
         if (graphs) |g| {
             try g.run(.{ .rows = @intCast(R), .bucket = rd.bucket, .stretch = sn }, e, rd, ch, cs, rings, &cy, li, end);
         } else try stretch(e, rd, ch, cs, rings, &cy, li, end, probe);
+        if (!ahead) try engramAhead(e, eh orelse return error.NoEngramTables, seq, rows, &ah);
+        ahead = true;
         li = end;
     }
     if (graphs != null) {
