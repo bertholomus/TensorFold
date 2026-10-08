@@ -108,6 +108,49 @@ const MarkovGather = struct {
     }
 };
 
+/// The drafter pass's CUDA graphs (BatchDraftGraph), one a (streams, steps): every pointer it reads is a fixed
+/// buffer and every per-pass value (ids, positions, slots, the pick lists) is uploaded ahead of the replay.
+pub const PassGraphs = struct {
+    gpa: std.mem.Allocator,
+    map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
+
+    pub const Key = struct { streams: u32, steps: u32 };
+
+    pub fn init(gpa: std.mem.Allocator) PassGraphs {
+        return .{ .gpa = gpa };
+    }
+
+    pub fn deinit(g: *PassGraphs) void {
+        var it = g.map.valueIterator();
+        while (it.next()) |x| x.deinit();
+        g.map.deinit(g.gpa);
+        g.* = undefined;
+    }
+
+    pub fn count(g: *const PassGraphs) usize {
+        return g.map.count();
+    }
+
+    fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize) !void {
+        const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
+        if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
+        try cuda.graph.beginCapture(e.s, .thread_local);
+        dr.body(e, ch, pool, N, steps, null) catch |err| {
+            if (cuda.graph.endCapture(e.s)) |got| {
+                var x = got;
+                x.deinit();
+            } else |_| {}
+            return err;
+        };
+        var graph = try cuda.graph.endCapture(e.s);
+        defer graph.deinit();
+        var exec = try graph.instantiate();
+        errdefer exec.deinit();
+        try g.map.put(g.gpa, key, exec);
+        try exec.launchOn(e.s);
+    }
+};
+
 pub const Drafter = struct {
     ds: weights.DSpark,
     n: usize, // a stream's block rows: [token, noise x (n - 1)]
@@ -180,6 +223,8 @@ pub const Drafter = struct {
     ao: u64,
     apos: u64,
     arows: u64,
+    // the pass's graphs (BatchDraftGraph: one a streams and steps; null: eager)
+    graphs: ?*PassGraphs = null,
     // the last pass on the host: each stream's drafts and confidences (`steps` of them)
     streams: usize = 0,
     steps: usize = 0,
@@ -207,6 +252,7 @@ pub const Drafter = struct {
         dr.taps_w = c.dspark_taps.slice().len * d;
         dr.streams = 0;
         dr.steps = 0;
+        dr.graphs = null;
         dr.rows = try a.take(6 * R * 8);
         dr.bidx = try a.take(R * pick_pad * 8);
         dr.wlo = try a.take(8);
@@ -378,14 +424,11 @@ pub const Drafter = struct {
     /// BatchDraftGraph.run for N streams (tokens at positions q0 in slots): each stream's `steps` drafts and their
     /// confidences into drafts / confs. Each slot's rings hold its positions before q0 (absorbed).
     pub fn pass(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, tokens: []const i64, q0: []const i64, slots: []const i64, steps: usize, probe: ?Probe) !void {
-        const c = e.c;
-        const t = e.t;
         const N = tokens.len;
         const n = dr.n;
         const R = N * n;
         if (N == 0 or N > max_streams or R > max_rows or q0.len != N or slots.len != N) return error.NotPortedYet;
         if (steps == 0 or steps > n) return error.BadDraftPass;
-        const d = c.hidden;
         // _body's index rows: ids [token, noise ...], positions q0 + j, window positions q0 - 1, ring bases
         var hv: [6 * max_rows]i64 = @splat(0);
         var hb: [max_rows * pick_pad]i64 = @splat(-1);
@@ -405,6 +448,33 @@ pub const Drafter = struct {
         }
         try prompt.upload(e, dr.rows, &hv, hv.len * 8);
         try prompt.upload(e, dr.bidx, &hb, R * bw * 8);
+        // the Markov loop's out [N, steps + 1]: each stream's last token first
+        const ts = steps + 1;
+        var ho: [max_streams * (max_block + 1)]i64 = @splat(0);
+        for (0..N) |i| ho[i * ts] = tokens[i];
+        try prompt.upload(e, dr.out, &ho, N * ts * 8);
+        if (dr.graphs != null and probe == null) try dr.graphs.?.run(dr, e, ch, pool, N, steps) else try dr.body(e, ch, pool, N, steps, probe);
+        // one host read: the drafts and the confidences
+        try e.s.synchronize();
+        var hc: [max_streams * max_block]f32 = undefined;
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&ho, dr.out, N * ts * 8), "cuMemcpyDtoH");
+        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hc, dr.conf, N * steps * 4), "cuMemcpyDtoH");
+        for (0..N) |i| for (0..steps) |j| {
+            dr.drafts[i][j] = ho[i * ts + 1 + j];
+            dr.confs[i][j] = hc[i * steps + j];
+        };
+        dr.streams = N;
+        dr.steps = steps;
+    }
+
+    /// The pass's device work for N streams of `steps` drafts, from the rows' embeddings to the confidence head (its
+    /// inputs uploaded: the index rows, the pick lists, the Markov loop's first column): what a pass graph captures.
+    fn body(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize, probe: ?Probe) !void {
+        const c = e.c;
+        const t = e.t;
+        const n = dr.n;
+        const R = N * n;
+        const d = c.hidden;
         // the streams: every row's token embedding in each stream, pre (1, 0, 0, 0)
         try tri_basic.embedInit(t, e.w.embed, dr.row(0), dr.h, dr.pre, R, d, c.hc);
         // _stages_fused
@@ -442,9 +512,6 @@ pub const Drafter = struct {
         try Probe.check(probe, .local, S, dr.local);
         // the Markov loop: out [N, steps + 1], each stream's last token first
         const ts = steps + 1;
-        var ho: [max_streams * (max_block + 1)]i64 = @splat(0);
-        for (0..N) |i| ho[i * ts] = tokens[i];
-        try prompt.upload(e, dr.out, &ho, N * ts * 8);
         var g: MarkovGather = .{ .e = e, .dst = dr.mg };
         try dr.mk.steps(t, dr.local, dr.out, ts, N, n, steps, dr.msc, .{ .ctx = &g, .run = MarkovGather.run });
         try Probe.check(probe, .markov, S, dr.out);
@@ -460,17 +527,6 @@ pub const Drafter = struct {
         try e.ops.copyRows(e.s, dr.xcf, d * 4, dr.conf_in, w * 4, d * 4, N * steps);
         try e.ops.copyRows(e.s, dr.ef, rank * 4, dr.conf_in + d * 4, w * 4, rank * 4, N * steps);
         try e.blas.xv(dr.conf_in, dr.confw, dr.conf, N * steps, w);
-        // one host read: the drafts and the confidences
-        try e.s.synchronize();
-        var hc: [max_streams * max_block]f32 = undefined;
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&ho, dr.out, N * ts * 8), "cuMemcpyDtoH");
-        try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hc, dr.conf, N * steps * 4), "cuMemcpyDtoH");
-        for (0..N) |i| for (0..steps) |j| {
-            dr.drafts[i][j] = ho[i * ts + 1 + j];
-            dr.confs[i][j] = hc[i * steps + j];
-        };
-        dr.streams = N;
-        dr.steps = steps;
     }
 
     /// pre_mix of _stages_fused: hc_pre2 of the streams h with the pending gathered partials posted in (into the spare

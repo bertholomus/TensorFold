@@ -34,6 +34,8 @@ pub const Ops = struct {
     to_bf16: cuda.Function,
     strided: cuda.Function,
     gather: cuda.Function,
+    copy16: cuda.Function,
+    argmax_rows: cuda.Function,
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -62,6 +64,8 @@ pub const Ops = struct {
             .to_bf16 = try pw.function("tf_f32_to_bf16_kernel"),
             .strided = try mv.function("tf_strided_copy_kernel"),
             .gather = try mv.function("tf_gather_rows_kernel"),
+            .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
+            .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
         };
     }
 
@@ -249,6 +253,16 @@ pub const Ops = struct {
     pub fn copyRows(o: *const Ops, s: cuda.Stream, src: u64, src_ld: usize, dst: u64, dst_ld: usize, bytes: usize, rows: usize) !void {
         if (rows == 0) return;
         if (src_ld < bytes or dst_ld < bytes) return error.Overlap;
+        if ((src | dst | src_ld | dst_ld | bytes) % 16 == 0 and rows <= 65535) {
+            // 16-byte words, a word a thread (the same bytes)
+            var w: cuda.Args = .{};
+            w.add(src);
+            w.add(@as(u64, src_ld / 16));
+            w.add(dst);
+            w.add(@as(u64, dst_ld / 16));
+            w.add(@as(u64, bytes / 16));
+            return cuda.launch.launch(o.copy16, .{ .grid = .{ .x = blocks(bytes / 16, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &w);
+        }
         var a: cuda.Args = .{};
         a.add(src);
         a.add(dst);
@@ -256,6 +270,18 @@ pub const Ops = struct {
         // a row a block
         for ([_]u64{ rows, 1, bytes, src_ld, bytes, dst_ld, bytes }) |v| a.add(v);
         try go(o.strided, s, rows, 256, &a);
+    }
+
+    /// Each row's greedy token (sampling.argmax's: the first largest, a NaN never larger, 0 when the first value is
+    /// NaN): out [rows] u32 of logits [rows, n] fp32 (row stride ld floats).
+    pub fn argmaxRows(o: *const Ops, s: cuda.Stream, logits: u64, ld: usize, n: usize, rows: usize, out: u64) !void {
+        if (rows == 0 or n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(u64, ld));
+        a.add(@as(c_int, @intCast(n)));
+        a.add(out);
+        try go(o.argmax_rows, s, rows, 1024, &a);
     }
 
     /// dst row i = src row idx[i] (int64 indices, rows of `bytes` bytes); an index outside [0, src_rows) sets the

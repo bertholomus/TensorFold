@@ -417,7 +417,15 @@ pub const Lanes = struct {
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
         const t2 = m.now();
-        const logits = try m.roundLogits(rows.ids.len);
+        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
+        var greedy = true;
+        for (windows) |w| {
+            if (w.stream.sampling) |sm| if (sm.temperature > 0) {
+                greedy = false;
+            };
+        }
+        const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
+        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
@@ -432,7 +440,7 @@ pub const Lanes = struct {
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
-            for (0..w.rows()) |r| o.sampled[r] = try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
