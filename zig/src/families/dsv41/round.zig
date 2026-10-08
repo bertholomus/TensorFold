@@ -468,16 +468,10 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         const src = sh.kv_layer orelse return error.NoKvSource;
         const vis = rd.g(if (ratio == 1) .vis1 else .vis2);
         if (idx_all) {
-            // topk_indices of every scanned key is 0 .. nb - 1 whatever the scores, then the visible mask
-            var top: [max_rows * 512]i64 = undefined;
+            // topk_indices of every scanned key is 0 .. nb - 1 whatever the scores, then the visible mask (on the
+            // device: no host round trip in the round)
             if (nb > 512) return error.NotPortedYet;
-            var hv: [max_rows]i64 = undefined;
-            try e.d.check(e.d.api.cuStreamSynchronize(e.s.handle), "cuStreamSynchronize");
-            try e.d.check(e.d.api.cuMemcpyDtoH_v2(&hv, vis, R * 8), "cuMemcpyDtoH");
-            for (0..R) |r| for (0..nb) |j| {
-                top[r * nb + j] = if (@as(i64, @intCast(j)) < hv[r]) @intCast(j) else -1;
-            };
-            try prompt.upload(e, rd.cidx, &top, R * nb * 8);
+            try e.ops.iotaVis(e.s, vis, rd.cidx, nb, R);
             rd.kk = nb;
         } else if (lay.idx_wq_b != null) {
             const ih = c.index_heads;

@@ -23,6 +23,7 @@ pub const Ops = struct {
     topk_indices: cuda.Function,
     scatter: cuda.Function,
     cand_fast: cuda.Function,
+    iota_vis: cuda.Function,
     block_max: cuda.Function,
     pool_pick: cuda.Function,
     apply_pool: cuda.Function,
@@ -49,6 +50,7 @@ pub const Ops = struct {
             .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
             .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
             .cand_fast = try fm.function("tf_ds_cand_fast_kernel"),
+            .iota_vis = try fm.function("tf_ds_iota_vis_kernel"),
             .block_max = try fm.function("tf_ds_block_max_kernel"),
             .pool_pick = try fm.function("tf_ds_pool_pick_kernel"),
             .apply_pool = try fm.function("tf_ds_apply_pool_kernel"),
@@ -158,6 +160,17 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(c_longlong, @intCast(os)));
         try cuda.launch.launch(o.cand_fast, .{ .grid = .{ .x = blocks(nb, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+    }
+
+    /// The indexer's selection of every scanned key (its top-k takes all nb): out [rows, nb] int64 = j where j <
+    /// vis[r], else -1 (vis [rows] int64), on the device.
+    pub fn iotaVis(o: *const Ops, s: cuda.Stream, vis: u64, out: u64, nb: usize, rows: usize) !void {
+        if (rows == 0 or nb == 0) return;
+        var a: cuda.Args = .{};
+        a.add(vis);
+        a.add(out);
+        a.add(@as(c_int, @intCast(nb)));
+        try cuda.launch.launch(o.iota_vis, .{ .grid = .{ .x = blocks(nb, 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
     }
 
     /// The candidate pool's block maxima (model.py _candidates, rounds.py _candidate_blocks): out [rows, nb] fp32 (row
