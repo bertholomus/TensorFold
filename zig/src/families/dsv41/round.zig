@@ -208,6 +208,12 @@ pub const Round = struct {
         const nb_max = bucketFor(pool_cap, pool_cap);
         var rd: Round = undefined;
         rd.r = 0;
+        // the profile's clocks off until Model.useClock (rd starts undefined: a field default does not apply)
+        rd.launches = @splat(0);
+        rd.launch_mark = 0;
+        rd.clk_layers = false;
+        rd.clk_marks = false;
+        rd.clk = 0;
         rd.bucket = 0;
         rd.has_cand = false;
         rd.kk = 0;
