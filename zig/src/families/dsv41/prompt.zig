@@ -149,8 +149,22 @@ pub const Engine = struct {
 };
 
 /// A prompt chunk's buffers for up to `cap` rows (model.py _forward_k's and its steps' torch.empty's).
+/// An image span of the prompt: positions [at, at + len), its rows from row `row` of the image rows buffer.
+pub const Span = struct { at: usize, len: usize, row: usize };
+
+/// The rows [r0, r1) of the chunk (relative to its start) a span covers, if any.
+fn overlap(sp: Span, start: usize, n: usize) ?[2]usize {
+    const lo = @max(sp.at, start);
+    const hi = @min(sp.at + sp.len, start + n);
+    return if (lo < hi) .{ lo - start, hi - start } else null;
+}
+
 pub const Chunk = struct {
     cap: usize,
+    spans: []const Span = &.{}, // the prompt's image spans (absolute positions)
+    img_rows: u64 = 0, // bf16 [span tokens, D]: their rows
+    pick_vl: u64 = 0, // int32 [cap, slots]: the routing of span rows with the image bias, before it joins pick
+    wts_vl: u64 = 0, // fp32 [cap, slots]
     n: usize = 0,
     start: usize = 0,
     ids: u64, // int64 [cap]
@@ -260,6 +274,8 @@ pub const Chunk = struct {
         const ex = l0.experts;
         const sl = e.slots();
         var ch: Chunk = undefined;
+        ch.spans = &.{};
+        ch.img_rows = 0;
         ch.cap = cap;
         ch.n = 0;
         ch.start = 0;
@@ -298,6 +314,8 @@ pub const Chunk = struct {
         ch.logits = try a.take(cap * c.experts * 4);
         ch.pick = try a.take(cap * sl * 4);
         ch.wts = try a.take(cap * sl * 4);
+        ch.pick_vl = try a.take(cap * sl * 4);
+        ch.wts_vl = try a.take(cap * sl * 4);
         ch.pm = try a.take(cap * d * 4);
         ch.gm = try a.take(e.world * cap * d * 4);
         // compressed layers: the smallest ratio sets the most compressed entries a row can see
@@ -643,6 +661,18 @@ pub fn begin(e: *const Engine, ch: *Chunk, ids: []const i64, start: usize, host_
     try tri_basic.embedInit(e.t, e.w.embed, ch.ids, ch.h, ch.pre, n, e.c.hidden, e.c.hc);
 }
 
+/// merge_image_embeddings on the chunk: each span row's embedding (in every one of the hc streams) replaced by its
+/// image row (the delimiters' learned rows and the aligner's), before the first layer.
+pub fn embedSpans(e: *const Engine, ch: *Chunk) !void {
+    const c = e.c;
+    const row = c.hidden * 2;
+    for (ch.spans) |sp| {
+        const o = overlap(sp, ch.start, ch.n) orelse continue;
+        const src = ch.img_rows + (sp.row + (ch.start + o[0] - sp.at)) * row;
+        for (0..c.hc) |s| try e.ops.copyRows(e.s, src, row, ch.h + (o[0] * c.hc + s) * row, c.hc * row, row, o[1] - o[0]);
+    }
+}
+
 /// The streams' second buffer becomes the streams (hc_pre_pf wrote the posted ones there) and the old one the spare.
 fn swapStreams(ch: *Chunk, src: u64) void {
     std.debug.assert(src == ch.h_alt);
@@ -981,9 +1011,10 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     const d = c.hidden;
     const sl = e.slots();
     const shared_id = lay.experts.count - 1;
+    var kc: usize = 0;
     if (n <= tri.decode_rows) {
         // a decode-sized chunk: the row-invariant gate (rowmm_gate's chunk sums) and its routing
-        const kc = try tri_norm.rowmmGate(e.t, ch.x, d, lay.gate_w, ch.gl, n, d, c.experts);
+        kc = try tri_norm.rowmmGate(e.t, ch.x, d, lay.gate_w, ch.gl, n, d, c.experts);
         try tri_norm.route(e.t, ch.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
     } else {
         try e.ops.toF32(e.s, ch.x, ch.xf, n * d);
@@ -991,10 +1022,32 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
         try e.blas.xwT(ch.xf, ch.gate_f, ch.logits, n, d, c.experts);
         try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
     }
+    try routeSpans(e, ch, lay, shared_id, sl, kc);
     if (e.two) |t| return t.experts(e, ch, lay); // 2D: gate / up here, the intermediate's exchange, down here
     // routed(): a chunk of fewer than EXACT_ROWS rows takes the decode window's fused path and scratch
     if (n < exl3_experts.exact_rows) return exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
     try exl3_experts.prompt(e.ex, e.s, lay.experts, ch.xs, ch.x, d, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
+}
+
+/// The VL routing (Gate.forward's bias = where(image_mask, bias_vl, bias)) as the served build runs it (recording v0's
+/// launches): every row routed with the text bias, then each span's rows of the gate's output (the logits, or a
+/// decode-sized chunk's chunk sums [n, kc, NE]) routed again with the image bias in a launch of their own, their picks and
+/// weights put over the text ones. Row by row the routing is independent, so the text rows keep theirs.
+fn routeSpans(e: *const Engine, ch: *Chunk, lay: weights.Layer, shared_id: usize, sl: usize, kc: usize) !void {
+    if (ch.spans.len == 0) return;
+    if (lay.gate_b_vl == 0) return error.NoImageRoutingBias;
+    const c = e.c;
+    const n = ch.n;
+    const src = if (n <= tri.decode_rows) ch.gl else ch.logits;
+    const row = @max(kc, 1) * c.experts * 4;
+    for (ch.spans) |sp| {
+        const o = overlap(sp, ch.start, n) orelse continue;
+        const rows = o[1] - o[0];
+        try tri_norm.route(e.t, src + o[0] * row, kc, lay.gate_b_vl, c.top_k, c.routed_scaling, shared_id, ch.pick_vl, ch.wts_vl, rows, c.experts, sl);
+        const dd = e.d;
+        try dd.check(dd.api.cuMemcpyDtoDAsync_v2(ch.pick + o[0] * sl * 4, ch.pick_vl, rows * sl * 4, e.s.handle), "cuMemcpyDtoDAsync");
+        try dd.check(dd.api.cuMemcpyDtoDAsync_v2(ch.wts + o[0] * sl * 4, ch.wts_vl, rows * sl * 4, e.s.handle), "cuMemcpyDtoDAsync");
+    }
 }
 
 /// Engram on the host: the hasher (the compressed token map, the multipliers), this rank's hash columns [lo, hi) of
@@ -1164,6 +1217,12 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     }
     try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
     swapStreams(ch, ch.h_alt);
+    // image spans take no Engram contribution: their rows keep the streams they came with (engram_mask)
+    const rowb = c.hc * c.hidden * 2;
+    for (ch.spans) |sp| {
+        const o = overlap(sp, ch.start, n) orelse continue;
+        try e.ops.copyRows(e.s, ch.h_alt + o[0] * rowb, rowb, ch.h + o[0] * rowb, rowb, rowb, o[1] - o[0]);
+    }
     if (prof) {
         eh.p_gate += lap(e, eh, &tq);
         eh.p_calls += 1;

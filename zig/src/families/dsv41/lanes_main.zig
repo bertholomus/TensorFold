@@ -24,7 +24,11 @@ const Request = struct {
     top_k: u32 = 20,
     top_p: f64 = 0.95,
     expect_sha: ?[]const u8 = null,
+    images: []const ImageRows = &.{}, // a vision request: its spans' rows ready (zrec_v3req.py from a recording)
 };
+
+/// An image span of a request's prompt and its rows: bf16 [tokens, hidden] from row `row` of `rows_file`.
+const ImageRows = struct { at: u32, tokens: u32, rows_file: []const u8, row: u32 = 0 };
 
 const Job = struct {
     req: *const Request,
@@ -106,6 +110,10 @@ pub fn main(init: std.process.Init) !u8 {
             o.token_map = val;
         } else if (std.mem.eql(u8, key, "--rdma-kernels")) {
             o.rdma_kernels = val;
+        } else if (std.mem.eql(u8, key, "--vision-bias")) {
+            o.vision_bias = val;
+        } else if (std.mem.eql(u8, key, "--logits-sha")) {
+            dsv41.lanes.logits_sha = !std.mem.eql(u8, val, "0");
         } else return error.BadArgument;
     }
     const par = parallel orelse o.streams;
@@ -199,6 +207,7 @@ pub fn main(init: std.process.Init) !u8 {
             j.stream = try lanes.Stream.init(gpa, .{
                 .id = r.name,
                 .prompt = r.prompt,
+                .images = try imageRows(a, io, r.images, m.cfg.hidden),
                 .max_new = r.max_tokens,
                 .eos = &eos,
                 .sampling = if (r.temperature > 0) .{ .seed = r.seed orelse 0, .temperature = r.temperature, .top_k = r.top_k, .top_p = r.top_p } else null,
@@ -276,6 +285,18 @@ pub fn main(init: std.process.Init) !u8 {
 
 fn seconds(t: std.Io.Timestamp, io: std.Io) f64 {
     return @as(f64, @floatFromInt(t.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds)) / 1e9;
+}
+
+/// A request's image spans with their rows read (the files kept for the run).
+fn imageRows(a: std.mem.Allocator, io: std.Io, imgs: []const ImageRows, hidden: usize) ![]const lanes.stream.Image {
+    const out = try a.alloc(lanes.stream.Image, imgs.len);
+    for (imgs, out) |img, *o| {
+        const bytes = try std.Io.Dir.cwd().readFileAlloc(io, img.rows_file, a, .limited(1 << 32));
+        const row = hidden * 2;
+        if ((@as(usize, img.row) + img.tokens) * row > bytes.len) return error.ShortImageRows;
+        o.* = .{ .at = img.at, .tokens = img.tokens, .bytes = bytes[img.row * row ..][0 .. img.tokens * row], .rows = true };
+    }
+    return out;
 }
 
 /// The served server's token_sha: sha256 of the reply's ids joined by commas, its first 12 hex digits.

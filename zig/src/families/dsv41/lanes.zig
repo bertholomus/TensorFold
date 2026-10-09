@@ -30,8 +30,14 @@ const max_rows = round.max_rows;
 /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
 pub const window_rows = 6;
 
+/// The image rows a fill_images frame carries at most.
+pub const image_piece = 32 << 10;
+
+/// A gate's diagnostic (the tools' --logits-sha 1): each prompt's logits' sha256 on stderr.
+pub var logits_sha = false;
+
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, done = 9 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -71,6 +77,13 @@ pub const Reader = struct {
         const v = std.mem.readInt(T, r.b[r.at..][0..n], .little);
         r.at += n;
         return v;
+    }
+
+    /// The frame's bytes after those read.
+    pub fn rest(r: *Reader) []const u8 {
+        const b = r.b[r.at..];
+        r.at = r.b.len;
+        return b;
     }
 
     /// A list of ids written by Wire.ids, into `out` (replacing it).
@@ -357,7 +370,8 @@ pub const Lanes = struct {
         var moved = false;
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
-            if (self.usable(sn, len)) {
+            // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
+            if (s.images.len == 0 and self.usable(sn, len)) {
                 kept = sn;
                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
             } else s.reuse_failed = true;
@@ -378,6 +392,29 @@ pub const Lanes = struct {
         const seq = &self.seqs[slot];
         try seq.resize(gpa, len);
         for (seq.items, ids) |*q, id| q.* = @intCast(id);
+        // images: each span's positions dead in the sequence (negative: no Engram n-gram reaches into or across one),
+        // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start
+        var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
+        defer spans.deinit(gpa);
+        var rows: std.ArrayList(u8) = .empty;
+        defer rows.deinit(gpa);
+        if (s.images.len > 0) {
+            const image_id = m.cfg.image_token orelse return error.NoVision;
+            const row_bytes = m.cfg.hidden * 2;
+            var at_row: usize = 0;
+            for (s.images) |img| {
+                if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
+                for (seq.items[img.at..][0..img.tokens]) |*q| {
+                    if (q.* != @as(i64, image_id)) return error.BadImageSpan;
+                    q.* = -1;
+                }
+                if (!img.rows) return error.NoVisionTower; // the server path (vit.zig on rank 0) comes with the tower
+                if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
+                try rows.appendSlice(gpa, img.bytes);
+                try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
+                at_row += img.tokens;
+            }
+        }
         if (try self.begin(.fill_begin)) {
             try self.wire.int(gpa, u32, @intCast(slot));
             try self.wire.int(gpa, u64, base);
@@ -385,6 +422,26 @@ pub const Lanes = struct {
             try self.flush();
         }
         try m.fillBegin(slot, base);
+        if (spans.items.len > 0) {
+            // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
+            // the ids of a full pool)
+            var off: usize = 0;
+            while (off < rows.items.len) {
+                const n = @min(image_piece, rows.items.len - off);
+                if (try self.begin(.fill_images)) {
+                    try self.wire.int(gpa, u32, @intCast(spans.items.len));
+                    for (spans.items) |sp| {
+                        try self.wire.int(gpa, u64, sp.at);
+                        try self.wire.int(gpa, u64, sp.len);
+                    }
+                    try self.wire.int(gpa, u64, off);
+                    try self.wire.buf.appendSlice(gpa, rows.items[off..][0..n]);
+                    try self.flush();
+                }
+                off += n;
+            }
+            try m.setImages(spans.items, rows.items);
+        }
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
@@ -421,10 +478,16 @@ pub const Lanes = struct {
             }
             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
             start += n;
-            if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+            if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
         }
         if (!head) return error.NoPromptLogits;
-        const token = try draw(try m.promptLogitsHost(), len, s.sampling);
+        const logits = try m.promptLogitsHost();
+        if (logits_sha) {
+            var dg: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
+            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
+        }
+        const token = try draw(logits, len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
     }
 
@@ -711,6 +774,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     var built: Built = .{};
     var step: u64 = 0;
     var slot: usize = 0;
+    var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
+    defer img_rows.deinit(gpa);
     var kept: std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer) = .empty; // rank 0's kept states, this rank's part
     defer {
         var ki = kept.valueIterator();
@@ -729,13 +794,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             5 => .snap_save,
             6 => .snap_restore,
             7 => .snap_drop,
+            8 => .fill_images,
             9 => .done,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore) {
+        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore and kind != .fill_images) {
             m.joinAhead();
             m.fill_seq = &.{};
         }
@@ -744,6 +810,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 slot = try r.int(u32);
                 const base = try r.int(u64);
                 if (slot >= max_streams) return error.BadSlot;
+                img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
@@ -789,6 +856,27 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     slots[i] = try r.int(i64);
                 }
                 m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
+            },
+            .fill_images => {
+                const count = try r.int(u32);
+                var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
+                defer spans.deinit(gpa);
+                var row: usize = 0;
+                for (0..count) |_| {
+                    const at: usize = @intCast(try r.int(u64));
+                    const n: usize = @intCast(try r.int(u64));
+                    try spans.append(gpa, .{ .at = at, .len = n, .row = row });
+                    row += n;
+                }
+                const off: usize = @intCast(try r.int(u64));
+                const piece = r.rest();
+                const total = row * m.cfg.hidden * 2;
+                if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
+                try img_rows.appendSlice(gpa, piece);
+                if (img_rows.items.len == total) {
+                    m.setImages(spans.items, img_rows.items) catch |err| refused(err);
+                    img_rows.clearRetainingCapacity();
+                }
             },
             .snap_save => {
                 const id = try r.int(u64);
