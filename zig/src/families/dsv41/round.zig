@@ -23,6 +23,7 @@ const tri_index = @import("tri_index.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const round2d = @import("round2d.zig");
+const exl3_experts2d = @import("exl3_experts2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
@@ -734,8 +735,14 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const sl = e.slots();
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
+    try rd.mark(e, .m_rt);
     if (e.two) |tw| {
-        try round2d.experts(tw, e, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit); // 2D: around the intermediate's exchange
+        // 2D (round2d.experts, the profile's marks between): gate / up, the intermediate's exchange, down
+        try exl3_experts2d.decodeGateUp(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
+        try rd.mark(e, .m_gu);
+        try tw.catRank(e, ch.xsd.xd, tw.xd_full, R * ch.xsd.slots, tw.gu, 2);
+        try rd.mark(e, .m_x);
+        try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, ch.xsd, tw.xd_full, rd.pick, rd.mw, rd.pm, R);
     } else try exl3_experts.decode(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
     // the prefetch behind the experts: the next layer's attention mix and input linears (an Engram layer: the first
     // 4 MiB of its wkv), after the last layer the head
@@ -766,7 +773,7 @@ fn hcFnBytes(c: anytype) u64 {
 /// A round's GPU time by phase (tf-dsv41-lanes --profile 2): a timing event on the main stream at each phase's end,
 /// the elapsed times read after the round. Eager rounds only (in a graph the events would be captured).
 pub const PhaseTimer = struct {
-    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head, a_in, a_q, a_idx, a_core, a_woa, a_x };
+    pub const Phase = enum(u8) { start, embed, engram, mix_attn, attn, gather_a, mix_ffn, moe, gather_m, post, head, a_in, a_q, a_idx, a_core, a_woa, a_x, m_rt, m_gu, m_x };
     pub const phases = @typeInfo(Phase).@"enum".field_names;
     const max_marks = 1024;
     events: []cuda.Event,
