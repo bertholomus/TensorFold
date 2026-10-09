@@ -41,6 +41,7 @@ pub const script =
 ;
 
 pub const Pil = struct {
+    gpa: Allocator,
     io: std.Io,
     child: std.process.Child,
     mutex: std.Io.Mutex = .init,
@@ -53,15 +54,20 @@ pub const Pil = struct {
     pub fn start(gpa: Allocator, io: std.Io) !*Pil {
         const p = try gpa.create(Pil);
         errdefer gpa.destroy(p);
-        p.* = .{ .io = io, .child = undefined, .reader = undefined };
-        p.child = try std.process.spawn(io, .{ .argv = &.{ "python3", "-I", "-c", script }, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit });
-        errdefer p.child.kill(io);
-        p.reader = p.child.stdout.?.readerStreaming(io, &p.buf);
+        p.* = .{ .gpa = gpa, .io = io, .child = undefined, .reader = undefined };
+        try p.spawn();
+        return p;
+    }
+
+    /// The child, its reader, and Pillow's greeting.
+    fn spawn(p: *Pil) !void {
+        p.child = try std.process.spawn(p.io, .{ .argv = &.{ "python3", "-I", "-c", script }, .stdin = .pipe, .stdout = .pipe, .stderr = .inherit });
+        errdefer p.child.kill(p.io);
+        p.reader = p.child.stdout.?.readerStreaming(p.io, &p.buf);
         var hello: [16]u8 = undefined;
         p.reader.interface.readSliceAll(&hello) catch return error.NoPillow;
         if (!std.mem.eql(u8, hello[0..3], "PIL")) return error.NoPillow;
         @memcpy(&p.version, hello[3..16]);
-        return p;
     }
 
     pub fn stop(p: *Pil, gpa: Allocator) void {
@@ -77,10 +83,23 @@ pub const Pil = struct {
 
     pub const Decoded = union(enum) { rgb: picture.Rgb, refused: []const u8 };
 
-    /// The image's RGB as Pillow's open(...).convert("RGB") gives it, or the lane's refusal of it (`a` holds either).
+    /// The image's RGB as Pillow's open(...).convert("RGB") gives it, or the lane's refusal of it (`a` holds either); a
+    /// child that has died is started again once.
     pub fn decode(p: *Pil, a: Allocator, data: []const u8) !Decoded {
         p.mutex.lockUncancelable(p.io);
         defer p.mutex.unlock(p.io);
+        return p.exchange(a, data) catch |err| switch (err) {
+            error.OutOfMemory, error.BadPillowReply => err,
+            else => {
+                std.log.warn("Pillow's child failed ({s}): starting it again", .{@errorName(err)});
+                p.child.kill(p.io);
+                try p.spawn();
+                return p.exchange(a, data);
+            },
+        };
+    }
+
+    fn exchange(p: *Pil, a: Allocator, data: []const u8) !Decoded {
         var len: [8]u8 = undefined;
         std.mem.writeInt(u64, &len, data.len, .little);
         const in = p.child.stdin orelse return error.NoPillow;
