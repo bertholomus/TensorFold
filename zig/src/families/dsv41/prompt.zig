@@ -125,6 +125,7 @@ pub const Engine = struct {
     round_rows: usize = 16, // a concurrent round's rows at most (TF_DS_ROUND_ROWS; round.max_rows at most)
     two: ?*const prompt2d.Two = null, // a node of the four-node 2D split (prompt2d.zig); `world` stays TP2's
     ring: ?*rdma.Ring = null, // TP2: the decode-size all-gathers over the RDMA ring (the served lane's), else NCCL
+    par: ?*const exl3_experts2d.ParKernels = null, // the parity split's gate / up in one launch (null: the served two)
 
     /// A decode-size all-gather of `count` fp32 a rank into `dst`, rank after rank: the RDMA ring when the engine has
     /// one and the slice fits a slot (whole float4s), else NCCL. The same bytes either way.

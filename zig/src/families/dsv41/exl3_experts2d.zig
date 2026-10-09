@@ -312,6 +312,63 @@ pub fn decodeGateUpRest(k: *const X.Kernels, o: *const ops_mod.Ops, s: cuda.Stre
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(w.maxu), .y = @intCast(ir / 128), .z = @intCast(2 * w.sk * w.mt) }, .block = .{ .x = 4 * 32 } }, s, &gu);
 }
 
+/// The rest columns' tables of the one-launch parity gate / up (experts_par.cu RestTab).
+pub const RestTab = extern struct {
+    tp0: u64, // int64 [E]: gate's trellis of the rest columns, 0 for an expert another pair computes
+    tp1: u64,
+    k2_0: u64, // int32 [E]
+    k2_1: u64,
+    z: u64, // fp32 [2, splits, P, ir]
+    cnt: u64, // int32 [places x ir / 128], zeros
+    svh_g: u64, // fp16 [E, ir]
+    svh_u: u64,
+    suh_d: u64,
+    xd: u64, // fp16 [P, ir]: the pack's rest rows
+    n: c_int, // ir
+    pad: c_int = 0,
+};
+
+comptime {
+    // the layout experts_par.cu compiles (ten pointers, an int, C padding)
+    std.debug.assert(@sizeOf(RestTab) == 88 and @offsetOf(RestTab, "z") == 32 and @offsetOf(RestTab, "n") == 80);
+}
+
+/// Our image's one-launch parity gate / up (zig/kernels/cuda/dsv41/experts_par.cu): grouped_cp_kernel's gate / up
+/// programs (mul1, 8 tiles, 4 warps, 3 stages) by K2 range, as range() picks them.
+pub const ParKernels = struct {
+    module: cuda.Module,
+    gu: [3]cuda.Function,
+
+    pub fn load(d: *const cuda.Driver, image: []const u8) !ParKernels {
+        var m = try cuda.Module.load(d, image);
+        errdefer m.unload();
+        return .{ .module = m, .gu = .{ try m.function("tf_ds_par_gu_8_8"), try m.function("tf_ds_par_gu_2_10"), try m.function("tf_ds_par_gu_2_16") } };
+    }
+
+    pub fn unload(k: *ParKernels) void {
+        k.module.unload();
+        k.* = undefined;
+    }
+};
+
+/// A parity split's gate / up on a decode window in one launch: decode_prep, then one grid of the main launch's
+/// programs and, past its column blocks, the rest's (experts_par.cu): every place's rest block runs when this pair
+/// computes its expert's rest (on the main grouping's members), each program as the served main or rest launch runs
+/// it, so sc.xd holds decodeGateUp + decodeGateUpRest's bits without the rest's grouping, launch or stream.
+pub fn decodeGateUpOne(k: *const X.Kernels, pk: *const ParKernels, s: cuda.Stream, ex: weights.Experts, sc: X.DecodeScratch, rs: RestScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32) !void {
+    const rest = ex.rest orelse return error.NoRest;
+    const w = try Window.of(ex, sc, r);
+    const ir: usize = rest.width;
+    if (ir == 0 or ir % 128 != 0) return error.UnsupportedShape;
+    var ls = try gateUpLaunches(ex, sc, x, x_stride, pick, wts, out, r, limit);
+    try cuda.launch.launch(k.decode_prep, ls[0].cfg, s, &ls[0].args);
+    ls[1].args.add(RestTab{ .tp0 = rest.gate_ptr, .tp1 = rest.up_ptr, .k2_0 = rest.gate_k2, .k2_1 = rest.up_k2, .z = rs.z, .cnt = rs.cnt_gu, .svh_g = rest.svh_g, .svh_u = rest.svh_u, .suh_d = rest.suh_d, .xd = sc.xd + w.p * w.ig * 2, .n = @intCast(ir) });
+    var cfg = ls[1].cfg;
+    cfg.grid.y += @intCast(ir / 128);
+    const rg = X.range(@min(ex.k2_gu[0], rest.k2_gu[0]), @max(ex.k2_gu[1], rest.k2_gu[1]));
+    try cuda.launch.launch(pk.gu[rg], cfg, s, &ls[1].args);
+}
+
 /// gateup_rest's rest half on a prompt chunk, after gateUp: the rest picks (remap: another pair's experts -> E), their
 /// grouping and work lists, gate and up for the rest columns on the main launch's rotated rows, the epilogue (TP2's
 /// values on them) into the rows after the main ones in sc.xd ([P, ir], valid on the slots this pair computes).

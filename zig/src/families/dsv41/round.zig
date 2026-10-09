@@ -766,8 +766,12 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
     try rd.mark(e, .m_rt);
     if (e.two) |tw| if (tw.ir != 0) {
-        // 2D with the parity split: the rest's gate / up beside the main one, the packs exchanged and assembled, down
-        try exl3_experts2d.decodeGateUpParity(e.ex, e.ops, e.s, rd.par, rd.par_fork, rd.par_join, lay.experts, ch.xsd, tw.rest_dec.?, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
+        // 2D with the parity split: the rest's gate / up in the main launch (else beside it), the packs exchanged and
+        // assembled, down
+        if (e.par) |pk|
+            try exl3_experts2d.decodeGateUpOne(e.ex, pk, e.s, lay.experts, ch.xsd, tw.rest_dec.?, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit)
+        else
+            try exl3_experts2d.decodeGateUpParity(e.ex, e.ops, e.s, rd.par, rd.par_fork, rd.par_join, lay.experts, ch.xsd, tw.rest_dec.?, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
         try rd.mark(e, .m_gu);
         try tw.assembleParity(e, lay.experts, ch.xsd.xd, rd.pick, R * ch.xsd.slots);
         try rd.mark(e, .m_x);

@@ -20,6 +20,7 @@ const engram_aio = @import("engram_aio.zig");
 const exl3_prefill = @import("exl3_prefill.zig");
 const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
+const exl3_experts2d = @import("exl3_experts2d.zig");
 const ops_mod = @import("ops.zig");
 const exact = @import("exact.zig");
 const cublas = @import("cublas.zig");
@@ -71,6 +72,13 @@ pub fn parityGU() bool {
     return std.mem.eql(u8, std.mem.span(v), "parity");
 }
 
+/// The parity split's decode gate / up in one launch (experts_par.cu, the same bits); TF_DS_PAR_ONE=0: the served
+/// build's launches (main, then the rest's grouping and gate / up, beside it on a stream of its own with --side).
+pub fn parOne() bool {
+    const v = std.c.getenv("TF_DS_PAR_ONE") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(v), "0");
+}
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     host: std.heap.ArenaAllocator, // allocations that live as long as the model
@@ -97,6 +105,7 @@ pub const Model = struct {
     exk: exl3_experts.Kernels,
     ops: ops_mod.Ops,
     ex: exact.Exact,
+    par: ?exl3_experts2d.ParKernels, // the parity split's one-launch gate / up (parOne)
     rope_buf: cuda.DeviceBuffer,
     arena: prompt.Arena,
     eng: prompt.Engine,
@@ -247,6 +256,8 @@ pub const Model = struct {
         errdefer m.ops.unload();
         m.ex = try exact.Exact.load(d, cuda.kernels.dsv41_torch);
         errdefer m.ex.unload();
+        m.par = if (sp.parity and parOne()) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
+        errdefer if (m.par) |*x| x.unload();
 
         // the RoPE tables (the served build's bits: torch CPU pow and polar), every position of the pool
         const half = c.rope_dim / 2;
@@ -288,6 +299,7 @@ pub const Model = struct {
         }
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
+        if (m.par) |*x| m.eng.par = x;
         m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
@@ -304,7 +316,7 @@ pub const Model = struct {
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
-        if (m.two) |t| if (t.ir != 0 and o.side) try m.rd.usePar(&m.eng); // parity: the rest beside the main gate / up
+        if (m.two) |t| if (t.ir != 0 and o.side and m.par == null) try m.rd.usePar(&m.eng); // parity in two launches: the rest beside the main gate / up
         if (o.drafts) {
             m.dpool = try draft.Pool.init(&m.eng, &m.arena, m.streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
@@ -379,6 +391,7 @@ pub const Model = struct {
         m.blas.close();
         m.arena.deinit();
         m.rope_buf.free();
+        if (m.par) |*x| x.unload();
         m.ex.unload();
         m.ops.unload();
         m.exk.unload();

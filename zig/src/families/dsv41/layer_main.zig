@@ -364,6 +364,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ops.unload();
     var ex = try dsv41.exact.Exact.load(&driver, cuda.kernels.dsv41_torch);
     defer ex.unload();
+    var par: ?dsv41.exl3_experts2d.ParKernels = if (sp.parity and dsv41.model.parOne()) try dsv41.exl3_experts2d.ParKernels.load(&driver, cuda.kernels.dsv41_experts_par) else null;
+    defer if (par) |*x| x.unload();
 
     // the caches' positions: the deepest round's bucket and the widest extent the recording reaches (every row's: a
     // concurrent round's rows are several streams'); the deepest position any row or prompt reaches
@@ -424,6 +426,7 @@ pub fn main(init: std.process.Init) !u8 {
         two.?.rings = &rdma_rings.?;
     }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
+    if (par) |*x| eng.par = x;
     // TP2 with --rdma: the decode gathers over the RDMA ring (the served lane's), their bytes checked as NCCL's were
     var tp2_mod: ?cuda.Module = null;
     defer if (tp2_mod) |*mm| mm.unload();
