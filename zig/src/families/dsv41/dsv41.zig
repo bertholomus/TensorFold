@@ -5,6 +5,7 @@ pub const native = @import("native.zig");
 pub const rank_cache = @import("rank_cache.zig");
 pub const plan = @import("plan.zig");
 pub const engram = @import("engram.zig");
+pub const picture = @import("picture.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const weights = @import("weights.zig");
 pub const engram_io = @import("engram_io.zig");
