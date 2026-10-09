@@ -405,3 +405,109 @@ extern "C" __global__ void __launch_bounds__(1024) tf_ds_argmax_rows_kernel(cons
     }
     if (lane == 0) out[blockIdx.x] = row[0] != row[0] ? 0u : (unsigned)bi;
 }
+
+// ---- the vision tower (vit.zig): DeepSeek's ViT and aligner as the served lane runs them on torch, each torch op its
+// own rounding point (this file builds with --fmad=false, so a product and a sum stay two roundings).
+
+// get_vision_cos_sin on the GPU: a patch at grid row h, column w (row-major over n_w columns) gets
+// freqs[c] = float(c < 16 ? h : w) * inv_freq[c % 16], inv_freq[j] = 1 / powf(theta, float(2j) / 32), then cosf, sinf;
+// out [n, 32] fp32 each.
+extern "C" __global__ void tf_ds_vrope_kernel(float* cos_out, float* sin_out, int n, int nw, float theta) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n * 32) return;
+    const int r = i / 32, c = i % 32, j = c % 16;
+    const float t = float(2 * j) / 32.0f;
+    const float inv = 1.0f / powf(theta, t);
+    const float pos = float(c < 16 ? r / nw : r % nw);
+    const float f = pos * inv;
+    cos_out[i] = cosf(f);
+    sin_out[i] = sinf(f);
+}
+
+// The attention's inputs from wqkv's output qkv bf16 [n, 3 * 16 * 64]: q and k rotated (apply_rotary: x.float(), halves
+// x1 = x[:32], x2 = x[32:], cat(x1 * cos - x2 * sin, x2 * cos + x1 * sin).to(bf16)) and every value then .float() for the
+// fp32 attention: q32, k32, v32 fp32 [n, 16, 64]. One thread a (row, head, d < 32) pair.
+extern "C" __global__ void tf_ds_vrot_kernel(const __nv_bfloat16* qkv, const float* cosb, const float* sinb, float* q32,
+                                             float* k32, float* v32, int n) {
+    const long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= (long long)n * 16 * 32) return;
+    const long long r = i / 512;
+    const int rem = int(i % 512), h = rem / 32, d = rem % 32;
+    const float c = cosb[r * 32 + d], s = sinb[r * 32 + d];
+    for (int which = 0; which < 2; ++which) {
+        const __nv_bfloat16* x = qkv + r * 3072 + which * 1024 + h * 64;
+        float* out = (which == 0 ? q32 : k32) + r * 1024 + h * 64;
+        const float x1 = __bfloat162float(x[d]), x2 = __bfloat162float(x[d + 32]);
+        const float o1 = x1 * c - x2 * s;
+        const float o2 = x2 * c + x1 * s;
+        out[d] = __bfloat162float(__float2bfloat16_rn(o1));
+        out[d + 32] = __bfloat162float(__float2bfloat16_rn(o2));
+    }
+    const __nv_bfloat16* v = qkv + r * 3072 + 2048 + h * 64;
+    v32[r * 1024 + h * 64 + d] = __bfloat162float(v[d]);
+    v32[r * 1024 + h * 64 + d + 32] = __bfloat162float(v[d + 32]);
+}
+
+// `.to(bf16)` of count fp32 values (round to nearest even).
+extern "C" __global__ void tf_ds_f32_to_bf16_kernel(const float* in, __nv_bfloat16* out, unsigned long long count) {
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += (unsigned long long)gridDim.x * blockDim.x)
+        out[i] = __float2bfloat16_rn(in[i]);
+}
+
+// x + y of bf16 values in place on x (torch's add: fp32 sum, rounded once).
+extern "C" __global__ void tf_ds_add_bf16_kernel(__nv_bfloat16* x, const __nv_bfloat16* y, unsigned long long count) {
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += (unsigned long long)gridDim.x * blockDim.x)
+        x[i] = __float2bfloat16_rn(__bfloat162float(x[i]) + __bfloat162float(y[i]));
+}
+
+// The MLP's F.silu(gate) * up of w1's output gu bf16 [n, 2 * inter]: silu in fp32 (x / (1 + expf(-x))) rounded to bf16,
+// then the bf16 product rounded again; out bf16 [n, inter].
+extern "C" __global__ void tf_ds_vsilu_mul_kernel(const __nv_bfloat16* gu, __nv_bfloat16* out, int n, int inter) {
+    const long long total = (long long)n * inter;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {
+        const long long r = i / inter, c = i % inter;
+        const float g = __bfloat162float(gu[r * 2 * inter + c]);
+        const __nv_bfloat16 sg = __float2bfloat16_rn(g / (1.0f + expf(-g)));
+        const float u = __bfloat162float(gu[r * 2 * inter + inter + c]);
+        out[i] = __float2bfloat16_rn(__bfloat162float(sg) * u);
+    }
+}
+
+// The aligner's unfold of the tower's output x bf16 [n_h * n_w, dim] (row-major patch grid) padded with zeros to whole
+// 3x3 cells: out bf16 [dim * 9, cells] (F.unfold's [C * k * k, L] layout), feature f = c * 9 + ki * 3 + kj of cell
+// l = lh * cells_w + lw taking x at grid (3 * lh + ki, 3 * lw + kj), 0 outside the grid.
+extern "C" __global__ void tf_ds_vunfold3_kernel(const __nv_bfloat16* x, __nv_bfloat16* out, int n_h, int n_w, int dim,
+                                                 int cells_h, int cells_w) {
+    const long long cells = (long long)cells_h * cells_w;
+    const long long total = (long long)dim * 9 * cells;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {
+        const long long f = i / cells, l = i % cells;
+        const int c = int(f / 9), k = int(f % 9), ki = k / 3, kj = k % 3;
+        const int y = int(l / cells_w) * 3 + ki, xx = int(l % cells_w) * 3 + kj;
+        out[i] = (y < n_h && xx < n_w) ? x[((long long)y * n_w + xx) * dim + c] : __float2bfloat16_rn(0.0f);
+    }
+}
+
+// F.gelu (erf) of bf16 values in place: x * 0.5 * (1 + erf(x * M_SQRT1_2)) in fp32, rounded to bf16.
+extern "C" __global__ void tf_ds_vgelu_kernel(__nv_bfloat16* x, unsigned long long count) {
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < count;
+         i += (unsigned long long)gridDim.x * blockDim.x) {
+        const float v = __bfloat162float(x[i]);
+        x[i] = __float2bfloat16_rn(v * 0.5f * (1.0f + erff(v * float(M_SQRT1_2))));
+    }
+}
+
+// An image span's rows bf16 [tokens, dim]: IMAGE_START / IMAGE_NEW_LINE / IMAGE_END take their learned embedding,
+// IMAGE the aligner's rows in reading order. types: 0 start, 1 image, 2 newline, 3 end.
+extern "C" __global__ void tf_ds_vspan_kernel(const unsigned char* types, const __nv_bfloat16* rows, const __nv_bfloat16* start,
+                                              const __nv_bfloat16* newline, const __nv_bfloat16* end, __nv_bfloat16* out,
+                                              int tokens, int dim, const int* row_of) {
+    const long long total = (long long)tokens * dim;
+    for (long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x; i < total; i += (long long)gridDim.x * blockDim.x) {
+        const int t = int(i / dim), c = int(i % dim);
+        const unsigned char ty = types[t];
+        out[i] = ty == 1 ? rows[(long long)row_of[t] * dim + c] : ty == 0 ? start[c] : ty == 2 ? newline[c] : end[c];
+    }
+}
