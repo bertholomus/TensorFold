@@ -92,7 +92,8 @@ Its image path (`picture.zig`, `vit.zig`, `vision.zig`, `cublaslt.zig`, `fmha.zi
 processor, vision tower and aligner (MIT, as above). Pictures decode and resample as Pillow's `convert("RGB")` and 8-bit
 BICUBIC `resize` compute them (Pillow, MIT-CMU License, Copyright © 1997-2011 Secret Labs AB, Copyright © 1995-2011
 Fredrik Lundh and contributors, Copyright © 2010 Jeffrey 'Alex' Clark and contributors; `LICENSES/Pillow-MIT-CMU.txt`),
-written for TensorFold without including Pillow's source. The tower's attention launches PyTorch's memory-efficient
+written for TensorFold without including Pillow's source; images in formats other than PNG are decoded by the
+runtime's own Pillow, called in a `python3` child process (`pil.zig`), which TensorFold does not bundle. The tower's attention launches PyTorch's memory-efficient
 attention kernel (`fmha_cutlassF_f32_aligned_64x64_rf_sm80`) from its sm_120 binary, extracted from the served image's
 `libtorch_cuda.so` into a deployment's kernel kit (`vision/torch_fmha_sm120.cubin`, not in this repository); that kernel
 is PyTorch's, BSD-3-Clause (`LICENSES/PyTorch-BSD-3-Clause.txt`), built on NVIDIA CUTLASS, BSD-3-Clause, Copyright (c)
