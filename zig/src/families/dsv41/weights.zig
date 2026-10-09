@@ -40,6 +40,24 @@ pub const Experts = struct {
     shared_gate: [2]u64 = .{ 0, 0 }, // the shared expert's gate trellis: its first byte and length (the paced L2 prefetch)
     shared_up: [2]u64 = .{ 0, 0 }, // its up and down trellises the same way (the served "moe" fork reads all three)
     shared_down: [2]u64 = .{ 0, 0 },
+    rest: ?Rest = null, // TF_DS_2D_GU=parity: the ninth gate / up block of the experts whose parity is this pair's
+};
+
+/// experts2d.Rest2D: a parity split's rest columns (one 128-block of the rank's half, after both pairs' main blocks) of
+/// the experts this node computes them for; every table [E] or [E, width] with zeros (no trellis) elsewhere.
+pub const Rest = struct {
+    gate_ptr: u64, // int64 [E]: trellis [D/16, width/16, *], 0 for an expert another node computes
+    up_ptr: u64,
+    gate_k2: u64, // int32 [E]
+    up_k2: u64,
+    svh_g: u64, // fp16 [E, width]
+    svh_u: u64,
+    suh_d: u64, // fp16 [E, width]: down's input signs on the rest block
+    remap: u64, // int32 [E + 1]: e -> e when this node computes e's rest, else E (skipped by the grouping)
+    owner: u64, // int32 [E + 1]: the pair computing e's rest (E -> 0)
+    width: u32,
+    k2_gu: [2]u32,
+    mine: u32, // this node's pair
 };
 
 pub const Layer = struct {
@@ -204,7 +222,7 @@ const Loader = struct {
     /// load_block's experts: exl3_parts of w1 / w3 by output columns and w2 by input rows for every expert and the
     /// shared one, packed as pack_trellises packs them, with prepare's tables. `half`: the rank's intermediate; `gu`:
     /// gate / up's columns of it here (the half, or a 2D node's blocks); `dcols`: down's output columns (null: all).
-    fn experts(L: *Loader, p: []const u8, n: usize, half: [2]usize, gu: [2]usize, dcols: ?[2]usize, d: usize) !Experts {
+    fn experts(L: *Loader, p: []const u8, n: usize, half: [2]usize, gu: [2]usize, dcols: ?[2]usize, d: usize, rest: ?[2]usize, pair: ?u32) !Experts {
         const e_count = n + 1;
         const width = gu[1] - gu[0];
         const down_k = half[1] - half[0];
@@ -303,7 +321,90 @@ const Loader = struct {
             }
             s.dst.* = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.{s}", .{ p, s.name }), L.aux.items);
         }
+        x.rest = null;
+        if (rest) |rc| x.rest = try L.expertsRest(p, prefixes, n, half, dcols, rc, d, pair.?);
         return x;
+    }
+
+    /// experts2d.prepare_rest: the rest block's gate / up parts of the experts whose rest is this pair's (their
+    /// trellises in one buffer), the tables over every expert (zeros where another node computes it), the remap and
+    /// the owners.
+    fn expertsRest(L: *Loader, p: []const u8, prefixes: []const [3][]u8, n: usize, half: [2]usize, dcols: ?[2]usize, rc: [2]usize, d: usize, mine: u32) !Rest {
+        const e_count = n + 1;
+        const ir = rc[1] - rc[0];
+        if (rc[0] % 128 != 0 or ir % 128 != 0 or ir == 0) return error.UnsupportedShape;
+        var kb: [256]u8 = undefined;
+        var nb: [256]u8 = undefined;
+        var total: usize = 0;
+        for (0..e_count) |e| {
+            if (plan.restPair(e, n) != mine) continue;
+            for (0..2) |j| total += try L.src.size(try plan.partKey(&kb, prefixes[e][j], rc, null, "tr"));
+        }
+        if (total == 0) return error.NoRestHere;
+        var buf = try cuda.DeviceBuffer.alloc(L.d, total);
+        errdefer buf.free();
+        const ptrs = try L.gpa.alloc(u64, 2 * e_count);
+        defer L.gpa.free(ptrs);
+        const k2s = try L.gpa.alloc(i32, 2 * e_count);
+        defer L.gpa.free(k2s);
+        @memset(ptrs, 0);
+        @memset(k2s, 0);
+        const svh = try L.gpa.alloc(u8, 2 * e_count * ir * 2);
+        defer L.gpa.free(svh);
+        const suh_d = try L.gpa.alloc(u8, e_count * ir * 2);
+        defer L.gpa.free(suh_d);
+        @memset(svh, 0);
+        @memset(suh_d, 0);
+        const remap = try L.gpa.alloc(i32, e_count + 1);
+        defer L.gpa.free(remap);
+        const owner = try L.gpa.alloc(i32, e_count + 1);
+        defer L.gpa.free(owner);
+        var k2_gu: [2]u32 = .{ std.math.maxInt(u32), 0 };
+        var at: usize = 0;
+        for (0..e_count) |e| {
+            const o = plan.restPair(e, n);
+            owner[e] = @intCast(o);
+            remap[e] = if (o == mine) @intCast(e) else @intCast(e_count);
+            if (o != mine) continue;
+            for (0..2) |j| {
+                const key = try plan.partKey(&kb, prefixes[e][j], rc, null, "tr");
+                const t = try L.shape(key);
+                if (t[0] * 16 != d or t[1] * 16 != ir) return error.UnexpectedTensor;
+                const tr = try L.entry(key);
+                try buf.upload(at, tr);
+                ptrs[j * e_count + e] = buf.ptr + at;
+                const k2: u32 = @intCast(t[2] / 8);
+                k2s[j * e_count + e] = @intCast(k2);
+                k2_gu = .{ @min(k2_gu[0], k2), @max(k2_gu[1], k2) };
+                at += tr.len;
+                const row = try L.entry(try plan.partKey(&kb, prefixes[e][j], rc, null, "svh"));
+                if (row.len != ir * 2) return error.UnexpectedTensor;
+                @memcpy(svh[(j * e_count + e) * ir * 2 ..][0 .. ir * 2], row);
+            }
+            // down's input signs over the half (its rows), at the rest's columns
+            const drow = try L.entry(try plan.partKey(&kb, prefixes[e][2], dcols, half, "suh"));
+            if (drow.len != (half[1] - half[0]) * 2) return error.UnexpectedTensor;
+            @memcpy(suh_d[e * ir * 2 ..][0 .. ir * 2], drow[(rc[0] - half[0]) * 2 ..][0 .. ir * 2]);
+        }
+        remap[e_count] = @intCast(e_count);
+        owner[e_count] = 0;
+        try L.w.buffers.append(L.gpa, buf);
+        try L.w.named.append(L.gpa, .{ .name = try std.fmt.allocPrint(L.gpa, "{s}.ffn.experts.rest_trellis", .{p}), .ptr = buf.ptr, .len = total });
+        L.w.bytes += total;
+        var r: Rest = undefined;
+        r.width = @intCast(ir);
+        r.k2_gu = k2_gu;
+        r.mine = mine;
+        r.gate_ptr = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_ptr0", .{p}), std.mem.sliceAsBytes(ptrs[0..e_count]));
+        r.up_ptr = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_ptr1", .{p}), std.mem.sliceAsBytes(ptrs[e_count..]));
+        r.gate_k2 = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_k20", .{p}), std.mem.sliceAsBytes(k2s[0..e_count]));
+        r.up_k2 = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_k21", .{p}), std.mem.sliceAsBytes(k2s[e_count..]));
+        r.svh_g = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_svh_g", .{p}), svh[0 .. e_count * ir * 2]);
+        r.svh_u = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_svh_u", .{p}), svh[e_count * ir * 2 ..]);
+        r.suh_d = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_suh_d", .{p}), suh_d);
+        r.remap = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_remap", .{p}), std.mem.sliceAsBytes(remap));
+        r.owner = try L.upload(try std.fmt.bufPrint(&nb, "{s}.ffn.experts.rest_owner", .{p}), std.mem.sliceAsBytes(owner));
+        return r;
     }
 
     fn block(L: *Loader, c: Config, s: plan.Split, p: []const u8, i: usize, n_experts: usize) !Layer {
@@ -363,7 +464,7 @@ const Loader = struct {
         lay.gate_w = try L.plain(try std.fmt.bufPrint(&nb, "{s}.ffn.gate.weight", .{p}), .f16);
         lay.gate_b = try L.plain(try std.fmt.bufPrint(&nb, "{s}.ffn.gate.bias", .{p}), .f32);
         const xp = s.expertParts(c);
-        lay.experts = try L.experts(p, n_experts, xp.half, xp.gu, xp.dcols, c.hidden);
+        lay.experts = try L.experts(p, n_experts, xp.half, xp.gu, xp.dcols, c.hidden, xp.rest, s.pair);
         if (c.engram_layers.has(i)) {
             lay.engram_wkv = try L.linear(try std.fmt.bufPrint(&nb, "{s}.engram.wkv", .{p}), s.engramCols(c), s.range(s.engramRows(c)));
             if (s.pair != null) lay.engram_wkv.?.plan_n = @intCast((c.hc + 1) * c.hidden);

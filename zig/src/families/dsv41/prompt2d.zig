@@ -20,6 +20,7 @@ const weights = @import("weights.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const exl3_experts2d = @import("exl3_experts2d.zig");
 const ring2d = @import("ring2d.zig");
+const rdma_mod = @import("rdma.zig");
 const round2d = @import("round2d.zig");
 const round_rows = @import("round.zig").max_rows;
 const Link = @import("link.zig").Link;
@@ -108,6 +109,13 @@ pub const Two = struct {
     xd_full: u64, // fp16 [cap * slots, gu0 + gu1]: the rank's expert intermediate, pair 0's blocks then pair 1's
     own: u64, // fp16 [round rows, uw[p]]: a round's half of wo_b's rotated input rows (wo_a's epilogue, round2d.woRot)
     rings: ?*const ring2d.Rings, // the RDMA rings (TF_DS_2D_INTO, TF_DS_2D_GROUPS), when the caller opened them
+    // TF_DS_2D_GU=parity: the rest block's width (0: "first"), the rest launches' scratch for a decode window and for a
+    // prompt chunk, and the column partner's pack (its main rows, then its rest rows) as the exchange delivers it
+    ir: usize = 0,
+    rest_rows: usize = 0, // the prompt chunks' rows the rest scratch holds (init's cap)
+    rest_dec: ?exl3_experts2d.RestScratch = null,
+    rest_chunk: ?exl3_experts2d.RestScratch = null,
+    peer: u64 = 0,
 
     /// The widths from the split (both pairs'), and the buffers for chunks of up to `cap` rows (and rounds) from `a`.
     pub fn init(c: *const Config, w: *const weights.Weights, a: *prompt.Arena, s: plan.Split, cap: usize) !Two {
@@ -140,10 +148,68 @@ pub const Two = struct {
         t.parts = try a.take(4 * biggest);
         t.pad = try a.take(biggest);
         t.u_full = try a.take(cap * (t.uw[0] + t.uw[1]) * 2);
-        t.xd_full = try a.take(@max(cap, round_rows) * slots * (t.gu[0] + t.gu[1]) * 2);
+        // parity: the rest block after both pairs' main blocks in the assembled intermediate
+        const ex0 = l0.experts;
+        t.ir = if (ex0.rest) |r| r.width else 0;
+        t.rest_rows = cap;
+        t.rest_dec = null;
+        t.rest_chunk = null;
+        t.peer = 0;
+        t.xd_full = try a.take(@max(cap, round_rows) * slots * (t.gu[0] + t.gu[1] + t.ir) * 2);
+        if (t.ir != 0) {
+            if (t.gu[0] != t.gu[1]) return error.UnequalParityParts;
+            t.rest_dec = try restScratch(a, ex0, exl3_experts.exact_rows, slots, false);
+            t.rest_chunk = try restScratch(a, ex0, cap, slots, true);
+            t.peer = try a.take(@max(cap, round_rows) * slots * (t.gu[t.p] + t.ir) * 2);
+        }
         t.own = try a.take(round_rows * t.uw[pp] * 2);
         t.rings = null;
         return t;
+    }
+
+    fn restScratch(a: *prompt.Arena, ex: weights.Experts, rows: usize, slots: usize, chunk: bool) !exl3_experts2d.RestScratch {
+        const sz = try exl3_experts2d.RestScratch.sizes(rows, slots, ex, chunk);
+        var rs: exl3_experts2d.RestScratch = undefined;
+        inline for (.{ "ids", "count", "counts", "members", "cnt_gu", "z", "work_gu", "work_d", "rpick" }, 0..) |f, j| @field(rs, f) = try a.take(sz[j]);
+        return rs;
+    }
+
+    /// The rest scratch's first use: members -1, the counters and partials zero (as the main scratch starts).
+    pub fn clearRest(t: *const Two, e: *const prompt.Engine) !void {
+        for ([_]?exl3_experts2d.RestScratch{ t.rest_dec, t.rest_chunk }, [_]bool{ false, true }) |o, chunk| {
+            const rs = o orelse continue;
+            const ex = e.w.layers[0].experts;
+            const sz = try exl3_experts2d.RestScratch.sizes(if (chunk) t.rest_rows else exl3_experts.exact_rows, e.slots(), ex, chunk);
+            try prompt.fill32(e, rs.members, 0xffffffff, sz[3] / 4);
+            for ([_]u64{ rs.ids, rs.count, rs.counts, rs.cnt_gu, rs.z }, [_]usize{ sz[0], sz[1], sz[2], sz[4], sz[5] }) |ptr, n| try prompt.fill(e, ptr, 0, n);
+        }
+    }
+
+    /// The column partner's pack (a parity split's main rows, then its rest rows: `bytes` each way) into t.peer: over
+    /// the column ring when the caller opened the rings and it fits, else NCCL send / recv with the partner.
+    pub fn packExchange(t: *const Two, e: *const prompt.Engine, mine: u64, rows: usize, width: usize) !void {
+        if (t.rings) |rs| {
+            var dsts: [2]rdma_mod.Ring.Dst = .{ .{}, .{} };
+            dsts[1 - t.p] = .{ .ptr = t.peer, .row4 = @intCast(width * 2 / 16), .stride4 = width * 2 / 16 };
+            if (rs.col.gatherInto(e.s, mine, @intCast(rows), @intCast(width * 2 / 16), &dsts)) |_| return else |err| switch (err) {
+                error.TooLarge => {},
+                else => return err,
+            }
+        }
+        const g: u32 = @intCast(t.r + 2 * t.p);
+        try e.comm.exchange(mine, rows * width, t.peer, rows * width, .f16, g ^ 2, e.s);
+    }
+
+    /// moe_2d's parity experts after the main gate / up and the rest's: the packs exchanged with the column partner,
+    /// the half's intermediate assembled into t.xd_full (pair 0's main, pair 1's main, each slot's rest from its
+    /// owner), for down.
+    pub fn assembleParity(t: *const Two, e: *const prompt.Engine, ex: weights.Experts, xd: u64, pick: u64, p: usize) !void {
+        const rest = ex.rest orelse return error.NoRest;
+        const ig = t.gu[t.p];
+        try t.packExchange(e, xd, p, ig + t.ir);
+        const part0 = if (t.p == 0) xd else t.peer;
+        const part1 = if (t.p == 1) xd else t.peer;
+        try e.ops.assembleRest(e.s, part0, part1, pick, rest.owner, t.xd_full, p, ig, t.ir);
     }
 
     /// Every node's part over NCCL into `parts` [4, n, wmax] (bytes), this node's `src` [n, w[p]] padded to wmax.
@@ -217,6 +283,12 @@ pub const Two = struct {
         const n = ch.n;
         if (n < exl3_experts.exact_rows) return round2d.experts(t, e, lay.experts, ch.xsd, ch.x, c.hidden, ch.pick, ch.wts, ch.pm, n, c.swiglu_limit);
         try exl3_experts2d.gateUp(e.ex, e.s, lay.experts, ch.xs, ch.x, c.hidden, ch.pick, n, c.swiglu_limit);
+        if (t.ir != 0) {
+            // parity: the rest columns of the experts this pair computes them for, the packs exchanged and assembled
+            try exl3_experts2d.gateUpRest(e.ex, e.ops, e.s, lay.experts, ch.xs, t.rest_chunk.?, ch.pick, n, c.swiglu_limit);
+            try t.assembleParity(e, lay.experts, ch.xs.xd, ch.pick, n * ch.xs.slots);
+            return exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
+        }
         try t.catRank(e, ch.xs.xd, t.xd_full, n * ch.xs.slots, t.gu, 2);
         try exl3_experts2d.down(e.ex, e.s, lay.experts, ch.xs, t.xd_full, ch.pick, ch.wts, ch.pm, n);
     }

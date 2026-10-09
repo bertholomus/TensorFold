@@ -9,6 +9,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const weights = @import("weights.zig");
 const X = @import("exl3_experts.zig");
+const ops_mod = @import("ops.zig");
 
 fn launch(f: cuda.Function, s: cuda.Stream, grid: [3]usize, block: usize, args: *cuda.Args) !void {
     try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(grid[0]), .y = @intCast(grid[1]), .z = @intCast(grid[2]) }, .block = .{ .x = @intCast(block) } }, s, args);
@@ -178,7 +179,8 @@ pub fn decodeSizes(rows: usize, slots: usize, ex: weights.Experts) ![13]usize {
     const maxu = @min(p, @as(usize, ex.count));
     const one: usize = 1;
     const zrow = @max(2 * (try X.config(d, i, true))[2] * ig, (try X.config(i, d, false))[2] * dn);
-    return .{ 2 * p * d, 2 * p * d, 2 * p * ig, 4 * zrow * p, 4 * p * dn, 4 * maxu * @max(one, ig / 128), 4 * rows * @max(one, dn / 128), 4, 4 * @max(one, maxu), 4 * @max(one, maxu), 4 * maxu, 4, 4 * maxu * ((rows + 127) / 128 * 128) };
+    const pack = ig + if (ex.rest) |r| @as(usize, r.width) else 0; // parity: main rows [P, ig], then the rest's [P, ir]
+    return .{ 2 * p * d, 2 * p * d, 2 * p * pack, 4 * zrow * p, 4 * p * dn, 4 * maxu * @max(one, ig / 128), 4 * rows * @max(one, dn / 128), 4, 4 * @max(one, maxu), 4 * @max(one, maxu), 4 * maxu, 4, 4 * maxu * ((rows + 127) / 128 * 128) };
 }
 
 /// gateup_fused's two launches on a decode window (R < 64): decode_prep (the grouping; gate / up's rotated input rows,
@@ -246,6 +248,124 @@ pub fn decodeGateUp(k: *const X.Kernels, s: cuda.Stream, ex: weights.Experts, sc
 pub fn decodeDown(k: *const X.Kernels, s: cuda.Stream, ex: weights.Experts, sc: X.DecodeScratch, xd_full: u64, pick: u64, wts: u64, out: u64, r: usize) !void {
     var l = try downLaunch(ex, sc, xd_full, pick, wts, out, r);
     try cuda.launch.launch(try function(k, &l), l.cfg, s, &l.args);
+}
+
+/// A parity split's own grouping, partials and counters for the rest launch (experts2d Scratch2D.rest): a decode
+/// window's (decodeGateUpRest) or a prompt chunk's (gateUpRest). The rotated rows are the main launch's; the rest's
+/// output rows go after the main ones in the scratch's xd (the pack the exchange sends).
+pub const RestScratch = struct {
+    ids: u64, // int32 [maxu]
+    count: u64, // int32 [1]
+    counts: u64, // int32 [E] (a chunk's grouping)
+    members: u64, // int32 [maxu * member stride], -1
+    cnt_gu: u64, // int32 [maxu * ir / 128] (a decode window's epilogue counters), zeros
+    z: u64, // fp32 [max(2 * splits * ir, ir) * P], zeros
+    work_gu: u64, // int32 [listLen(P, maxu, mma rows) * 2] (a chunk's)
+    work_d: u64, // int32 [listLen(P, maxu, down rows) * 2] (the work list launch writes both)
+    rpick: u64, // int32 [P]: rest_picks (a chunk's)
+
+    /// Bytes of each buffer in field order, for `rows` rows of `slots` slots (members at the chunk stride when
+    /// `chunk`, else the decode window's).
+    pub fn sizes(rows: usize, slots: usize, ex: weights.Experts, chunk: bool) ![9]usize {
+        const r = ex.rest orelse return error.NoRest;
+        const p = rows * slots;
+        const maxu = @min(p, @as(usize, ex.count));
+        const ir: usize = r.width;
+        const sk = (try X.config(ex.dims, ex.down_k, true))[2];
+        const stride = if (chunk) X.memberStride(rows) else (rows + 127) / 128 * 128;
+        return .{ 4 * maxu, 4, 4 * @as(usize, ex.count), 4 * maxu * stride, 4 * maxu * @max(1, ir / 128), 4 * @max(2 * sk * ir, ir) * p, 8 * X.listLen(p, maxu, X.mma_rows_gu), 8 * X.listLen(p, maxu, X.rows_rows_d), 4 * p };
+    }
+};
+
+/// gateup_rest_fused's rest half on a decode window, after decodeGateUp: the rest's grouping (the main grouping's
+/// places whose expert's rest this pair computes, in order) and its fused gate / up launch with the epilogue into the
+/// rows after the main ones in sc.xd ([P, ir], valid on those slots). TP2's launch at the rest's width, as served.
+/// A parity split's gate / up on a decode window with the rest beside the main launch: decode_prep, then the rest's
+/// grouping and gate / up on `side` (forked behind prep) while the main gate / up runs on `s`, joined after it. The
+/// same launches as decodeGateUp + decodeGateUpRest (the same bits), the rest's blocks running alongside the main
+/// ones instead of after them. Without a side stream: those two calls in order.
+pub fn decodeGateUpParity(k: *const X.Kernels, o: *const ops_mod.Ops, s: cuda.Stream, side: ?cuda.Stream, fork: ?cuda.Event, join: ?cuda.Event, ex: weights.Experts, sc: X.DecodeScratch, rs: RestScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, r: usize, limit: f32) !void {
+    const ps = side orelse {
+        try decodeGateUp(k, s, ex, sc, x, x_stride, pick, wts, out, r, limit);
+        return decodeGateUpRest(k, o, s, ex, sc, rs, pick, r, limit);
+    };
+    var ls = try gateUpLaunches(ex, sc, x, x_stride, pick, wts, out, r, limit);
+    try cuda.launch.launch(try function(k, &ls[0]), ls[0].cfg, s, &ls[0].args);
+    try fork.?.record(s);
+    try ps.wait(fork.?);
+    try decodeGateUpRest(k, o, ps, ex, sc, rs, pick, r, limit);
+    try join.?.record(ps);
+    try cuda.launch.launch(try function(k, &ls[1]), ls[1].cfg, s, &ls[1].args);
+    try s.wait(join.?);
+}
+
+pub fn decodeGateUpRest(k: *const X.Kernels, o: *const ops_mod.Ops, s: cuda.Stream, ex: weights.Experts, sc: X.DecodeScratch, rs: RestScratch, pick: u64, r: usize, limit: f32) !void {
+    const rest = ex.rest orelse return error.NoRest;
+    const w = try Window.of(ex, sc, r);
+    const ir: usize = rest.width;
+    try o.restGroup(s, sc.ids, sc.count, sc.members, rest.owner, rest.mine, rs.ids, rs.count, rs.members, w.maxu, r);
+    var gu: cuda.Args = .{};
+    for ([_]u64{ sc.xg, sc.xu, rest.gate_ptr, rest.up_ptr, rest.gate_k2, rest.up_k2, rs.ids, rs.count, rs.members, rs.z }) |v| gu.add(v);
+    for ([_]usize{ w.d, ir, w.p, w.sk, r, w.slots }) |v| i32a(&gu, v);
+    gu.add(X.DecodeEpi{ .pick = pick, .E = @intCast(w.e), .svh_g = rest.svh_g, .svh_u = rest.svh_u, .suh_d = rest.suh_d, .xd = sc.xd + w.p * w.ig * 2, .limit = limit, .act_mode = X.act_f32, .cnt = rs.cnt_gu, .discard = @intFromBool(8 * w.sk <= 32) });
+    const f = k.cp[X.range(rest.k2_gu[0], rest.k2_gu[1])][0] orelse return error.MissingKernel;
+    try cuda.launch.launch(f, .{ .grid = .{ .x = @intCast(w.maxu), .y = @intCast(ir / 128), .z = @intCast(2 * w.sk * w.mt) }, .block = .{ .x = 4 * 32 } }, s, &gu);
+}
+
+/// gateup_rest's rest half on a prompt chunk, after gateUp: the rest picks (remap: another pair's experts -> E), their
+/// grouping and work lists, gate and up for the rest columns on the main launch's rotated rows, the epilogue (TP2's
+/// values on them) into the rows after the main ones in sc.xd ([P, ir], valid on the slots this pair computes).
+pub fn gateUpRest(k: *const X.Kernels, o: *const ops_mod.Ops, s: cuda.Stream, ex: weights.Experts, sc: X.Scratch, rs: RestScratch, pick: u64, r: usize, limit: f32) !void {
+    const rest = ex.rest orelse return error.NoRest;
+    const pl = try Plan.of(ex);
+    const e: usize = ex.count;
+    const slots = sc.slots;
+    if (r < X.exact_rows or r > sc.rows) return error.NotAPromptChunk;
+    const ir: usize = rest.width;
+    if (ir % X.mma_cols != 0) return error.UnsupportedShape;
+    const p = r * slots;
+    const maxu = @min(p, e);
+    const maxm = X.memberStride(r);
+    const n_gu = X.listLen(p, maxu, X.mma_rows_gu);
+    const n_d = X.listLen(p, maxu, X.rows_rows_d);
+    const mma = k.mma[X.range(rest.k2_gu[0], rest.k2_gu[1])] orelse return error.MissingKernel;
+    try o.remapPicks(s, pick, rest.remap, rs.rpick, p);
+
+    var a: cuda.Args = .{};
+    a.add(rs.rpick);
+    a.add(rs.counts);
+    i32a(&a, p);
+    try launch(k.group_count, s, .{ e, 1, 1 }, X.place_threads, &a);
+
+    a = .{};
+    for ([_]u64{ rs.rpick, rs.counts, rs.ids, rs.count, rs.members }) |v| a.add(v);
+    for ([_]usize{ p, slots, e, maxm }) |v| i32a(&a, v);
+    try launch(k.group_place, s, .{ e, 1, 1 }, X.place_threads, &a);
+
+    a = .{};
+    for ([_]u64{ rs.counts, rs.ids, rs.count }) |v| a.add(v);
+    i32a(&a, maxu);
+    a.add(rs.work_gu);
+    i32a(&a, X.mma_rows_gu);
+    i32a(&a, n_gu);
+    a.add(rs.work_d);
+    i32a(&a, X.rows_rows_d);
+    i32a(&a, n_d);
+    a.add(@as(c_int, -1));
+    try launch(k.work_list, s, .{ 1, 1, 1 }, X.list_threads, &a);
+
+    a = .{};
+    for ([_]u64{ sc.xg, sc.xu, rest.gate_ptr, rest.up_ptr, rest.gate_k2, rest.up_k2, rs.ids, rs.count, rs.members, rs.z }) |v| a.add(v);
+    for ([_]usize{ pl.d, ir, p, pl.cgu[2], pl.cgu[1], maxm, slots, n_gu }) |v| i32a(&a, v);
+    a.add(rs.work_gu);
+    if (n_gu > 0) try launch(mma, s, .{ 1, ir / X.mma_cols, n_gu * 2 }, 256, &a);
+
+    a = .{};
+    for ([_]u64{ rs.z, rs.rpick, rest.svh_g, rest.svh_u, rest.suh_d, sc.xd + p * pl.ig * 2 }) |v| a.add(v);
+    for ([_]usize{ p, ir, 1, e }) |v| i32a(&a, v);
+    a.add(limit);
+    a.add(@as(c_int, X.act_f32));
+    try launch(k.gateup_epilogue, s, .{ p, ir / 128, 1 }, 32, &a);
 }
 
 test "a 2D node's prompt experts keep the TP2 half's settings" {

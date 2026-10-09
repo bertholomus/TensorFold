@@ -17,6 +17,10 @@ pub const Split = struct {
     pair: ?u32 = null,
     /// TF_DS_2D_DOWN: pair 0's blocks of the experts' down outputs (hidden / 128 of them; 20 is even).
     down0: usize = 20,
+    /// TF_DS_2D_GU=parity (split2d.py): each pair keeps half the rank's whole gate / up blocks of every expert (pair 0
+    /// first) and the odd block left over (the ninth) of the experts whose parity is its own (restPair); else
+    /// "first": whole blocks, pair 0 the larger part.
+    parity: bool = false,
 
     pub fn heads(s: Split, c: Config) usize {
         return c.heads / s.world;
@@ -72,7 +76,15 @@ pub const Split = struct {
     /// 128-blocks, pair 0 the larger part), down's output columns (null: all; TF_DS_2D_DOWN = down0 blocks for pair 0).
     pub fn expertParts(s: Split, c: Config) ExpertParts {
         const half = s.range(s.inter(c));
-        return .{ .half = half, .gu = s.part(half, null), .dcols = if (s.pair != null) s.cut(.{ 0, c.hidden }, s.down0) else null };
+        const dcols: ?[2]usize = if (s.pair != null) s.cut(.{ 0, c.hidden }, s.down0) else null;
+        if (s.parity) if (s.pair) |p| {
+            // split2d.py gate_up_main / gate_up_rest: half the blocks each, pair 0 first; the blocks after both
+            const m = (half[1] - half[0]) / 128 / 2;
+            const main: [2]usize = .{ half[0] + p * m * 128, half[0] + (p + 1) * m * 128 };
+            const rest: ?[2]usize = if (half[0] + 2 * m * 128 < half[1]) .{ half[0] + 2 * m * 128, half[1] } else null;
+            return .{ .half = half, .gu = main, .dcols = dcols, .rest = rest };
+        };
+        return .{ .half = half, .gu = s.part(half, null), .dcols = dcols };
     }
     /// Engram wkv's output columns (null: all; its input rows are the rank's hash columns either way).
     pub fn engramCols(s: Split, c: Config) ?[2]usize {
@@ -90,7 +102,13 @@ pub const Split = struct {
     }
 };
 
-pub const ExpertParts = struct { half: [2]usize, gu: [2]usize, dcols: ?[2]usize };
+pub const ExpertParts = struct { half: [2]usize, gu: [2]usize, dcols: ?[2]usize, rest: ?[2]usize = null };
+
+/// split2d.py rest_pair: the pair that computes expert e's rest columns on a parity split: routed experts by parity,
+/// the shared expert (id n_routed) on pair 1.
+pub fn restPair(e: usize, n_routed: usize) u32 {
+    return if (e >= n_routed) 1 else @intCast(e % 2);
+}
 
 /// One tensor a rank loads: the loader's key, the dtype it is stored in (null: the checkpoint's own), and for an EXL3
 /// trellis its K / 16 and N / 16 when the split fixes them.
@@ -188,6 +206,10 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
         try b.exl3(try b.fmt("{s}.w1", .{ep}), xp.gu, null, d, null);
         try b.exl3(try b.fmt("{s}.w3", .{ep}), xp.gu, null, d, null);
         try b.exl3(try b.fmt("{s}.w2", .{ep}), xp.dcols, xp.half, null, d);
+        if (xp.rest) |rc| if (restPair(e, experts) == s.pair.?) {
+            try b.exl3(try b.fmt("{s}.w1", .{ep}), rc, null, d, null);
+            try b.exl3(try b.fmt("{s}.w3", .{ep}), rc, null, d, null);
+        };
     }
     if (c.engram_layers.has(i)) {
         try b.exl3(try b.fmt("{s}.engram.wkv", .{p}), s.engramCols(c), s.range(s.engramRows(c)), null, null);
@@ -270,6 +292,14 @@ test "each split tensor's ranges: TP2's slices, a 2D node's pair parts of them" 
     try eq([2]usize{ 97024, 129280 }, n3.headCols(c));
     // its column partner, node 1
     try eq(ExpertParts{ .half = .{ 1152, 2304 }, .gu = .{ 1152, 1792 }, .dcols = .{ 0, 2560 } }, n3.atPair(0).expertParts(c));
+    // TF_DS_2D_GU=parity: four blocks a pair, the ninth by expert parity (the shared expert's on pair 1)
+    var n3p = n3;
+    n3p.parity = true;
+    try eq(ExpertParts{ .half = .{ 1152, 2304 }, .gu = .{ 1664, 2176 }, .dcols = .{ 2560, 5120 }, .rest = .{ 2176, 2304 } }, n3p.expertParts(c));
+    try eq(ExpertParts{ .half = .{ 1152, 2304 }, .gu = .{ 1152, 1664 }, .dcols = .{ 0, 2560 }, .rest = .{ 2176, 2304 } }, n3p.atPair(0).expertParts(c));
+    try eq(@as(u32, 0), restPair(10, 384));
+    try eq(@as(u32, 1), restPair(11, 384));
+    try eq(@as(u32, 1), restPair(384, 384));
     try eq([2]usize{ 4, 2 }, n3.atPair(0).woAGroups(c));
 }
 

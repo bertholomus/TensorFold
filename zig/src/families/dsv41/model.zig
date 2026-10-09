@@ -64,6 +64,13 @@ pub const Options = struct {
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
 };
 
+/// TF_DS_2D_GU=parity (the served switch): the 2D split's experts with half the gate / up blocks a pair and the ninth by
+/// expert parity (plan.Split.parity); the rank cache must be one written for it.
+pub fn parityGU() bool {
+    const v = std.c.getenv("TF_DS_2D_GU") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "parity");
+}
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     host: std.heap.ArenaAllocator, // allocations that live as long as the model
@@ -202,7 +209,8 @@ pub const Model = struct {
         errdefer m.ix.deinit();
         m.cache_file = try m.cache_dir.openFile(io, cache_name, .{});
         errdefer m.cache_file.close(io);
-        const sp = try prompt2d.split(o.rank, o.world);
+        var sp = try prompt2d.split(o.rank, o.world);
+        sp.parity = sp.pair != null and parityGU(); // TF_DS_2D_GU=parity: the balanced experts split
         m.w = try weights.load(gpa, d, .{ .cache = .{ .file = m.cache_file, .index = &m.ix, .io = io } }, c.*, sp, o.drafts);
         errdefer m.w.deinit();
         if (o.drafts and m.w.dspark == null) return error.NoDrafter;
@@ -296,6 +304,7 @@ pub const Model = struct {
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
+        if (m.two) |t| if (t.ir != 0 and o.side) try m.rd.usePar(&m.eng); // parity: the rest beside the main gate / up
         if (o.drafts) {
             m.dpool = try draft.Pool.init(&m.eng, &m.arena, m.streams);
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
@@ -361,6 +370,7 @@ pub const Model = struct {
         }
         m.rd.dropSide(&m.eng);
         m.rd.dropPrefetch();
+        m.rd.dropPar();
         if (m.aio) |x| x.deinit();
         if (m.paio) |x| x.deinit();
         if (m.epool) |p| p.deinit(m.gpa);

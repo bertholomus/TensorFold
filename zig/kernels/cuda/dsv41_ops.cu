@@ -511,3 +511,53 @@ extern "C" __global__ void tf_ds_vspan_kernel(const unsigned char* types, const 
         out[i] = ty == 1 ? rows[(long long)row_of[t] * dim + c] : ty == 0 ? start[c] : ty == 2 ? newline[c] : end[c];
     }
 }
+
+// TF_DS_2D_GU=parity (exl3/experts2d.py _rest_group_kernel): program i, a place of the window's grouping (uids, count,
+// members [maxu, maxm]), goes to ruids / rmembers at its rank among the places whose expert's rest is this pair's
+// (owner[e] == mine), their order kept, its member row copied; program 0 writes rcount. Data moves only.
+extern "C" __global__ void tf_ds_rest_group_kernel(const int* uids, const int* count, const int* members, const int* owner,
+                                                   int mine, int* ruids, int* rcount, int* rmembers, int maxu, int maxm) {
+    __shared__ int k_sh, tot_sh;
+    const int i = blockIdx.x;
+    const int n = min(*count, maxu);
+    if (threadIdx.x == 0) {
+        int k = 0, tot = 0;
+        for (int j = 0; j < n; ++j) {
+            const int o = owner[uids[j]] == mine;
+            k += (j < i) ? o : 0;
+            tot += o;
+        }
+        k_sh = k;
+        tot_sh = tot;
+    }
+    __syncthreads();
+    if (i == 0 && threadIdx.x == 0) *rcount = tot_sh;
+    if (i >= n) return;
+    const int e = uids[i];
+    if (owner[e] != mine) return;
+    for (int c = threadIdx.x; c < maxm; c += blockDim.x) rmembers[(size_t)k_sh * maxm + c] = members[(size_t)i * maxm + c];
+    if (threadIdx.x == 0) ruids[k_sh] = e;
+}
+
+// TF_DS_2D_GU=parity (exl3/experts2d.py rest_picks): out[i] = remap[pick[i]] (an expert another pair computes the rest
+// of -> E, which the grouping skips).
+extern "C" __global__ void tf_ds_remap_picks_kernel(const int* pick, const int* remap, int* out, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) out[i] = remap[pick[i]];
+}
+
+// TF_DS_2D_GU=parity (exl3/experts2d.py assemble_rest): the half's intermediate out [P, 2 Ig + Ir] fp16 from the
+// pairs' packs (pair p: its main rows [P, Ig], then its rest rows [P, Ir]): pair 0's main, pair 1's main, then each
+// slot's rest from the pair that computed it (owner[pick]). One program a slot row; 16-byte moves.
+extern "C" __global__ void tf_ds_assemble_rest_kernel(const uint4* part0, const uint4* part1, const int* pick,
+                                                      const int* owner, uint4* out, int P, int ig8, int ir8) {
+    const int row = blockIdx.x;
+    if (row >= P) return;
+    const int i8 = 2 * ig8 + ir8;
+    const uint4* rest = (owner[pick[row]] == 0 ? part0 : part1) + (size_t)P * ig8 + (size_t)row * ir8;
+    uint4* o = out + (size_t)row * i8;
+    for (int c = threadIdx.x; c < ig8; c += blockDim.x) {
+        o[c] = part0[(size_t)row * ig8 + c];
+        o[ig8 + c] = part1[(size_t)row * ig8 + c];
+    }
+    for (int c = threadIdx.x; c < ir8; c += blockDim.x) o[2 * ig8 + c] = rest[c];
+}

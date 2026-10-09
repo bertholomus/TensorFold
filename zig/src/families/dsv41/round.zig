@@ -186,6 +186,10 @@ pub const Round = struct {
     pf: ?cuda.Stream = null,
     pf_fork: ?cuda.Event = null,
     pf_join: ?cuda.Event = null,
+    // a parity split's rest gate / up beside the main one (usePar): its stream and the fork / join events
+    par: ?cuda.Stream = null,
+    par_fork: ?cuda.Event = null,
+    par_join: ?cuda.Event = null,
     pf_out: bool = false,
     timer: ?*PhaseTimer = null, // eager rounds' GPU time by phase (a profile)
     // a profile's GPU clocks a round (Model.useClock): at the forward's start, then before and after each stretch
@@ -329,6 +333,9 @@ pub const Round = struct {
         rd.pf = null;
         rd.pf_fork = null;
         rd.pf_join = null;
+        rd.par = null;
+        rd.par_fork = null;
+        rd.par_join = null;
         rd.pf_out = false;
         rd.timer = null;
         return rd;
@@ -357,6 +364,26 @@ pub const Round = struct {
     /// The paced L2 prefetch, as the served build's trace shows it: three launches a layer on a stream of its own, each
     /// touching the next kernels' weights into L2 while the current ones run (after the q/kv linears: wo_a and wo_b;
     /// after wo_b: the router; after the experts: the next layer's input linears). It writes nothing.
+    /// A parity split's rest gate / up on a stream of its own, beside the main gate / up (exl3_experts2d
+    /// decodeGateUpParity): the same launches, the rest's blocks running alongside instead of after.
+    pub fn usePar(rd: *Round, e: *const Engine) !void {
+        if (rd.par != null) return;
+        var s = try cuda.Stream.init(e.d, true);
+        errdefer s.deinit();
+        rd.par_fork = try cuda.Event.init(e.d, false);
+        rd.par_join = try cuda.Event.init(e.d, false);
+        rd.par = s;
+    }
+
+    pub fn dropPar(rd: *Round) void {
+        if (rd.par_fork) |*x| x.deinit();
+        if (rd.par_join) |*x| x.deinit();
+        if (rd.par) |*s| s.deinit();
+        rd.par_fork = null;
+        rd.par_join = null;
+        rd.par = null;
+    }
+
     pub fn usePrefetch(rd: *Round, e: *const Engine) !void {
         if (rd.pf != null) return;
         var s = try cuda.Stream.init(e.d, true);
@@ -738,7 +765,14 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     const kc = try tri_norm.rowmmGate(e.t, rd.x, c.hidden, lay.gate_w, rd.gl, R, c.hidden, c.experts);
     try tri_norm.route(e.t, rd.gl, kc, lay.gate_b, c.top_k, c.routed_scaling, lay.experts.count - 1, rd.pick, rd.mw, R, c.experts, sl);
     try rd.mark(e, .m_rt);
-    if (e.two) |tw| {
+    if (e.two) |tw| if (tw.ir != 0) {
+        // 2D with the parity split: the rest's gate / up beside the main one, the packs exchanged and assembled, down
+        try exl3_experts2d.decodeGateUpParity(e.ex, e.ops, e.s, rd.par, rd.par_fork, rd.par_join, lay.experts, ch.xsd, tw.rest_dec.?, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
+        try rd.mark(e, .m_gu);
+        try tw.assembleParity(e, lay.experts, ch.xsd.xd, rd.pick, R * ch.xsd.slots);
+        try rd.mark(e, .m_x);
+        try exl3_experts2d.decodeDown(e.ex, e.s, lay.experts, ch.xsd, tw.xd_full, rd.pick, rd.mw, rd.pm, R);
+    } else {
         // 2D (round2d.experts, the profile's marks between): gate / up, the intermediate's exchange, down
         try exl3_experts2d.decodeGateUp(e.ex, e.s, lay.experts, ch.xsd, rd.x, c.hidden, rd.pick, rd.mw, rd.pm, R, c.swiglu_limit);
         try rd.mark(e, .m_gu);

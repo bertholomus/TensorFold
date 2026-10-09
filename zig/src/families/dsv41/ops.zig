@@ -41,6 +41,9 @@ pub const Ops = struct {
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
     gpu_clock: cuda.Function,
+    rest_group: cuda.Function,
+    remap_picks: cuda.Function,
+    assemble_rest: cuda.Function,
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -72,6 +75,9 @@ pub const Ops = struct {
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
+            .rest_group = try fm.function("tf_ds_rest_group_kernel"),
+            .remap_picks = try fm.function("tf_ds_remap_picks_kernel"),
+            .assemble_rest = try fm.function("tf_ds_assemble_rest_kernel"),
         };
     }
 
@@ -294,6 +300,39 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(n)));
         a.add(out);
         try go(o.argmax_rows, s, rows, 1024, &a);
+    }
+
+    /// A parity split's rest grouping (experts2d _rest_group_kernel): the places of (uids, count, members [maxu, maxm])
+    /// whose expert's rest this pair computes, in order, into (ruids, rcount, rmembers).
+    pub fn restGroup(o: *const Ops, s: cuda.Stream, uids: u64, count: u64, members: u64, owner: u64, mine: u32, ruids: u64, rcount: u64, rmembers: u64, maxu: usize, maxm: usize) !void {
+        if (maxu == 0) return;
+        var a: cuda.Args = .{};
+        for ([_]u64{ uids, count, members, owner }) |v| a.add(v);
+        a.add(@as(c_int, @intCast(mine)));
+        for ([_]u64{ ruids, rcount, rmembers }) |v| a.add(v);
+        a.add(@as(c_int, @intCast(maxu)));
+        a.add(@as(c_int, @intCast(maxm)));
+        try go(o.rest_group, s, @intCast(maxu), 32, &a);
+    }
+
+    /// rest_picks: out int32 [n] = remap[pick[i]].
+    pub fn remapPicks(o: *const Ops, s: cuda.Stream, pick: u64, remap: u64, out: u64, n: usize) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        for ([_]u64{ pick, remap, out }) |v| a.add(v);
+        a.add(@as(c_int, @intCast(n)));
+        try go(o.remap_picks, s, blocks(n, 256), 256, &a);
+    }
+
+    /// assemble_rest: out fp16 [P, 2 ig + ir] from the pairs' packs (main rows [P, ig] then rest rows [P, ir] each),
+    /// the rest of a slot from owner[pick].
+    pub fn assembleRest(o: *const Ops, s: cuda.Stream, part0: u64, part1: u64, pick: u64, owner: u64, out: u64, p: usize, ig: usize, ir: usize) !void {
+        if (p == 0) return;
+        if (ig % 8 != 0 or ir % 8 != 0) return error.UnsupportedShape;
+        var a: cuda.Args = .{};
+        for ([_]u64{ part0, part1, pick, owner, out }) |v| a.add(v);
+        for ([_]usize{ p, ig / 8, ir / 8 }) |v| a.add(@as(c_int, @intCast(v)));
+        try go(o.assemble_rest, s, @intCast(p), 64, &a);
     }
 
     /// The GPU clock (ns) into buf[i] when the stream reaches it (a profile).

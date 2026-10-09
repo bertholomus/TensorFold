@@ -376,7 +376,7 @@ pub const Chunk = struct {
             ch.kv = try a.take(cap * en * 2);
             break;
         }
-        const sz = exl3_experts.Scratch.sizes(cap, sl, ex.dims, ex.width, ex.count);
+        const sz = exl3_experts.Scratch.sizes(cap, sl, ex.dims, ex.width + if (ex.rest) |r| r.width else 0, ex.count); // parity: the pack
         var xs: exl3_experts.Scratch = undefined;
         xs.rows = cap;
         xs.slots = sl;
@@ -385,6 +385,7 @@ pub const Chunk = struct {
         }
         ch.xs = xs;
         ch.xsd = try decodeScratch(e, a, ex, sl);
+        if (e.two) |t| try t.clearRest(e); // parity: the rest launches' grouping starts empty
         ch.gl = try a.take(16 * (d / 256) * c.experts * 4);
         // prefill.Workspace: the largest prompt GEMM's rotated input and W_q (fp16) over every layer, and the Hadamard
         var max_xk: usize = 0;
@@ -521,7 +522,7 @@ pub fn fill(e: *const Engine, dst: u64, value: u8, bytes: usize) !void {
 }
 
 /// cuMemsetD32 in the stream's order.
-fn fill32(e: *const Engine, dst: u64, value: u32, words: usize) !void {
+pub fn fill32(e: *const Engine, dst: u64, value: u32, words: usize) !void {
     try e.d.check(e.d.api.cuMemsetD32Async(dst, value, words, e.s.handle), "cuMemsetD32Async");
 }
 

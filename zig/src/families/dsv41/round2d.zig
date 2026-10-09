@@ -40,7 +40,12 @@ pub fn woExchange(t: *const Two, e: *const Engine, xb: u64, rows: usize) !void {
 /// node's output columns with the combine: out fp32 [R, dw[p]].
 pub fn experts(t: *const Two, e: *const Engine, ex: weights.Experts, sc: exl3_experts.DecodeScratch, x: u64, x_stride: usize, pick: u64, wts: u64, out: u64, rows: usize, limit: f32) !void {
     try exl3_experts2d.decodeGateUp(e.ex, e.s, ex, sc, x, x_stride, pick, wts, out, rows, limit);
-    try t.catRank(e, sc.xd, t.xd_full, rows * sc.slots, t.gu, 2);
+    if (t.ir != 0) {
+        // TF_DS_2D_GU=parity (experts2d gateup_rest_fused, pair_parts, assemble_rest): the rest columns of the experts
+        // this pair computes them for, then the packs exchanged with the column partner and the half assembled
+        try exl3_experts2d.decodeGateUpRest(e.ex, e.ops, e.s, ex, sc, t.rest_dec.?, pick, rows, limit);
+        try t.assembleParity(e, ex, sc.xd, pick, rows * sc.slots);
+    } else try t.catRank(e, sc.xd, t.xd_full, rows * sc.slots, t.gu, 2);
     try exl3_experts2d.decodeDown(e.ex, e.s, ex, sc, t.xd_full, pick, wts, out, rows);
 }
 
