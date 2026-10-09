@@ -76,7 +76,7 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
         var problem: []const u8 = "";
         const prep = vision.prepare(vision.ctx, cx.a, images[k], &problem) catch |e| switch (e) {
             error.OutOfMemory => return error.OutOfMemory,
-            error.BadImage => return cx.fail(.request, "image input: {s}", .{problem}),
+            error.BadImage => return cx.refuse(problem),
         };
         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);

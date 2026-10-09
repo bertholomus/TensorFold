@@ -30,10 +30,13 @@ pub const Images = struct {
 
 pub const image_text_refusal = "image input: message text must not contain the image placeholder token";
 
+pub const image_role_refusal = "image input: images are accepted only in user messages and tool results";
+const text_only_refusal = "this server accepts text parts only; image, audio and video inputs are unsupported";
+
 fn isImagePart(part: Value) bool {
     if (part != .object) return false;
     const t = part.get("type") orelse return false;
-    return t == .string and (std.mem.eql(u8, t.string, "image_url") or std.mem.eql(u8, t.string, "image"));
+    return t == .string and std.mem.eql(u8, t.string, "image_url");
 }
 
 /// Whether any message's content list holds an image part.
@@ -47,30 +50,94 @@ fn hasImages(list: Value) bool {
     return false;
 }
 
-/// An image part's bytes: an ``image_url`` (a string or ``{"url": ...}``) or an ``image`` block's ``url``, a base64
-/// data URL (characters outside the alphabet skipped, as Python's b64decode does).
+/// An ``image_url`` part's bytes: ``{"url": "data:...,<base64>"}`` (other URLs are off), the base64 as Python's
+/// b64decode reads it.
 fn imageBytes(cx: *Cx, part: Value) errors.Refused![]const u8 {
-    const t = part.get("type").?.string;
-    const ref: ?Value = if (std.mem.eql(u8, t, "image_url")) part.get("image_url") else part.get("url");
-    const url: []const u8 = blk: {
-        const r = ref orelse break :blk "";
-        if (r == .string) break :blk r.string;
-        if (r == .object) if (r.get("url")) |u| if (u == .string) break :blk u.string;
-        break :blk "";
+    const r = part.get("image_url") orelse return cx.refuse(text_only_refusal);
+    if (r != .object) return cx.refuse(text_only_refusal);
+    const u = r.get("url") orelse return cx.refuse(text_only_refusal);
+    if (u != .string) return cx.refuse(text_only_refusal);
+    const url = u.string;
+    if (!std.mem.startsWith(u8, url, "data:")) return cx.refuse("image input: image URLs are off on this server (send a base64 data URL)");
+    const comma = std.mem.indexOfScalar(u8, url, ',') orelse url.len;
+    if (std.mem.indexOf(u8, url[0..comma], ";base64") == null) return cx.fail(.request, "image input: Unsupported data URL encoding: {s}", .{url[0..comma]});
+    const data = if (comma < url.len) url[comma + 1 ..] else "";
+    return switch (b64decode(cx.a, data)) {
+        .ok => |b| b,
+        .short => |n| cx.fail(.request, "image input: Invalid base64-encoded string: number of data characters ({d}) cannot be 1 more than a multiple of 4", .{n}),
+        .padding => cx.refuse("image input: Incorrect padding"),
+        .oom => error.OutOfMemory,
     };
-    if (url.len == 0) return cx.refuse("image input: an image part must contain an image URL");
-    if (!std.mem.startsWith(u8, url, "data:")) return cx.refuse("image input: images must be base64 data URLs");
-    const comma = std.mem.indexOfScalar(u8, url, ',') orelse return cx.refuse("image input: a data URL must hold base64 data");
-    if (!std.mem.endsWith(u8, url[0..comma], ";base64")) return cx.refuse("image input: a data URL must hold base64 data");
-    var clean: std.ArrayList(u8) = .empty;
-    for (url[comma + 1 ..]) |ch| {
-        if (std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '/' or ch == '=') try clean.append(cx.a, ch);
+}
+
+const B64 = union(enum) { ok: []u8, short: usize, padding, oom };
+
+/// binascii.a2b_base64 as base64.b64decode calls it (not strict): characters outside the alphabet skipped, the input
+/// read until a complete padding, an incomplete last quad an error (one character over: "short", with the data
+/// characters it counts; two or three: "padding").
+fn b64decode(a: std.mem.Allocator, s: []const u8) B64 {
+    const out = a.alloc(u8, s.len / 4 * 3 + 3) catch return .oom;
+    var n: usize = 0;
+    var quad: u8 = 0;
+    var left: u8 = 0;
+    var pads: usize = 0;
+    for (s) |ch| {
+        if (ch == '=') {
+            if (quad >= 2) {
+                pads += 1;
+                if (quad + pads >= 4) return .{ .ok = out[0..n] };
+            }
+            continue;
+        }
+        const v: u8 = switch (ch) {
+            'A'...'Z' => ch - 'A',
+            'a'...'z' => ch - 'a' + 26,
+            '0'...'9' => ch - '0' + 52,
+            '+' => 62,
+            '/' => 63,
+            else => continue,
+        };
+        pads = 0;
+        switch (quad) {
+            0 => {
+                quad = 1;
+                left = v;
+            },
+            1 => {
+                quad = 2;
+                out[n] = (left << 2) | (v >> 4);
+                n += 1;
+                left = v & 0x0f;
+            },
+            2 => {
+                quad = 3;
+                out[n] = (left << 4) | (v >> 2);
+                n += 1;
+                left = v & 0x03;
+            },
+            else => {
+                quad = 0;
+                out[n] = (left << 6) | v;
+                n += 1;
+                left = 0;
+            },
+        }
     }
-    const d = std.base64.standard.Decoder;
-    const n = d.calcSizeForSlice(clean.items) catch return cx.refuse("image input: the image's base64 data is malformed");
-    const out = try cx.a.alloc(u8, n);
-    d.decode(out, clean.items) catch return cx.refuse("image input: the image's base64 data is malformed");
-    return out;
+    if (quad == 1) return .{ .short = n / 3 * 4 + 1 };
+    if (quad != 0) return .padding;
+    return .{ .ok = out[0..n] };
+}
+
+test "base64 as Python's b64decode reads it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualStrings("hello", b64decode(a, "aGVsbG8=").ok);
+    try std.testing.expectEqualStrings("hello", b64decode(a, "aGVs\nbG8=").ok); // a newline skipped
+    try std.testing.expectEqualStrings("hello", b64decode(a, "aGVsbG8=ignored").ok); // stops at the padding
+    try std.testing.expectEqual(@as(usize, 9), b64decode(a, "aGVsbG8hZ").short); // 9 data characters
+    try std.testing.expect(b64decode(a, "aGVsbG8") == .padding);
+    try std.testing.expectEqualStrings("", b64decode(a, "").ok);
 }
 
 /// ``normalize_messages`` (text only): leading system and developer text merged, later ones as ``late_system``; a template that needs a user query gains one user turn after a trailing tool run.
@@ -101,6 +168,8 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
             const content = message.get("content");
             var item: *json.Object = message.object;
             if (content != null and content.? == .array) {
+                const r = role.?.string;
+                if (!std.mem.eql(u8, r, "user") and !std.mem.eql(u8, r, "tool")) for (content.?.array) |part| if (isImagePart(part)) return cx.refuse(image_role_refusal);
                 var text: std.ArrayList(u8) = .empty;
                 for (content.?.array, 0..) |part, k| {
                     if (k > 0) try text.appendSlice(cx.a, "\n\n");
@@ -110,7 +179,7 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
                         continue;
                     }
                     const typed = part == .object and part.get("type") != null and part.get("type").? == .string and std.mem.eql(u8, part.get("type").?.string, "text");
-                    if (!typed or fields.hasMedia(part)) return cx.refuse("this server accepts text parts only; image, audio and video inputs are unsupported");
+                    if (!typed or fields.hasMedia(part)) return cx.refuse(text_only_refusal);
                     const t: Value = part.get("text") orelse .null;
                     if (t != .string and t != .null) return cx.refuse("a text content part must contain a text string");
                     if (t == .string) {

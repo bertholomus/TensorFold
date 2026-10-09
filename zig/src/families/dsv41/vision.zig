@@ -9,6 +9,7 @@ const picture = @import("picture.zig");
 const vit = @import("vit.zig");
 const fmha = @import("fmha.zig");
 const model = @import("model.zig");
+const pil = @import("pil.zig");
 
 /// A prepared image's payload: its grid (six u32, little-endian: best_h, best_w, n_vit_h, n_vit_w, n_llm_h, n_llm_w)
 /// then its patches (bf16, picture.patchify's order), the patches 16-byte aligned.
@@ -24,6 +25,7 @@ pub const Vision = struct {
     tower: vit.Tower,
     span: cuda.DeviceBuffer, // bf16 [max_span, 5120]: a picture's span rows
     scratch: cuda.DeviceBuffer, // the span's types and rows (Tower.spanRows)
+    pil: ?*pil.Pil = null, // the formats picture.zig does not decode (null: no python3 with Pillow here)
 
     /// The tower on `m`'s stream (its exact kernels and cuBLAS handle, as the tower gate ran them), its weights from
     /// the checkpoint, torch's attention cubin from the kit's vision/, and its workspace for the largest picture.
@@ -43,10 +45,17 @@ pub const Vision = struct {
         v.span = try cuda.DeviceBuffer.alloc(d, max_span * vit.model_dim * 2);
         errdefer v.span.free();
         v.scratch = try cuda.DeviceBuffer.alloc(d, max_span * 8 + 4096);
+        errdefer v.scratch.free();
+        v.pil = pil.Pil.start(gpa, io) catch |err| blk: {
+            std.debug.print("{{\"vision\": \"no Pillow ({s}): images other than PNG are refused\"}}\n", .{@errorName(err)});
+            break :blk null;
+        };
+        if (v.pil) |p| std.debug.print("{{\"vision\": \"Pillow {s} decodes the formats other than PNG\"}}\n", .{p.versionText()});
         return v;
     }
 
     pub fn close(v: *Vision) void {
+        if (v.pil) |p| p.stop(v.gpa);
         v.scratch.free();
         v.span.free();
         v.tower.close();
@@ -62,9 +71,11 @@ pub const Vision = struct {
 
     fn prepareFn(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!lanes.stream.Vision.Prepared {
         const v: *Vision = @ptrCast(@alignCast(ctx));
-        var pic = picture.picture(a, bytes, v.cfg) catch |err| {
+        var rgb = try v.decode(a, bytes, problem);
+        defer rgb.deinit(a);
+        var pic = picture.fromRgb(a, rgb, v.cfg) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
-            problem.* = refusal(err);
+            problem.* = "image input: the image could not be prepared";
             return error.BadImage;
         };
         defer pic.deinit(a);
@@ -76,13 +87,34 @@ pub const Vision = struct {
         return .{ .tokens = @intCast(g.spanTokens()), .payload = payload };
     }
 
-    /// Why an image is refused, in words.
-    fn refusal(err: anyerror) []const u8 {
-        return switch (err) {
-            error.NotPng => "cannot identify image file",
-            error.TooLarge => "the image is larger than the decoder allows",
-            else => "the image could not be decoded",
+    /// The image's RGB as the lane's Pillow decodes it: picture.zig's PNG, else Pillow's own (the refusal in the lane's
+    /// words on BadImage).
+    fn decode(v: *Vision, a: std.mem.Allocator, bytes: []const u8, problem: *[]const u8) lanes.stream.Vision.PrepareError!picture.Rgb {
+        if (picture.decodePng(a, bytes)) |rgb| return rgb else |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.TooLarge => {
+                problem.* = try std.fmt.allocPrint(a, "Image size ({d} pixels) exceeds limit of {d} pixels, could be decompression bomb DOS attack.", .{ picture.pixels(bytes) orelse 0, picture.max_pixels });
+                return error.BadImage;
+            },
+            else => {}, // not a PNG this decoder reads: Pillow's
+        }
+        const p = v.pil orelse {
+            problem.* = "image input: cannot identify image file (no Pillow on this server for formats other than PNG)";
+            return error.BadImage;
         };
+        const got = p.decode(a, bytes) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            std.debug.print("{{\"vision\": \"Pillow's child failed ({s})\"}}\n", .{@errorName(err)});
+            problem.* = "image input: the image decoder failed";
+            return error.BadImage;
+        };
+        switch (got) {
+            .rgb => |rgb| return rgb,
+            .refused => |m| {
+                problem.* = m;
+                return error.BadImage;
+            },
+        }
     }
 
     /// A prepared picture's span rows bf16 [tokens, 5120] appended to `out` (the tower on the model's stream, then the
