@@ -176,8 +176,14 @@ pub const Ops = struct {
     /// Every 128-byte line of `pf`'s ranges touched into L2 (one block of 128 threads); writes nothing.
     pub fn l2Prefetch(o: *const Ops, s: cuda.Stream, pf: Prefetch) !void {
         if (pf.n == 0) return;
+        // the served decode settings (exl3/prefetch.py): 3 us before the first wave, waves of 128 chunks of 8 KiB
+        // at 230 GB/s (TF_EXL3_L2_DELAY_NS, TF_EXL3_L2_RATE_GBPS), one block
+        const delay_ns: c_longlong = 3000;
+        const wave_ns: c_longlong = @intFromFloat(128.0 * 8192.0 / 230.0);
         var a: cuda.Args = .{};
         a.add(pf);
+        a.add(delay_ns);
+        a.add(wave_ns);
         try cuda.launch.launch(o.l2_prefetch, .{ .grid = .{ .x = 1 }, .block = .{ .x = 128 } }, s, &a);
     }
 
