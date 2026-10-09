@@ -135,6 +135,11 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const ds_picture = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/picture_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_picture.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-picture", .root_module = ds_picture }));
+    // the vision tower on recorded patches, each step's bytes against the served lane's (vit.zig)
+    const ds_vit = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/vit_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_vit.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    ds_vit.addImport("cuda", cuda);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-vit", .root_module = ds_vit }));
     // the 2D split's decode-size exchanges over the RDMA rings on four nodes, word for word against Comm2D's layout
     const ds_ring2d = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/ring2d_check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_ring2d.addImport("dsv41", ds_check.import_table.get("dsv41").?);

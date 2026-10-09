@@ -22,6 +22,7 @@ pub const Api = struct {
     cublasSetWorkspace_v2: *const fn (Handle, D, usize) callconv(.c) S,
     cublasSetMathMode: *const fn (Handle, c_int) callconv(.c) S,
     cublasSgemm_v2: *const fn (Handle, Op, Op, c_int, c_int, c_int, *const f32, D, c_int, D, c_int, *const f32, D, c_int) callconv(.c) S,
+    cublasGemmEx: *const fn (Handle, Op, Op, c_int, c_int, c_int, *const anyopaque, D, c_int, c_int, D, c_int, c_int, *const anyopaque, D, c_int, c_int, c_int, c_int) callconv(.c) S,
 };
 
 /// One handle bound to a stream, with torch's workspace size and math mode.
@@ -60,6 +61,16 @@ pub const Blas = struct {
             std.log.err("cuBLAS status {d}", .{s});
             return error.CublasFailed;
         }
+    }
+
+    /// nn.Linear without a bias of x bf16 [rows, k] and w bf16 [n, k]: out bf16 [rows, n], as torch issues it
+    /// (cublasGemmEx: transa T, transb N, m = n, n = rows, lda = ldb = k, ldc = n, fp32 alpha 1 and beta 0, bf16
+    /// operands, COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP; the recording's cuBLAS log for the vision MLP).
+    pub fn linearBf16(b: *const Blas, x: u64, w: u64, out: u64, rows: usize, k: usize, n: usize) Error!void {
+        const one: f32 = 1;
+        const zero: f32 = 0;
+        const bf16_type: c_int = 14; // CUDA_R_16BF
+        try b.check(b.api.cublasGemmEx(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, bf16_type, @intCast(k), x, bf16_type, @intCast(k), &zero, out, bf16_type, @intCast(n), 68, 99));
     }
 
     /// torch.matmul of x [rows, k] fp32 (row-major) and w [n, k] fp32 transposed: out [rows, n] fp32, as torch issues
