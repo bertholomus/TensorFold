@@ -1,5 +1,15 @@
 # TensorFold
 
+> **This is a fork of TensorFold 1.0.2** by Bertholomus AI, not the upstream project. It adds the `dsv41` family:
+> DeepSeek-V4.1-Flash (EXL3), with image input, on TensorFold 1.0's native Zig engine, tensor-parallel over two NVIDIA
+> GB10 (DGX Spark) nodes. The family is in `zig/src/families/dsv41/`, its tools and attribution in `tools/dsv41-zig/`
+> (`ATTRIBUTION.md`). `NOTICE` lists every upstream file this fork changes. Upstream TensorFold is at
+> https://github.com/ashhart/TensorFold; the text below is upstream's README, unchanged, and its install commands
+> install upstream, not this fork.
+>
+> Weights: [Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw)
+> (MIT), an EXL3 quant of [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
+
 TensorFold 1.0.0 serves language models from a Zig binary on Apple Silicon and NVIDIA GPUs.
 The engine reads checkpoints, tokenizes requests and runs Metal or CUDA kernels directly.
 Serving needs no Python or MLX installation.
