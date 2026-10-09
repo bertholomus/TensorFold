@@ -41,6 +41,9 @@ pub const LaneHost = struct {
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
+    // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
+    // other streams ran): admitted again once fewer than this many streams are active
+    full_wait: ?usize = null,
 
     const Mark = struct { at: i96, tokens: u64 };
     const window_ns: i96 = 2 * std.time.ns_per_s;
@@ -285,6 +288,14 @@ pub const LaneHost = struct {
             h.unlock();
             return false;
         }
+        if (h.full_wait) |n| {
+            const active = h.core.activeCount();
+            if (active > 0 and active >= n) {
+                h.unlock();
+                return false;
+            }
+            h.full_wait = null;
+        }
         const job = h.queued.orderedRemove(0);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
@@ -327,7 +338,11 @@ pub const LaneHost = struct {
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
         job.began = began;
         if (h.loneFits(job)) return h.runLone(job, began);
-        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
+        h.core.addStream(&job.stream) catch |e| {
+            if (e == error.Cancelled) return h.cancel(job);
+            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+            return h.drop(job, h.words(e));
+        };
         h.prefilled(job, began);
         if (h.deliver(job)) h.remove(job);
         return true;
@@ -407,6 +422,33 @@ pub const LaneHost = struct {
         if (job.started and !job.stream.finished) h.core.discard(&job.stream);
         h.finish(job, .failed, message);
         return true;
+    }
+
+    /// A request whose prompt pass the backend's pool cannot hold while other streams run (error.ContextFull, before
+    /// anything of it was placed) goes back to the queue's front and waits until one of them ends, as the Python
+    /// lane's window waits, instead of failing. Returns false: nothing more is admitted now.
+    fn requeue(h: *LaneHost, job: *Job) bool {
+        h.remove(job);
+        h.core.discard(&job.stream);
+        job.entry = null; // nothing was restored: the store keeps the entry for the next lookup
+        h.gpa.free(job.marks);
+        job.marks = &.{};
+        job.stream.deinit(h.gpa);
+        job.proposer.deinit();
+        job.started = false;
+        job.began = 0;
+        job.prefilled = null;
+        job.delivered = 0;
+        job.prefill_sent = false;
+        h.lock();
+        h.queued.insert(h.gpa, 0, job) catch {
+            h.unlock();
+            h.finish(job, .failed, "out of memory");
+            return true;
+        };
+        h.full_wait = h.core.activeCount();
+        h.unlock();
+        return false;
     }
 
     /// A job cancelled in its prompt pass, its lane already released.
