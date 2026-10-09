@@ -152,6 +152,28 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
+/// Whether, with an extent of `size` at `b` taken besides `used`, another extent of `size` still fits in [0, cap).
+pub fn roomAfter(gpa: std.mem.Allocator, used: []const [2]usize, b: usize, size: usize, cap: usize) !bool {
+    const all = try gpa.alloc([2]usize, used.len + 1);
+    defer gpa.free(all);
+    @memcpy(all[0..used.len], used);
+    all[used.len] = .{ b, b + size };
+    return place(all, size, cap) != null;
+}
+
+test "a copy that fills the pool leaves no room for another request of its size" {
+    const c = model.chunk_rows;
+    // three live extents of 4 chunks in a 16-chunk pool: a fourth fits, and leaves no room for a fifth
+    const used = [_][2]usize{ .{ 0, 4 * c }, .{ 4 * c, 8 * c }, .{ 8 * c, 12 * c } };
+    const gpa = std.testing.allocator;
+    const b = place(&used, 4 * c, 16 * c).?;
+    try std.testing.expectEqual(@as(usize, 12 * c), b);
+    try std.testing.expect(!try roomAfter(gpa, &used, b, 4 * c, 16 * c));
+    // two live extents: the third leaves room for a fourth
+    const b2 = place(used[0..2], 4 * c, 16 * c).?;
+    try std.testing.expect(try roomAfter(gpa, used[0..2], b2, 4 * c, 16 * c));
+}
+
 pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
     var base: usize = 0;
     while (base + size <= cap) {
@@ -700,28 +722,37 @@ pub const Lanes = struct {
     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
     /// first and `source` (the state this prompt resumes from, its rows copied here) last, as the Python lane's _place
     /// takes the oldest other kept prompt before the source; a state whose rows lie in a live stream's extent gives
-    /// none (that stream holds the room) and stays. When a live stream holds `source` and the copy needs another
-    /// state's room, the request first waits up to held_wait_ns for that stream to end (error.ContextFull: the host
-    /// tries it again), so it resumes in place and every kept state stays (the 5 x 500K check).
+    /// none (that stream holds the room) and stays. When a live stream holds `source`, the request first waits up to
+    /// held_wait_ns for that stream to end (error.ContextFull: the host tries it again; it then resumes in place) if
+    /// the copy needs another state's room or would leave none for another request of its size: a copy that fills the
+    /// pool makes the next prompt evict a kept state (the 5 x 500K check with the duplicate admitted fourth).
     fn placeKept(self: *Lanes, live: []const [2]usize, size: usize, source: ?*Snap) !usize {
         const gpa = self.gpa;
         var used: std.ArrayList([2]usize) = .empty;
         defer used.deinit(gpa);
+        const held = if (source) |sn| !sn.stale and clashes(live, sn.base, sn.base + sn.at) else false;
         while (true) {
             used.clearRetainingCapacity();
             try used.appendSlice(gpa, live);
             for (self.snaps.items) |sn| if (!sn.stale) try used.append(gpa, .{ sn.base, sn.base + sn.at });
-            if (place(used.items, size, self.m.pool_cap)) |b| return b;
-            if (source) |sn| if (!sn.stale and clashes(live, sn.base, sn.base + sn.at)) {
-                const t = self.m.now();
-                if (sn.wanted == 0) sn.wanted = t;
-                if (t - sn.wanted < held_wait_ns) return error.ContextFull;
-            };
+            const got = place(used.items, size, self.m.pool_cap);
+            if (held and self.patient(source.?)) {
+                const b = got orelse return error.ContextFull;
+                return if (try roomAfter(gpa, used.items, b, size, self.m.pool_cap)) b else error.ContextFull;
+            }
+            if (got) |b| return b;
             const victim = for (self.snaps.items) |sn| {
                 if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
             victim.stale = true;
         }
+    }
+
+    /// Whether a request still waits for the live stream that holds `sn` (held_wait_ns from its first wait).
+    fn patient(self: *const Lanes, sn: *Snap) bool {
+        const t = self.m.now();
+        if (sn.wanted == 0) sn.wanted = t;
+        return t - sn.wanted < held_wait_ns;
     }
 
     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
