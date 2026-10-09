@@ -218,7 +218,18 @@ extern "c" fn exp(x: f64) f64;
 /// replay): the slot's own part on the device (Model.snapCopy), and the extent its compressed rows stay in,
 /// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
 /// and the prompt runs from 0).
-pub const Snap = struct { id: u64, at: usize, base: usize, buf: cuda.DeviceBuffer, stale: bool = false };
+pub const Snap = struct {
+    id: u64,
+    at: usize,
+    base: usize,
+    buf: cuda.DeviceBuffer,
+    stale: bool = false,
+    wanted: u64 = 0, // when a request first waited for the live stream that holds these rows (placeKept; 0: none)
+};
+
+/// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
+/// in place and every kept state stays) before other kept states give their room for a copy of it.
+const held_wait_ns: u64 = 10 * std.time.ns_per_s;
 
 /// First tokens a handle names (each prompt's draw, read back right after its prefill).
 const ring = 1024;
@@ -381,7 +392,8 @@ pub const Lanes = struct {
                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
             } else s.reuse_failed = true;
         }
-        const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size);
+        const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
+        if (kept) |sn| sn.wanted = 0;
         if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
             kept = null;
             s.reuse_failed = true;
@@ -685,9 +697,13 @@ pub const Lanes = struct {
         return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
     }
 
-    /// The first extent that fits around the live streams and the kept states; the oldest kept states go stale
-    /// until it does.
-    fn placeKept(self: *Lanes, live: []const [2]usize, size: usize) !usize {
+    /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
+    /// first and `source` (the state this prompt resumes from, its rows copied here) last, as the Python lane's _place
+    /// takes the oldest other kept prompt before the source; a state whose rows lie in a live stream's extent gives
+    /// none (that stream holds the room) and stays. When a live stream holds `source` and the copy needs another
+    /// state's room, the request first waits up to held_wait_ns for that stream to end (error.ContextFull: the host
+    /// tries it again), so it resumes in place and every kept state stays (the 5 x 500K check).
+    fn placeKept(self: *Lanes, live: []const [2]usize, size: usize, source: ?*Snap) !usize {
         const gpa = self.gpa;
         var used: std.ArrayList([2]usize) = .empty;
         defer used.deinit(gpa);
@@ -696,10 +712,15 @@ pub const Lanes = struct {
             try used.appendSlice(gpa, live);
             for (self.snaps.items) |sn| if (!sn.stale) try used.append(gpa, .{ sn.base, sn.base + sn.at });
             if (place(used.items, size, self.m.pool_cap)) |b| return b;
-            const oldest = for (self.snaps.items) |sn| {
-                if (!sn.stale) break sn;
-            } else return error.ContextFull;
-            oldest.stale = true;
+            if (source) |sn| if (!sn.stale and clashes(live, sn.base, sn.base + sn.at)) {
+                const t = self.m.now();
+                if (sn.wanted == 0) sn.wanted = t;
+                if (t - sn.wanted < held_wait_ns) return error.ContextFull;
+            };
+            const victim = for (self.snaps.items) |sn| {
+                if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
+            } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
+            victim.stale = true;
         }
     }
 

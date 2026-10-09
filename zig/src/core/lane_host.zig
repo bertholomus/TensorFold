@@ -42,10 +42,13 @@ pub const LaneHost = struct {
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
-    // other streams ran): admitted again once fewer than this many streams are active
+    // other streams ran): admitted again once fewer than this many streams are active, or at full_retry (a backend
+    // may refuse for a while to keep its kept states, waiting for one stream, and then place it)
     full_wait: ?usize = null,
+    full_retry: i96 = 0,
 
     const Mark = struct { at: i96, tokens: u64 };
+    const full_retry_ns: i96 = std.time.ns_per_s;
     const window_ns: i96 = 2 * std.time.ns_per_s;
 
     const Job = struct {
@@ -290,7 +293,7 @@ pub const LaneHost = struct {
         }
         if (h.full_wait) |n| {
             const active = h.core.activeCount();
-            if (active > 0 and active >= n) {
+            if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
                 h.unlock();
                 return false;
             }
@@ -426,7 +429,8 @@ pub const LaneHost = struct {
 
     /// A request whose prompt pass the backend's pool cannot hold while other streams run (error.ContextFull, before
     /// anything of it was placed) goes back to the queue's front and waits until one of them ends, as the Python
-    /// lane's window waits, instead of failing. Returns false: nothing more is admitted now.
+    /// lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
+    /// false: nothing more is admitted now.
     fn requeue(h: *LaneHost, job: *Job) bool {
         h.remove(job);
         h.core.discard(&job.stream);
@@ -447,6 +451,7 @@ pub const LaneHost = struct {
             return true;
         };
         h.full_wait = h.core.activeCount();
+        h.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
         h.unlock();
         return false;
     }

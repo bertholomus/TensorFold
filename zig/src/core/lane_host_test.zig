@@ -1,4 +1,4 @@
-//! Host memory reporting and isolated request refusal through LaneHost.
+//! Host memory reporting, isolated request refusal and the pool-full retry through LaneHost.
 const std = @import("std");
 const lanes = @import("lanes");
 const api = @import("engine_api.zig");
@@ -93,4 +93,61 @@ test "a request the backend refuses fails alone, in the backend's words" {
     try std.testing.expectEqualStrings("send temperature 0", sampled.message);
     try std.testing.expectEqual(Reason.length, plain.wait());
     try std.testing.expectEqual(@as(usize, 64), plain.tokens);
+}
+
+test "a request refused for room while another stream runs is tried again within a second" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .refuse_full = 1 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    try host.start();
+    defer host.stop();
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        done: ?Reason = null,
+        tokens: usize = 0,
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .tokens => |t| b.tokens += t.len,
+                .finished => |f| b.done = f.reason,
+                else => {},
+            }
+        }
+        fn state(b: *@This()) struct { ?Reason, usize } {
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            return .{ b.done, b.tokens };
+        }
+        // the reason the request ended with, or null when it has not ended within `ms`
+        fn waitFor(b: *@This(), ms: u32) ?Reason {
+            for (0..ms) |_| {
+                if (b.state()[0]) |r| return r;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+            return b.state()[0];
+        }
+    };
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    var long: Box = .{};
+    var short: Box = .{};
+    const e = host.engine();
+    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 1 << 30 }, .{ .ctx = &long, .event = Box.event });
+    while (long.state()[1] == 0) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    // the second request's prompt pass is refused once for room (error.ContextFull) while the first stream runs on:
+    // it goes back to the queue and is tried again within a second, not only when that stream ends
+    try e.submit(2, &.{ .prompt = &prompt, .max_tokens = 8 }, .{ .ctx = &short, .event = Box.event });
+    try std.testing.expectEqual(@as(?Reason, Reason.length), short.waitFor(5000));
+    try std.testing.expectEqual(@as(usize, 8), short.state()[1]);
+    try std.testing.expectEqual(@as(usize, 0), target.refuse_full);
+    try std.testing.expect(long.state()[0] == null);
+    e.cancel(1);
+    try std.testing.expect(long.waitFor(5000) != null);
 }
