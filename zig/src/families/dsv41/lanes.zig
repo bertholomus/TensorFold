@@ -411,7 +411,10 @@ pub const Lanes = struct {
             // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
             if (s.images.len == 0 and self.usable(sn, len)) {
                 kept = sn;
-                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
+                // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
+                // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
+                // the Python lane's _place resumes "here" only in a free extent)
+                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn);
             } else s.reuse_failed = true;
         }
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
@@ -746,6 +749,12 @@ pub const Lanes = struct {
             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
             victim.stale = true;
         }
+    }
+
+    /// Whether a kept state other than `except` has rows in [lo, hi).
+    fn keptOver(self: *const Lanes, lo: usize, hi: usize, except: *const Snap) bool {
+        for (self.snaps.items) |sn| if (sn != except and !sn.stale and sn.base < hi and lo < sn.base + sn.at) return true;
+        return false;
     }
 
     /// Whether a request still waits for the live stream that holds `sn` (held_wait_ns from its first wait).
