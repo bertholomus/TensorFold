@@ -20,6 +20,7 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
+const cuda = @import("cuda");
 
 const be = lanes.backend;
 const Model = model.Model;
@@ -30,7 +31,7 @@ const max_rows = round.max_rows;
 pub const window_rows = 6;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, done = 9 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, done = 9 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -126,6 +127,18 @@ pub const Built = struct {
 };
 
 /// The first chunk-aligned extent of `size` positions in [0, cap) that overlaps none of `used`.
+/// Whether [lo, hi) meets any of `used`.
+fn clashes(used: []const [2]usize, lo: usize, hi: usize) bool {
+    for (used) |u| if (lo < u[1] and u[0] < hi) return true;
+    return false;
+}
+
+/// Whether one of the prompt cache's marks has its chunk end at `at` (each kept at the chunk end at or before it).
+fn markEnds(marks: []const u32, at: usize) bool {
+    for (marks) |w| if (w / model.chunk_rows * model.chunk_rows == at) return true;
+    return false;
+}
+
 pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
     var base: usize = 0;
     while (base + size <= cap) {
@@ -188,6 +201,12 @@ const Lane = struct {
 
 extern "c" fn exp(x: f64) f64;
 
+/// A kept prompt state (the prompt cache's saved state, kept at a chunk end the prompt pass reached before its
+/// replay): the slot's own part on the device (Model.snapCopy), and the extent its compressed rows stay in,
+/// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
+/// and the prompt runs from 0).
+pub const Snap = struct { id: u64, at: usize, base: usize, buf: cuda.DeviceBuffer, stale: bool = false };
+
 /// First tokens a handle names (each prompt's draw, read back right after its prefill).
 const ring = 1024;
 
@@ -207,6 +226,8 @@ pub const Lanes = struct {
     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
+    snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+    next_snap: u64 = 1,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -219,6 +240,11 @@ pub const Lanes = struct {
 
     /// Tells rank 1 to stop, then frees the host state (the model is the caller's).
     pub fn deinit(self: *Lanes) void {
+        for (self.snaps.items) |sn| {
+            sn.buf.free();
+            self.gpa.destroy(sn);
+        }
+        self.snaps.deinit(self.gpa);
         if (self.peer != null) self.send(.done) catch {};
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
@@ -324,16 +350,23 @@ pub const Lanes = struct {
             taken[nt] = .{ l.base, l.end };
             nt += 1;
         }
-        const base = place(taken[0..nt], size, m.pool_cap) orelse return error.ContextFull;
+        // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent
+        s.cached = 0;
+        var kept: ?*Snap = null;
+        if (s.reuse.saved) |p| {
+            const sn: *Snap = @ptrCast(@alignCast(p));
+            const fits = sn.base + size <= m.pool_cap and !clashes(taken[0..nt], sn.base, sn.base + size);
+            if (self.usable(sn, len) and fits) kept = sn else s.reuse_failed = true;
+        }
+        const base = if (kept) |sn| sn.base else try self.placeKept(taken[0..nt], size);
+        // the rows this stream writes are no other kept state's
+        self.staleOver(if (kept) |sn| base + sn.at else base, base + size, kept);
         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
         self.used[slot] = true;
         errdefer {
             _ = self.streams.remove(s);
             self.used[slot] = false;
         }
-        // a kept prompt state is not restored yet: the whole prompt runs
-        if (s.reuse.saved != null) s.reuse_failed = true;
-        s.cached = 0;
         const seq = &self.seqs[slot];
         try seq.resize(gpa, len);
         for (seq.items, ids) |*q, id| q.* = @intCast(id);
@@ -346,6 +379,19 @@ pub const Lanes = struct {
         try m.fillBegin(slot, base);
         const replay = len -| m.cfg.window;
         var start: usize = 0;
+        if (kept) |sn| {
+            if (try self.begin(.snap_restore)) {
+                try self.wire.int(gpa, u64, sn.id);
+                try self.wire.int(gpa, u32, @intCast(slot));
+                try self.flush();
+            }
+            try m.snapCopy(slot, sn.buf.ptr, false);
+            start = sn.at;
+            s.cached = @intCast(sn.at);
+        }
+        // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
+        // kept prompt), each at the chunk end at or before it
+        const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
         var head = false;
         m.fill_seq = seq.items;
         defer {
@@ -363,6 +409,7 @@ pub const Lanes = struct {
             }
             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
             start += n;
+            if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
         }
         if (!head) return error.NoPromptLogits;
         const token = try draw(try m.promptLogitsHost(), len, s.sampling);
@@ -539,6 +586,82 @@ pub const Lanes = struct {
         return true;
     }
 
+    /// Whether a kept state still restores for a prompt of `len` tokens: live, not stale, a chunk end before the
+    /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
+    fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
+        if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
+        return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+    }
+
+    /// The first extent that fits around the live streams and the kept states; the oldest kept states go stale
+    /// until it does.
+    fn placeKept(self: *Lanes, live: []const [2]usize, size: usize) !usize {
+        const gpa = self.gpa;
+        var used: std.ArrayList([2]usize) = .empty;
+        defer used.deinit(gpa);
+        while (true) {
+            used.clearRetainingCapacity();
+            try used.appendSlice(gpa, live);
+            for (self.snaps.items) |sn| if (!sn.stale) try used.append(gpa, .{ sn.base, sn.base + sn.at });
+            if (place(used.items, size, self.m.pool_cap)) |b| return b;
+            const oldest = for (self.snaps.items) |sn| {
+                if (!sn.stale) break sn;
+            } else return error.ContextFull;
+            oldest.stale = true;
+        }
+    }
+
+    /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
+    fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
+        for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
+            sn.stale = true;
+        };
+    }
+
+    /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
+    pub fn snapBytesFn(ptr: *anyopaque, at: u32) u64 {
+        _ = at;
+        return of(ptr).m.snapBytes();
+    }
+
+    /// The live state at `at` (the pass stands at that chunk end): the slot's own part copied, the extent's rows kept.
+    pub fn snapSaveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+        const self = of(ptr);
+        const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+        const sn = try self.gpa.create(Snap);
+        errdefer self.gpa.destroy(sn);
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
+        errdefer sn.buf.free();
+        try self.snaps.append(self.gpa, sn);
+        self.next_snap += 1;
+        if (try self.begin(.snap_save)) {
+            try self.wire.int(self.gpa, u64, sn.id);
+            try self.wire.int(self.gpa, u32, @intCast(l.slot));
+            try self.flush();
+        }
+        try self.m.snapCopy(l.slot, sn.buf.ptr, true);
+        return sn;
+    }
+
+    pub fn snapRestoreFn(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
+        return error.BackendRestores; // the prompt pass restores, before its first chunk
+    }
+
+    pub fn snapDropFn(ptr: *anyopaque, saved: *anyopaque) void {
+        const self = of(ptr);
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        const i = std.mem.indexOfScalar(*Snap, self.snaps.items, sn) orelse return;
+        _ = self.snaps.orderedRemove(i);
+        if (self.begin(.snap_drop) catch false) {
+            self.wire.int(self.gpa, u64, sn.id) catch {};
+            self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
+        }
+        sn.buf.free();
+        self.gpa.destroy(sn);
+    }
+
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.streams.fetchRemove(s) orelse return;
@@ -576,6 +699,12 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     var built: Built = .{};
     var step: u64 = 0;
     var slot: usize = 0;
+    var kept: std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer) = .empty; // rank 0's kept states, this rank's part
+    defer {
+        var ki = kept.valueIterator();
+        while (ki.next()) |b| b.free();
+        kept.deinit(gpa);
+    }
     while (true) {
         // the next primitive, polled for 20 ms before the read blocks (rank 0 sends it a fraction of a millisecond
         // after this rank's GPU goes idle in a decode; a sleeping thread would add its core's wake-up to every frame)
@@ -585,13 +714,16 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             2 => .fill_chunk,
             3 => .verify,
             4 => .pass,
+            5 => .snap_save,
+            6 => .snap_restore,
+            7 => .snap_drop,
             9 => .done,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
         step += 1;
         // a chunk's read-ahead of the next is done before anything but that chunk (a prompt's ids may change)
-        if (kind != .fill_chunk) {
+        if (kind != .fill_chunk and kind != .snap_save and kind != .snap_restore) {
             m.joinAhead();
             m.fill_seq = &.{};
         }
@@ -645,6 +777,32 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     slots[i] = try r.int(i64);
                 }
                 m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
+            },
+            .snap_save => {
+                const id = try r.int(u64);
+                const s: usize = try r.int(u32);
+                if (s >= max_streams) return error.BadSlot;
+                var b = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
+                m.snapCopy(s, b.ptr, true) catch |err| {
+                    b.free();
+                    refused(err);
+                    continue;
+                };
+                try kept.put(gpa, id, b);
+            },
+            .snap_restore => {
+                const id = try r.int(u64);
+                const s: usize = try r.int(u32);
+                if (s >= max_streams) return error.BadSlot;
+                const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
+                m.snapCopy(s, b.ptr, false) catch |err| refused(err);
+            },
+            .snap_drop => {
+                const id = try r.int(u64);
+                if (kept.fetchRemove(id)) |kv| {
+                    var b = kv.value;
+                    b.free();
+                }
             },
             .done => return,
         }

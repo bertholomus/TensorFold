@@ -421,6 +421,43 @@ pub const Model = struct {
         m.ahead = null;
     }
 
+    /// A kept prompt state's own bytes (the prompt cache's snapshots; the compressed plane stays in the stream's
+    /// extent): one slot's window ring of every layer and positional stores of every ratio-2 layer.
+    pub fn snapBytes(m: *const Model) usize {
+        const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
+        var n: usize = m.rings.len * m.eng.ringBytes();
+        for (m.caches.raw_kv[0..m.eng.c.layers], m.caches.raw_score[0..m.eng.c.layers]) |k, sc| {
+            if (k != 0) n += pb;
+            if (sc != 0) n += pb;
+        }
+        return n;
+    }
+
+    /// Slot `slot`'s own state into `buf` (save: true) or back from it, in the stream's order (no wait): with the
+    /// extent's compressed rows, the state a prompt pass stands in at a chunk end.
+    pub fn snapCopy(m: *Model, slot: usize, buf: u64, save: bool) !void {
+        const rb = m.eng.ringBytes();
+        const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
+        var at = buf;
+        for (m.rings) |r| {
+            try m.copyState(r + slot * rb, at, rb, save);
+            at += rb;
+        }
+        for (m.caches.raw_kv[0..m.eng.c.layers], m.caches.raw_score[0..m.eng.c.layers]) |k, sc| {
+            for ([_]u64{ k, sc }) |live| if (live != 0) {
+                try m.copyState(live + slot * pb, at, pb, save);
+                at += pb;
+            };
+        }
+    }
+
+    fn copyState(m: *Model, live: u64, kept: u64, bytes: usize, save: bool) !void {
+        const d = m.ctx.d;
+        const dst = if (save) kept else live;
+        const src = if (save) live else kept;
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
+    }
+
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
         if (slot >= m.streams) return error.BadSlot;
         m.view = try m.caches.view(&m.eng, slot, base);

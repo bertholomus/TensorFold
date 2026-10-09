@@ -155,6 +155,8 @@ const Host = struct {
     host: api.LaneHost,
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
+    cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
+    snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -162,6 +164,7 @@ const Host = struct {
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
+        if (h.cache) |*store| store.deinit(); // the family's kept states go before the family
         h.release(h.family);
         if (h.gpu) |g| {
             g.ctx.deinit();
@@ -191,6 +194,7 @@ const Host = struct {
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
+        if (h.cache) |*store| h.host.cache = store;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -363,6 +367,14 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
     });
     errdefer gpa.free(h.startup);
+    // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
+    if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
+        const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
+        if (want > 0) {
+            h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
+            h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, want);
+        }
+    };
     // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
     try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .efforts = familyEfforts(F) }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
