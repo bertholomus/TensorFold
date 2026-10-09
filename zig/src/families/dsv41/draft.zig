@@ -368,7 +368,7 @@ pub const Drafter = struct {
     pub fn absorb(dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *Pool, slot: usize, taps: u64, n: usize, start: usize) !void {
         if (n == 0 or slot >= pool.slots) return error.BadAbsorb;
         const keep = @min(n, pool.ring);
-        if (keep > 128) return error.NotPortedYet; // main_proj's prompt GEMM (the served lane's replay keeps 128 rows)
+        if (keep > 128) return notPorted(@src()); // main_proj's prompt GEMM (the served lane's replay keeps 128 rows)
         const first = start + n - keep;
         var pos: [max_absorb * 9]i64 = undefined;
         var rows: [max_absorb * 9]i64 = undefined;
@@ -439,7 +439,7 @@ pub const Drafter = struct {
         const N = tokens.len;
         const n = dr.n;
         const R = N * n;
-        if (N == 0 or N > max_streams or R > max_rows or q0.len != N or slots.len != N) return error.NotPortedYet;
+        if (N == 0 or N > max_streams or R > max_rows or q0.len != N or slots.len != N) return notPorted(@src());
         if (steps == 0 or steps > n) return error.BadDraftPass;
         // _body's index rows: ids [token, noise ...], positions q0 + j, window positions q0 - 1, ring bases
         var hv: [6 * max_rows]i64 = @splat(0);
@@ -694,4 +694,10 @@ test "draft depths and pass steps as multi.py takes them" {
     try std.testing.expectEqual(@as(usize, 5), passSteps(2, 4, 5, 16, 5));
     try std.testing.expectEqual(@as(usize, 3), passSteps(3, 4, 5, 16, 5));
     try std.testing.expectEqual(@as(usize, 3), passSteps(4, 4, 5, 16, 5));
+}
+
+/// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).
+fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
+    std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
+    return error.NotPortedYet;
 }
