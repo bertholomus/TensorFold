@@ -458,9 +458,12 @@ class App:
                 if len(reasoning) > sent["reasoning"]:
                     delta["reasoning_content"] = reasoning[sent["reasoning"]:]
                     sent["reasoning"] = len(reasoning)
-                if len(answer) > sent["content"]:
-                    delta["content"] = answer[sent["content"]:]
-                    sent["content"] = len(answer)
+                # with tools, trailing whitespace waits for more text: before a tool call it is the template's separator,
+                # which the final content drops (parse_tool_calls); streamed, a client would send it back doubled
+                shown = answer.rstrip() if tools else answer
+                if len(shown) > sent["content"]:
+                    delta["content"] = shown[sent["content"]:]
+                    sent["content"] = len(shown)
                 if delta and not emit(delta):
                     stopped["client"] = True
                 if calls_stream is not None and not stopped["client"]:
