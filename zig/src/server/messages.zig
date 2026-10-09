@@ -50,17 +50,20 @@ fn hasImages(list: Value) bool {
     return false;
 }
 
-/// An ``image_url`` part's bytes: ``{"url": "data:...,<base64>"}`` (other URLs are off), the base64 as Python's
-/// b64decode reads it.
+/// An ``image_url`` part's bytes: its URL (the part's string, or its object's ``url``) a base64 data URL, the base64 as
+/// Python's b64decode reads it; the served lane's refusals otherwise.
 fn imageBytes(cx: *Cx, part: Value) errors.Refused![]const u8 {
-    const r = part.get("image_url") orelse return cx.refuse(text_only_refusal);
-    if (r != .object) return cx.refuse(text_only_refusal);
-    const u = r.get("url") orelse return cx.refuse(text_only_refusal);
-    if (u != .string) return cx.refuse(text_only_refusal);
-    const url = u.string;
-    if (!std.mem.startsWith(u8, url, "data:")) return cx.refuse("image input: image URLs are off on this server (send a base64 data URL)");
+    const url: []const u8 = blk: {
+        const r = part.get("image_url") orelse break :blk "";
+        if (r == .string) break :blk r.string;
+        if (r == .object) if (r.get("url")) |u| if (u == .string) break :blk u.string;
+        break :blk "";
+    };
+    if (url.len == 0) return cx.refuse("image input: an image_url part needs a url");
+    if (std.mem.startsWith(u8, url, "http://") or std.mem.startsWith(u8, url, "https://")) return cx.refuse("image input: image URLs are off on this server (send a base64 data URL)");
+    if (!std.mem.startsWith(u8, url, "data:")) return cx.refuse("image input: image_url must be a data: URL");
     const comma = std.mem.indexOfScalar(u8, url, ',') orelse url.len;
-    if (std.mem.indexOf(u8, url[0..comma], ";base64") == null) return cx.fail(.request, "image input: Unsupported data URL encoding: {s}", .{url[0..comma]});
+    if (std.mem.indexOf(u8, url[0..comma], ";base64") == null) return cx.refuse("image input: image data URLs must be base64");
     const data = if (comma < url.len) url[comma + 1 ..] else "";
     return switch (b64decode(cx.a, data)) {
         .ok => |b| b,
@@ -180,12 +183,10 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
                     }
                     const typed = part == .object and part.get("type") != null and part.get("type").? == .string and std.mem.eql(u8, part.get("type").?.string, "text");
                     if (!typed or fields.hasMedia(part)) return cx.refuse(text_only_refusal);
-                    const t: Value = part.get("text") orelse .null;
-                    if (t != .string and t != .null) return cx.refuse("a text content part must contain a text string");
-                    if (t == .string) {
-                        if (std.mem.indexOf(u8, t.string, im.placeholder) != null) return cx.refuse(image_text_refusal);
-                        try text.appendSlice(cx.a, t.string);
-                    }
+                    const t = part.get("text") orelse return cx.refuse("image input: a text part needs a text string");
+                    if (t != .string) return cx.refuse("image input: a text part needs a text string");
+                    if (std.mem.indexOf(u8, t.string, im.placeholder) != null) return cx.refuse(image_text_refusal);
+                    try text.appendSlice(cx.a, t.string);
                 }
                 item = try withField(cx, message.object, "content", .{ .string = text.items });
             } else if (content == null or content.? == .null) {
