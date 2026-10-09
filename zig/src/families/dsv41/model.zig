@@ -64,6 +64,9 @@ pub const Options = struct {
     vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
 };
 
+/// TF_DS_RING_ZERO=1 (fillBegin): each prompt's window rings start cleared.
+pub var ring_zero = false;
+
 pub const Model = struct {
     gpa: std.mem.Allocator,
     host: std.heap.ArenaAllocator, // allocations that live as long as the model
@@ -148,6 +151,7 @@ pub const Model = struct {
         errdefer gpa.destroy(m);
         m.* = undefined;
         m.gpa = gpa;
+        if (std.c.getenv("TF_DS_RING_ZERO")) |v| ring_zero = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         m.spans = .empty;
         m.img_buf = null;
         m.host = std.heap.ArenaAllocator.init(gpa);
@@ -540,6 +544,14 @@ pub const Model = struct {
         m.ch.spans = &.{};
         m.view = try m.caches.view(&m.eng, slot, base);
         for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
+        // TF_DS_RING_ZERO=1: the slot's window rings cleared for each prompt. A chunk of 16 rows or fewer at the replay
+        // point reads its window from the ring, below the floor too, where the ring still holds the slot's last
+        // request's keys (the served lane reads the same): its reply then depends on that request. Off: the served
+        // lane's bits (a change of bits is the owner's call).
+        if (ring_zero) {
+            const d = m.ctx.d;
+            for (m.ring_view) |v| try d.check(d.api.cuMemsetD8Async(v, 0, m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
+        }
         m.fill_slot = slot;
     }
 
