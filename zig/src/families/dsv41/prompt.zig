@@ -822,13 +822,13 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     const rd = c.rope_dim;
     const r: usize = lay.ratio;
     const cwkv = lay.comp_wkv.?;
-    if (start % r != 0) return error.NotPortedYet; // the group's earlier rows from the positional store
+    if (start % r != 0) return notPorted(@src()); // the group's earlier rows from the positional store
     const full = n / r;
     if (r == 1) {
         try mm(e, ch, cwkv, ch.x, c.hidden, ch.lat2, .bf16, hd);
         try e.exact.rmsNorm(e.s, ch.lat2, hd, lay.comp_norm, ch.lat, hd, n, hd, c.eps);
     } else {
-        if (r != 2) return error.NotPortedYet;
+        if (r != 2) return notPorted(@src());
         try mm(e, ch, cwkv, ch.x, c.hidden, ch.kvc, .fp32, hd);
         try mm(e, ch, lay.comp_wgate.?, ch.x, c.hidden, ch.scc, .fp32, hd);
         // rk[pw] = kv[-keep:], rs[pw] = score[-keep:]: pw = positions start + n - keep .. % RAW
@@ -838,7 +838,7 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
         try upload(e, ch.raw_idx, &idx, keep * 8);
         try e.ops.scatterRows(e.s, ch.kvc + (n - keep) * hd * 4, hd * 4, ch.raw_idx, cs.raw_kv[li], hd * 4, hd * 4, keep);
         try e.ops.scatterRows(e.s, ch.scc + (n - keep) * hd * 4, hd * 4, ch.raw_idx, cs.raw_score[li], hd * 4, hd * 4, keep);
-        if (full == 0) return error.NotPortedYet;
+        if (full == 0) return notPorted(@src());
         try e.exact.compress2(e.s, ch.kvc, ch.scc, ch.lat2, full, hd);
         try e.exact.rmsNorm(e.s, ch.lat2, hd, lay.comp_norm, ch.lat, hd, full, hd, c.eps);
     }
@@ -877,7 +877,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     const n = ch.n;
     const ih = c.index_heads;
     const id = c.index_head_dim;
-    if (n_comp_end == 0) return error.NotPortedYet; // cidx [n, 0]
+    if (n_comp_end == 0) return notPorted(@src()); // cidx [n, 0]
     if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
     try mm(e, ch, wqb, ch.qr, lay.wq_a.n, ch.iq, .bf16, ih * id);
     try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
@@ -1153,7 +1153,7 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     } else {
         if (e.two) |two| try two.quarters(e, ch.ek, ch.ekg, n, two.ew, 4) else try e.comm.allGather(ch.ek, ch.ekg, n * ew.n, .f32, e.s);
         if (prof) eh.p_x += lap(e, eh, &tq);
-        if (e.world != 2) return error.NotPortedYet; // Comm.sum of more ranks: acc += g[r]
+        if (e.world != 2) return notPorted(@src()); // Comm.sum of more ranks: acc += g[r]
         try e.ops.add2Bf16(e.s, ch.ekg, ch.ekg + n * en * 4, ch.kv, n * en);
     }
     try tri_basic.engramGate(e.t, ch.h, ch.kv, lay.engram_qk, ch.h_alt, c.eps, n, c.hidden);
@@ -1273,4 +1273,10 @@ pub fn endLayer(ch: *Chunk) void {
 
 test "hd ** -0.5 as the served build passes it" {
     try std.testing.expectEqual(@as(u32, 0x3d3504f3), @as(u32, @bitCast(scale(512))));
+}
+
+/// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).
+fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
+    std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
+    return error.NotPortedYet;
 }

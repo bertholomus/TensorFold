@@ -594,7 +594,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
                 try e.ops.gatherRows(e.s, cs.raw_score[li], cs.slots * raw_rows, rd.g(.gi), rd.sg, hd * 4, 2 * R, ch.invalid);
                 try e.exact.compress2(e.s, rd.kvg, rd.sg, rd.lat2, R, hd);
                 try tri_basic.rmsnorm(t, rd.lat2, hd, lay.comp_norm, rd.lat, hd, c.eps, R, hd);
-            } else return error.NotPortedYet;
+            } else return notPorted(@src());
             sh.kv_layer = li;
             const ctarget = rd.g(if (ratio == 1) .ctarget1 else .ctarget2);
             const gpos = rd.g(if (ratio == 1) .gpos1 else .gpos2);
@@ -614,7 +614,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         if (idx_all) {
             // topk_indices of every scanned key is 0 .. nb - 1 whatever the scores, then the visible mask (on the
             // device: no host round trip in the round)
-            if (nb > 512) return error.NotPortedYet;
+            if (nb > 512) return notPorted(@src());
             try e.ops.iotaVis(e.s, vis, rd.cidx, nb, R);
             rd.kk = nb;
         } else if (lay.idx_wq_b != null) {
@@ -660,7 +660,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
                     try e.ops.poolPick(e.s, rd.bmax, nbk, nbk, rd.pidx, c.candidate_blocks, 0, 0, rd.cblk, R);
                     rd.has_cblk = true;
                 } else {
-                    if (nb % cb != 0) return error.NotPortedYet; // _candidates' padded path (buckets are whole blocks)
+                    if (nb % cb != 0) return notPorted(@src()); // _candidates' padded path (buckets are whole blocks)
                     try e.ops.candFast(e.s, rd.score, nb, nb / cb, cb, vis, rd.cand, nb / cb, R);
                     rd.has_cand = true;
                 }
@@ -671,7 +671,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
                     try tri_index.scoreKeys(t, rd.score, null, rd.keys, R, nb);
                     try tri_index.topkSelect(t, rd.keys, nb, kk, vis, rd.cidx, top, R, nb);
                 }
-            } else return error.NotPortedYet; // the scores' topk_indices path (a top-k of no power of two)
+            } else return notPorted(@src()); // the scores' topk_indices path (a top-k of no power of two)
             rd.kk = kk;
         }
         comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
@@ -965,7 +965,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
             const en = if (e.two) |tw| tw.engramWidth() else ew.n;
             if (e.two) |tw| try tw.quarters(e, rd.ek, rd.ekg, R, tw.ew, 4) else try e.gatherF32(rd.ek, rd.ekg, R * ew.n);
             try Probe.check(probe, .engram_gather, l, rd.ekg);
-            if (e.world != 2) return error.NotPortedYet;
+            if (e.world != 2) return notPorted(@src());
             try e.ops.add2Bf16(e.s, rd.ekg, rd.ekg + R * en * 4, rd.ekv, R * en);
             try tri_basic.engramGate(t, h, rd.ekv, lay.engram_qk, spare, c.eps, R, d);
             std.mem.swap(u64, &h, &spare);
@@ -1114,4 +1114,10 @@ test "context buckets as graph.py makes them" {
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(4096, 1 << 20));
     try std.testing.expectEqual(@as(usize, 8192), bucketFor(4097, 1 << 20));
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(5000, 4096));
+}
+
+/// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).
+fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
+    std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
+    return error.NotPortedYet;
 }
