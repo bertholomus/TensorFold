@@ -838,7 +838,10 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
         try upload(e, ch.raw_idx, &idx, keep * 8);
         try e.ops.scatterRows(e.s, ch.kvc + (n - keep) * hd * 4, hd * 4, ch.raw_idx, cs.raw_kv[li], hd * 4, hd * 4, keep);
         try e.ops.scatterRows(e.s, ch.scc + (n - keep) * hd * 4, hd * 4, ch.raw_idx, cs.raw_score[li], hd * 4, hd * 4, keep);
-        if (full == 0) return notPorted(@src());
+        if (full == 0) { // a one-row chunk (a prompt one past a chunk end): its row waits in the store, no new group
+            sh.kv_layer = li;
+            return;
+        }
         try e.exact.compress2(e.s, ch.kvc, ch.scc, ch.lat2, full, hd);
         try e.exact.rmsNorm(e.s, ch.lat2, hd, lay.comp_norm, ch.lat, hd, full, hd, c.eps);
     }
