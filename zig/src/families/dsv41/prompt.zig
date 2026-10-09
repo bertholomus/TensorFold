@@ -880,7 +880,10 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     const n = ch.n;
     const ih = c.index_heads;
     const id = c.index_head_dim;
-    if (n_comp_end == 0) return notPorted(@src()); // cidx [n, 0]
+    if (n_comp_end == 0) { // cidx [n, 0]: no compressed entry yet (a one-token prompt), the attention reads none
+        sh.kk = 0;
+        return;
+    }
     if (n_comp_end > ch.max_comp) return error.ChunkTooLong;
     try mm(e, ch, wqb, ch.qr, lay.wq_a.n, ch.iq, .bf16, ih * id);
     try tri_norm.ropeHeads(e.t, ch.iq, rope.cos, rope.sin, ch.pos, c.rope_dim, false, n, ih, id);
