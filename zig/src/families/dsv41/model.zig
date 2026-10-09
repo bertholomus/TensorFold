@@ -451,6 +451,31 @@ pub const Model = struct {
         }
     }
 
+    /// The compressed rows of positions [0, at) of the extent at `from` copied into the extent at `to` (a kept prompt
+    /// resumed in another extent while a live stream holds its own), in the stream's order: every kv-source layer's
+    /// codes and scales and its index keys, the rows view() places at those positions.
+    pub fn copyExtent(m: *Model, from: usize, to: usize, at: usize) !void {
+        const c = m.eng.c;
+        const cs = &m.caches;
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const r: usize = lay.ratio;
+            if (from % r != 0 or to % r != 0 or at % r != 0) return error.BadView;
+            const n = at / r;
+            try m.copySpan(cs.comp_codes[i], from / r, to / r, n, c.head_dim / 2);
+            try m.copySpan(cs.comp_scales[i], from / r, to / r, n, c.head_dim / 16);
+            if (lay.idx_wk != null) {
+                try m.copySpan(cs.idx_codes[i], from / r, to / r, n, c.index_head_dim / 2);
+                try m.copySpan(cs.idx_scales[i], from / r, to / r, n, c.index_head_dim / 32);
+            }
+        }
+    }
+
+    fn copySpan(m: *Model, plane: u64, from: usize, to: usize, n: usize, row: usize) !void {
+        const d = m.ctx.d;
+        try d.check(d.api.cuMemcpyDtoDAsync_v2(plane + to * row, plane + from * row, n * row, m.stream.handle), "cuMemcpyDtoDAsync");
+    }
+
     fn copyState(m: *Model, live: u64, kept: u64, bytes: usize, save: bool) !void {
         const d = m.ctx.d;
         const dst = if (save) kept else live;
