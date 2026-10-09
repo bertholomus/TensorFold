@@ -1,6 +1,7 @@
 //! tf-dsv41-check MODEL_DIR CACHE_DIR RANK WORLD [--no-dspark] [--bytes EVERY]: the TP split plan against the lane's
 //! rank cache, entry by entry: key, order, dtype and trellis tiles; the checkpoint reader's layout of every entry; with
 //! --bytes, the bytes of every EVERY-th entry and of every entry outside the routed experts, read both ways. No GPU.
+//! --parity (the four-node split's balanced experts) is refused: branch deepseek-v41-zig-tp4 checks those files.
 const std = @import("std");
 const dsv41 = @import("dsv41");
 
@@ -21,6 +22,10 @@ pub fn main(init: std.process.Init) !u8 {
     var ai: usize = 5;
     while (ai < args.len) : (ai += 1) {
         if (std.mem.eql(u8, args[ai], "--no-dspark")) dspark = false;
+        if (std.mem.eql(u8, args[ai], "--parity")) {
+            std.debug.print("tf-dsv41-check: {s}\n", .{dsv41.rank_cache.parity_refused});
+            return 2;
+        }
         if (std.mem.eql(u8, args[ai], "--bytes") and ai + 1 < args.len) {
             every = try std.fmt.parseInt(usize, args[ai + 1], 10);
             ai += 1;
