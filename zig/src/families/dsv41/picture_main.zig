@@ -4,6 +4,7 @@
 const std = @import("std");
 const dsv41 = @import("dsv41");
 const picture = dsv41.picture;
+const pil = dsv41.pil;
 
 fn hex(d: [32]u8) [64]u8 {
     return std.fmt.bytesToHex(d, .lower);
@@ -27,13 +28,22 @@ pub fn main(init: std.process.Init) !u8 {
     var out = std.Io.File.stdout().writer(io, &out_buf);
     const w = &out.interface;
     var bad: u8 = 0;
+    const child: ?*pil.Pil = pil.Pil.start(init.gpa, io) catch null;
+    defer if (child) |p| p.stop(init.gpa);
     for (args[1..]) |path| {
         const data = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20)) catch |e| {
             try w.print("{{\"file\": \"{s}\", \"error\": \"{s}\"}}\n", .{ path, @errorName(e) });
             bad = 1;
             continue;
         };
-        var rgb = picture.decodePng(a, data) catch |e| {
+        var rgb = picture.decodePng(a, data) catch |e| png: {
+            if (child) |p| if (e != error.TooLarge) switch (try p.decode(a, data)) {
+                .rgb => |r| break :png r,
+                .refused => |m| {
+                    try w.print("{{\"file\": \"{s}\", \"refused\": \"{s}\"}}\n", .{ path, m });
+                    continue;
+                },
+            };
             try w.print("{{\"file\": \"{s}\", \"error\": \"{s}\"}}\n", .{ path, @errorName(e) });
             bad = 1;
             continue;

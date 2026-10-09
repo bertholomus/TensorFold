@@ -145,8 +145,15 @@ fn be32(b: []const u8) u32 {
     return std.mem.readInt(u32, b[0..4], .big);
 }
 
-/// The pixel count PIL decodes at most before it refuses (Image.MAX_IMAGE_PIXELS * 2 raises DecompressionBombError).
-pub const max_pixels: usize = 2 * 89478485;
+/// The pixel count the lane's PIL decodes at most before it refuses (DecompressionBombError past twice its
+/// Image.MAX_IMAGE_PIXELS: 134,217,728 in the served lane, its probes 2026-10-09).
+pub const max_pixels: usize = 134217728;
+
+/// The pixels an image's header declares (PNG's IHDR), or null.
+pub fn pixels(data: []const u8) ?usize {
+    if (data.len < 24 or !std.mem.eql(u8, data[0..8], "\x89PNG\r\n\x1a\n")) return null;
+    return @as(usize, std.mem.readInt(u32, data[16..20], .big)) * std.mem.readInt(u32, data[20..24], .big);
+}
 
 /// PNG bytes to RGB as PIL's open(...).convert("RGB") gives them: 8-bit samples as they are, 16-bit ones by their high
 /// byte, grey of 1, 2 and 4 bits scaled to 0..255 (0 / 255, x 85, x 17), 16-bit grey clipped at 255 (PIL's I;16 to L),
@@ -572,6 +579,11 @@ pub const Picture = struct {
 pub fn picture(a: Allocator, data: []const u8, cfg: Config) !Picture {
     var rgb = try decodePng(a, data);
     defer rgb.deinit(a);
+    return fromRgb(a, rgb, cfg);
+}
+
+/// load_image after its decode: the decoded RGB planned, padded and cut into the ViT's patches.
+pub fn fromRgb(a: Allocator, rgb: Rgb, cfg: Config) !Picture {
     const g = plan(rgb.w, rgb.h, cfg);
     var padded = try pad(a, rgb, g.best_w, g.best_h);
     defer padded.deinit(a);

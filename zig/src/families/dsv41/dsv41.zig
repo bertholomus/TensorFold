@@ -10,6 +10,7 @@ pub const cublaslt = @import("cublaslt.zig");
 pub const fmha = @import("fmha.zig");
 pub const vit = @import("vit.zig");
 pub const vision = @import("vision.zig");
+pub const pil = @import("pil.zig");
 pub const checkpoint = @import("checkpoint.zig");
 pub const weights = @import("weights.zig");
 pub const engram_io = @import("engram_io.zig");
