@@ -46,9 +46,17 @@ pub const LaneHost = struct {
     // may refuse for a while to keep its kept states, waiting for one stream, and then place it)
     full_wait: ?usize = null,
     full_retry: i96 = 0,
+    // after a long prompt pass (the whole pass runs inside its admission, no round meanwhile), the streams within
+    // finish_left tokens of their max_tokens decode before the next admission, finish_ns at most: such a stream ends
+    // and frees its extent (its kept state then resumes in place) instead of waiting out every queued pass, as the
+    // Python lane's fills leave decoding its share
+    finish_until: ?i96 = null,
 
     const Mark = struct { at: i96, tokens: u64 };
     const full_retry_ns: i96 = std.time.ns_per_s;
+    const long_pass_ns: i96 = std.time.ns_per_s;
+    const finish_ns: i96 = 5 * std.time.ns_per_s;
+    const finish_left: i64 = 256;
     const window_ns: i96 = 2 * std.time.ns_per_s;
 
     const Job = struct {
@@ -299,6 +307,13 @@ pub const LaneHost = struct {
             }
             h.full_wait = null;
         }
+        if (h.finish_until) |t| {
+            if (std.Io.Clock.awake.now(h.io).toNanoseconds() < t and h.nearEnd()) {
+                h.unlock();
+                return false;
+            }
+            h.finish_until = null;
+        }
         const job = h.queued.orderedRemove(0);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
@@ -347,8 +362,20 @@ pub const LaneHost = struct {
             return h.drop(job, h.words(e));
         };
         h.prefilled(job, began);
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        if (now - began >= long_pass_ns) {
+            h.lock();
+            h.finish_until = now + finish_ns;
+            h.unlock();
+        }
         if (h.deliver(job)) h.remove(job);
         return true;
+    }
+
+    /// Whether an admitted stream decodes within finish_left tokens of its max_tokens (the lock held).
+    fn nearEnd(h: *LaneHost) bool {
+        for (h.admitted.items) |job| if (job.started and !job.stream.finished and job.stream.budgetLeft() <= finish_left) return true;
+        return false;
     }
 
     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
