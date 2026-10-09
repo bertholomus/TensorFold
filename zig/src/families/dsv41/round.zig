@@ -577,7 +577,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
         var r: [5][2]u64 = @splat(.{ 0, 0 });
         for (lay.wo_a[0..lay.groups], 0..) |wo, j| r[j] = linearBytes(wo);
         r[4] = linearBytes(lay.wo_b);
-        try rd.prefetch(e, &r, prefetch_budget);
+        if (l2_skip & 1 == 0) try rd.prefetch(e, &r, l2_mb[0] << 20);
     }
     try rd.mark(e, .a_q);
     // _kv_idx: the compressor's caches (a kv source) and the indexer's selection
@@ -725,7 +725,7 @@ fn attention(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, 
     var cb_call = [_]exl3_linear.Call{.{ .layer = lay.wo_b, .x = 0, .ldx = 0, .x_dtype = .bf16, .xh = rd.xb, .y = rd.pa, .ldy = @intCast(lay.wo_b.n), .y_dtype = .f32, .counters = 0 }};
     try prompt.groupedRotated(e, ch, R, &cb_call);
     // the prefetch behind wo_b: the ffn mix's weights, the router, the shared expert's gate
-    try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, prefetch_budget / 2);
+    if (l2_skip & 2 == 0) try rd.prefetch(e, &.{ .{ lay.hc_ffn[0], hcFnBytes(c) }, .{ lay.gate_w, @as(u64, c.experts) * c.hidden * 2 }, lay.experts.shared_gate, lay.experts.shared_up, lay.experts.shared_down }, l2_mb[1] << 20);
 }
 
 /// Model.moe of a decode window (shared_side off: SHARED_OVERLAP unset in the served lane): the gate's chunk sums
@@ -751,11 +751,11 @@ fn moe(e: *const Engine, rd: *Round, ch: *const Chunk, li: usize) !void {
     if (li + 1 < e.w.layers.len) {
         const nx = e.w.layers[li + 1];
         if (nx.engram_wkv) |ew| {
-            try rd.prefetch(e, &.{linearBytes(ew)}, prefetch_budget / 4);
+            if (l2_skip & 4 == 0) try rd.prefetch(e, &.{linearBytes(ew)}, l2_mb[3] << 20);
         } else {
-            try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, prefetch_budget);
+            if (l2_skip & 4 == 0) try rd.prefetch(e, &.{ .{ nx.hc_attn[0], hcFnBytes(c) }, linearBytes(nx.wq_a), linearBytes(nx.wkv), if (nx.comp_wkv) |x| linearBytes(x) else .{ 0, 0 }, if (nx.comp_wgate) |x| linearBytes(x) else .{ 0, 0 }, linearBytes(nx.wq_b) }, l2_mb[2] << 20);
         }
-    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, prefetch_budget);
+    } else try rd.prefetch(e, &.{linearBytes(e.w.head)}, l2_mb[2] << 20);
 }
 
 /// An EXL3 linear's words: their first byte and length (k * n values of k2 / 2 bits).
@@ -763,9 +763,14 @@ fn linearBytes(l: weights.Linear) [2]u64 {
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 
-/// A paced prefetch launch's most bytes (the served launch trace: 16 MiB; 8 MiB behind wo_b, 4 MiB before an Engram
-/// layer).
-const prefetch_budget: u64 = 16 << 20;
+
+/// A measurement's L2 prefetches left out (TF_DS_L2_SKIP, read at Model.open: bit 1 the "attn" fork after q, 2 the "moe"
+/// fork after wo_b, 4 the "next" fork after the experts); 0 in service.
+pub var l2_skip: u8 = 0;
+
+/// The forks' MiB (the served L2_ATTN_MB, L2_MOE_MB, L2_NEXT_MB and L2_STRETCH_END_MB: 16, 8, 16, 4; TF_DS_L2_ATTN_MB,
+/// TF_DS_L2_MOE_MB, TF_DS_L2_NEXT_MB, TF_DS_L2_STRETCH_END_MB at Model.open).
+pub var l2_mb: [4]u64 = .{ 16, 8, 16, 4 };
 
 /// An mHC mix's weights hc_*_fn: fp32 [24, hc * d].
 fn hcFnBytes(c: anytype) u64 {

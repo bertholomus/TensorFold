@@ -12,6 +12,10 @@ fn blocks(count: usize, threads: usize) u32 {
     return @intCast(@min((count + threads - 1) / threads, 65535));
 }
 
+/// The paced prefetch's settings (TF_EXL3_L2_DELAY_NS, TF_EXL3_L2_RATE_GBPS at Model.open; 0 GB/s: every chunk at once).
+pub var l2_delay_ns: c_longlong = 3000;
+pub var l2_rate_gbps: f64 = 230;
+
 /// tf_ds_l2_prefetch_kernel's argument: up to 16 device ranges (their first byte and length).
 pub const Prefetch = extern struct { ptr: [16]u64 = @splat(0), bytes: [16]u64 = @splat(0), n: c_int = 0 };
 
@@ -178,8 +182,8 @@ pub const Ops = struct {
         if (pf.n == 0) return;
         // the served decode settings (exl3/prefetch.py): 3 us before the first wave, waves of 128 chunks of 8 KiB
         // at 230 GB/s (TF_EXL3_L2_DELAY_NS, TF_EXL3_L2_RATE_GBPS), one block
-        const delay_ns: c_longlong = 3000;
-        const wave_ns: c_longlong = @intFromFloat(128.0 * 8192.0 / 230.0);
+        const delay_ns: c_longlong = l2_delay_ns;
+        const wave_ns: c_longlong = if (l2_rate_gbps > 0) @intFromFloat(128.0 * 8192.0 / l2_rate_gbps) else 0;
         var a: cuda.Args = .{};
         a.add(pf);
         a.add(delay_ns);

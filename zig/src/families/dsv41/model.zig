@@ -159,6 +159,12 @@ pub const Model = struct {
         m.world = o.world;
         if (o.streams == 0 or o.streams > max_streams) return error.BadStreams;
         m.streams = o.streams;
+        if (std.c.getenv("TF_DS_L2_SKIP")) |v| round.l2_skip = std.fmt.parseInt(u8, std.mem.span(v), 10) catch 0;
+        for ([_][:0]const u8{ "TF_DS_L2_ATTN_MB", "TF_DS_L2_MOE_MB", "TF_DS_L2_NEXT_MB", "TF_DS_L2_STRETCH_END_MB" }, 0..) |name, i| {
+            if (std.c.getenv(name)) |v| round.l2_mb[i] = std.fmt.parseInt(u64, std.mem.span(v), 10) catch round.l2_mb[i];
+        }
+        if (std.c.getenv("TF_EXL3_L2_DELAY_NS")) |v| ops_mod.l2_delay_ns = std.fmt.parseInt(c_longlong, std.mem.span(v), 10) catch ops_mod.l2_delay_ns;
+        if (std.c.getenv("TF_EXL3_L2_RATE_GBPS")) |v| ops_mod.l2_rate_gbps = std.fmt.parseFloat(f64, std.mem.span(v)) catch ops_mod.l2_rate_gbps;
         m.round_ms = o.round_ms orelse &draft.round_ms;
         if (m.round_ms.len == 0) return error.BadRoundMs;
         m.pool_cap = o.pool;
@@ -707,7 +713,9 @@ pub const Model = struct {
     /// The rounds' GPU clocks (a profile): the forward's start and each stretch's ends, for its gaps.
     pub fn useClock(m: *Model, marks: u8) !void {
         m.rd.clk_marks = marks == 1 or marks == 3;
-        m.rd.clk_ratio = if (marks == 3) 2 else null;
+        // TF_DS_CLOCK_RATIO: the compress ratio whose layers mode 3 times (2 unless set)
+        const r: u8 = if (std.c.getenv("TF_DS_CLOCK_RATIO")) |v| std.fmt.parseInt(u8, std.mem.span(v), 10) catch 2 else 2;
+        m.rd.clk_ratio = if (marks == 3) r else null;
         m.rd.clk_layers = marks == 2 or marks == 3;
         if (m.rd.clk == 0) m.rd.clk = try m.arena.take((1 + 2 * round.Round.max_clocks) * 8);
     }
