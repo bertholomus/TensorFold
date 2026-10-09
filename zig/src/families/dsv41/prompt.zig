@@ -709,6 +709,10 @@ pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: us
     try mmRows(e, ch, ch.n, l, x, ldx, out, out_type, os);
 }
 
+/// TF_DS_REPLAY_FLOOR=1 (model.zig sets it on every rank): a small chunk whose window reaches below the floor reads it
+/// by the gather path (off: ring mode, as the served lane reads, the slot's previous request's keys below the floor).
+pub var replay_floor = false;
+
 /// attention_k: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the layer's window ring
 /// (bf16 [window + RING_EXTRA, head_dim]). A compressed layer also attends to its kv source's latents the indexer picks
 /// (a kv source first compresses the chunk into them). `floor`: no window key before this position.
@@ -723,8 +727,12 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     // _cs: the layer's RoPE kind (compressed layers rotate by the compressed table) for every rotation it makes
     const rope = if (lay.ratio != 0) e.compressed else e.plain;
     const ring_rows = c.window + ring_extra;
-    // ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring
-    const ring_mode = n <= ring_extra;
+    // ring mode (a chunk of RING_EXTRA rows or fewer): the rows' keys into the ring first, the attention reads the ring.
+    // With replay_floor, not when the window reaches below `floor` (the replay's cut: below it the ring holds the slot's
+    // previous request's keys): such a chunk reads by the gather path from the floor, as one large chunk's rows would
+    const below = floor > start -| (c.window - 1);
+    const ring_mode = n <= ring_extra and !(replay_floor and below);
+    const one_split = !ring_mode and n <= tri.decode_rows;
     // attn_in: wq_a and wkv of x, one prompt GEMM each, or one group up to 128 rows
     if (n > 128) {
         try mm(e, ch, lay.wq_a, ch.x, c.hidden, ch.qa, .bf16, lay.wq_a.n);
@@ -775,7 +783,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const kk = sh.kk orelse return error.NoIndexerSelection;
         comp = .{ .fp4 = .{ .codes = cs.comp_codes[src], .scales = cs.comp_scales[src] } };
         n_idx = kk;
-        if (kk % 16 != 0 and n > tri.decode_rows) {
+        if (kk % 16 != 0 and (n > tri.decode_rows or one_split)) {
             // sparse_attn: a prompt chunk's pick list padded with -1 to whole 16-column tiles (F.pad), read from there
             const kp = (kk + 15) / 16 * 16;
             try fill(e, ch.cidxp, 0xff, n * kp * 8);
@@ -801,6 +809,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         .pos = ch.pos,
         .scale = scale(hd),
         .window = c.window,
+        .one_split = one_split,
     });
     try tri_norm.ropeHeads(e.t, ch.o, rope.cos, rope.sin, ch.pos, rd, true, n, hl, hd);
     // ring[pos[-keep:] % R] = kv[-keep:] (ring mode wrote them before the attention)
