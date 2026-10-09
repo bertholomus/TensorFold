@@ -152,6 +152,30 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
+/// The first extent of `size` in [0, cap) clear of `live` and of the kept states ([base, at, end] each): clear of their
+/// whole extents (rows and tail) where one fits so, else of their rows only.
+pub fn placeSoft(gpa: std.mem.Allocator, live: []const [2]usize, kept: []const [3]usize, size: usize, cap: usize) !?usize {
+    var used: std.ArrayList([2]usize) = .empty;
+    defer used.deinit(gpa);
+    try used.appendSlice(gpa, live);
+    for (kept) |k| try used.append(gpa, .{ k[0], @max(k[2], k[0] + k[1]) });
+    if (place(used.items, size, cap)) |b| return b;
+    used.shrinkRetainingCapacity(live.len);
+    for (kept) |k| try used.append(gpa, .{ k[0], k[0] + k[1] });
+    return place(used.items, size, cap);
+}
+
+test "a kept state's tail stays free while a placement fits elsewhere" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    const kept = [_][3]usize{.{ 0, 4 * c, 5 * c }}; // rows [0, 4c), its stream's extent to 5c
+    try std.testing.expectEqual(@as(?usize, 5 * c), try placeSoft(gpa, &.{}, &kept, 4 * c, 16 * c));
+    // no room clear of the tail: the rows alone are held back
+    const live = [_][2]usize{.{ 9 * c, 16 * c }};
+    try std.testing.expectEqual(@as(?usize, 4 * c), try placeSoft(gpa, &live, &kept, 5 * c, 16 * c));
+    try std.testing.expectEqual(@as(?usize, null), try placeSoft(gpa, &live, &kept, 6 * c, 16 * c));
+}
+
 /// Whether, with an extent of `size` at `b` taken besides `used`, another extent of `size` still fits in [0, cap).
 pub fn roomAfter(gpa: std.mem.Allocator, used: []const [2]usize, b: usize, size: usize, cap: usize) !bool {
     const all = try gpa.alloc([2]usize, used.len + 1);
@@ -247,6 +271,7 @@ pub const Snap = struct {
     buf: cuda.DeviceBuffer,
     stale: bool = false,
     wanted: u64 = 0, // when a request first waited for the live stream that holds these rows (placeKept; 0: none)
+    end: usize = 0, // the extent end of the stream that kept it (placement holds [base, end) back while room allows)
 };
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
@@ -418,7 +443,10 @@ pub const Lanes = struct {
             } else s.reuse_failed = true;
         }
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
-        if (kept) |sn| sn.wanted = 0;
+        if (kept) |sn| {
+            sn.wanted = 0;
+            if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
+        }
         if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
             kept = null;
             s.reuse_failed = true;
@@ -728,20 +756,28 @@ pub const Lanes = struct {
     /// none (that stream holds the room) and stays. When a live stream holds `source`, the request first waits up to
     /// held_wait_ns for that stream to end (error.ContextFull: the host tries it again; it then resumes in place) if
     /// the copy needs another state's room or would leave none for another request of its size: a copy that fills the
-    /// pool makes the next prompt evict a kept state (the 5 x 500K check with the duplicate admitted fourth).
+    /// pool makes the next prompt evict a kept state (the 5 x 500K check with the duplicate admitted fourth). Kept
+    /// states hold their stream's whole extent back while a placement still fits so (placeSoft): its tail stays free
+    /// for the resume in place, which then stales nothing.
     fn placeKept(self: *Lanes, live: []const [2]usize, size: usize, source: ?*Snap) !usize {
         const gpa = self.gpa;
-        var used: std.ArrayList([2]usize) = .empty;
-        defer used.deinit(gpa);
+        var kept: std.ArrayList([3]usize) = .empty;
+        defer kept.deinit(gpa);
+        var rows: std.ArrayList([2]usize) = .empty;
+        defer rows.deinit(gpa);
         const held = if (source) |sn| !sn.stale and clashes(live, sn.base, sn.base + sn.at) else false;
         while (true) {
-            used.clearRetainingCapacity();
-            try used.appendSlice(gpa, live);
-            for (self.snaps.items) |sn| if (!sn.stale) try used.append(gpa, .{ sn.base, sn.base + sn.at });
-            const got = place(used.items, size, self.m.pool_cap);
+            kept.clearRetainingCapacity();
+            rows.clearRetainingCapacity();
+            try rows.appendSlice(gpa, live);
+            for (self.snaps.items) |sn| if (!sn.stale) {
+                try kept.append(gpa, .{ sn.base, sn.at, sn.end });
+                try rows.append(gpa, .{ sn.base, sn.base + sn.at });
+            };
+            const got = try placeSoft(gpa, live, kept.items, size, self.m.pool_cap);
             if (held and self.patient(source.?)) {
                 const b = got orelse return error.ContextFull;
-                return if (try roomAfter(gpa, used.items, b, size, self.m.pool_cap)) b else error.ContextFull;
+                return if (try roomAfter(gpa, rows.items, b, size, self.m.pool_cap)) b else error.ContextFull;
             }
             if (got) |b| return b;
             const victim = for (self.snaps.items) |sn| {
@@ -751,9 +787,9 @@ pub const Lanes = struct {
         }
     }
 
-    /// Whether a kept state other than `except` has rows in [lo, hi).
+    /// Whether a kept state other than `except` and its siblings (the same stream's other marks) has rows in [lo, hi).
     fn keptOver(self: *const Lanes, lo: usize, hi: usize, except: *const Snap) bool {
-        for (self.snaps.items) |sn| if (sn != except and !sn.stale and sn.base < hi and lo < sn.base + sn.at) return true;
+        for (self.snaps.items) |sn| if (sn != except and !sn.stale and sn.base != except.base and sn.base < hi and lo < sn.base + sn.at) return true;
         return false;
     }
 
@@ -785,7 +821,7 @@ pub const Lanes = struct {
         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
         errdefer sn.buf.free();
         try self.snaps.append(self.gpa, sn);
         self.next_snap += 1;
