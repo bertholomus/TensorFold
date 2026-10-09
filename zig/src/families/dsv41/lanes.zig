@@ -227,6 +227,7 @@ pub const Lanes = struct {
     gpa: std.mem.Allocator,
     m: *Model,
     peer: ?link.Link, // rank 1 (null: one rank); every follower gets each frame (Model.followers)
+    vision: ?*@import("vision.zig").Vision = null, // rank 0's tower (a vision checkpoint served with its kit's vision/)
     step: u64 = 0,
     wire: Wire = .{},
     streams: std.AutoHashMapUnmanaged(*const lanes.Stream, Lane) = .empty,
@@ -408,9 +409,14 @@ pub const Lanes = struct {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                     q.* = -1;
                 }
-                if (!img.rows) return error.NoVisionTower; // the server path (vit.zig on rank 0) comes with the tower
-                if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
-                try rows.appendSlice(gpa, img.bytes);
+                if (img.rows) {
+                    if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
+                    try rows.appendSlice(gpa, img.bytes);
+                } else {
+                    // a prepared picture (vision.zig): the tower's span rows, here on rank 0
+                    const v = self.vision orelse return error.NoVisionTower;
+                    if (try v.rows(img.bytes, gpa, &rows) != img.tokens) return error.BadImageSpan;
+                }
                 try spans.append(gpa, .{ .at = img.at, .len = img.tokens, .row = at_row });
                 at_row += img.tokens;
             }

@@ -238,6 +238,11 @@ pub const Tower = struct {
         return Work.plan(tw.work.?.ptr, n, l);
     }
 
+    /// The workspace for the largest picture up front (n patches, l aligner rows), so serving allocates nothing.
+    pub fn reserve(tw: *Tower, n: usize, l: usize) !void {
+        _ = try tw.ensure(n, l);
+    }
+
     fn blocksFor(count: usize, per: usize) u32 {
         return @intCast(@max(1, @min(65535, (count + per - 1) / per)));
     }

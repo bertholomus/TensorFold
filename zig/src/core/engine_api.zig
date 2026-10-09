@@ -18,6 +18,13 @@ pub const Stop = struct {
     check: *const fn (ctx: *anyopaque, emitted: []const u32) bool,
 };
 
+/// A prompt's image (a vision family's): its span and the family's payload (lanes.stream.Image).
+pub const Image = lanes.stream.Image;
+
+/// A vision family's image input (lanes.stream.Vision): the server renders each image part as the placeholder and the
+/// family's prepare sizes its span.
+pub const Vision = lanes.stream.Vision;
+
 /// tool_choice "required" or a named function: outside a think block the answer opens a call to an offered tool.
 pub const CallGate = struct {
     /// The token that opens a call, the template text before the name, and the mark that ends the name.
@@ -42,6 +49,8 @@ pub const Structure = struct {
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
     prompt: []const u32,
+    /// The prompt's images in order, each span inside the prompt (its positions hold the image token).
+    images: []const Image = &.{},
     max_tokens: u32,
     sampling: ?Sampling = null,
     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
@@ -125,6 +134,8 @@ pub const Info = struct {
     /// The reasoning efforts the family's template takes as numbers: each name passes as asked and the template hears
     /// its number. Empty: the names the template quotes, as text (the nearest one for any other name).
     efforts: []const Effort = &.{},
+    /// A vision family's image input; null: the server refuses images.
+    vision: ?Vision = null,
 };
 
 /// A checkpoint family an engine reads: its config ``model_type`` and weight formats, as gate entries name them.

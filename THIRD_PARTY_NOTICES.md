@@ -88,6 +88,18 @@ cached Markov rows (`markov_tokens.zig`) is a frequency ranking generated from E
 target sampler follows the keyed draws of TensorFold's `tensorfold.engine.exact_sampling`. The Zig 0.17.0 toolchain
 (MIT) is used at build time only.
 
+Its image path (`picture.zig`, `vit.zig`, `vision.zig`, `cublaslt.zig`, `fmha.zig`) follows the same reference's image
+processor, vision tower and aligner (MIT, as above). Pictures decode and resample as Pillow's `convert("RGB")` and 8-bit
+BICUBIC `resize` compute them (Pillow, MIT-CMU License, Copyright © 1997-2011 Secret Labs AB, Copyright © 1995-2011
+Fredrik Lundh and contributors, Copyright © 2010 Jeffrey 'Alex' Clark and contributors; `LICENSES/Pillow-MIT-CMU.txt`),
+written for TensorFold without including Pillow's source. The tower's attention launches PyTorch's memory-efficient
+attention kernel (`fmha_cutlassF_f32_aligned_64x64_rf_sm80`) from its sm_120 binary, extracted from the served image's
+`libtorch_cuda.so` into a deployment's kernel kit (`vision/torch_fmha_sm120.cubin`, not in this repository); that kernel
+is PyTorch's, BSD-3-Clause (`LICENSES/PyTorch-BSD-3-Clause.txt`), built on NVIDIA CUTLASS, BSD-3-Clause, Copyright (c)
+2017 - 2025 NVIDIA CORPORATION & AFFILIATES (`LICENSES/CUTLASS-BSD-3-Clause.txt`). Its bias GEMMs call cuBLASLt as
+PyTorch's `gemm_and_bias` does. The image routing bias (`gate_bias_vl.safetensors` in the kit) holds the checkpoint's own
+`ffn.gate.bias_vl` tensors (MIT).
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from

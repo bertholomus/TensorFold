@@ -32,6 +32,8 @@ pub const Input = struct {
     id: []const u8 = "",
     /// ``return_token_ids``: the generated ids in the reply's tensorfold block (the Python server's token_ids).
     token_ids: bool = false,
+    /// The image parts' bytes in prompt order (their placeholders in the messages' text), for an engine with vision.
+    images: []const []const u8 = &.{},
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
@@ -173,6 +175,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     const drafts = srv.config.use_drafts and !(draft_field != null and draft_field.? == .bool and !draft_field.?.bool);
     var request: api.Request = .{
         .prompt = rendered.ids,
+        .images = rendered.images,
         .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
         .sampling = sampling,
         .eos = if (stops_opt.ignore_eos) &.{} else srv.eos,
