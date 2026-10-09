@@ -18,8 +18,8 @@
 # cuobjdump; 3 Engram's constants and the RoPE tables (zrec_fixtures.py, CPU); 4 the image routing bias
 # (make_bias_vl.py); 5 the Triton kernel set packed from the recordings (triton_aot_manifest.py + aot_pack.py).
 # Byte-identical to a published kit: steps 2-4 always; step 1's linear cubins and step 5 given the same .so files and
-# recordings. nvcc names anonymous-namespace symbols with a per-build hash, so experts cubins from a fresh extension
-# build differ from the published ones in those bytes only.
+# recordings. An extension rebuilt from source is not byte-identical (nvcc, build to build): its experts cubins
+# then differ from the published ones in a few bytes (18 and 1,246 in our rebuild); the published kit stays the record.
 set -eu
 OUT=$(mkdir -p "$1" && cd "$1" && pwd)
 T=$(cd "$(dirname "$0")" && pwd)            # tools/dsv41-zig
