@@ -68,6 +68,7 @@ pub const Layer = struct {
     idx_k_norm: u64 = 0,
     gate_w: u64 = 0, // [E, d] f16
     gate_b: u64 = 0, // [E] f32
+    gate_b_vl: u64 = 0, // [E] f32: the routing bias of image-span tokens (the checkpoint's extra gate_bias_vl)
     experts: Experts = undefined,
     engram_wkv: ?Linear = null, // this rank's hash columns' input rows
     engram_qk: u64 = 0, // q_weight * k_weight [hc, d] f32

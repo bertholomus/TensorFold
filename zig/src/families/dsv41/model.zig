@@ -61,6 +61,7 @@ pub const Options = struct {
     round_rows: usize = round.default_rows, // a round's rows at most (TF_DS_ROUND_ROWS; the four-node lane's 48)
     streams: usize = draft.default_streams, // the pool's streams (--parallel; the four-node lane's 16)
     round_ms: ?[]const f64 = null, // the lane core's round costs by rows (TF_DS_ROUND_MS; null: the served ROUND_MS)
+    vision_bias: ?[]const u8 = null, // gate_bias_vl.safetensors (null: the kit's vision/): the image-span routing bias
 };
 
 pub const Model = struct {
@@ -120,6 +121,9 @@ pub const Model = struct {
     fill_seq: []const i32 = &.{},
     ahead: ?std.Thread = null,
     view: prompt.Caches = undefined,
+    // the filling prompt's image spans and their rows (setImages; cleared by fillBegin)
+    spans: std.ArrayList(prompt.Span) = .empty,
+    img_buf: ?cuda.DeviceBuffer = null,
     // profiling (lanes' --profile): the last round's forward and absorb, synchronized apart (ns)
     prof: bool = false,
     timer: ?*round.PhaseTimer = null, // a profile's GPU time by phase (eager rounds)
@@ -144,6 +148,8 @@ pub const Model = struct {
         errdefer gpa.destroy(m);
         m.* = undefined;
         m.gpa = gpa;
+        m.spans = .empty;
+        m.img_buf = null;
         m.host = std.heap.ArenaAllocator.init(gpa);
         errdefer m.host.deinit();
         const a = m.host.allocator();
@@ -319,6 +325,12 @@ pub const Model = struct {
             }
         } else if (c.engram_layers.slice().len > 0) return error.NoEngramTables;
 
+        // a vision checkpoint's image routing bias (without it a prompt with images is refused; text runs as ever)
+        if (c.vision) {
+            const path = o.vision_bias orelse try std.fs.path.join(a, &.{ o.kit_dir, "vision", "gate_bias_vl.safetensors" });
+            m.loadVisionBias(path) catch |err| if (o.vision_bias != null or err != error.FileNotFound) return err;
+        }
+
         m.host_pos = try a.alloc(i64, chunk_rows);
         m.ids64 = try a.alloc(i64, chunk_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
@@ -329,6 +341,8 @@ pub const Model = struct {
     pub fn close(m: *Model) void {
         m.joinAhead();
         m.stream.synchronize() catch {};
+        if (m.img_buf) |*b| b.free();
+        m.spans.deinit(m.gpa);
         if (m.graphs) |*g| g.deinit();
         if (m.pgraphs) |*g| g.deinit();
         if (m.timer) |t| {
@@ -483,8 +497,47 @@ pub const Model = struct {
         try d.check(d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, m.stream.handle), "cuMemcpyDtoDAsync");
     }
 
+    /// Each layer's gate_bias_vl (f32 [experts], the checkpoint's extra file) on the device: Gate.forward's bias at
+    /// image-span positions.
+    fn loadVisionBias(m: *Model, path: []const u8) !void {
+        const core = @import("core");
+        var f = try core.safetensors.File.open(m.gpa, m.io, path);
+        defer f.close(m.io);
+        var nb: [64]u8 = undefined;
+        for (m.w.layers, 0..) |*lay, i| {
+            const t = f.get(try std.fmt.bufPrint(&nb, "layers.{d}.ffn.gate.bias_vl", .{i})) orelse return error.MissingVisionBias;
+            if (!t.is(.f32, &.{m.cfg.experts})) return error.BadVisionBias;
+            const dst = try m.arena.take(t.bytes.len);
+            const tmp = try m.gpa.dupe(u8, t.bytes); // (a copy out of the file mapping first: see vit.zig)
+            defer m.gpa.free(tmp);
+            try m.ctx.d.check(m.ctx.d.api.cuMemcpyHtoD_v2(dst, tmp.ptr, tmp.len), "cuMemcpyHtoD");
+            lay.gate_b_vl = dst;
+        }
+    }
+
+    /// The filling prompt's image spans (absolute positions, in order) and their rows bf16 [tokens, hidden] from the
+    /// host, after fillBegin and before its chunks.
+    pub fn setImages(m: *Model, spans: []const prompt.Span, rows: []const u8) !void {
+        if (rows.len > 0) {
+            if (m.img_buf == null or m.img_buf.?.len < rows.len) {
+                if (m.img_buf) |*b| b.free();
+                m.img_buf = null;
+                m.img_buf = try cuda.DeviceBuffer.alloc(m.ctx.d, rows.len);
+            }
+            const d = m.ctx.d;
+            try d.check(d.api.cuMemcpyHtoDAsync_v2(m.img_buf.?.ptr, rows.ptr, rows.len, m.stream.handle), "cuMemcpyHtoDAsync");
+            try m.stream.synchronize(); // (the caller's rows may go once this returns)
+        }
+        m.spans.clearRetainingCapacity();
+        try m.spans.appendSlice(m.gpa, spans);
+        m.ch.spans = m.spans.items;
+        m.ch.img_rows = if (m.img_buf) |b| b.ptr else 0;
+    }
+
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
         if (slot >= m.streams) return error.BadSlot;
+        m.spans.clearRetainingCapacity();
+        m.ch.spans = &.{};
         m.view = try m.caches.view(&m.eng, slot, base);
         for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
         m.fill_slot = slot;
@@ -499,11 +552,15 @@ pub const Model = struct {
         const e = &m.eng;
         const c = e.c;
         const ch = &m.ch;
-        for (0..n) |j| m.ids64[j] = seq[start + j];
+        // an image position's id is negative in the sequence (its n-grams dead for Engram): its embedding's id is the
+        // image token's, which its span row then replaces
+        const image_id: i64 = if (c.image_token) |t| t else 0;
+        for (0..n) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
         var shared: prompt.Shared = .{};
         const pt = m.ptimer;
         if (pt) |t| try t.mark(m.stream, .start);
         try prompt.begin(e, ch, m.ids64[0..n], start, m.host_pos);
+        if (ch.spans.len > 0) try prompt.embedSpans(e, ch);
         if (pt) |t| try t.mark(m.stream, .embed);
         const taps = m.dr != null;
         var floor: usize = 0;

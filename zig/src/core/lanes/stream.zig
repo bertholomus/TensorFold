@@ -95,6 +95,15 @@ pub const Held = struct {
     parents: ?[]i32 = null,
 };
 
+/// An image in the prompt (a vision family's): the span of `tokens` positions from `at` it fills (each position carries
+/// the image token id), and its encoded bytes, or with `rows` its span's embedding rows ready (a gate's input).
+pub const Image = struct {
+    at: u32,
+    tokens: u32,
+    bytes: []const u8,
+    rows: bool = false,
+};
+
 pub const Spec = struct {
     id: []const u8,
     prompt: []const u32,
@@ -112,6 +121,7 @@ pub const Spec = struct {
     loop_guard: bool = false,
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     reuse: Reuse = .{},
+    images: []const Image = &.{}, // in prompt order; the caller's until the stream is released
 };
 
 pub const Stream = struct {
@@ -132,6 +142,7 @@ pub const Stream = struct {
     loop_period: ?u32 = null,
     chunks: []const u32,
     reuse: Reuse = .{},
+    images: []const Image = &.{},
     cached: u32 = 0, // prompt tokens the backend restored from `reuse` (its prompt pass started there)
     reuse_failed: bool = false, // the backend's restore of `reuse` failed: it prefilled from 0
     context: std.ArrayList(u32) = .empty,
@@ -184,6 +195,7 @@ pub const Stream = struct {
             .loop_guard = spec.loop_guard,
             .chunks = spec.chunks,
             .reuse = spec.reuse,
+            .images = spec.images,
         };
         try s.context.appendSlice(gpa, spec.prompt);
         return s;
