@@ -55,12 +55,19 @@ pub fn cf(name: []const u8, v: f32) Const {
     return .{ .name = name, .f32 = v };
 }
 
-const Variant = struct { spec: KernelJson, kernel: triton.Kernel };
+const Variant = struct {
+    spec: KernelJson,
+    kernel: triton.Kernel,
+    /// Said once on stderr when a launch first takes this variant in place of its own specialization.
+    told: std.atomic.Value(bool) = .init(false),
+};
 
 pub const Set = struct {
     parsed: std.json.Parsed(SetJson),
     variants: []Variant,
     gpa: std.mem.Allocator,
+    /// TF_AOT_WEAKEST=1: every launch takes its most general fitting variant (a gate of the fallback's exactness).
+    weakest: bool = false,
 
     /// Loads every cubin listed in `dir`/aot.json into its own module.
     pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const Driver, device: abi.Device, dir: []const u8) !Set {
@@ -88,7 +95,8 @@ pub const Set = struct {
             variants[n] = .{ .spec = k, .kernel = try triton.Kernel.load(d, device, cubin, meta, name_z) };
             n += 1;
         }
-        return .{ .parsed = parsed, .variants = variants, .gpa = gpa };
+        const weakest = if (std.c.getenv("TF_AOT_WEAKEST")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        return .{ .parsed = parsed, .variants = variants, .gpa = gpa, .weakest = weakest };
     }
 
     pub fn deinit(self: *Set) void {
@@ -98,11 +106,28 @@ pub const Set = struct {
         self.* = undefined;
     }
 
-    /// The variant of `function` compiled for these constexprs and these arguments' specialization.
+    /// The variant of `function` compiled for these constexprs and these arguments' specialization; without one, the
+    /// fitting variant that assumes least less (fits: the same constexprs, each assumption it makes held by the
+    /// launch), named once on stderr.
     pub fn find(self: *const Set, function: []const u8, args: []const Arg, consts: []const Const) !*const Variant {
-        for (self.variants) |*v| {
+        if (!self.weakest) for (self.variants) |*v| {
             if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
             if (matches(v.spec, args, consts)) return v;
+        };
+        var best: ?*Variant = null;
+        var best_held: usize = 0;
+        for (self.variants) |*v| {
+            if (!std.mem.eql(u8, v.spec.@"fn", function)) continue;
+            const held = fits(v.spec, args, consts) orelse continue;
+            const better = if (self.weakest) held < best_held else held > best_held;
+            if (best == null or better) {
+                best = v;
+                best_held = held;
+            }
+        }
+        if (best) |v| {
+            if (!v.told.swap(true, .monotonic)) std.log.warn("{s}: a launch whose specialization no captured variant has runs variant {s} (assumes less)", .{ function, v.spec.hash[0..@min(12, v.spec.hash.len)] });
+            return v;
         }
         std.log.err("no captured Triton variant of {s} for this launch:", .{function});
         for (args) |a| switch (a.value) {
@@ -145,6 +170,61 @@ pub const Set = struct {
 fn lookup(args: []const Arg, name: []const u8) ?Arg {
     for (args) |a| if (std.mem.eql(u8, a.name, name)) return a;
     return null;
+}
+
+/// Whether variant `k` may run this launch though compiled for a narrower one: the same constexprs, and every
+/// assumption it makes held by the launch (an argument it takes as 16-divisible is; an int it folded to 1 is 1). Null
+/// when it may not, else how many of the launch's own specializations it shares.
+fn fits(k: KernelJson, args: []const Arg, consts: []const Const) ?usize {
+    for (consts) |c| {
+        const got = k.consts.map.get(c.name) orelse return null;
+        if (c.int) |x| if (got.int == null or got.int.? != x) return null;
+        if (c.f32) |x| if (got.f32 == null or got.f32.? != @as(u32, @bitCast(x))) return null;
+    }
+    var held: usize = 0;
+    var runtime: usize = 0;
+    for (args) |a| {
+        const param = for (k.params) |p| {
+            if (std.mem.eql(u8, p.name, a.name)) break p;
+        } else null;
+        switch (a.value) {
+            .i32 => |x| {
+                if (param == null) {
+                    const got = k.consts.map.get(a.name) orelse return null;
+                    if (x != 1 or got.int == null or got.int.? != 1) return null;
+                    held += 1;
+                    continue;
+                }
+                const p = param.?;
+                if (!std.mem.eql(u8, p.type, "i32")) return null;
+                const d16 = !p.nospec and x != 1 and @mod(x, 16) == 0;
+                if (p.div16 and !d16) return null;
+                if (p.div16 == d16 and (p.nospec or x != 1)) held += 1;
+            },
+            .ptr => |x| {
+                const p = param orelse return null;
+                if (!std.mem.eql(u8, p.type, x.ty)) return null;
+                const d16 = x.addr % 16 == 0;
+                if (p.div16 and !d16) return null;
+                if (p.div16 == d16) held += 1;
+            },
+            .f32 => {
+                const p = param orelse return null;
+                if (!std.mem.eql(u8, p.type, "fp32")) return null;
+                held += 1;
+            },
+            .u64 => |x| {
+                const p = param orelse return null;
+                if (!std.mem.eql(u8, p.type, "u64")) return null;
+                const d16 = x % 16 == 0;
+                if (p.div16 and !d16) return null;
+                if (p.div16 == d16) held += 1;
+            },
+        }
+        runtime += 1;
+    }
+    if (runtime != k.params.len) return null;
+    return held;
 }
 
 fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
