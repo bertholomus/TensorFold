@@ -238,9 +238,10 @@ pub const Lanes = struct {
     built: Built = .{},
     prof: ?Profile = null,
     fix_k: ?usize = null, // a measurement (tf-dsv41-lanes --fix-k): K drafts a stream, chances 1 to K and 0 past it
-    // a measurement (TF_DS_SERVED_K=1): a stream's chances end past the served lane's own choice (draft.chooseK: its
-    // round table and draft ms, the other live streams at their table depth), so a round takes at most those drafts
-    served_k: bool = false,
+    // TF_DS_SERVED_K: a stream's chances end past the served lane's own choice (draft.chooseK: its round table and
+    // draft ms, the other live streams at their table depth), so a round takes at most those drafts: at any number of
+    // streams (all), or with one stream live (solo: the served one-stream choice; more keep the lane core's allocation)
+    served_k: enum { off, all, solo } = .off,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
@@ -667,8 +668,8 @@ pub const Lanes = struct {
             return true;
         }
         survivals(l.confs[0..out.len], out);
-        if (self.served_k) {
-            const live = @max(1, self.streams.count());
+        const live = @max(1, self.streams.count());
+        if (self.served_k == .all or (self.served_k == .solo and live == 1)) {
             const drafts: usize = if (self.m.dr) |dr| dr.n else 1;
             const kmax = @min(out.len, draft.depth(live, drafts, self.m.eng.round_rows));
             const k = draft.chooseK(l.confs[0..out.len], kmax, live, drafts, self.m.eng.round_rows);
