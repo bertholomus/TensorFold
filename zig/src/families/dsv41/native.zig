@@ -58,6 +58,16 @@ pub const Loaded = struct {
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
+    /// Kept prompt states for the host's prompt cache (core/prompt_cache Snapshots: `ptr` and its functions).
+    snaps: ?Snaps = null,
+};
+
+pub const Snaps = struct {
+    ptr: *anyopaque,
+    bytes: *const fn (*anyopaque, u32) u64,
+    save: *const fn (*anyopaque, ?*anyopaque, u32) anyerror!*anyopaque,
+    restore: *const fn (*anyopaque, ?*anyopaque, *anyopaque) anyerror!void,
+    drop: *const fn (*anyopaque, *anyopaque) void,
 };
 
 /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
@@ -130,7 +140,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes = lanes_mod.Lanes.init(gpa, st.m);
     if (getenv("TF_DS_FIX_K")) |t| st.lanes.fix_k = std.fmt.parseInt(usize, t, 10) catch return error.BadFixK;
     // the pool is the model's (preallocated): a stream takes no device memory of its own
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn };
+    const L = lanes_mod.Lanes;
+    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps };
 }
 
 fn deinitFn(ptr: *anyopaque) void {
