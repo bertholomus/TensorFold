@@ -156,6 +156,40 @@ TENSORFOLD_CUDA_MEMORY_LIMIT_GB=31 tensorfold serve nvidia/Qwen3.8-27B-NVFP4
 A budget close to a shared pool can end requests with CUDA errors mid-reply, which is why a unified GPU keeps
 its floor; `TENSORFOLD_MEMORY_RESERVE_GIB` moves that floor. A discrete card's host need is its loading
 buffers, which startup checks on its own.
+
+On a unified GPU that a checkpoint nearly fills (two DGX Sparks serving DeepSeek-V4.1-Flash, for one), the kernel
+pages the server's host memory out to swap while it idles. The first request after an idle spell then stalls on page
+faults, and cold prompts slow down the longer the server has run. To see whether it applies, read the server's swap
+after an idle spell; more than a few MB means it does:
+
+```bash
+grep VmSwap /proc/$(pgrep -x tensorfold | head -1)/status
+```
+
+Keep the server out of swap and let the machine's other processes take it: run it in a systemd slice or scope with
+swap off, and lower `vm.swappiness` so the kernel drops page cache before it swaps. In Docker:
+
+```bash
+sudo systemctl set-property tensorfold.slice MemorySwapMax=0
+docker run --cgroup-parent tensorfold.slice ...
+cat /sys/fs/cgroup/tensorfold.slice/memory.swap.max     # 0 while a container runs in it
+```
+
+Without Docker, where your user manager has the memory controller (the default on current Ubuntu and DGX OS):
+
+```bash
+systemd-run --user --scope -p MemorySwapMax=0 tensorfold serve ...
+```
+
+Either way:
+
+```bash
+echo 'vm.swappiness = 10' | sudo tee /etc/sysctl.d/99-tensorfold.conf && sudo sysctl -w vm.swappiness=10
+```
+
+`docker run --memory-swappiness` has no effect under cgroup v2. With the server's swap off, memory pressure falls on
+the rest of the machine, so keep an OOM daemon such as earlyoom away from the server's process (`tensorfold`).
+
 Requested replies need cache space too. Reduce context, reply length, retained prefixes on MLX, or
 checkpoint size after a memory refusal. The MLX process budget reserves 3 GiB outside the allocator.
 Release-qualified memory and speed results are TBD [release-0.3.5]; see the
