@@ -350,17 +350,25 @@ pub const Lanes = struct {
             taken[nt] = .{ l.base, l.end };
             nt += 1;
         }
-        // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent
+        // a kept state of this prompt's prefix: the pass resumes at its chunk end, in its extent, or in one of its own
+        // with the kept rows copied there when a live stream holds that extent (a burst's second request on a prompt)
         s.cached = 0;
         var kept: ?*Snap = null;
+        var moved = false;
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
-            const fits = sn.base + size <= m.pool_cap and !clashes(taken[0..nt], sn.base, sn.base + size);
-            if (self.usable(sn, len) and fits) kept = sn else s.reuse_failed = true;
+            if (self.usable(sn, len)) {
+                kept = sn;
+                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
+            } else s.reuse_failed = true;
         }
-        const base = if (kept) |sn| sn.base else try self.placeKept(taken[0..nt], size);
+        const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size);
+        if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+            kept = null;
+            s.reuse_failed = true;
+        };
         // the rows this stream writes are no other kept state's
-        self.staleOver(if (kept) |sn| base + sn.at else base, base + size, kept);
+        self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
         self.used[slot] = true;
         errdefer {
@@ -383,8 +391,12 @@ pub const Lanes = struct {
             if (try self.begin(.snap_restore)) {
                 try self.wire.int(gpa, u64, sn.id);
                 try self.wire.int(gpa, u32, @intCast(slot));
+                try self.wire.int(gpa, u64, sn.base);
+                try self.wire.int(gpa, u64, base);
+                try self.wire.int(gpa, u64, sn.at);
                 try self.flush();
             }
+            if (base != sn.base) try m.copyExtent(sn.base, base, sn.at);
             try m.snapCopy(slot, sn.buf.ptr, false);
             start = sn.at;
             s.cached = @intCast(sn.at);
@@ -794,7 +806,11 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const id = try r.int(u64);
                 const s: usize = try r.int(u32);
                 if (s >= max_streams) return error.BadSlot;
+                const from: usize = @intCast(try r.int(u64));
+                const to: usize = @intCast(try r.int(u64));
+                const at: usize = @intCast(try r.int(u64));
                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
+                if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
                 m.snapCopy(s, b.ptr, false) catch |err| refused(err);
             },
             .snap_drop => {
