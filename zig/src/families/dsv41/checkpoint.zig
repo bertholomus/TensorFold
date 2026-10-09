@@ -146,12 +146,33 @@ pub fn describe(sh: *const Shards, key: []const u8) !Slice {
     return out;
 }
 
-/// `key`'s bytes into `out` (describe(key).bytes long).
-pub fn read(sh: *const Shards, key: []const u8, out: []u8) !void {
+/// Where `key`'s source tensor lies in its shard (a reader that takes the whole tensor in one read, then readFrom).
+pub const Span = struct { file: *const st.File, offset: usize, len: usize };
+
+pub fn span(sh: *const Shards, key: []const u8) !Span {
     const k = try Key.parse(key);
     var buf: [256]u8 = undefined;
     const s = try source(sh, k, &buf);
-    const t = s.t;
+    const f = &sh.files[sh.names.get(s.name).?];
+    return .{ .file = f, .offset = @intFromPtr(s.t.bytes.ptr) - @intFromPtr(f.map.memory.ptr), .len = s.t.bytes.len };
+}
+
+/// `key`'s bytes into `out` (describe(key).bytes long).
+pub fn read(sh: *const Shards, key: []const u8, out: []u8) !void {
+    return readFrom(sh, key, null, out);
+}
+
+/// read, the source tensor's bytes taken from `bytes` (its span, read by the caller) instead of the mapped shard: a
+/// column slice touches every row of its tensor, which through the map is a disk read a row.
+pub fn readFrom(sh: *const Shards, key: []const u8, bytes: ?[]const u8, out: []u8) !void {
+    const k = try Key.parse(key);
+    var buf: [256]u8 = undefined;
+    const s = try source(sh, k, &buf);
+    var t = s.t;
+    if (bytes) |b| {
+        if (b.len != t.bytes.len) return error.BadSize;
+        t.bytes = b;
+    }
     const want = try describe(sh, key);
     if (out.len != want.bytes) return error.BadSize;
     if (!k.exl3) {
@@ -244,6 +265,16 @@ test "column, row and whole slices of a toy trellis and its scales" {
     var svh: [64]u8 = undefined;
     try read(&sh, "w|(32, 64)|None|svh", &svh);
     try std.testing.expectEqualSlices(u8, body[96 + 64 .. 224], &svh);
+    // the same from a copy of the tensor's span, as tf-dsv41-rank-cache reads it
+    const sp = try span(&sh, "w|(32, 64)|(16, 32)|tr");
+    try std.testing.expectEqual(@as(usize, 8 + json.len), sp.offset);
+    try std.testing.expectEqual(@as(usize, 32), sp.len);
+    var copy: [32]u8 = undefined;
+    @memcpy(&copy, file.items[sp.offset..][0..sp.len]);
+    var both2: [8]u8 = undefined;
+    try readFrom(&sh, "w|(32, 64)|(16, 32)|tr", &copy, &both2);
+    try std.testing.expectEqualSlices(u8, &both, &both2);
+    try std.testing.expectError(error.BadSize, readFrom(&sh, "w|(32, 64)|(16, 32)|tr", copy[0..16], &both2));
     var wide: [16]u8 = undefined;
     try read(&sh, "g.bias|torch.float32", &wide);
     const h0: f16 = @bitCast(std.mem.readInt(u16, body[224..226], .little));

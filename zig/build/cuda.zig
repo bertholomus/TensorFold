@@ -111,6 +111,10 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const ds_check = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/check_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_check.addImport("dsv41", engines(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.core).dsv41);
     b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-check", .root_module = ds_check }));
+    // each rank's weight file (the lane's rank cache) from the checkpoint alone, no GPU and no Python
+    const ds_rank_cache = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/rank_cache_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    ds_rank_cache.addImport("dsv41", ds_check.import_table.get("dsv41").?);
+    b.installArtifact(b.addExecutable(.{ .name = "tf-dsv41-rank-cache", .root_module = ds_rank_cache }));
     const ds_load = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv41/load_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     ds_load.addImport("dsv41", ds_check.import_table.get("dsv41").?);
     ds_load.addImport("cuda", cuda);

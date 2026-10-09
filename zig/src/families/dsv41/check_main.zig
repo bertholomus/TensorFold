@@ -1,10 +1,11 @@
-//! tf-dsv41-check MODEL_DIR CACHE_DIR RANK WORLD [--no-dspark] [--bytes EVERY]: the TP split plan against the lane's
-//! rank cache, entry by entry: key, order, dtype and trellis tiles; the checkpoint reader's layout of every entry; with
-//! --bytes, the bytes of every EVERY-th entry and of every entry outside the routed experts, read both ways. No GPU.
+//! tf-dsv41-check MODEL_DIR CACHE_DIR RANK WORLD [--no-dspark] [--parity] [--bytes EVERY]: the TP split plan against
+//! the lane's rank cache, entry by entry: key, order, dtype and trellis tiles; the checkpoint reader's layout of every
+//! entry; with --bytes, the bytes of every EVERY-th entry and of every entry outside the routed experts, read both ways.
+//! --parity: the four-node split's balanced experts (TF_DS_2D_GU=parity). No GPU.
 const std = @import("std");
 const dsv41 = @import("dsv41");
 
-const usage = "usage: tf-dsv41-check MODEL_DIR CACHE_DIR RANK WORLD [--no-dspark] [--bytes EVERY]\n";
+const usage = "usage: tf-dsv41-check MODEL_DIR CACHE_DIR RANK WORLD [--no-dspark] [--parity] [--bytes EVERY]\n";
 
 pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
@@ -17,10 +18,12 @@ pub fn main(init: std.process.Init) !u8 {
     const rank = try std.fmt.parseInt(u32, args[3], 10);
     const world = try std.fmt.parseInt(u32, args[4], 10);
     var dspark = true;
+    var parity = false;
     var every: usize = 0;
     var ai: usize = 5;
     while (ai < args.len) : (ai += 1) {
         if (std.mem.eql(u8, args[ai], "--no-dspark")) dspark = false;
+        if (std.mem.eql(u8, args[ai], "--parity")) parity = true;
         if (std.mem.eql(u8, args[ai], "--bytes") and ai + 1 < args.len) {
             every = try std.fmt.parseInt(usize, args[ai + 1], 10);
             ai += 1;
@@ -33,7 +36,7 @@ pub fn main(init: std.process.Init) !u8 {
     var ix = try dsv41.rank_cache.open(init.gpa, io, dir, name);
     defer ix.deinit();
     // four ranks: the exact 2D split (node g = TP2 rank g % 2 of pair g / 2); the cache file is still rank g of 4
-    const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2 } else .{ .rank = rank, .world = world };
+    const split: dsv41.plan.Split = if (world == 4) .{ .rank = rank % 2, .world = 2, .pair = rank / 2, .parity = parity } else .{ .rank = rank, .world = world };
     const want = try dsv41.plan.wants(a, cfg, split, dspark);
     var out_buf: [4096]u8 = undefined;
     var out = std.Io.File.stdout().writer(io, &out_buf);

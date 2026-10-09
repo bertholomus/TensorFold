@@ -1,6 +1,6 @@
 //! The Python lane's per-rank weight file (TF_DS_RANK_CACHE, weights.py RankCache): this rank's slices of the checkpoint
 //! in the loader's order and dtypes, a JSON index after them, then the index's offset and a magic word. Both engines load
-//! from the one file.
+//! from the one file; tf-dsv41-rank-cache (rank_cache_main.zig) writes it from the checkpoint alone.
 const std = @import("std");
 const Io = std.Io;
 
@@ -31,6 +31,20 @@ pub const DType = enum {
         const names = .{ .{ "bfloat16", .bf16 }, .{ "float16", .f16 }, .{ "float32", .f32 }, .{ "int16", .i16 }, .{ "int32", .i32 }, .{ "int64", .i64 }, .{ "uint8", .u8 }, .{ "float8_e4m3fn", .f8e4m3 } };
         inline for (names) |n| if (std.mem.eql(u8, text, n[0])) return n[1];
         return null;
+    }
+
+    /// The name parse takes (torch's: str(dtype).split(".")[1]).
+    pub fn name(self: DType) []const u8 {
+        return switch (self) {
+            .bf16 => "bfloat16",
+            .f16 => "float16",
+            .f32 => "float32",
+            .i16 => "int16",
+            .i32 => "int32",
+            .i64 => "int64",
+            .u8 => "uint8",
+            .f8e4m3 => "float8_e4m3fn",
+        };
     }
 };
 
@@ -142,6 +156,36 @@ pub fn find(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, rank: u32, world: u32) 
     return found orelse error.NoRankCache;
 }
 
+/// One index row as weights.py RankCache writes it (json.dumps of [key, dtype, shape, offset, bytes]); the index is the
+/// rows in file order, ", " between them, in one list (tf-dsv41-rank-cache writes the file).
+pub fn writeRow(w: *Io.Writer, key: []const u8, dtype: DType, shape: []const usize, offset: u64, bytes: u64) !void {
+    try w.writeByte('[');
+    try jsonString(w, key);
+    try w.print(", \"{s}\", [", .{dtype.name()});
+    for (shape, 0..) |d, i| try w.print("{s}{d}", .{ if (i > 0) ", " else "", d });
+    try w.print("], {d}, {d}]", .{ offset, bytes });
+}
+
+/// An ASCII string as json.dumps writes it: quotes, backslashes and control characters escaped.
+fn jsonString(w: *Io.Writer, s: []const u8) !void {
+    try w.writeByte('"');
+    for (s) |ch| switch (ch) {
+        '"', '\\' => {
+            try w.writeByte('\\');
+            try w.writeByte(ch);
+        },
+        '\n' => try w.writeAll("\\n"),
+        '\r' => try w.writeAll("\\r"),
+        '\t' => try w.writeAll("\\t"),
+        0x08 => try w.writeAll("\\b"),
+        0x0c => try w.writeAll("\\f"),
+        0x00...0x07, 0x0b, 0x0e...0x1f, 0x7f => try w.print("\\u{x:0>4}", .{ch}),
+        0x80...0xff => return error.NonAsciiKey,
+        else => try w.writeByte(ch),
+    };
+    try w.writeByte('"');
+}
+
 /// A cache file as weights.py writes one, for the tests: each tensor's bytes, then the index, offset and magic.
 fn writeFake(a: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8, rows: []const struct { key: []const u8, dtype: []const u8, shape: []const usize, fill: u8 }) !void {
     var body: std.ArrayList(u8) = .empty;
@@ -192,6 +236,29 @@ test "a rank cache's index reads back in order, and its file is found by rank" {
     try std.testing.expectEqual(@as(usize, 288), tr.numel());
     try std.testing.expectEqual(@as(u64, 64 + 576 + 256), ix.data_end);
     try std.testing.expectEqualStrings("embed.weight|None", ix.entries.keys()[0]);
+}
+
+test "index rows as json.dumps writes them, read back" {
+    var buf: [512]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try w.writeByte('[');
+    try writeRow(&w, "embed.weight|None", .bf16, &.{ 4, 8 }, 0, 64);
+    try w.writeAll(", ");
+    try writeRow(&w, "layers.0.attn.wq_b|(0, 16384)|None|tr", .i16, &.{ 2, 3, 48 }, 64, 576);
+    try w.writeAll(", ");
+    try writeRow(&w, "layers.0.attn.attn_sink|torch.float32", .f32, &.{64}, 640, 256);
+    try w.writeByte(']');
+    try std.testing.expectEqualStrings("[[\"embed.weight|None\", \"bfloat16\", [4, 8], 0, 64], " ++
+        "[\"layers.0.attn.wq_b|(0, 16384)|None|tr\", \"int16\", [2, 3, 48], 64, 576], " ++
+        "[\"layers.0.attn.attn_sink|torch.float32\", \"float32\", [64], 640, 256]]", w.buffered());
+    var ix = try parseIndex(std.testing.allocator, w.buffered(), 896);
+    defer ix.deinit();
+    try std.testing.expectEqual(@as(u64, 64), ix.get("layers.0.attn.wq_b|(0, 16384)|None|tr").?.offset);
+    w = .fixed(&buf);
+    try jsonString(&w, "a\"b\\c\x01\x08\x7f");
+    try std.testing.expectEqualStrings("\"a\\\"b\\\\c\\u0001\\b\\u007f\"", w.buffered());
+    try std.testing.expectError(error.NonAsciiKey, jsonString(&w, "\xc3\xa9"));
+    inline for (comptime std.enums.values(DType)) |d| try std.testing.expectEqual(d, DType.parse(d.name()).?);
 }
 
 test "an index whose entries overlap, leave gaps or disagree with their shapes is refused" {
