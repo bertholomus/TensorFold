@@ -96,12 +96,26 @@ pub const Held = struct {
 };
 
 /// An image in the prompt (a vision family's): the span of `tokens` positions from `at` it fills (each position carries
-/// the image token id), and its encoded bytes, or with `rows` its span's embedding rows ready (a gate's input).
+/// the image token id), and the payload its family's Vision.prepare made, or with `rows` its span's embedding rows
+/// ready (a gate's input).
 pub const Image = struct {
     at: u32,
     tokens: u32,
     bytes: []const u8,
     rows: bool = false,
+};
+
+/// A vision family's image input as a server renders it (engine_api.Info.vision): each image part becomes
+/// `placeholder` (one token: `token`) in the template's text, and `prepare` turns the image's bytes into its span's
+/// length and the payload the backend reads (Image.bytes), on the request's thread; on BadImage `problem` says why.
+pub const Vision = struct {
+    ctx: *anyopaque,
+    placeholder: []const u8,
+    token: u32,
+    prepare: *const fn (ctx: *anyopaque, a: Allocator, bytes: []const u8, problem: *[]const u8) PrepareError!Prepared,
+
+    pub const Prepared = struct { tokens: u32, payload: []const u8 };
+    pub const PrepareError = error{ BadImage, OutOfMemory };
 };
 
 pub const Spec = struct {

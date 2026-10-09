@@ -121,12 +121,16 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     try fields.probabilityOptions(cx, body);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
+    // an engine with vision takes image parts: their placeholders in the text, their bytes in input.images
+    var images: messages.Images = .{ .placeholder = if (srv.info.vision) |v| v.placeholder else "" };
+    const take: ?*messages.Images = if (srv.info.vision != null) &images else null;
     if (is_chat) {
-        input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
+        input.messages = try messages.normalizeImages(cx, body.get("messages"), "system", srv.needs_user_after_tool, take);
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
-        input.messages = try messages.normalize(cx, m, "system", srv.needs_user_after_tool);
+        input.messages = try messages.normalizeImages(cx, m, "system", srv.needs_user_after_tool, take);
     };
+    input.images = images.list.items;
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     input.token_ids = if (body.get("return_token_ids")) |v| v.truthy() else false;
     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now

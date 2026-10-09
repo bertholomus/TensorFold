@@ -21,16 +21,112 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
     return copy;
 }
 
+/// A request's images as normalize meets them when the server takes images (its engine's Info.vision): each image
+/// part's bytes in prompt order, the part itself the placeholder in its message's text.
+pub const Images = struct {
+    placeholder: []const u8,
+    list: std.ArrayList([]const u8) = .empty,
+};
+
+pub const image_text_refusal = "image input: message text must not contain the image placeholder token";
+
+fn isImagePart(part: Value) bool {
+    if (part != .object) return false;
+    const t = part.get("type") orelse return false;
+    return t == .string and (std.mem.eql(u8, t.string, "image_url") or std.mem.eql(u8, t.string, "image"));
+}
+
+/// Whether any message's content list holds an image part.
+fn hasImages(list: Value) bool {
+    for (list.array) |message| {
+        if (message != .object) continue;
+        const content = message.get("content") orelse continue;
+        if (content != .array) continue;
+        for (content.array) |part| if (isImagePart(part)) return true;
+    }
+    return false;
+}
+
+/// An image part's bytes: an ``image_url`` (a string or ``{"url": ...}``) or an ``image`` block's ``url``, a base64
+/// data URL (characters outside the alphabet skipped, as Python's b64decode does).
+fn imageBytes(cx: *Cx, part: Value) errors.Refused![]const u8 {
+    const t = part.get("type").?.string;
+    const ref: ?Value = if (std.mem.eql(u8, t, "image_url")) part.get("image_url") else part.get("url");
+    const url: []const u8 = blk: {
+        const r = ref orelse break :blk "";
+        if (r == .string) break :blk r.string;
+        if (r == .object) if (r.get("url")) |u| if (u == .string) break :blk u.string;
+        break :blk "";
+    };
+    if (url.len == 0) return cx.refuse("image input: an image part must contain an image URL");
+    if (!std.mem.startsWith(u8, url, "data:")) return cx.refuse("image input: images must be base64 data URLs");
+    const comma = std.mem.indexOfScalar(u8, url, ',') orelse return cx.refuse("image input: a data URL must hold base64 data");
+    if (!std.mem.endsWith(u8, url[0..comma], ";base64")) return cx.refuse("image input: a data URL must hold base64 data");
+    var clean: std.ArrayList(u8) = .empty;
+    for (url[comma + 1 ..]) |ch| {
+        if (std.ascii.isAlphanumeric(ch) or ch == '+' or ch == '/' or ch == '=') try clean.append(cx.a, ch);
+    }
+    const d = std.base64.standard.Decoder;
+    const n = d.calcSizeForSlice(clean.items) catch return cx.refuse("image input: the image's base64 data is malformed");
+    const out = try cx.a.alloc(u8, n);
+    d.decode(out, clean.items) catch return cx.refuse("image input: the image's base64 data is malformed");
+    return out;
+}
+
 /// ``normalize_messages`` (text only): leading system and developer text merged, later ones as ``late_system``; a template that needs a user query gains one user turn after a trailing tool run.
 pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool) errors.Refused!Value {
+    return normalizeImages(cx, messages, late_system, needs_user_after_tool, null);
+}
+
+/// normalize, and with `images` (a server that takes them) a request with an image part anywhere as the served lane
+/// renders it (the reference's process_image_messages): every message's content list joined with blank lines, each
+/// image part its placeholder (its bytes into `images`), no message text holding the placeholder.
+pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, images: ?*Images) errors.Refused!Value {
     const list = messages orelse return cx.refuse("messages must be a non-empty list");
     if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
+    const with_images = images != null and hasImages(list);
     var out: std.ArrayList(Value) = .empty;
     var instructions: std.ArrayList(*json.Object) = .empty;
     for (list.array) |message| {
         if (message != .object) return cx.refuse("each message must be an object");
         const role = message.get("role");
         if (!isRole(role)) return cx.refuse("message role must be system, developer, user, assistant or tool");
+        if (with_images) {
+            const im = images.?;
+            // media other than the content's images is refused as ever
+            const rest = try json.copyObject(cx.a, message.object);
+            _ = rest.orderedRemove("content");
+            if (fields.hasMedia(.{ .object = rest })) return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
+            for ([_][]const u8{ "content", "reasoning_content" }) |key| if (message.get(key)) |v| if (v == .string and std.mem.indexOf(u8, v.string, im.placeholder) != null) return cx.refuse(image_text_refusal);
+            const content = message.get("content");
+            var item: *json.Object = message.object;
+            if (content != null and content.? == .array) {
+                var text: std.ArrayList(u8) = .empty;
+                for (content.?.array, 0..) |part, k| {
+                    if (k > 0) try text.appendSlice(cx.a, "\n\n");
+                    if (isImagePart(part)) {
+                        try im.list.append(cx.a, try imageBytes(cx, part));
+                        try text.appendSlice(cx.a, im.placeholder);
+                        continue;
+                    }
+                    const typed = part == .object and part.get("type") != null and part.get("type").? == .string and std.mem.eql(u8, part.get("type").?.string, "text");
+                    if (!typed or fields.hasMedia(part)) return cx.refuse("this server accepts text parts only; image, audio and video inputs are unsupported");
+                    const t: Value = part.get("text") orelse .null;
+                    if (t != .string and t != .null) return cx.refuse("a text content part must contain a text string");
+                    if (t == .string) {
+                        if (std.mem.indexOf(u8, t.string, im.placeholder) != null) return cx.refuse(image_text_refusal);
+                        try text.appendSlice(cx.a, t.string);
+                    }
+                }
+                item = try withField(cx, message.object, "content", .{ .string = text.items });
+            } else if (content == null or content.? == .null) {
+                item = try withField(cx, message.object, "content", .{ .string = "" });
+            } else if (content.? != .string) {
+                return cx.refuse("message content must be text or an array of text parts");
+            }
+            try place(cx, &out, &instructions, item, role.?.string, late_system);
+            continue;
+        }
         if (fields.hasMedia(message)) return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
         const content = message.get("content");
         var item: *json.Object = message.object;
@@ -49,15 +145,7 @@ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_
         } else if (content.? != .string) {
             return cx.refuse("message content must be text or an array of text parts");
         }
-        const r = role.?.string;
-        if (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer")) {
-            if (out.items.len == 0) {
-                try instructions.append(cx.a, item);
-                continue;
-            }
-            if (!std.mem.eql(u8, r, late_system)) item = try withField(cx, item, "role", .{ .string = late_system });
-        }
-        try out.append(cx.a, .{ .object = item });
+        try place(cx, &out, &instructions, item, role.?.string, late_system);
     }
     if (instructions.items.len > 0) {
         var joined: std.ArrayList(u8) = .empty;
@@ -94,6 +182,19 @@ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_
         }
     }
     return .{ .array = out.items };
+}
+
+/// A normalized message into the list: leading instructions held to be merged, a later one as ``late_system``.
+fn place(cx: *Cx, out: *std.ArrayList(Value), instructions: *std.ArrayList(*json.Object), message: *json.Object, r: []const u8, late_system: []const u8) errors.Refused!void {
+    var item = message;
+    if (std.mem.eql(u8, r, "system") or std.mem.eql(u8, r, "developer")) {
+        if (out.items.len == 0) {
+            try instructions.append(cx.a, item);
+            return;
+        }
+        if (!std.mem.eql(u8, r, late_system)) item = try withField(cx, item, "role", .{ .string = late_system });
+    }
+    try out.append(cx.a, .{ .object = item });
 }
 
 /// ``_normalize_tool_call_arguments``: call arguments as objects for templates; bad ones under ``_invalid_arguments``.

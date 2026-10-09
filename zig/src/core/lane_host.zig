@@ -65,6 +65,7 @@ pub const LaneHost = struct {
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
+            if (job.request.images.len > 0) return; // a kept state is keyed by tokens: an image's are its placeholder's
             if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks);
         }
 
@@ -294,7 +295,7 @@ pub const LaneHost = struct {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
+        if (r.images.len == 0) if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -317,6 +318,7 @@ pub const LaneHost = struct {
             .loop_guard = r.loop_guard,
             .chunks = r.chunks,
             .reuse = reuse,
+            .images = r.images,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");
