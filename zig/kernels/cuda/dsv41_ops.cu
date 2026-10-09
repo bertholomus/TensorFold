@@ -201,15 +201,63 @@ struct TfDsPrefetch {
     unsigned long long bytes[16];
     int n;
 };
-extern "C" __global__ void tf_ds_l2_prefetch_kernel(TfDsPrefetch a) {
-    const unsigned long long step = (unsigned long long)blockDim.x * gridDim.x * 128ull;
-    for (int t = 0; t < a.n; ++t) {
-        const char* p = a.ptr[t];
-        const unsigned long long n = a.bytes[t];
-        for (unsigned long long off = ((unsigned long long)blockIdx.x * blockDim.x + threadIdx.x) * 128ull; off < n; off += step) {
-            asm volatile("prefetch.global.L2 [%0];" ::"l"(p + off));
+// The served paced prefetch (exl3/l2_prefetch.cu, its decode settings): after delay_ns (a gather's staging kernel
+// launched beside it first runs undisturbed), one block issues a wave of blockDim 8 KiB bulk L2 prefetches every
+// wave_ns, the ranges in order, so DRAM's queue holds about a wave and the latency-bound kernels running beside keep
+// most of their load latency. Each range starts on a chunk of its own; its bytes are cut to whole 16-byte units.
+// wave_ns 0: every chunk at once from the grid's blocks. Writes nothing.
+extern "C" __global__ void __launch_bounds__(128) tf_ds_l2_prefetch_kernel(TfDsPrefetch a, long long delay_ns, long long wave_ns) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+    const long long chunk = 8 << 10;
+    if (delay_ns > 0) {
+        unsigned long long t0;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        for (;;) {
+            unsigned long long t;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            if (t - t0 >= (unsigned long long)delay_ns) break;
+            __nanosleep(500);
         }
     }
+    long long end[16];
+    long long total = 0;
+    for (int t = 0; t < a.n; ++t) {
+        total += ((long long)(a.bytes[t] / 16 * 16) + chunk - 1) / chunk;
+        end[t] = total;
+    }
+    const long long stride = (long long)gridDim.x * blockDim.x;
+    int r = 0;
+    unsigned long long t0;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+    long long wave = 0;
+    for (long long c = (long long)blockIdx.x * blockDim.x + threadIdx.x; c - threadIdx.x < total; c += stride) {
+        if (wave_ns > 0) {
+            __syncthreads();
+            if (threadIdx.x == 0) {
+                for (;;) {
+                    unsigned long long t;
+                    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+                    if (t - t0 >= (unsigned long long)(wave * wave_ns)) break;
+                    __nanosleep(256);
+                }
+            }
+            __syncthreads();
+            ++wave;
+        }
+        if (c >= total) continue;
+        while (c >= end[r]) ++r;
+        const long long off = (c - (r ? end[r - 1] : 0)) * chunk;
+        const long long left = (long long)(a.bytes[r] / 16 * 16) - off;
+        const unsigned size = (unsigned)(left < chunk ? left : chunk);
+        asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;" ::"l"(a.ptr[r] + off), "r"(size) : "memory");
+    }
+#else
+    const unsigned long long step = (unsigned long long)blockDim.x * gridDim.x * 128ull;
+    for (int t = 0; t < a.n; ++t) {
+        for (unsigned long long off = ((unsigned long long)blockIdx.x * blockDim.x + threadIdx.x) * 128ull; off < a.bytes[t]; off += step)
+            asm volatile("prefetch.global.L2 [%0];" ::"l"(a.ptr[t] + off));
+    }
+#endif
 }
 
 // The indexer's selection when its top-k takes every key it scans (nb <= index_topk): kernels.topk_indices of all nb

@@ -192,7 +192,9 @@ pub const Round = struct {
     launches: [32]u64 = @splat(0),
     launch_mark: u64 = 0,
     clk_layers: bool = false, // a clock at each layer's end alone (tag 64 + the layer), TF_DS_CLOCK_MARKS=2
-    clk_marks: bool = false, // clocks at every phase mark too (Model.useClock(true)), not only around the stretches
+    clk_marks: bool = false,
+    clk_ratio: ?u8 = null, // phase clocks only in the layers of this compress ratio (TF_DS_CLOCK_MARKS=3: ratio 2)
+    cur_ratio: u8 = 0, // the layer a stretch is on (its compress ratio) // clocks at every phase mark too (Model.useClock(true)), not only around the stretches
     clk: u64 = 0, // [1 + 2 * max_clocks] u64: the count, then each clock and its phase (PhaseTimer.Phase or clock_*)
 
     pub fn init(e: *const Engine, a: *prompt.Arena, gpa: std.mem.Allocator, pool_cap: usize) !Round {
@@ -412,7 +414,7 @@ pub const Round = struct {
     }
 
     fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
-        if (rd.clk != 0 and rd.clk_marks) {
+        if (rd.clk != 0 and rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio)) {
             const now = cuda.launch.count;
             rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
             rd.launch_mark = now;
@@ -955,6 +957,7 @@ fn stretch(e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, ri
     var pending: ?u64 = null;
     for (li..end) |l| {
         const lay = w.layers[l];
+        rd.cur_ratio = lay.ratio;
         if (lay.engram_wkv) |ew| {
             if (pending) |gp| {
                 try tri_basic.hcPost(t, gp, h, rd.post, rd.comb, h, e.world, R, d);
