@@ -1,3 +1,13 @@
+> **BertholomusAI's fork of TensorFold, branch `deepseek-v41-zig-tp4`: DeepSeek-V4.1-Flash on four NVIDIA GB10 (DGX
+> Spark) nodes.** Weights: [Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw)
+> (MIT), an EXL3 quant of [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
+> The branch adds a `dsv41` family to TensorFold 1.0.2's native engine: a four-node split whose replies equal the
+> two-node family's token for token in our gates, image input, up to 1,048,576 tokens a request in a shared
+> 2,097,152-position window with kept-prompt reuse, and exact DSpark speculative decoding. Launch, measured numbers and
+> gates are in the recipe, [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10)
+> (v0.1.0). See NOTICE and ATTRIBUTION.md. This fork is not affiliated with or endorsed by DeepSeek, NVIDIA, the
+> TensorFold authors or Mia-AiLab.
+
 # TensorFold
 
 TensorFold 1.0.0 serves language models from a Zig binary on Apple Silicon and NVIDIA GPUs.

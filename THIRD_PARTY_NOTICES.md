@@ -101,6 +101,13 @@ is PyTorch's, BSD-3-Clause (`LICENSES/PyTorch-BSD-3-Clause.txt`), built on NVIDI
 PyTorch's `gemm_and_bias` does. The image routing bias (`gate_bias_vl.safetensors` in the kit) holds the checkpoint's own
 `ffn.gate.bias_vl` tensors (MIT).
 
+On four nodes (`TF_TP_WORLD=4`: `prompt2d.zig`, `round2d.zig`, `draft2d.zig`, `ring2d.zig`, `exl3_experts2d.zig`) the
+family splits each layer over two pairs of nodes. Its one-launch gate / up for the balanced experts split
+(`zig/kernels/cuda/dsv41/experts_par.cu`) copies the device code of the grouped expert kernel of TensorFold's EXL3
+module (`experts_grouped.cuh` of the Python line, whose header credits ExLlamaV3, MIT License, Copyright (c) 2025
+Turboderp, text below), its arithmetic unchanged; the file's header says so. The branch's ATTRIBUTION.md lists every
+outside source of the family.
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from
