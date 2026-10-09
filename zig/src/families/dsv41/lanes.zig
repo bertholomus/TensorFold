@@ -358,7 +358,7 @@ pub const Lanes = struct {
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
         const size = std.mem.alignForward(usize, len + s.max_new + m.eng.round_rows + 2, model.chunk_rows);
-        if (size > m.pool_cap) return error.PromptTooLong;
+        if (size > m.ctx_cap) return error.PromptTooLong;
         if (self.streams.fetchRemove(s)) |old| self.used[old.value.slot] = false;
         const slot = std.mem.indexOfScalar(bool, self.used[0..self.m.streams], false) orelse return error.NoFreeSlot;
         var taken: [max_streams][2]usize = undefined;

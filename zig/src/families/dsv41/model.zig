@@ -50,6 +50,7 @@ pub const Options = struct {
     engram_dir: ?[]const u8 = null, // the Engram tables (none: a checkpoint without Engram layers)
     token_map: ?[]const u8 = null, // the compressed token map (the lane's JSON cache)
     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
+    context: usize = 0, // a stream's extent at most (its prompt, budget and a round's rows; 0: the pool)
     drafts: bool = true, // load the DSpark drafter
     rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated), else NCCL: TP2's
     // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
@@ -91,6 +92,7 @@ pub const Model = struct {
     streams: usize, // the pool's streams (Options.streams)
     round_ms: []const f64, // the lane core's round costs by rows (Options.round_ms, else draft.round_ms)
     pool_cap: usize,
+    ctx_cap: usize, // a stream's extent at most (Options.context, else the pool)
     cache_dir: std.Io.Dir,
     cache_file: std.Io.File,
     ix: rank_cache.Index,
@@ -184,6 +186,7 @@ pub const Model = struct {
         m.round_ms = o.round_ms orelse &draft.round_ms;
         if (m.round_ms.len == 0) return error.BadRoundMs;
         m.pool_cap = o.pool;
+        m.ctx_cap = if (o.context != 0) @min(o.context, o.pool) else o.pool;
         m.fill_slot = 0;
         m.prof = false;
         m.timer = null;
@@ -259,9 +262,9 @@ pub const Model = struct {
         m.par = if (sp.parity and parOne()) try exl3_experts2d.ParKernels.load(d, cuda.kernels.dsv41_experts_par) else null;
         errdefer if (m.par) |*x| x.unload();
 
-        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position of the pool
+        // the RoPE tables (the served build's bits: torch CPU pow and polar), every position a stream reaches
         const half = c.rope_dim / 2;
-        const rope_rows = o.pool + round.max_rows + 1;
+        const rope_rows = m.ctx_cap + round.max_rows + 1;
         m.rope_buf = try cuda.DeviceBuffer.alloc(d, 4 * rope_rows * half * 4);
         errdefer m.rope_buf.free();
         {
@@ -270,7 +273,7 @@ pub const Model = struct {
             for ([_][]const u8{ "rope-plain-cos.f32", "rope-plain-sin.f32", "rope-compressed-cos.f32", "rope-compressed-sin.f32" }, 0..) |name, j| {
                 var f = try std.Io.Dir.cwd().openFile(io, try std.fs.path.join(a, &.{ o.kit_dir, name }), .{});
                 defer f.close(io);
-                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than the pool
+                if (try f.readPositionalAll(io, part, 0) != part.len) return error.ShortRopeTable; // a table of fewer rows than a stream's context
                 try m.rope_buf.upload(j * part.len, part);
             }
         }
@@ -300,7 +303,7 @@ pub const Model = struct {
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
         if (m.par) |*x| m.eng.par = x;
-        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, o.pool);
+        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.ctx_cap); // a stream's keys at most
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
@@ -311,7 +314,7 @@ pub const Model = struct {
             r.* = try m.arena.take(m.streams * m.eng.ringBytes());
             try d.check(d.api.cuMemsetD8Async(r.*, 0, m.streams * m.eng.ringBytes(), m.stream.handle), "cuMemsetD8Async");
         }
-        m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
+        m.rd = try round.Round.init(&m.eng, &m.arena, a, m.ctx_cap); // a round's deepest bucket: a stream's context
         m.amax = try m.arena.take(round.max_rows * 4);
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.side) try m.rd.useSide(&m.eng);

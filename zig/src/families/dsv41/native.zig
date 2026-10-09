@@ -11,6 +11,8 @@
 //!                                               they need, the pool's caches by the context)
 //!   TF_DS_ROUND_MS                              the lane core's round costs by rows (ms, comma separated; the
 //!                                               served ROUND_MS unless set: a four-node lane's rounds cost less)
+//!   TF_DS_WINDOW                                the streams' shared pool of positions (unset: --context; the
+//!                                               four-node lane's 2,097,152 with requests of up to --context)
 //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
 //!                                               streams (4; its 16): --parallel at most the streams
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
@@ -107,14 +109,16 @@ pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
     return st.size;
 }
 
-/// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds `o.context`
-/// positions. Needs `ctx` current.
+/// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds TF_DS_WINDOW
+/// positions (else `o.context`), a stream at most `o.context`. Needs `ctx` current.
 pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
     const world = std.fmt.parseInt(u32, getenv("TF_TP_WORLD") orelse "2", 10) catch return error.BadWorld;
     if (world != 2 and world != 4) return error.NotPortedYet; // TP2, or the four-node 2D split
     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
+    const window = if (getenv("TF_DS_WINDOW")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadWindow else o.context;
+    if (window < o.context) return error.BadWindow;
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.gpa = gpa;
@@ -135,7 +139,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,
         .prefetch = if (getenv("TF_DS_L2_PREFETCH")) |v| !std.mem.eql(u8, v, "0") else false,
         .engram_aio = if (getenv("TF_DS_ENGRAM_AIO")) |v| !std.mem.eql(u8, v, "0") else false,
-        .pool = o.context,
+        .pool = window,
+        .context = o.context,
         .drafts = o.drafts,
         .arena_bytes = arena_gib << 30,
         .round_rows = if (getenv("TF_DS_ROUND_ROWS")) |v| std.fmt.parseInt(usize, v, 10) catch return error.BadRoundRows else round.default_rows,
@@ -176,6 +181,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+        error.BadWindow => "TF_DS_WINDOW: the streams' shared positions, at least --context",
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",

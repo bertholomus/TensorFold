@@ -13,7 +13,7 @@ const cuda = @import("cuda");
 const dsv41 = @import("dsv41");
 const lanes = @import("lanes");
 
-const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S]\n";
+const usage = "usage: tf-dsv41-lanes MODEL_DIR CACHE_DIR RANK WORLD MASTER_IP PORT KIT_DIR --requests FILE [--parallel N] [--pool P] [--context C] [--drafts 0|1] [--arena-gib G] [--engram DIR --token-map FILE] [--rdma DEVICES --rdma-kernels FATBIN] [--fix-k K] [--round-rows R] [--streams S]\n";
 
 const Request = struct {
     name: []const u8 = "",
@@ -83,6 +83,8 @@ pub fn main(init: std.process.Init) !u8 {
             o.streams = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--pool")) {
             o.pool = try std.fmt.parseInt(usize, val, 10);
+        } else if (std.mem.eql(u8, key, "--context")) {
+            o.context = try std.fmt.parseInt(usize, val, 10);
         } else if (std.mem.eql(u8, key, "--drafts")) {
             o.drafts = !std.mem.eql(u8, val, "0");
         } else if (std.mem.eql(u8, key, "--arena-gib")) {
