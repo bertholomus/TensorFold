@@ -19,6 +19,11 @@ from typing import Any, Callable
 import torch
 
 PREFILL_CHUNK = int(os.environ.get("TF_DS_PREFILL_CHUNK") or 512)
+# TF_DS_RESUME_ANYWHERE=1 (default 0): a continued prompt may resume where an earlier prompt or its reply ended, not
+# only at a chunk boundary, so an agent's next turn fills just its new rows. Replies stop being bit-exact with a fresh
+# prefill: a resumed row's cache comes from decoding (or from a chunk that started elsewhere), not from this prompt's
+# own chunks. 0 keeps the exact behaviour.
+RESUME_ANYWHERE = os.environ.get("TF_DS_RESUME_ANYWHERE", "0") == "1"
 # the RDMA gather's slot in MiB (default 4.25; 8 before): fp32 gathers up to it go over RDMA writes, larger ones over
 # NCCL. Decode's largest is a 16-row vocab-split head (4.14 MB); prefill chunks of 218-409 rows send 4.3-8 MB a gather
 # (over NCCL at 4.25). Pinned host memory a rank: slot x TF_RDMA_SLOTS x (1 + world) (4.25 MiB x 4 x 3 = 51 MiB; 96 at 8)
@@ -383,7 +388,7 @@ class DsEngine:
         prefill's own from there; ``snap(end)`` runs after each chunk that ends on a chunk boundary."""
 
         m = self.model
-        assert start % PREFILL_CHUNK == 0 and start < len(prompt), (start, len(prompt))
+        assert (start % PREFILL_CHUNK == 0 or RESUME_ANYWHERE) and start < len(prompt), (start, len(prompt))
         sc.length = start
         sc.host.truncate(start)
         use_drafts = dc is not None
@@ -400,20 +405,26 @@ class DsEngine:
             host = list(prompt)
             for p in positions:
                 host[p] = -1                  # Engram's hashing: no n-gram reaches into an image span
-        def ahead(a: int) -> None:                     # the chunk at ``a``: its Engram rows start reading now
+        def ahead(a: int, b: int) -> None:             # the chunk [a, b): its Engram rows start reading now
             if m.engram is None or m.engram.bg is None or a >= len(prompt):
                 return
-            hs = m.engram.hashes(host, a, min(len(prompt), a + PREFILL_CHUNK) - a)
+            hs = m.engram.hashes(host, a, b - a)
             lo, hi = m.engram.cols
             for i in self.w.cfg.engram_layers:
                 if i < len(self.w.layers):
                     m.engram.prefetch(i, hs[:, self.w.cfg.engram_layers.index(i), lo:hi], lane=1)
 
-        for s in range(start, len(prompt), PREFILL_CHUNK):
-            e = min(len(prompt), s + PREFILL_CHUNK)
-            if s == start:
-                ahead(s)
-            ahead(e)                                   # the next chunk's rows read while this one runs
+        # chunks end on PREFILL_CHUNK multiples (a resume from anywhere first fills up to the next one), and at the end
+        first = min(len(prompt), (start // PREFILL_CHUNK + 1) * PREFILL_CHUNK)
+        ends = [first] + list(range(first + PREFILL_CHUNK, len(prompt), PREFILL_CHUNK))
+        if ends[-1] != len(prompt):
+            ends.append(len(prompt))
+        chunks = list(zip([start] + ends[:-1], ends))
+        for i, (s, e) in enumerate(chunks):
+            if i == 0:
+                ahead(s, e)
+            if i + 1 < len(chunks):
+                ahead(*chunks[i + 1])                  # the next chunk's rows read while this one runs
             ids = torch.tensor(prompt[s:e], dtype=torch.long, device="cuda")
             taps: list | None = [] if use_drafts else None
             block = None
@@ -438,7 +449,7 @@ class DsEngine:
                 last = out
             if use_drafts and taps:
                 self.drafter.absorb(dc, sc, torch.cat(taps, -1), m.taps_start)
-            if snap is not None and e % PREFILL_CHUNK == 0:
+            if snap is not None and (e % PREFILL_CHUNK == 0 or (RESUME_ANYWHERE and e == len(prompt))):
                 snap(e)
             if e < len(prompt):
                 yield e
