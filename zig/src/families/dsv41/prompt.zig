@@ -211,6 +211,7 @@ pub const Chunk = struct {
     wl: u64 = 0, // fp32 [cap, index_heads]
     iw: u64 = 0, // bf16 [cap, index_heads]: the heads' weights
     vis: u64 = 0, // int64 [cap]: compressed entries a row sees
+    vis_blk: u64 = 0, // int64 [cap]: an indexer row block's vis when its view of vis is not 16-byte aligned
     keys: u64 = 0, // int64 [rows of a block, n_comp]: at most key_elems
     score: u64 = 0, // fp32 [rows of a block, n_comp]: the candidate pool's layers' index scores
     tmax: u64 = 0, // int64 [rows of a block, cdiv(n_comp, 64)]
@@ -339,6 +340,7 @@ pub const Chunk = struct {
             ch.wl = try a.take(cap * c.index_heads * 4);
             ch.iw = try a.take(cap * c.index_heads * 2);
             ch.vis = try a.take(cap * 8);
+            ch.vis_blk = try a.take(cap * 8);
             // the indexer's row blocks keep rows * n_comp under 2^24 (model.py rb), so their keys under key_elems
             const ke: usize = @min(cap * ch.max_comp, key_elems); // (typed: @min with a comptime bound narrows)
             ch.keys = try a.take(ke * 8);
@@ -909,6 +911,14 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     try tri_attn.fp4Store(e.t, ch.lat2, hd, cs.comp_codes[li], cs.comp_scales[li], ch.groups, full, hd, 16, true);
 }
 
+/// vis[r0..][0..m] at a 16-byte-aligned address, as the kit's indexer variants take VIS: the view, else a copy.
+fn visBlock(e: *const Engine, ch: *const Chunk, r0: usize, m: usize) !u64 {
+    const view = ch.vis + r0 * 8;
+    if (view % 16 == 0) return view;
+    try e.ops.copyRows(e.s, view, m * 8, ch.vis_blk, m * 8, m * 8, 1);
+    return ch.vis_blk;
+}
+
 /// The indexer of a layer with index queries (switch "prompt_keys", layers before the candidate source): the
 /// queries (idx_wq_b of q's latent, RoPE, fp4_qd's bytes), the heads' weights (x.float() @ idx_proj.t() through cuBLAS,
 /// to bf16, times idx_dim ** -0.5 * idx_heads ** -0.5), each row's int64 keys of the kv source's index keys and the
@@ -957,12 +967,12 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     const pk = @min(c.candidate_blocks, nbk);
     var r0: usize = 0;
     while (r0 < n) : (r0 += rb) {
-        // the block's rows: iq[r0:r1], wts[r0:r1] and vis[r0:r1] as views (their offsets the served pointers'), its
-        // selection into cidx[r0:r1]
+        // the block's rows: iq[r0:r1] and wts[r0:r1] as views (their offsets the served pointers'), vis[r0:r1] at a
+        // 16-byte-aligned address (visBlock), its selection into cidx[r0:r1]
         const m = @min(n, r0 + rb) - r0;
         const q = ch.iq4 + r0 * ih * id * 2;
         const wb = ch.iw + r0 * ih * 2;
-        const vr = ch.vis + r0 * 8;
+        const vr = try visBlock(e, ch, r0, m);
         const out = ch.cidx + r0 * kk * 8;
         if (keyed) {
             try tri_index.indexScore(e.t, q, k, wb, vr, n_comp_end, ch.keys, null, true, ch.tmax, false, m, ih, id);
