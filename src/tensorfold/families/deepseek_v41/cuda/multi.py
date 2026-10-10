@@ -108,6 +108,14 @@ KEEP_SHRINK = os.environ.get("TF_DS_KEEP_SHRINK", "1") == "1"
 # prompts of at least this many tokens get the 3/4 and 7/8 boundaries (one ring snapshot each, ~8 MB): the ones whose
 # fill is expensive to repeat; shorter prompts keep the boundaries they had
 KEEP_SHRINK_MIN = int(os.environ.get("TF_DS_KEEP_SHRINK_MIN") or 131072)
+# TF_DS_RESUME_ANYWHERE=1 (default 0; engine.py reads it too): a kept prompt also keeps FULL snapshots (every layer's
+# window ring, the compressor inputs and the drafter rings) at the prompt's own end and at its reply's end, with the
+# reply's rows, so the conversation's next turn resumes there and fills only its new rows. Not bit-exact with a fresh
+# prefill. Boundary snapshots stay as they were; only full ones may sit inside a later prompt's last window. A kept
+# prompt holds its newest RESUME_FULL_KEPT full snapshots (~11 MB each; where it resumed, its prompt's end, its reply's
+# end), not two for every turn of its conversation.
+RESUME_ANYWHERE = os.environ.get("TF_DS_RESUME_ANYWHERE", "0") == "1"
+RESUME_FULL_KEPT = max(1, int(os.environ.get("TF_DS_RESUME_FULL_KEPT") or 3))
 
 
 ALIGN = 2048                     # extents start and end on multiples of this many positions
@@ -535,6 +543,8 @@ class MultiDecoder:
             diff = np.flatnonzero(k.keys[:n] != keys[:n])
             common = int(diff[0]) if diff.size else n
             cut = max((b for b in k.snaps if b <= min(common, limit)), default=0)
+            if RESUME_ANYWHERE:                        # full snapshots may sit inside the last window (one new row at least)
+                cut = max([cut] + [b for b, v in k.snaps.items() if len(v) > 2 and b <= min(common, len(s.prompt) - 1)])
             if cut and (best is None or (cut, k.tick) > (best[1], best[0].tick)):
                 best = (k, cut)
         return None if best is None else [best[0].eid, best[1]]
@@ -556,19 +566,24 @@ class MultiDecoder:
                     marks.add(b)
         return marks
 
-    def _snapshot(self, index: int):
+    def _snapshot(self, index: int, full: bool = False):
         """Slot ``index``'s window rings (with replay prefill the encoder layers' only: a resumed prompt's decoder
-        layers read no window key before its replay row) and compressor inputs, copied."""
+        layers read no window key before its replay row) and compressor inputs, copied. ``full`` (TF_DS_RESUME_ANYWHERE):
+        every layer's ring and the drafter rings too, so a later prompt may resume inside its last window."""
 
         RS, n = self.pool.ring_size, len(self.pool.ring)
-        layers = range(self.m.cfg.n_layers // 2) if self._replay() else range(n)
+        layers = range(self.m.cfg.n_layers // 2) if self._replay() and not full else range(n)
         ring = torch.stack([self.pool.ring[i][index * RS:(index + 1) * RS] for i in layers])
         raw = [torch.stack([x[index * RAW:(index + 1) * RAW] for x in pair])
                for _, pair in sorted(self.pool.comp_raw.items())]
-        return ring, (torch.stack(raw) if raw else None)
+        snap = (ring, (torch.stack(raw) if raw else None))
+        if full:
+            draft = torch.stack(list(self.dpool.views[index].rings)) if self.dpool is not None else None
+            snap = snap + (draft,)
+        return snap
 
     def _restore(self, index: int, snap) -> None:
-        ring, raw = snap
+        ring, raw = snap[0], snap[1]
         RS = self.pool.ring_size
         for i in range(ring.shape[0]):
             self.pool.ring[i][index * RS:(index + 1) * RS].copy_(ring[i])
@@ -576,6 +591,9 @@ class MultiDecoder:
             for j, (_, pair) in enumerate(sorted(self.pool.comp_raw.items())):
                 for h, x in enumerate(pair):
                     x[index * RAW:(index + 1) * RAW].copy_(raw[j, h])
+        if len(snap) > 2 and snap[2] is not None and self.dpool is not None:
+            for r, saved in zip(self.dpool.views[index].rings, snap[2]):
+                r.copy_(saved)
 
     def _copy_rows(self, src: int, dst: int, n: int) -> None:
         """Positions [src, src + n) of the window's compressed, indexer and token rows to [dst, dst + n) (through a
@@ -661,18 +679,23 @@ class MultiDecoder:
     @staticmethod
     def _kept_marks(snaps: dict) -> list[int]:
         """The boundaries a finished stream keeps, KEEP_MARKS at most: the doubling ones, its last two, then the
-        earliest."""
+        earliest. TF_DS_RESUME_ANYWHERE: and its newest RESUME_FULL_KEPT full snapshots, apart from those rules (the
+        older ones go)."""
 
         from .engine import PREFILL_CHUNK as C
 
         marks = sorted(snaps)
+        full: list[int] = []
+        if RESUME_ANYWHERE:
+            full = [b for b in marks if len(snaps[b]) > 2][-RESUME_FULL_KEPT:]
+            marks = [b for b in marks if len(snaps[b]) <= 2]
         if len(marks) > KEEP_MARKS:
             must = {b for b in marks if (b // C) & (b // C - 1) == 0} | set(marks[-2:])
             if KEEP_SHRINK:
                 must |= {b for b in marks if 2 * b > marks[-1]}       # the upper half's cut points (_shrink)
             rest = [b for b in marks if b not in must]
             marks = sorted(must | set(rest[:max(0, KEEP_MARKS - len(must))]))
-        return marks
+        return sorted(set(marks) | set(full)) if full else marks
 
     def _keep(self, s: Stream) -> None:
         """A finished stream's prompt into ``kept``: its extent's rows to its last kept boundary stay, the rest goes
@@ -693,9 +716,29 @@ class MultiDecoder:
         s.st.sc = None
         s.snaps = None
 
+    def _reply_end(self, s: Stream) -> None:
+        """TF_DS_RESUME_ANYWHERE: a finished stream's state where its decoding stopped (every decoded row is in its
+        extent; its rings, compressor inputs and drafter rings are at that position) as a full snapshot, and its ids
+        to there as its keys, so the conversation's next turn can resume after the reply instead of before it."""
+
+        import numpy as np
+
+        sc = s.st.sc
+        if sc is None:
+            return
+        end, plen = sc.length, len(s.prompt)
+        if end <= plen or end in s.snaps:
+            return
+        s.snaps[end] = self._snapshot(s.st.index, full=True)
+        ids = np.asarray(sc.host[plen:end], dtype=np.int64)
+        sc.tokens[plen:end] = torch.from_numpy(ids).to(sc.tokens.device)
+        keys = getattr(s, "keys", None)
+        if keys is not None:                           # rank 0 only
+            s.keys = np.concatenate([keys[:plen], ids])
+
     def _covered(self, done: list[Stream]) -> list[int]:
         """Rank 0: the kept prompts the finishing streams' prompts will cover (the same ids to their top, every kept
-        boundary of theirs kept again)."""
+        boundary of theirs kept again; TF_DS_RESUME_ANYWHERE: not their full snapshots, which newer ones replace)."""
 
         import numpy as np
 
@@ -707,8 +750,9 @@ class MultiDecoder:
             marks = set(self._kept_marks(snaps))
             top = max(marks)
             for k in self.kept.values():
+                own = {b for b, v in k.snaps.items() if len(v) <= 2} if RESUME_ANYWHERE else set(k.snaps)
                 if (k.eid not in drops and k.keys is not None and k.top <= top and k.replay == self._replay()
-                        and set(k.snaps) <= marks and np.array_equal(k.keys, keys[:k.top])):
+                        and own <= marks and np.array_equal(k.keys, keys[:k.top])):
                     drops.append(k.eid)
         return drops
 
@@ -792,9 +836,12 @@ class MultiDecoder:
             snap = None
             if KEEP:
                 marks = self._marks(len(s.prompt))
+                plen = len(s.prompt)
 
                 def snap(end: int) -> None:
-                    if end in marks:
+                    if RESUME_ANYWHERE and end == plen:        # the prompt's own end: a full snapshot
+                        s.snaps[end] = self._snapshot(index, full=True)
+                    elif end in marks:
                         s.snaps[end] = self._snapshot(index)
 
             s.steps = e.prefill_steps(slot.sc, slot.dc if s.draft else None, list(s.prompt), image, start=cut,
@@ -1142,6 +1189,8 @@ class MultiDecoder:
             if s is None:
                 continue
             if KEEP and getattr(s, "snaps", None):
+                if RESUME_ANYWHERE:
+                    self._reply_end(s)
                 self._keep(s)
             else:
                 self._release(s)
