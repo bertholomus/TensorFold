@@ -23,6 +23,8 @@ pub const margin = 8;
 /// The candidates a row takes at most here (top_k + MARGIN).
 pub const max_candidates = 64;
 
+pub const Candidate = extern struct { value: f32, id: u32 };
+
 extern "c" fn exp(x: f64) f64;
 extern "c" fn log(x: f64) f64;
 
@@ -106,6 +108,15 @@ pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     var values: [max_candidates]f32 = undefined;
     var ids: [max_candidates]i64 = undefined;
     const width = topCandidates(row, count, &values, &ids);
+    return sampleCandidates(values[0..width], ids[0..width], position, s);
+}
+
+/// Draw from an exact ordered candidate list, with the original host arithmetic.
+pub fn sampleCandidates(values: []const f32, ids: []const i64, position: u64, s: Sampling) !i64 {
+    if (values.len == 0 or values.len != ids.len or values.len > max_candidates) return error.BadCandidates;
+    if (s.temperature <= 0) return ids[0];
+    if (s.top_k == 0) return error.NotPortedYet;
+    const width = values.len;
     // choose_rows on the candidates (already in lexsort's order)
     const k = @max(1, @min(s.top_k, width));
     const t = @max(s.temperature, 1e-6);
@@ -167,4 +178,28 @@ test "top candidates by value, then id" {
     try std.testing.expectEqual(@as(usize, 4), topCandidates(&row, 4, &v, &ids));
     try std.testing.expectEqualSlices(i64, &.{ 1, 3, 5, 2 }, &ids);
     try std.testing.expectEqualSlices(f32, &.{ 5, 5, 5, 3 }, &v);
+}
+
+test "compact candidates preserve seeded draws across sampling settings" {
+    var row: [257]f32 = undefined;
+    for (&row, 0..) |*v, i| v.* = @as(f32, @floatFromInt((i * 73) % 101)) / 7 - 9;
+    row[0] = -0.0;
+    row[256] = 0.0;
+    var values: [max_candidates]f32 = undefined;
+    var ids: [max_candidates]i64 = undefined;
+    const width = topCandidates(&row, max_candidates, &values, &ids);
+    for ([_]usize{ 1, 2, 20, 56 }) |k| {
+        for ([_]f64{ 0.01, 0.7, 1.0, 2.0 }) |temperature| {
+            for ([_]f64{ 0.1, 0.95, 1.0 }) |p| {
+                for ([_]f64{ 0.0, 0.2 }) |minimum| {
+                    for ([_]u64{ 0, 1, 123456789, 0xffffffffffffffff }) |seed| {
+                        const s: Sampling = .{ .seed = seed, .temperature = temperature, .top_k = k, .top_p = p, .min_p = minimum };
+                        try std.testing.expectEqual(try sampleRow(&row, 999, s), try sampleCandidates(values[0..width], ids[0..width], 999, s));
+                    }
+                }
+            }
+        }
+    }
+    try std.testing.expectError(error.BadCandidates, sampleCandidates(&.{}, &.{}, 0, .{ .seed = 0 }));
+    try std.testing.expectError(error.NotPortedYet, sampleCandidates(&.{1}, &.{5}, 0, .{ .seed = 0, .top_k = 0 }));
 }
