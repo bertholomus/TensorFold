@@ -88,15 +88,16 @@ test "direct reads return the same bytes as buffered reads" {
     const gpa = std.testing.allocator;
     var f = try File.open("/proc/self/exe");
     defer f.close();
-    var plain = try File.open("/proc/self/exe");
-    defer plain.close();
-    plain.direct = false;
+    // Open a genuinely buffered descriptor; toggling File.direct does not clear O_DIRECT.
+    const plain = std.c.open("/proc/self/exe", .{ .ACCMODE = .RDONLY, .CLOEXEC = true });
+    try std.testing.expect(plain >= 0);
+    defer _ = std.c.close(plain);
     const buf = try gpa.alignedAlloc(u8, .fromByteUnits(alignment), 1 << 20);
     defer gpa.free(buf);
     const want = try gpa.alloc(u8, 1 << 19);
     defer gpa.free(want);
     for ([_][2]usize{ .{ 0, 1 }, .{ 1, 4095 }, .{ 4095, 2 }, .{ 12345, 100000 }, .{ 8192, 1 << 19 } }) |c| {
-        const n = std.c.pread(plain.fd, want.ptr, c[1], @intCast(c[0]));
+        const n = std.c.pread(plain, want.ptr, c[1], @intCast(c[0]));
         try std.testing.expectEqual(@as(isize, @intCast(c[1])), n);
         try std.testing.expectEqualSlices(u8, want[0..c[1]], try f.read(buf, c[0], c[1]));
     }
