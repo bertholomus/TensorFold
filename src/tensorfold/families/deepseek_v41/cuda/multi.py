@@ -40,6 +40,7 @@ import torch
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
 
+from ..ops import HostIds
 from .model import RAW
 
 # the most drafts a stream verifies a round by how many streams decode ("5,5,3,3": up to the drafter's block of five
@@ -108,6 +109,10 @@ KEEP_SHRINK = os.environ.get("TF_DS_KEEP_SHRINK", "1") == "1"
 # prompts of at least this many tokens get the 3/4 and 7/8 boundaries (one ring snapshot each, ~8 MB): the ones whose
 # fill is expensive to repeat; shorter prompts keep the boundaries they had
 KEEP_SHRINK_MIN = int(os.environ.get("TF_DS_KEEP_SHRINK_MIN") or 131072)
+# TF_DS_SPILL_GIB=N (default 0: off; with TF_DS_KEEP): every kept prompt of TF_DS_SPILL_MIN tokens or more also goes to
+# this rank's disk (spill.py: TF_DS_SPILL_DIR, N GiB at most, unused ones gone after TF_DS_SPILL_MAX_AGE_H), so a
+# prompt that continues one the window no longer holds (a restart, an eviction) reads its rows back instead of filling
+# them: rank 0 offers the spilled boundary when it is past every kept prompt's, and every rank must hold it
 
 
 ALIGN = 2048                     # extents start and end on multiples of this many positions
@@ -350,6 +355,7 @@ class Kept:
                  tick: int) -> None:
         self.eid, self.base, self.size, self.top, self.host = eid, base, size, top, host
         self.snaps, self.replay, self.keys, self.tick, self.hits = snaps, replay, keys, tick, 0
+        self.disk: dict | None = None                    # its spilled manifest (TF_DS_SPILL_GIB), when written
 
 
 def _picture_key(pic) -> int:
@@ -410,6 +416,27 @@ class MultiDecoder:
         self.kept: dict[int, Kept] = {}                  # kept prompts by id
         self.next_kept, self.ticks = 0, 0
         self.keep_stats: dict[str, int] = {}             # admissions that continued a kept prompt, by placement
+        self.spill = None                                # TF_DS_SPILL_GIB: kept prompts on this rank's disk
+        self.spill_nonce = os.urandom(4).hex() if engine.rank == 0 else None   # names this run's spilled prompts
+        if KEEP:
+            from . import spill as sp
+
+            if sp.SPILL_GIB > 0:
+                try:
+                    ratios = {i: m.cfg.compress_ratios[i] for i in set(self.pool.comp) | set(self.pool.index_k)}
+                    ident = sp.engine_id(getattr(engine, "model_dir", "."), world=engine.world, pool=self.pool,
+                                         dpool=self.dpool)
+                    self.spill = sp.Spill(sp.SPILL_DIR, engine=ident, rank=engine.rank, pool=self.pool, ratios=ratios,
+                                          budget=int(sp.SPILL_GIB * 2**30), max_age=sp.SPILL_MAX_AGE_H * 3600.0)
+                    self.spill.recycle()
+                    if engine.rank == 0:
+                        st = self.spill.stats()
+                        print(f"[tensorfold] spilled kept prompts: {self.spill.dir} ({st['manifests']} on disk, "
+                              f"{st['bytes'] / 2**30:.2f} of {sp.SPILL_GIB:g} GiB)", flush=True)
+                except Exception as exc:                 # noqa: BLE001  (no disk: kept prompts stay in the window only)
+                    print(f"[tensorfold] rank {engine.rank}: spilled kept prompts off ({type(exc).__name__}: {exc})",
+                          flush=True)
+                    self.spill = None
 
     def warm(self, buckets=(1024, 2048, 4096, 8192)) -> None:
         """Before serving, on every rank in the same order: round graphs for 1 .. 16 rows at the small context
@@ -495,6 +522,14 @@ class MultiDecoder:
         every = self.m.comm.gather(mine).tolist()
         if any(row != every[0] for row in every):
             raise OutOfStep(f"the ranks planned different {what}s; its requests fail, serving goes on")
+
+    def _all(self, ok: bool) -> bool:
+        """Whether ``ok`` holds on every rank (one small gather: every rank calls it at the same point of a step)."""
+
+        if self.e.world < 2:
+            return bool(ok)
+        mine = torch.tensor([1.0 if ok else 0.0, 0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
+        return all(row[0] == 1.0 for row in self.m.comm.gather(mine).tolist())
 
     def _shape(self) -> list:
         return [self.next_id, list(self.free), list(self.extents.gaps),
@@ -690,6 +725,10 @@ class MultiDecoder:
                  self._replay(), None if keys is None else keys[:top], self.ticks)
         self.kept[k.eid] = k
         self.next_kept += 1
+        if self.spill is not None:                       # write-through: its rows past what its lineage holds
+            k.disk = self.spill.persist(f"{self.spill_nonce or 'run'}-{k.eid:06d}", base=k.base, top=k.top,
+                                        replay=k.replay, snaps=k.snaps, host=k.host,
+                                        lineage=getattr(s, "lineage", None), keys=k.keys)
         s.st.sc = None
         s.snaps = None
 
@@ -734,6 +773,11 @@ class MultiDecoder:
         index = self.free[0]
         s.keys = self._keys(s) if KEEP else None
         reuse = self._match(s, s.keys) if KEEP and self.kept else None
+        if self.spill is not None and s.keys is not None:   # a spilled boundary past every kept prompt's
+            far = self.spill.best(s.keys, len(s.prompt), window=self.m.cfg.window, replay=self._replay(),
+                                  above=int(reuse[1]) if reuse else 0)
+            if far is not None:
+                reuse = ["disk", far[0], far[1]]
         self._send(["admit", list(s.prompt), s.count, _pack(s.sampling), bool(s.draft), bool(s.stop_eos), index,
                     positions, reuse])
         self._admit(s, index, positions, reuse)
@@ -745,7 +789,9 @@ class MultiDecoder:
 
     def _admit(self, s: Stream, index: int, positions: list[int], reuse: list | None = None) -> None:
         """Its slot, its extent, its image rows (shared from rank 0) and its prompt's chunk steps; ``_fill`` runs
-        them. ``reuse`` [kept id, boundary]: the prompt continues that kept prompt from the boundary."""
+        them. ``reuse`` [kept id, boundary]: the prompt continues that kept prompt from the boundary; ["disk", name,
+        boundary]: it continues a spilled one (TF_DS_SPILL_GIB), its rows read into a fresh extent, or it fills fresh
+        when a rank cannot read them (every rank agrees first)."""
 
         e = self.e
         self._step(True)
@@ -754,8 +800,14 @@ class MultiDecoder:
                                       bool(s.stop_eos), index, positions, reuse])
             self.ticks += 1
             need = self._need(s)
-            src = self.kept.get(int(reuse[0])) if reuse else None
-            if reuse and src is None:
+            disk = bool(reuse) and reuse[0] == "disk"
+            if disk and not self._all(self.spill is not None and self.spill.check(str(reuse[1]), int(reuse[2]))):
+                if e.rank == 0:
+                    print(f"[tensorfold] spilled prompt {reuse[1]}: not on every rank, the prompt fills fresh",
+                          flush=True)
+                reuse, disk = None, False
+            src = self.kept.get(int(reuse[0])) if reuse and not disk else None
+            if reuse and not disk and src is None:
                 raise OutOfStep("an admission continues a kept prompt this rank does not hold")
             base, how = self._place(need, src)
             if base is None:                             # (every rank at the same point: the same extents)
@@ -766,8 +818,29 @@ class MultiDecoder:
             slot.sc = self.m.pool_view(self.pool, index, base, s.size)
             s.sid, s.st = self.next_id, slot
             self.next_id += 1
-            cut, s.snaps = 0, {}
-            if how != "fresh":
+            cut, s.snaps, s.lineage = 0, {}, None
+            if disk:
+                name, at, t0 = str(reuse[1]), int(reuse[2]), time.perf_counter()
+                try:
+                    snaps, host, lineage = self.spill.load(name, at, base)
+                    loaded = at in snaps
+                except Exception as exc:                 # noqa: BLE001  (every rank agrees on the outcome below)
+                    print(f"[tensorfold] rank {e.rank}: spilled prompt {name} did not load ({type(exc).__name__}: "
+                          f"{exc})", flush=True)
+                    loaded = False
+                if self._all(loaded):                    # else the rows written so far get filled over, fresh
+                    cut, how = at, "disk"
+                    self._restore(index, snaps[cut])
+                    slot.sc.host = HostIds(host)
+                    s.snaps, s.lineage = snaps, lineage
+                    self.keep_stats[how] = self.keep_stats.get(how, 0) + 1
+                    if e.rank == 0:
+                        print(f"[tensorfold] spilled prompt {name}: continued at {cut} of {len(s.prompt)} (disk, "
+                              f"{time.perf_counter() - t0:.2f}s)", flush=True)
+                elif e.rank == 0:
+                    print(f"[tensorfold] spilled prompt {name}: a rank could not read it, the prompt fills fresh",
+                          flush=True)
+            elif how != "fresh":
                 cut = int(reuse[1])
                 if how in ("copy", "move"):
                     self._copy_rows(src.base, base, cut)
@@ -780,6 +853,8 @@ class MultiDecoder:
                 self._restore(index, src.snaps[cut])
                 slot.sc.host = src.host.copy(cut)
                 s.snaps = {b: v for b, v in src.snaps.items() if b <= cut}
+                if self.spill is not None:               # its spilled rows to the boundary are this prompt's too
+                    s.lineage = self.spill.lineage(src.disk, cut)
             image = None
             later = [p for p in positions if p >= cut]
             if later:
@@ -1124,7 +1199,7 @@ class MultiDecoder:
         if not sids:
             return
         drops = self._covered(done) if KEEP else []
-        self._send(["finish", sids, drops])
+        self._send(["finish", sids, drops, self.spill_nonce])
         self._finish(sids, drops)
 
     def _release(self, s: Stream) -> None:
@@ -1135,21 +1210,32 @@ class MultiDecoder:
 
     def _finish(self, sids: list[int], drops: list[int] = ()) -> None:
         """Finished streams give their slots and extents back; with KEEP their prompts stay as kept prompts, the
-        ``drops`` (kept prompts they cover) go, and so do the oldest past KEEP_ENTRIES."""
+        ``drops`` (kept prompts they cover) go, and so do the oldest past KEEP_ENTRIES. Spilled (TF_DS_SPILL_GIB):
+        a dropped prompt's manifest goes once every new kept prompt that should have spilled did (the new manifests
+        name its rows); prompts that only leave the window stay on disk."""
 
+        kept_now: list[Kept] = []
         for sid in sids:
             s = self.streams.pop(sid, None)
             if s is None:
                 continue
             if KEEP and getattr(s, "snaps", None):
                 self._keep(s)
+                kept_now.append(self.kept[self.next_kept - 1])
             else:
                 self._release(s)
+        sp = self.spill
+        spilled = sp is not None and all(k.disk is not None for k in kept_now if k.top >= sp.min_top)
         for eid in drops:
             if int(eid) in self.kept:
-                self._forget(self.kept[int(eid)])
+                k = self.kept[int(eid)]
+                if spilled and k.disk is not None:
+                    sp.forget(k.disk["name"])
+                self._forget(k)
         while len(self.kept) > KEEP_ENTRIES:
             self._forget(min(self.kept.values(), key=lambda k: k.tick))
+        if sp is not None and kept_now:
+            sp.recycle(pinned={k.disk["name"] for k in self.kept.values() if k.disk is not None})
 
     def drop(self) -> list[Stream]:
         """Every live stream fails (a step raised); their slots are free again."""
@@ -1192,6 +1278,8 @@ class MultiDecoder:
                 elif kind == "round":
                     self.round(told=op)
                 elif kind == "finish":
+                    if len(op) > 3 and op[3]:
+                        self.spill_nonce = str(op[3])    # rank 0's name for this run's spilled prompts
                     self._finish([int(x) for x in op[1]], [int(x) for x in op[2]])
                 elif kind == "drop":
                     self._drop()
