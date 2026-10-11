@@ -55,6 +55,7 @@ class DsEngine:
 
         torch.cuda.set_device(0)
         self.rank, self.world, self._master = rank, world, master
+        self.model_dir = Path(model_dir)                 # (multi's spilled kept prompts: part of their engine identity)
         # NCCL only moves prompt chunks' partials ([2048, 5120] fp32): the Simple protocol on 4 channels took 3.8 ms a
         # gather on the CX7 link against 7.1 with NCCL's choice (decode windows go over the RDMA gather)
         os.environ.setdefault("NCCL_PROTO", "Simple")
