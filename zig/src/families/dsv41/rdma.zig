@@ -21,12 +21,33 @@ const send_depth = 512;
 const cq_depth = 4096;
 const stage_threads = 512;
 const collect_threads = 256;
-const mtu_4096 = 5;
 const wc_recv_rdma_with_imm = 129;
 const host_register_portable = 0x01;
 const host_register_devicemap = 0x02;
 
-pub const Error = error{ VerbsFailed, PostFailed, BadInfo, TooLarge, Failed, NoHostRegister } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+pub const Error = error{ VerbsFailed, PostFailed, BadMtu, BadInfo, TooLarge, Failed, NoHostRegister } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
+
+/// The served ring has its own GID selection, independent of NCCL's.
+pub fn parseGidIndex(text: ?[]const u8) error{InvalidRdmaGidIndex}!u8 {
+    const value = text orelse return 5;
+    if (value.len == 0) return error.InvalidRdmaGidIndex;
+    for (value) |c| if (c < '0' or c > '9') return error.InvalidRdmaGidIndex;
+    return std.fmt.parseInt(u8, value, 10) catch error.InvalidRdmaGidIndex;
+}
+
+pub fn servedGidIndex() error{InvalidRdmaGidIndex}!u8 {
+    const text = if (std.c.getenv("TF_RDMA_GID_INDEX")) |v| std.mem.span(v) else null;
+    return parseGidIndex(text) catch |err| {
+        std.debug.print("TF_RDMA_GID_INDEX: expected a decimal GID index in 0..255\n", .{});
+        return err;
+    };
+}
+
+/// ibv_mtu is an ordered enum, 1=256 through 5=4096. Both ends use the smaller active MTU.
+fn pathMtu(local: c_int, remote: c_int) error{BadMtu}!c_int {
+    if (local < 1 or local > 5 or remote < 1 or remote > 5) return error.BadMtu;
+    return @min(local, remote);
+}
 
 /// The Python build's switches, with their defaults (TF_RDMA_SLOTS, TF_RDMA_STAGE_BLOCKS, ..., TF_RDMA_PDL as served).
 pub const Settings = struct {
@@ -50,6 +71,7 @@ pub const Info = extern struct {
     psn: [max_devices]u32,
     rkey: [max_devices]u32,
     gid: [max_devices][16]u8,
+    active_mtu: [max_devices]c_int, // requires the same Info layout on every rank
     recv: u64,
 };
 
@@ -116,6 +138,7 @@ const Nic = struct {
     mr_send: *vabi.Mr,
     mr_recv: *vabi.Mr,
     gid: [16]u8,
+    active_mtu: c_int,
     qps: [max_ranks]?*vabi.Qp = @splat(null),
     psns: [max_ranks]u32 = @splat(0),
 };
@@ -202,6 +225,8 @@ pub const Ring = struct {
         const api = r.v.api;
         const ctx = try r.v.openDevice(name);
         errdefer _ = api.ibv_close_device(ctx);
+        const port = try r.v.port(ctx, 1);
+        const active_mtu = try pathMtu(port.active_mtu, port.active_mtu);
         const pd = api.ibv_alloc_pd(ctx) orelse return error.VerbsFailed;
         errdefer _ = api.ibv_dealloc_pd(pd);
         const cq = api.ibv_create_cq(ctx, cq_depth, null, null, 0) orelse return error.VerbsFailed;
@@ -212,7 +237,7 @@ pub const Ring = struct {
         const mr_recv = api.ibv_reg_mr(pd, r.recv.mem.ptr, r.recv.mem.len, access) orelse return error.VerbsFailed;
         errdefer _ = api.ibv_dereg_mr(mr_recv);
         const gid = try r.v.gid(ctx, 1, r.s.gid_index);
-        var nic: Nic = .{ .ctx = ctx, .pd = pd, .cq = cq, .mr_send = mr_send, .mr_recv = mr_recv, .gid = gid.raw };
+        var nic: Nic = .{ .ctx = ctx, .pd = pd, .cq = cq, .mr_send = mr_send, .mr_recv = mr_recv, .gid = gid.raw, .active_mtu = active_mtu };
         errdefer for (nic.qps) |q| if (q) |qp| {
             _ = api.ibv_destroy_qp(qp);
         };
@@ -264,6 +289,7 @@ pub const Ring = struct {
             out.psn[d] = n.psns[p];
             out.rkey[d] = n.mr_recv.rkey;
             out.gid[d] = n.gid;
+            out.active_mtu[d] = n.active_mtu;
         }
         return out;
     }
@@ -271,6 +297,12 @@ pub const Ring = struct {
     /// `remote[p]`: what rank p's `info(rank)` gave. Moves every QP to RTR and RTS (the Python build's attributes).
     pub fn connect(r: *Ring, remote: []const Info) Error!void {
         if (remote.len != r.world) return error.BadInfo;
+        // Validate all peer MTUs before transitioning any QP.
+        for (remote, 0..) |ri, p| {
+            if (p == r.rank) continue;
+            if (ri.devices != r.nd) return error.BadInfo;
+            for (r.nics[0..r.nd], 0..) |n, d| _ = try pathMtu(n.active_mtu, ri.active_mtu[d]);
+        }
         const api = r.v.api;
         const m = vabi.mask;
         for (remote, 0..) |ri, p| {
@@ -280,7 +312,8 @@ pub const Ring = struct {
             peer.* = .{ .qpn = ri.qpn, .psn = ri.psn, .rkey = ri.rkey, .gid = ri.gid, .recv = ri.recv };
             for (r.nics[0..r.nd], 0..) |n, d| {
                 const qp = n.qps[p].?;
-                var a: vabi.QpAttr = .{ .qp_state = vabi.qps_rtr, .path_mtu = mtu_4096, .dest_qp_num = ri.qpn[d], .rq_psn = ri.psn[d], .max_dest_rd_atomic = 1, .min_rnr_timer = 12 };
+                std.debug.print("RDMA rank {d} peer {d} rail {d}: gid_index={d} path_mtu={d}\n", .{ r.rank, p, d, r.s.gid_index, try pathMtu(n.active_mtu, ri.active_mtu[d]) });
+                var a: vabi.QpAttr = .{ .qp_state = vabi.qps_rtr, .path_mtu = try pathMtu(n.active_mtu, ri.active_mtu[d]), .dest_qp_num = ri.qpn[d], .rq_psn = ri.psn[d], .max_dest_rd_atomic = 1, .min_rnr_timer = 12 };
                 a.ah_attr = .{ .grh = .{ .dgid = .{ .raw = ri.gid[d] }, .sgid_index = r.s.gid_index, .hop_limit = 64 }, .is_global = 1, .port_num = 1 };
                 if (api.ibv_modify_qp(qp, &a, m.state | m.av | m.path_mtu | m.dest_qpn | m.rq_psn | m.max_dest_rd_atomic | m.min_rnr_timer) != 0) return error.VerbsFailed;
                 a = .{ .qp_state = vabi.qps_rts, .timeout = 14, .retry_cnt = 7, .rnr_retry = 7, .sq_psn = n.psns[p], .max_rd_atomic = 1 };
@@ -381,16 +414,13 @@ pub const Ring = struct {
         const slot: usize = @intCast(q % r.s.slots);
         return &r.flags()[slot * r.world + p];
     }
-
     fn peerOf(r: *const Ring, nic: Nic, qpn: u32) ?usize {
         for (0..r.world) |p| if (nic.qps[p]) |qp| if (qp.qp_num == qpn) return p;
         return null;
     }
-
     fn scalar(r: *const Ring, offset: usize) DevicePtr {
         return r.scalars.ptr + offset;
     }
-
     /// recv [world x n4 float4] <- every rank's send [n4 float4] (fp32, 16-byte aligned), on `stream`.
     pub fn gather(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, recv: DevicePtr) Error!void {
         if (r.failure() != null) return error.Failed;
@@ -417,10 +447,8 @@ pub const Ring = struct {
         const blocks = std.math.clamp((@as(u64, n4) * r.world + per - 1) / per, 1, r.s.collect_blocks);
         try cuda.launch.launch(r.k.collect, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
     }
-
     /// A rank's slice in `dsts` (its rows `row4` float4 wide, `stride4` apart; ptr 0: not copied out).
     pub const Dst = struct { ptr: DevicePtr = 0, row4: u32 = 0, stride4: u64 = 0 };
-
     /// Every rank's [rows, w_p] fp32 slice straight into dsts[p]; `send` is this rank's slice, contiguous. Every rank
     /// names the same widths, so each peer's ring slot holds rows x w_p floats.
     pub fn gatherInto(r: *Ring, stream: cuda.Stream, send: DevicePtr, rows: u32, own_row4: u32, dsts: []const Dst) Error!void {
@@ -458,11 +486,9 @@ pub const Ring = struct {
         const blocks = std.math.clamp((copy4 + per - 1) / per, 1, r.s.collect_blocks);
         try cuda.launch.launch(r.k.collect_into, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = collect_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
     }
-
     fn probe(r: *const Ring) DevicePtr {
         return if (r.s.probing) r.scalar(16) else 0;
     }
-
     fn stage(r: *Ring, stream: cuda.Stream, send: DevicePtr, n4: u32, own: DevicePtr, own_row4: u32, own_stride4: u64) Error!void {
         var a: cuda.Args = .{};
         a.add(send);
@@ -485,7 +511,6 @@ pub const Ring = struct {
         const blocks = std.math.clamp((@as(u64, n4) + 1023) / 1024, 1, r.s.stage_blocks);
         try cuda.launch.launch(r.k.stage, .{ .grid = .{ .x = @intCast(blocks), .y = 1, .z = 1 }, .block = .{ .x = stage_threads, .y = 1, .z = 1 }, .pdl = r.s.pdl }, stream, &a);
     }
-
     /// (stage, doorbell to every flag, copy-out) mean ns over the probed gathers and their count; resets the sums.
     pub fn probes(r: *Ring) Error![4]f64 {
         var host: [8]u64 = undefined;
@@ -495,27 +520,81 @@ pub const Ring = struct {
         return .{ @as(f64, @floatFromInt(host[0])) / n, @as(f64, @floatFromInt(host[1])) / n, @as(f64, @floatFromInt(host[2])) / n, @floatFromInt(host[3]) };
     }
 };
-
 fn postRecv(ctx: *vabi.Context, qp: *vabi.Qp) Error!void {
     var wr: vabi.RecvWr = .{};
     var bad: ?*vabi.RecvWr = null;
     if (ctx.ops.post_recv(qp, &wr, &bad) != 0) return error.PostFailed;
 }
-
 fn postWrite(ctx: *vabi.Context, qp: *vabi.Qp, local: []const u8, lkey: u32, remote: u64, rkey: u32, q: u64) Error!void {
     var sge: vabi.Sge = .{ .addr = @intFromPtr(local.ptr), .length = @intCast(local.len), .lkey = lkey };
     var wr: vabi.SendWr = .{ .wr_id = q, .sg_list = @ptrCast(&sge), .num_sge = @intFromBool(local.len > 0), .opcode = vabi.wr_rdma_write_imm, .send_flags = vabi.send_signaled, .imm_data = seqs.immediate(q), .remote_addr = remote, .rkey = rkey };
     var bad: ?*vabi.SendWr = null;
     if (ctx.ops.post_send(qp, &wr, &bad) != 0) return error.PostFailed;
 }
-
 test "every declaration compiles (the GPU and verbs paths run only on the nodes)" {
     std.testing.refAllDecls(@This());
     std.testing.refAllDecls(Ring);
     std.testing.refAllDecls(Kernels);
 }
-
 test "the info a peer reads is a plain extern struct (it crosses the link as bytes)" {
-    try std.testing.expectEqual(@as(usize, 128), @sizeOf(Info));
-    try std.testing.expectEqual(@as(usize, 120), @offsetOf(Info, "recv"));
+    try std.testing.expectEqual(@as(usize, 144), @sizeOf(Info));
+    try std.testing.expectEqual(@as(usize, 116), @offsetOf(Info, "active_mtu"));
+    try std.testing.expectEqual(@as(usize, 136), @offsetOf(Info, "recv"));
+}
+test "served GID defaults to 5 and accepts explicit 3 without silently accepting malformed settings" {
+    try std.testing.expectEqual(@as(u8, 5), try parseGidIndex(null));
+    try std.testing.expectEqual(@as(u8, 3), try parseGidIndex("3"));
+    try std.testing.expectEqual(@as(u8, 0), try parseGidIndex("0"));
+    try std.testing.expectEqual(@as(u8, 255), try parseGidIndex("255"));
+    for ([_][]const u8{ "", "-1", "+3", " 3", "3 ", "0x3", "3_0", "256", "invalid" }) |value|
+        try std.testing.expectError(error.InvalidRdmaGidIndex, parseGidIndex(value));
+}
+test "RDMA MTU negotiation is symmetric for every supported port MTU and rejects invalid metadata" {
+    for (1..6) |a| for (1..6) |b| {
+        try std.testing.expectEqual(@as(c_int, @intCast(@min(a, b))), try pathMtu(@intCast(a), @intCast(b)));
+    };
+    for ([_]c_int{ -1, 0, 6, 4096 }) |bad| {
+        try std.testing.expectError(error.BadMtu, pathMtu(bad, 3));
+        try std.testing.expectError(error.BadMtu, pathMtu(3, bad));
+    }
+}
+test "connect programs the negotiated MTU and configured GID and rejects bad peers before QP mutation" {
+    const Probe = struct {
+        var calls: usize = 0;
+        var mtu: c_int = 0;
+        var gid: u8 = 0;
+        fn modify(_: *vabi.Qp, attr: *vabi.QpAttr, _: c_int) callconv(.c) c_int {
+            calls += 1;
+            if (attr.qp_state == vabi.qps_rtr) {
+                mtu = attr.path_mtu;
+                gid = attr.ah_attr.grh.sgid_index;
+            }
+            return 0;
+        }
+    };
+    var verbs: Verbs = undefined;
+    verbs.api.ibv_modify_qp = Probe.modify;
+    var r: Ring = undefined;
+    r.v = &verbs;
+    r.rank = 0;
+    r.world = 2;
+    r.nd = 1;
+    r.s = .{ .max_bytes = 64, .gid_index = 3 };
+    r.nics[0].qps[1] = @ptrFromInt(0x1000);
+    r.nics[0].psns[1] = 1;
+    var peers: [2]Info = @splat(std.mem.zeroes(Info));
+    peers[1].devices = 1;
+    for ([_][2]c_int{ .{ 3, 5 }, .{ 5, 3 }, .{ 5, 5 } }) |mtus| {
+        r.nics[0].active_mtu = mtus[0];
+        peers[1].active_mtu[0] = mtus[1];
+        Probe.calls = 0;
+        try r.connect(&peers);
+        try std.testing.expectEqual(@as(usize, 2), Probe.calls);
+        try std.testing.expectEqual(@min(mtus[0], mtus[1]), Probe.mtu);
+        try std.testing.expectEqual(@as(u8, 3), Probe.gid);
+    }
+    Probe.calls = 0;
+    peers[1].active_mtu[0] = 0;
+    try std.testing.expectError(error.BadMtu, r.connect(&peers));
+    try std.testing.expectEqual(@as(usize, 0), Probe.calls);
 }

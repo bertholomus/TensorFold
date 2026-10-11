@@ -269,7 +269,7 @@ pub const Model = struct {
                 var devices: std.ArrayList([]const u8) = .empty;
                 var dit = std.mem.splitScalar(u8, devs, ',');
                 while (dit.next()) |x| try devices.append(a, x);
-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
+                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = try rdma.servedGidIndex() }, &m.comm, m.stream);
                 m.two.?.rings = &m.rdma_rings.?;
             }
         }
@@ -390,7 +390,7 @@ pub const Model = struct {
     /// connected, and started once both are (an all-gather as the barrier).
     pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
         if (comm.world != 2) return error.NotTwoRanks;
-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 5 });
+        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = try rdma.servedGidIndex() });
         errdefer r.destroy(gpa);
         const per = @sizeOf(rdma.Info);
         const mine = [2]rdma.Info{ r.info(0), r.info(1) };
