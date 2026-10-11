@@ -938,7 +938,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
     const kk = @min(c.index_topk, n_comp_end);
     // rows in blocks so the [rows, n_comp] keys stay bounded at long contexts
-    const rb = @max(16, @min(n, (@as(usize, 1) << 26) / (4 * @max(n_comp_end, 1))));
+    const rb = indexBlockRows(n, n_comp_end);
     if (rb * n_comp_end > key_elems) return error.ChunkTooLong;
     const keyed = li != c.candidate_source and !(c.candidate_source < li) and kk & (kk - 1) == 0;
     const k: tri_index.IndexK = .{ .fp4 = .{ .codes = cs.idx_codes[src], .scales = cs.idx_scales[src] } };
@@ -983,6 +983,31 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
     }
     if (pooled and li == c.candidate_source) sh.pool = true;
     sh.kk = kk;
+}
+
+/// Even multi-block strides preserve 16-byte VIS alignment without increasing workspace.
+fn indexBlockRows(rows: usize, compressed: usize) usize {
+    const limit = @max(16, @min(rows, (@as(usize, 1) << 26) / (4 * @max(compressed, 1))));
+    return if (limit < rows) limit & ~@as(usize, 1) else limit;
+}
+
+test "prompt index blocks preserve captured VIS alignment at long ragged contexts" {
+    try std.testing.expectEqual(@as(usize, 464), indexBlockRows(2048, 36075));
+    try std.testing.expectEqual(@as(usize, 465), indexBlockRows(465, 36075));
+    for ([_]usize{ 1, 15, 16, 17, 465, 466, 1024, 2048 }) |rows| {
+        for ([_]usize{ 1, 512, 8192, 32768, 32769, 36075, 65535, 65536, 100000, 524288 }) |compressed| {
+            const stride = indexBlockRows(rows, compressed);
+            try std.testing.expect(stride > 0);
+            var covered: usize = 0;
+            while (covered < rows) {
+                try std.testing.expectEqual(@as(usize, 0), (covered * 8) % 16);
+                const count = @min(stride, rows - covered);
+                try std.testing.expect(count * compressed <= (@as(usize, 1) << 24));
+                covered += count;
+            }
+            try std.testing.expectEqual(rows, covered);
+        }
+    }
 }
 
 /// topk_select's torch step, keys.topk(k).values: the top-k set of the unique int64 keys (ops.topkI64).
