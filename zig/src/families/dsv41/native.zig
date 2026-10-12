@@ -128,6 +128,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .engram_dir = getenv("TF_DS_ENGRAM"),
         .token_map = getenv("TF_DS_TOKEN_MAP"),
         .rdma_devices = nonEmpty(getenv("TF_RDMA_DEVICES")),
+        .rdma_gid_index = if (getenv("TF_RDMA_GID_INDEX")) |v| std.fmt.parseInt(u8, v, 10) catch return error.BadGidIndex else 5,
         .rdma_kernels = getenv("TF_DS_RDMA_KERNELS"),
         .graphs = if (getenv("TF_DS_GRAPHS")) |v| !std.mem.eql(u8, v, "0") else false,
         .side = if (getenv("TF_DS_HC_SIDE")) |v| !std.mem.eql(u8, v, "0") else false,

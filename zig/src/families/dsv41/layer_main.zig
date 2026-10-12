@@ -226,7 +226,9 @@ pub fn main(init: std.process.Init) !u8 {
     var token_map: ?[]const u8 = null;
     var dump: ?[]const u8 = null;
     var rdma_devices: ?[]const u8 = null; // 2D: the decode-size exchanges over RDMA rings (ring2d.zig) on these devices
+    var rdma_gid_index: u8 = 5;
     var rdma_kernels: ?[]const u8 = null; // their kernels' image (rdma_gather.cu's fatbin)
+    if (std.c.getenv("TF_RDMA_GID_INDEX")) |v| rdma_gid_index = std.fmt.parseInt(u8, std.mem.span(v), 10) catch return error.BadArgument;
     var ai: usize = 8;
     while (ai + 1 < args.len) : (ai += 2) {
         const key = args[ai];
@@ -419,7 +421,7 @@ pub fn main(init: std.process.Init) !u8 {
         var devices: std.ArrayList([]const u8) = .empty;
         var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
         while (dit.next()) |d| try devices.append(a, d);
-        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 5 }, &comm, stream);
+        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = rdma_gid_index }, &comm, stream);
         two.?.rings = &rdma_rings.?;
     }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };
@@ -433,7 +435,7 @@ pub fn main(init: std.process.Init) !u8 {
         var devices: std.ArrayList([]const u8) = .empty;
         var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
         while (dit.next()) |dv| try devices.append(a, dv);
-        tp2_ring = try dsv41.model.Model.openRing(gpa, &driver, try dsv41.rdma.Kernels.load(tp2_mod.?), devices.items, rank, &comm, stream);
+        tp2_ring = try dsv41.model.Model.openRing(gpa, &driver, try dsv41.rdma.Kernels.load(tp2_mod.?), devices.items, rank, rdma_gid_index, &comm, stream);
         eng.ring = tp2_ring;
     }
     var ch = try prompt.Chunk.init(&eng, &arena, chunk_rows, tokens);

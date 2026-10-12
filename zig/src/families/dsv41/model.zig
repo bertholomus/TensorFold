@@ -51,6 +51,7 @@ pub const Options = struct {
     pool: usize = 1 << 18, // positions of the streams' shared plane (their extents together)
     drafts: bool = true, // load the DSpark drafter
     rdma_devices: ?[]const u8 = null, // the decode gathers over RDMA on these devices (comma separated), else NCCL: TP2's
+    rdma_gid_index: u8 = 5, // RoCE GID table index; local GB10 fabric uses 3
     // ring (rdma.zig), or at world 4 the 2D split's decode-size exchanges over its rings (ring2d.zig)
     rdma_kernels: ?[]const u8 = null, // world 4: the rings' kernels' image (rdma_gather.cu's fatbin; null: the embedded one)
     graphs: bool = false, // the rounds' stretches as CUDA graphs (round.Graphs)
@@ -215,7 +216,7 @@ pub const Model = struct {
             var devices: std.ArrayList([]const u8) = .empty;
             var it = std.mem.splitScalar(u8, list, ',');
             while (it.next()) |dev| try devices.append(a, dev);
-            m.ring = try openRing(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, &m.comm, m.stream);
+            m.ring = try openRing(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, o.rdma_gid_index, &m.comm, m.stream);
         }
         errdefer if (m.ring) |r| r.destroy(gpa);
         errdefer if (m.rdma_mod) |*x| x.unload();
@@ -269,7 +270,7 @@ pub const Model = struct {
                 var devices: std.ArrayList([]const u8) = .empty;
                 var dit = std.mem.splitScalar(u8, devs, ',');
                 while (dit.next()) |x| try devices.append(a, x);
-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
+                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = o.rdma_gid_index }, &m.comm, m.stream);
                 m.two.?.rings = &m.rdma_rings.?;
             }
         }
@@ -388,9 +389,9 @@ pub const Model = struct {
 
     /// TP2's RDMA ring for the decode gathers: created on both ranks, the queue-pair infos exchanged over NCCL,
     /// connected, and started once both are (an all-gather as the barrier).
-    pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
+    pub fn openRing(gpa: std.mem.Allocator, d: *const cuda.Driver, k: rdma.Kernels, devices: []const []const u8, rank: u32, gid_index: u8, comm: *const comm_mod.Comm, stream: cuda.Stream) !*rdma.Ring {
         if (comm.world != 2) return error.NotTwoRanks;
-        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = 5 });
+        const r = try rdma.Ring.create(gpa, d, k, devices, rank, 2, .{ .max_bytes = ring_bytes, .gid_index = gid_index });
         errdefer r.destroy(gpa);
         const per = @sizeOf(rdma.Info);
         const mine = [2]rdma.Info{ r.info(0), r.info(1) };
