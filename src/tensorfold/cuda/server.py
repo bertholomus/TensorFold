@@ -611,8 +611,10 @@ class App:
 
         asked = body.get("loop_guard")
         on = LOOP_GUARD if asked is None else asked is True
-        end = self.tok.token_to_id("</think>")
-        if not on or not thinking or end is None or prepared.grammar is not None or prepared.think_budget > 0:
+        if not on or not thinking or prepared.grammar is not None or prepared.think_budget > 0:
+            return None
+        end = self.tok.token_to_id("</think>")         # only for a guarded reply: the tokenizer needs no lookup otherwise
+        if end is None:
             return None
         close = [*self.tok.encode("\n", add_special_tokens=False).ids, end, *self.tok.encode("\n\n", add_special_tokens=False).ids]
         return ThinkLoop(close, end)
