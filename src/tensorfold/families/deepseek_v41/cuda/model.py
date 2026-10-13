@@ -29,6 +29,11 @@ RING_EXTRA = 16                     # window ring slots beyond the 128-token win
 KV_QUANT = os.environ.get("TF_DS_KV", "native") != "bf16"
 KERNELS = os.environ.get("TF_DS_KERNELS", "1") != "0"      # 0: the plain-torch phase-1 path (A/B and debugging)
 TIMING = os.environ.get("TF_DS_TIMING", "0") == "1"        # per-section wall times (synchronizing; profiling only)
+# TF_DS_REPLAY_FLOOR=1: a prompt chunk of RING_EXTRA rows or fewer whose window reaches below the bounded replay's cut
+# reads its window keys by the gather path from the cut, as a larger chunk's rows do. Ring mode would read the ring's
+# slots below the cut, which still hold the slot's previous request's keys, so the reply could depend on what ran
+# before it (prompts of 2048k+112 to 2048k+127 tokens, or a short last chunk). The Zig port's switch of the same name.
+REPLAY_FLOOR = os.environ.get("TF_DS_REPLAY_FLOOR", "0") == "1"
 # TF_DS_ENGRAM_PREFETCH=1 (default): a prompt chunk reads its Engram rows ahead on a second reader pool
 ENGRAM_PREFETCH = os.environ.get("TF_DS_ENGRAM_PREFETCH", "1") == "1"
 # TF_DS_ENGRAM_RANDOM=1 (default): the tables' files are read without readahead (a row is 264 bytes at a random offset)
@@ -63,6 +68,13 @@ class _T:
             import time
             torch.cuda.synchronize()
             TIMES[self.name] = TIMES.get(self.name, 0.0) + time.perf_counter() - self.t
+
+
+def ring_mode_for(n: int, start: int, floor: int, window: int) -> bool:
+    """Whether a chunk of ``n`` rows at ``start`` reads its window keys from the ring: RING_EXTRA rows or fewer, unless
+    TF_DS_REPLAY_FLOOR is on and its window reaches below ``floor`` (the bounded replay's cut)."""
+
+    return n <= RING_EXTRA and not (REPLAY_FLOOR and floor > max(0, start - (window - 1)))
 
 
 def store_rows(cache, rows: torch.Tensor, x: torch.Tensor, block: int, e4m3: bool) -> None:
@@ -974,7 +986,7 @@ class Model:
         K.rope_heads(q, cos, sin, pos, rd)
         ring = sc.ring[lay.idx]
         R = sc.ring_size
-        ring_mode = n <= RING_EXTRA
+        ring_mode = ring_mode_for(n, start, floor, c.window)
         if ring_mode:
             kv = K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, pos % R, c.eps, KV_QUANT, rd)
             wsrc, wlo = ring, self._zero
