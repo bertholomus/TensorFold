@@ -28,7 +28,7 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
 from tensorfold.cuda import health
 from tensorfold.cuda.chat_template import ChatTemplate
-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
+from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, before_dsml, hide_tool_calls, parse_tool_calls
 from tensorfold.cuda.turns import Turns, Yield
 from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
@@ -467,7 +467,8 @@ class App:
                 if delta and not emit(delta):
                     stopped["client"] = True
                 if calls_stream is not None and not stopped["client"]:
-                    for call_delta in calls_stream.feed(answer_raw[0]):   # never the reasoning
+                    # never the reasoning, nor a DSML block (a <tool_call> there is an argument's text)
+                    for call_delta in calls_stream.feed(before_dsml(answer_raw[0])):
                         if not emit(call_delta):
                             stopped["client"] = True
                             break
