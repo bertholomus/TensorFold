@@ -189,7 +189,7 @@ class App:
                 raise DecisionError(f"the chat template failed: {exc}") from exc
 
         def encode(text: str) -> list[int]:
-            return [int(token) for token in self.tok.encode(text, add_special_tokens=False).ids]
+            return [int(token) for token in self._encode(text, False)]
 
         try:
             prepared = prompts_for(body, render, encode, context_len=self.effective_context_window)
@@ -283,19 +283,30 @@ class App:
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             text = render(body["messages"])
-            prompt = self.tok.encode(text, add_special_tokens=False).ids
+            prompt = self._encode(text, False)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
             text = body.get("prompt")
             if not isinstance(text, str):
                 raise RequestError("prompt must be a string or a list of token ids")
-            prompt = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", False)).ids
+            prompt = self._encode(text, flag(body, "add_special_tokens", False))
         if not prompt:
             raise RequestError("rendered prompt is empty")
         # sampling is resolved here, so a malformed control is refused before a stream opens
         return PreparedRequest(prompt, max_tokens, tools, thinking, self.sampling_for(body, prompt),
                                ignore_eos=ignore_eos, stop=stop, grammar=compiled, think_budget=budget)
+
+    def _encode(self, text: str, add_special_tokens: bool) -> list[int]:
+        """The tokenizer's ids for ``text``, encoded without holding the GIL: ``encode_batch`` releases it, ``encode``
+        does not, and a ~540K-token conversation's ~1 s encode stopped every other thread of this process (the rounds of
+        every stream, the replies streaming) until it was done. The same ids. A tokenizer without batches (the tests'
+        fakes) encodes as before."""
+
+        batch = getattr(self.tok, "encode_batch", None)
+        if batch is None:
+            return self.tok.encode(text, add_special_tokens=add_special_tokens).ids
+        return batch([text], add_special_tokens=add_special_tokens)[0].ids
 
     def token_ids(self, value: Any, field: str = "prompt") -> list[int]:
         """Token ids as a request gives them (a list, or a list holding one list); RequestError outside the
@@ -325,7 +336,7 @@ class App:
             text = body.get("prompt")
             if not isinstance(text, str):
                 raise RequestError("prompt must be a string (or send messages)")
-            ids = self.tok.encode(text, add_special_tokens=flag(body, "add_special_tokens", True)).ids
+            ids = self._encode(text, flag(body, "add_special_tokens", True))
         limit = self._context_limit()
         reply: dict[str, Any] = {"count": len(ids), "tokens": [int(t) for t in ids],
                                  "max_model_len": limit if limit is not None else self.native_context_window}
