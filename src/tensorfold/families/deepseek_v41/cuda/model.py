@@ -428,7 +428,7 @@ def _engram_io():
         here = Path(__file__).parent
         from torch.utils import cpp_extension
 
-        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v6", sources=[str(here / "engram_io.cpp")],
+        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v7", sources=[str(here / "engram_io.cpp")],
                                             extra_cflags=["-O3"], verbose=False)
     return _engram_io.ext
 

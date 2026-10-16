@@ -1,7 +1,9 @@
 // Parallel row reads for the Engram tables: one pread per row on a pool of threads, so a decode step's rows (dozens,
 // random offsets in ~95 GiB files) cost one NVMe latency instead of one per row. The pool's threads start once and
 // wait for work (a round's reads used to start and join up to 48 threads a call, four calls a round); a call reads a
-// layer's weight rows and scale rows together.
+// layer's weight rows and scale rows together. At exit each thread started here is stopped and joined before anything
+// it waits on is destroyed: glibc's pthread_cond_destroy waits for the condition variable's waiters, so a thread left
+// waiting on one that exit() destroys holds the process in exit() until it is killed.
 #include <torch/extension.h>
 #include <linux/aio_abi.h>
 #include <sys/syscall.h>
@@ -19,6 +21,16 @@
 #include <vector>
 
 namespace {
+
+// fn() at exit, as a static's destructor: one made when its threads start is destroyed before the statics made earlier
+// (touch_cv below). Only in the process that made it: a forked child has none of its threads to join.
+struct AtExit {
+    void (*fn)();
+    pid_t pid = getpid();
+    ~AtExit() {
+        if (getpid() == pid) fn();
+    }
+};
 
 class Pool {
   public:
@@ -45,6 +57,17 @@ class Pool {
         job_ = nullptr;
     }
 
+    // the threads end (a job under way is finished first) and are joined; a later run() runs on its calling thread
+    void stop() {
+        {
+            std::lock_guard<std::mutex> g(m_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& w : workers_) w.join();
+        workers_.clear();
+    }
+
   private:
     void work() {
         for (;;) {
@@ -63,7 +86,8 @@ class Pool {
         for (;;) {
             {
                 std::unique_lock<std::mutex> g(m_);
-                cv_.wait(g, [&] { return gen_ != seen; });
+                cv_.wait(g, [&] { return gen_ != seen || stop_; });
+                if (stop_) return;
                 seen = gen_;
                 if (job_ == nullptr) continue;
             }
@@ -77,12 +101,15 @@ class Pool {
     const std::function<void(int64_t)>* job_ = nullptr;
     std::atomic<int64_t> n_{0}, next_{0}, finished_{0};
     int64_t gen_ = 0;
+    bool stop_ = false;
 };
 
 Pool& pool(int threads, int which = 0) {
     // pool 0 serves the reads a step waits for; pool 1 the reads started ahead of a prompt chunk, pool 2 a round's
+    // (never destroyed, so a call still running at exit finds them whole; their threads are stopped at exit)
     static Pool* p[3] = {new Pool(std::max(1, threads - 1)), new Pool(std::max(1, threads - 1)),
                          new Pool(std::max(1, threads - 1))};
+    static AtExit stopped{[] { for (Pool* q : p) q->stop(); }};
     return *p[which];
 }
 
@@ -312,13 +339,15 @@ std::mutex touch_m;
 std::condition_variable touch_cv;
 std::vector<TouchReq> touch_q;
 std::thread* touch_thread = nullptr;
+bool touch_stop = false;                       // at exit: the thread ends, and a later touch is dropped
 
 void touch_loop() {
     for (;;) {
         std::vector<TouchReq> todo;
         {
             std::unique_lock<std::mutex> g(touch_m);
-            touch_cv.wait(g, [] { return !touch_q.empty(); });
+            touch_cv.wait(g, [] { return !touch_q.empty() || touch_stop; });
+            if (touch_stop) return;            // touches still queued are dropped (nobody waits for one)
             todo.swap(touch_q);
         }
         for (auto& t : todo) {
@@ -327,6 +356,16 @@ void touch_loop() {
                               (int64_t)t.idx.size(), nullptr, nullptr);
         }
     }
+}
+
+// The touch thread ends and is joined: at exit, before touch_cv is destroyed (its AtExit is made after touch_cv)
+void stop_touch() {
+    {
+        std::lock_guard<std::mutex> g(touch_m);
+        touch_stop = true;
+    }
+    touch_cv.notify_all();
+    touch_thread->join();
 }
 
 }  // namespace
@@ -361,7 +400,11 @@ void aio_touch(int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int64_
     const int64_t* ix = idx.data_ptr<int64_t>();
     {
         std::lock_guard<std::mutex> g(touch_m);
-        if (!touch_thread) touch_thread = new std::thread(touch_loop);
+        if (touch_stop) return;                // at exit: dropped
+        if (!touch_thread) {
+            touch_thread = new std::thread(touch_loop);
+            static AtExit stopped{stop_touch};
+        }
         touch_q.push_back({fd_w, base_w, row_w, fd_s, base_s, row_s, std::vector<int64_t>(ix, ix + idx.numel())});
     }
     touch_cv.notify_one();
