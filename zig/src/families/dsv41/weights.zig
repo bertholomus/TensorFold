@@ -7,6 +7,12 @@ const Config = @import("config.zig").Config;
 const plan = @import("plan.zig");
 const rank_cache = @import("rank_cache.zig");
 const checkpoint = @import("checkpoint.zig");
+const dio = @import("core").direct_io;
+
+/// The largest stretch of the rank cache read whole for one layer's experts.
+const max_span = 4 << 30;
+/// The size of one direct read within such a stretch.
+const span_piece = 64 << 20;
 
 /// An EXL3 linear in the strips layout: words int32 [N/128, K/16, 8, 8 * bits], fp16 suh [K] and svh [N].
 /// plan_n: the N its decode plan is made for, when not n: a 2D node's column part of a TP2 slice keeps that slice's
@@ -137,6 +143,16 @@ pub fn strips(src: []const u8, out: []u8, kt: usize, nt: usize, tile: usize) voi
     };
 }
 
+/// Fills `buf` from `f` at the aligned offset `base`, in direct reads of at most `piece` (aligned) bytes.
+fn readWhole(f: dio.File, buf: dio.Buffer, base: u64, piece: usize) !void {
+    var done: usize = 0;
+    while (done < buf.len) {
+        const n = @min(buf.len - done, piece);
+        _ = try f.read(@alignCast(buf[done..][0..n]), base + done, n);
+        done += n;
+    }
+}
+
 const Loader = struct {
     gpa: std.mem.Allocator,
     d: *const cuda.Driver,
@@ -144,6 +160,20 @@ const Loader = struct {
     w: *Weights,
     host: std.ArrayList(u8) = .empty,
     aux: std.ArrayList(u8) = .empty,
+    // A layer's expert entries read whole: experts() visits them out of file order, which defeats kernel readahead.
+    span: []u8 = &.{},
+    span_lo: u64 = 0,
+    span_buf: ?dio.Buffer = null, // page_allocator's, so its pages go back to the system before the pool is sized
+    direct: ?dio.File = null, // the cache reopened for direct reads (no page cache to fill and then reclaim)
+    span_bytes: u64 = 0, // bytes read as spans and the time they took, for the load's log line
+    span_ns: u64 = 0,
+
+    fn deinit(L: *Loader) void {
+        L.host.deinit(L.gpa);
+        L.aux.deinit(L.gpa);
+        if (L.span_buf) |b| std.heap.page_allocator.free(b);
+        if (L.direct) |*f| f.close();
+    }
 
     fn upload(L: *Loader, name: []const u8, bytes: []const u8) !u64 {
         var b = try cuda.DeviceBuffer.alloc(L.d, bytes.len);
@@ -155,10 +185,78 @@ const Loader = struct {
         return b.ptr;
     }
 
+    /// The entry's bytes, valid until the next entry() (a view into the span until endSpan).
     fn entry(L: *Loader, key: []const u8) ![]u8 {
+        if (L.spanned(key)) |bytes| return bytes;
         try L.host.resize(L.gpa, try L.src.size(key));
         try L.src.read(key, L.host.items);
         return L.host.items;
+    }
+
+    /// The entry's bytes in the span, when it lies inside it.
+    fn spanned(L: *const Loader, key: []const u8) ?[]u8 {
+        if (L.span.len == 0) return null;
+        const c = switch (L.src) {
+            .cache => |c| c,
+            .shards => return null,
+        };
+        const e = c.index.get(key) orelse return null;
+        if (e.offset < L.span_lo or e.offset + e.bytes > L.span_lo + L.span.len) return null;
+        return L.span[@intCast(e.offset - L.span_lo)..][0..@intCast(e.bytes)];
+    }
+
+    /// The cache bytes [lo, hi) holding every part experts() reads of a layer; null without a cache or an entry.
+    fn expertSpan(L: *const Loader, prefixes: []const [3][]u8, pq: anytype) !?[2]u64 {
+        const c = switch (L.src) {
+            .cache => |c| c,
+            .shards => return null,
+        };
+        var kb: [256]u8 = undefined;
+        var lo: u64 = std.math.maxInt(u64);
+        var hi: u64 = 0;
+        for (prefixes) |pp| for (0..3) |j| for ([_][]const u8{ "tr", "suh", "svh" }) |part| {
+            const e = c.index.get(try plan.partKey(&kb, pp[j], pq.cols(j), pq.rows(j), part)) orelse return null;
+            lo = @min(lo, e.offset);
+            hi = @max(hi, e.offset + e.bytes);
+        };
+        return if (hi > lo) .{ lo, hi } else null;
+    }
+
+    /// Serves the entries in the cache bytes [lo, hi) from one whole read until endSpan; on failure each is read alone.
+    fn beginSpan(L: *Loader, lo: u64, hi: u64) void {
+        L.readSpan(lo, hi) catch |err| {
+            std.log.warn("rank cache: reading bytes {d}..{d} whole failed ({t}); their entries are read one by one", .{ lo, hi, err });
+            L.span = &.{};
+        };
+    }
+
+    fn readSpan(L: *Loader, lo: u64, hi: u64) !void {
+        const c = switch (L.src) {
+            .cache => |c| c,
+            .shards => return,
+        };
+        if (hi <= lo or hi - lo > max_span) return;
+        if (L.direct == null) {
+            var path: [64]u8 = undefined;
+            L.direct = try dio.File.open(try std.fmt.bufPrintSentinel(&path, "/proc/self/fd/{d}", .{c.file.handle}, 0));
+        }
+        const base = std.mem.alignBackward(u64, lo, dio.alignment);
+        const need = dio.span(lo, @intCast(hi - lo));
+        if (L.span_buf == null or L.span_buf.?.len < need) {
+            if (L.span_buf) |b| std.heap.page_allocator.free(b);
+            L.span_buf = null;
+            L.span_buf = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(dio.alignment), need);
+        }
+        const t0 = std.Io.Timestamp.now(c.io, .awake);
+        try readWhole(L.direct.?, L.span_buf.?[0..need], base, span_piece);
+        L.span_ns += @intCast(t0.durationTo(std.Io.Timestamp.now(c.io, .awake)).nanoseconds);
+        L.span_bytes += need;
+        L.span = L.span_buf.?[@intCast(lo - base)..][0..@intCast(hi - lo)];
+        L.span_lo = lo;
+    }
+
+    fn endSpan(L: *Loader) void {
+        L.span = &.{};
     }
 
     /// plain(name, dtype).cuda(): the entry as it is.
@@ -234,6 +332,9 @@ const Loader = struct {
             }
         };
         const pq: Parts = .{ .gu = gu, .half = half, .dcols = dcols };
+        // the parts below sit together in the cache, expert by expert: read them whole, then visit them in memory
+        if (try L.expertSpan(prefixes, pq)) |extent| L.beginSpan(extent[0], extent[1]);
+        defer L.endSpan();
         // sizes first: one buffer, gate trellises of every expert, then up, then down
         const sizes = try L.gpa.alloc(usize, 3 * e_count);
         defer L.gpa.free(sizes);
@@ -389,10 +490,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
     var w: Weights = .{ .gpa = gpa };
     errdefer w.deinit();
     var L: Loader = .{ .gpa = gpa, .d = d, .src = src, .w = &w };
-    defer {
-        L.host.deinit(gpa);
-        L.aux.deinit(gpa);
-    }
+    defer L.deinit();
     w.embed = try L.plain("embed.weight", null);
     w.norm = try L.plain("norm.weight", null);
     const vr = s.headCols(c);
@@ -422,6 +520,7 @@ pub fn load(gpa: std.mem.Allocator, d: *const cuda.Driver, src: Source, c: Confi
             .conf = try L.plain(try std.fmt.bufPrint(&tb, "{s}.confidence_head.proj.weight", .{last}), null),
         };
     }
+    if (L.span_bytes > 0) std.log.info("rank cache: {d:.1} GiB of expert entries read whole in {d:.1} s", .{ @as(f64, @floatFromInt(L.span_bytes)) / (1 << 30), @as(f64, @floatFromInt(L.span_ns)) / 1e9 });
     return w;
 }
 
@@ -434,4 +533,65 @@ test "strips: each 128-column block's tiles in k order" {
     // block 0: k row 0 tiles 0..7, k row 1 tiles 16..23; block 1: tiles 8..15, then 24..31
     const want = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 8, 9, 10, 11, 12, 13, 14, 15, 24, 25, 26, 27, 28, 29, 30, 31 };
     try std.testing.expectEqualSlices(u8, &want, &out);
+}
+
+test "rank cache span: entries read whole come back byte for byte, the rest one by one" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // every boundary off the 4 KiB grid; "after" keeps the aligned end of [first, last] inside the file
+    const name = "rank0of1-span.bin";
+    try rank_cache.writeFake(a, io, tmp.dir, name, &.{
+        .{ .key = "before", .dtype = "uint8", .shape = &.{5000}, .fill = 1 },
+        .{ .key = "first", .dtype = "uint8", .shape = &.{3000}, .fill = 2 },
+        .{ .key = "middle", .dtype = "uint8", .shape = &.{70001}, .fill = 3 },
+        .{ .key = "last", .dtype = "uint8", .shape = &.{4096}, .fill = 4 },
+        .{ .key = "after", .dtype = "uint8", .shape = &.{9000}, .fill = 5 },
+    });
+    var ix = try rank_cache.open(std.testing.allocator, io, tmp.dir, name);
+    defer ix.deinit();
+    var file = try tmp.dir.openFile(io, name, .{});
+    defer file.close(io);
+    var L: Loader = .{ .gpa = std.testing.allocator, .d = undefined, .src = .{ .cache = .{ .file = file, .index = &ix, .io = io } }, .w = undefined };
+    defer L.deinit();
+
+    const first = ix.get("first").?;
+    const last = ix.get("last").?;
+    L.beginSpan(first.offset, last.offset + last.bytes);
+    try std.testing.expect(L.span.len > 0);
+    for ([_]struct { key: []const u8, len: usize, fill: u8 }{
+        .{ .key = "first", .len = 3000, .fill = 2 },
+        .{ .key = "middle", .len = 70001, .fill = 3 },
+        .{ .key = "last", .len = 4096, .fill = 4 },
+    }) |want| {
+        const got = L.spanned(want.key).?;
+        try std.testing.expectEqual(want.len, got.len);
+        for (got) |b| try std.testing.expectEqual(want.fill, b);
+    }
+    try std.testing.expect(L.spanned("before") == null);
+    try std.testing.expect(L.spanned("after") == null);
+    const before = try L.entry("before");
+    try std.testing.expectEqual(@as(usize, 5000), before.len);
+    for (before) |b| try std.testing.expectEqual(@as(u8, 1), b);
+    L.endSpan();
+    try std.testing.expect(L.spanned("first") == null);
+
+    // reads in pieces smaller than the span: the file's bytes, as a buffered read sees them
+    const pieces = try std.heap.page_allocator.alignedAlloc(u8, .fromByteUnits(dio.alignment), 12 * dio.alignment);
+    defer std.heap.page_allocator.free(pieces);
+    try readWhole(L.direct.?, pieces, 0, dio.alignment);
+    var buffered: [12 * dio.alignment]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, buffered.len), try file.readPositionalAll(io, &buffered, 0));
+    try std.testing.expectEqualSlices(u8, &buffered, pieces);
+
+    // a span that runs past the end of the file is given up, and its entries are still read one by one
+    const after = ix.get("after").?;
+    L.beginSpan(after.offset, after.offset + after.bytes + (1 << 20));
+    try std.testing.expectEqual(@as(usize, 0), L.span.len);
+    const tail = try L.entry("after");
+    try std.testing.expectEqual(@as(usize, 9000), tail.len);
+    for (tail) |b| try std.testing.expectEqual(@as(u8, 5), b);
 }

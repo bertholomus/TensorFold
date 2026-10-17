@@ -143,7 +143,7 @@ pub fn find(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, rank: u32, world: u32) 
 }
 
 /// A cache file as weights.py writes one, for the tests: each tensor's bytes, then the index, offset and magic.
-fn writeFake(a: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8, rows: []const struct { key: []const u8, dtype: []const u8, shape: []const usize, fill: u8 }) !void {
+pub fn writeFake(a: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8, rows: []const struct { key: []const u8, dtype: []const u8, shape: []const usize, fill: u8 }) !void {
     var body: std.ArrayList(u8) = .empty;
     var index: std.ArrayList(u8) = .empty;
     try index.append(a, '[');
