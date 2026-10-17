@@ -27,30 +27,30 @@ _DSML_PARAM_RE = re.compile(rf'<{_DSML} parameter name="([^"]+)"(?: string="(tru
                             re.DOTALL)
 
 
-def dsml_to_tool_calls(text: str) -> str:
-    """Rewrite each complete DSML calls block as ``<tool_call>{json}</tool_call>`` blocks (one per invoke)."""
+def _dsml_invokes(block: str) -> list[tuple[str, dict[str, Any]]]:
+    """A DSML calls block's invokes as (name, arguments)."""
 
-    if _DSML_OPEN not in text:
-        return text
+    out = []
+    for inv in _DSML_INVOKE_RE.finditer(block):
+        args: dict[str, Any] = {}
+        for p in _DSML_PARAM_RE.finditer(inv.group(2)):
+            key, is_str, value = p.group(1), p.group(2), p.group(3)
+            if is_str == "false":
+                try:
+                    args[key] = json.loads(value)
+                    continue
+                except json.JSONDecodeError:
+                    pass
+            args[key] = value
+        out.append((inv.group(1).strip(), args))
+    return out
 
-    def block(m: re.Match) -> str:
-        out = []
-        for inv in _DSML_INVOKE_RE.finditer(m.group(1)):
-            args: dict[str, Any] = {}
-            for p in _DSML_PARAM_RE.finditer(inv.group(2)):
-                key, is_str, value = p.group(1), p.group(2), p.group(3)
-                if is_str == "false":
-                    try:
-                        args[key] = json.loads(value)
-                        continue
-                    except json.JSONDecodeError:
-                        pass
-                args[key] = value
-            out.append(_CALL_OPEN + json.dumps({"name": inv.group(1), "arguments": args}, ensure_ascii=False)
-                       + _CALL_CLOSE)
-        return "".join(out)
 
-    return _DSML_BLOCK_RE.sub(block, text)
+def before_dsml(text: str) -> str:
+    """The text before the first DSML calls block: a ``<tool_call>`` inside one is an argument's text, not a call."""
+
+    cut = text.find(_DSML_OPEN)
+    return text if cut < 0 else text[:cut]
 
 
 
@@ -146,15 +146,48 @@ def _tool_name(tool: dict[str, Any]) -> str:
 
 
 def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int | None = None) -> tuple[str, list[dict[str, Any]] | None]:
-    """Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM ``name<arg_key>..`` or JSON calls."""
+    """DeepSeek DSML calls, and around them Qwen ``<function=name><parameter=k>v</parameter></function>``, GLM
+    ``name<arg_key>..`` or JSON calls."""
 
     if not tools:
         return text, None
-    text = dsml_to_tool_calls(text)
     known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []
     residue: list[str] = []
+    cursor = 0
+    # a DSML block is read from its own tags, never as <tool_call> text: a <tool_call> or </tool_call> in the prose or
+    # in an argument cannot move a call's bounds, and a call to a tool the request did not offer stays a call (the
+    # client answers it) instead of call syntax the model never wrote
+    for block in _DSML_BLOCK_RE.finditer(text) if _DSML_OPEN in text else ():
+        _tagged_calls(text[cursor:block.start()], tools, known, schemas, max_calls, calls, residue)
+        cursor = block.end()
+        for name, args in _dsml_invokes(block.group(1)):
+            if not name or max_calls is not None and (len(calls) >= max_calls or name.lower() not in known
+                                                      or not _finite(args)):
+                continue
+            calls.append(_call(known.get(name.lower(), name), args))
+    _tagged_calls(text[cursor:], tools, known, schemas, max_calls, calls, residue)
+    return "".join(residue).strip(), calls or None
+
+
+def _finite(args: Any) -> bool:
+    try:
+        json.dumps(args, allow_nan=False)
+    except (ValueError, TypeError):
+        return False
+    return isinstance(args, dict)
+
+
+def _call(name: str, args: Any) -> dict[str, Any]:
+    return {"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}}
+
+
+def _tagged_calls(text: str, tools: list[dict[str, Any]], known: dict[str, str], schemas: dict[str, Any],
+                  max_calls: int | None, calls: list[dict[str, Any]], residue: list[str]) -> None:
+    """The ``<tool_call>`` blocks of text outside DSML blocks, onto ``calls``; the rest of the text onto ``residue``."""
+
     cursor = 0
     for match in _TOOL_CALL_BLOCK_RE.finditer(text):
         residue.append(text[cursor:match.start()])
@@ -190,18 +223,10 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
             if max_calls is None:
                 residue.append(match.group(0))
             continue
-        if max_calls is not None:
-            try:
-                if not isinstance(args, dict):
-                    continue
-                json.dumps(args, allow_nan=False)
-            except (ValueError, TypeError):
-                continue
-        calls.append({"id": f"call_{uuid.uuid4().hex[:24]}", "type": "function",
-                      "function": {"name": known[str(name).lower()],
-                                   "arguments": json.dumps(args, ensure_ascii=False, separators=(",", ":"))}})
+        if max_calls is not None and not _finite(args):
+            continue
+        calls.append(_call(known[str(name).lower()], args))
     residue.append(text[cursor:])
-    return "".join(residue).strip(), calls or None
 
 
 # -- chat template -------------------------------------------------------------------------
