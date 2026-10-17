@@ -1199,7 +1199,8 @@ class MultiDecoder:
         if not sids:
             return
         drops = self._covered(done) if KEEP else []
-        self._send(["finish", sids, drops, self.spill_nonce])
+        # the spill's run name rides along only with the spill on, so the default path's message stays as it was
+        self._send(["finish", sids, drops] + ([self.spill_nonce] if self.spill is not None else []))
         self._finish(sids, drops)
 
     def _release(self, s: Stream) -> None:

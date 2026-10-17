@@ -11,8 +11,10 @@ conversation its prompt. Its next turn reads the rows back instead of filling th
 - **Reading.** Rank 0 matches a new prompt's ids against the manifests' boundaries by prefix hash (no ids held in
   memory) and takes a disk boundary only past what the window's kept prompts offer. Every rank checks its own copy,
   and one small gather agrees, else the prompt fills fresh. The rows stream into a fresh extent segment by segment.
-- **Recycling.** Files live in one directory per engine identity (the checkpoint, this package's code, the cache
-  formats, the prompt mode); other identities' directories go at start. A manifest unused for TF_DS_SPILL_MAX_AGE_H
+- **Recycling.** Files live in a folder the spill makes for itself, ``dsv41-spill`` inside TF_DS_SPILL_DIR (default
+  ``~/.cache/tensorfold``): one directory per engine identity in it (the checkpoint, this package's code, the cache
+  formats, the prompt mode); other identities' directories there go at start. Nothing outside that folder is removed
+  or has its mode changed. A manifest unused for TF_DS_SPILL_MAX_AGE_H
   goes; past TF_DS_SPILL_GIB the least recently used go first; then every segment and snapshot no manifest names.
   Half-written files (``.partial``) go too. It runs at start and after every write.
 - Restored rows are the bytes the same engine identity wrote when it filled them, so a resumed reply is the reply a
@@ -44,7 +46,8 @@ def _env_float(name: str, default: float) -> float:
 
 
 SPILL_GIB = _env_float("TF_DS_SPILL_GIB", 0.0)
-SPILL_DIR = os.environ.get("TF_DS_SPILL_DIR") or str(Path.home() / ".cache" / "tensorfold" / "dsv41-spill")
+SPILL_DIR = os.environ.get("TF_DS_SPILL_DIR") or str(Path.home() / ".cache" / "tensorfold")
+SPILL_SUBDIR = "dsv41-spill"     # the spill's own folder in SPILL_DIR: it writes, removes and chmods only in there
 SPILL_MAX_AGE_H = _env_float("TF_DS_SPILL_MAX_AGE_H", 168.0)
 SPILL_MIN = int(_env_float("TF_DS_SPILL_MIN", 4096))
 # the env settings that change what a cached row holds (TF_DS_SPILL_* and logging knobs do not)
@@ -118,11 +121,12 @@ def _pieces(start: int, top: int) -> list[tuple[int, int]]:
 
 class Spill:
     """One rank's kept prompts on its disk (module docstring). ``pool`` is the window (``Model.new_pool``), ``ratios``
-    each kv-source layer's compress ratio."""
+    each kv-source layer's compress ratio. ``root`` is TF_DS_SPILL_DIR, which may hold anything: the spill keeps
+    everything in its own folder there (SPILL_SUBDIR) and touches nothing outside it."""
 
     def __init__(self, root, *, engine: str, rank: int, pool, ratios: dict, budget: int, max_age: float,
                  min_top: int = SPILL_MIN, log=None, device="cuda") -> None:
-        self.root, self.engine, self.rank, self.device = Path(root), str(engine), int(rank), device
+        self.root, self.engine, self.rank, self.device = Path(root) / SPILL_SUBDIR, str(engine), int(rank), device
         self.dir = self.root / f"v{FORMAT}-{self.engine}"
         self.pool, self.ratios = pool, {int(i): int(r) for i, r in ratios.items()}
         self.budget, self.max_age, self.min_top = int(budget), float(max_age), int(min_top)

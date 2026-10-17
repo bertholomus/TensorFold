@@ -4,6 +4,7 @@ in the next, through the real MultiDecoder admission and finish paths, on CPU te
 
 import json
 import os
+import stat
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -278,12 +279,12 @@ def test_pinned_prompts_go_last_and_stray_files_go_at_start(mods):
     assert set(md.spill.manifests) == {old}                          # the window's prompt outlived a newer one
     (md.spill.dir / "seg-x-0.st.partial").write_bytes(b"half")
     (md.spill.dir / "snap-orphan-2048.st").write_bytes(b"nothing names me")
-    (root / "v1-otherengine").mkdir()
+    (md.spill.root / "v1-otherengine").mkdir()                       # another identity's, in the spill's folder
     md2, _ = _decoder(multi, spill, root, nonce="run2")
     md2.spill.recycle()
     assert not (md.spill.dir / "seg-x-0.st.partial").exists()
     assert not (md.spill.dir / "snap-orphan-2048.st").exists()
-    assert not (root / "v1-otherengine").exists() and old in md2.spill.manifests
+    assert not (md.spill.root / "v1-otherengine").exists() and old in md2.spill.manifests
 
 
 def test_matching_takes_the_furthest_shared_boundary_past_the_window(mods):
@@ -315,7 +316,7 @@ def test_a_tampered_manifest_naming_files_elsewhere_is_dropped_untouched(mods, t
     outside.write_bytes(b"not the spill's")
     entry = md.spill._entry(k.disk["name"])
     m = json.loads(entry.read_text())
-    m["segments"][0]["file"] = "../../keep-me.st"
+    m["segments"][0]["file"] = "../../../keep-me.st"                 # dir is <root>/dsv41-spill/v1-<engine>/
     entry.write_text(json.dumps(m))
     md2, calls = _decoder(multi, spill, root, nonce="run2")
     assert not md2.spill.manifests and not entry.exists()             # dropped at load
@@ -352,3 +353,35 @@ def test_a_continuation_below_the_spilled_top_keeps_its_manifest(mods):
     assert s.cached == 16384 < k.top
     (k2,) = md2.kept.values()
     assert set(md2.spill.manifests) == {k.disk["name"], k2.disk["name"]}   # the first still holds 16384..18432
+
+
+def test_the_spill_keeps_to_its_own_folder_in_a_shared_spill_dir(mods):
+    multi, spill, root = mods
+    root.mkdir()
+    os.chmod(root, 0o755)
+    (root / "videos").mkdir()                                         # TF_DS_SPILL_DIR's other contents, "v" names too
+    (root / "videos" / "clip.mp4").write_bytes(b"not the spill's")
+    (root / "v1-otherengine").mkdir()                                 # even one shaped like an identity directory
+    md, _ = _decoder(multi, spill, root)
+    _serve(multi, md, _prompt(9000, 70))
+    assert md.spill.dir.parent == root / spill.SPILL_SUBDIR and md.spill.manifests
+    md2, _ = _decoder(multi, spill, root, nonce="run2")               # a restart's cleanup: inside its folder only
+    md2.spill.recycle()
+    assert (root / "videos" / "clip.mp4").read_bytes() == b"not the spill's"
+    assert (root / "v1-otherengine").is_dir() and md2.spill.manifests == md.spill.manifests
+    if os.name == "posix":
+        assert stat.S_IMODE(root.stat().st_mode) == 0o755              # TF_DS_SPILL_DIR's mode as it was
+        assert stat.S_IMODE((root / spill.SPILL_SUBDIR).stat().st_mode) == 0o700
+
+
+def test_the_finish_message_names_the_run_only_with_the_spill_on(mods):
+    multi, spill, root = mods
+    for on in (True, False):
+        md, _ = _decoder(multi, spill, root / str(on))
+        if not on:
+            md.spill = None                                           # TF_DS_SPILL_GIB unset
+        sent = []
+        md._send = sent.append
+        _serve(multi, md, _prompt(9000, 80))
+        (msg,) = [m for m in sent if m[0] == "finish"]
+        assert msg[3:] == (["run1"] if on else [])                     # off: ["finish", sids, drops], as before
