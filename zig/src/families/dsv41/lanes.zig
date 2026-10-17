@@ -214,11 +214,16 @@ const Lane = struct {
 
 extern "c" fn exp(x: f64) f64;
 
-/// A kept prompt state (the prompt cache's saved state, kept at a chunk end the prompt pass reached before its
-/// replay): the slot's own part on the device (Model.snapCopy), and the extent its compressed rows stay in,
-/// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
-/// and the prompt runs from 0).
-pub const Snap = struct { id: u64, at: usize, base: usize, buf: cuda.DeviceBuffer, stale: bool = false };
+/// Retained device state reserves [base, end); an evicted extent must replay from the start.
+pub const Snap = struct { id: u64, at: usize, base: usize, end: usize, buf: cuda.DeviceBuffer, stale: bool = false };
+
+/// A resume may grow beyond its old reservation. Move it before overwriting another retained prefix.
+fn clashesKept(snaps: []const *Snap, lo: usize, hi: usize, except: *Snap) bool {
+    for (snaps) |sn| {
+        if (sn != except and !sn.stale and lo < sn.base + sn.at and sn.base < hi) return true;
+    }
+    return false;
+}
 
 /// First tokens a handle names (each prompt's draw, read back right after its prefill).
 const ring = 1024;
@@ -374,7 +379,8 @@ pub const Lanes = struct {
             // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
             if (s.images.len == 0 and self.usable(sn, len)) {
                 kept = sn;
-                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size);
+                moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or
+                    clashesKept(self.snaps.items, sn.base + sn.at, sn.base + size, sn);
             } else s.reuse_failed = true;
         }
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size);
@@ -461,6 +467,9 @@ pub const Lanes = struct {
             }
             if (base != sn.base) try m.copyExtent(sn.base, base, sn.at);
             try m.snapCopy(slot, sn.buf.ptr, false);
+            // Relocate retained ownership with the copied prefix to avoid pinning its previous extent.
+            sn.base = base;
+            sn.end = @min(m.pool_cap, base + size + model.chunk_rows);
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
@@ -683,7 +692,7 @@ pub const Lanes = struct {
         while (true) {
             used.clearRetainingCapacity();
             try used.appendSlice(gpa, live);
-            for (self.snaps.items) |sn| if (!sn.stale) try used.append(gpa, .{ sn.base, sn.base + sn.at });
+            for (self.snaps.items) |sn| if (!sn.stale) try used.append(gpa, .{ sn.base, sn.end });
             if (place(used.items, size, self.m.pool_cap)) |b| return b;
             const oldest = for (self.snaps.items) |sn| {
                 if (!sn.stale) break sn;
@@ -713,7 +722,7 @@ pub const Lanes = struct {
         if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = @min(self.m.pool_cap, l.end + model.chunk_rows), .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
         errdefer sn.buf.free();
         try self.snaps.append(self.gpa, sn);
         self.next_snap += 1;
@@ -978,4 +987,32 @@ test "greedy draws take the first largest logit" {
     const row = [_]f32{ 0.5, 2.0, -1.0, 2.0 };
     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, null));
     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, .{ .seed = 3, .temperature = 0 }));
+}
+
+test "retained histories preserve their replay and output reservations" {
+    var m: Model = undefined;
+    m.pool_cap = 1 << 20;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer ln.snaps.deinit(std.testing.allocator);
+    var snapshots: [8]Snap = undefined;
+    for (&snapshots, 0..) |*sn, i| {
+        const base = try ln.placeKept(&.{}, 102400);
+        try std.testing.expectEqual(i * 102400, base);
+        sn.* = .{ .id = i, .at = 98304, .base = base, .end = base + 102400, .buf = undefined };
+        try ln.snaps.append(std.testing.allocator, sn);
+    }
+    // All eight 100K histories can resume within their reservations without invalidating a neighbor.
+    for (&snapshots) |*sn| {
+        try std.testing.expect(!clashesKept(ln.snaps.items, sn.base + sn.at, sn.end, sn));
+        ln.staleOver(sn.base + sn.at, sn.end, sn);
+    }
+    for (snapshots) |sn| try std.testing.expect(!sn.stale);
+    // A larger continuation relocates into free room instead of overwriting the next cached prefix.
+    try std.testing.expect(clashesKept(ln.snaps.items, snapshots[0].at, 104448, &snapshots[0]));
+    try std.testing.expectEqual(@as(usize, 819200), try ln.placeKept(&.{}, 104448));
+    // At genuine capacity pressure, oldest retained states may still be evicted, never live ranges.
+    const live = [_][2]usize{.{ 0, 102400 }};
+    try std.testing.expectEqual(@as(usize, 102400), try ln.placeKept(&live, 409600));
+    try std.testing.expect(snapshots[0].stale and snapshots[4].stale);
+    try std.testing.expect(!snapshots[5].stale);
 }
