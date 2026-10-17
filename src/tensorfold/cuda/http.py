@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 import traceback
 import uuid
@@ -39,6 +41,19 @@ def _log_error(exc: BaseException) -> None:
 
 
 POLLED = ("/metrics", "/v1/metrics", "/health", "/v1/health")
+
+# TF_SSE_KEEPALIVE_S=N (seconds, default off): a stream quiet N seconds gets an SSE comment, which clients skip, so a
+# long prompt, a queue wait or a tool call's unstreamed arguments no longer look like a dead stream to a client's idle
+# timeout; unset or 0, streams are written as before
+KEEPALIVE = float(os.environ.get("TF_SSE_KEEPALIVE_S") or 0)
+
+
+def _keepalive(write: Any, last: list[float], done: threading.Event) -> None:
+    """Writes ``: keepalive`` whenever the stream's latest write, ``last[0]``, is KEEPALIVE seconds old."""
+
+    while not done.wait(max(0.0, last[0] + KEEPALIVE - time.monotonic())):
+        if time.monotonic() - last[0] >= KEEPALIVE and not write(b": keepalive\n\n"):
+            return
 
 
 def _api_key() -> str | None:
@@ -205,16 +220,26 @@ def make_handler(app: App):
                 self.send_header("Connection", "close")
                 self.end_headers()
 
-                def emit(delta: dict[str, Any]) -> bool:
-                    try:
-                        self.wfile.write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
-                        self.wfile.flush()
+                lock, last, done = threading.Lock(), [time.monotonic()], threading.Event()
+
+                def write(data: bytes) -> bool:
+                    with lock:
+                        try:
+                            self.wfile.write(data)
+                            self.wfile.flush()
+                        except OSError:         # reset, broken pipe, timed out, host unreachable: the client has gone
+                            return False
+                        last[0] = time.monotonic()
                         return True
-                    except OSError:             # reset, broken pipe, timed out, host unreachable: the client has gone
-                        return False
+
+                def emit(delta: dict[str, Any]) -> bool:
+                    return write(f"data: {json.dumps(chunk(delta))}\n\n".encode())
 
                 if chat:
                     emit({"role": "assistant"})
+                quiet = threading.Thread(target=_keepalive, args=(write, last, done), daemon=True)
+                if KEEPALIVE > 0:
+                    quiet.start()
                 try:
                     result = app.run(body, chat, emit, prepared=prepared, cancelled=cancelled)
                 except RequestCancelled:
@@ -225,6 +250,10 @@ def make_handler(app: App):
                 except Exception as exc:
                     _log_error(exc)
                     return self._stream_error({"message": _error_message(exc), "type": "server_error"})
+                finally:                        # the keep-alive stops before anything else writes
+                    done.set()
+                    if quiet.is_alive():
+                        quiet.join()
                 if result["final"]:
                     emit(result["final"])
                 if result["calls"]:
