@@ -40,6 +40,29 @@ fn isImagePart(part: Value) bool {
     return t == .string and std.mem.eql(u8, t.string, "image_url");
 }
 
+/// `s` with every `ph` as plain text: the placeholder's fullwidth bars to ASCII `|`, so the text no longer
+/// matches the tokenizer's special (whose id would otherwise add image tokens the prompt's span count misses).
+fn escape(cx: *Cx, s: []const u8, ph: []const u8) ![]const u8 {
+    if (ph.len == 0 or std.mem.indexOf(u8, s, ph) == null) return s;
+    var plain: std.ArrayList(u8) = .empty;
+    var i: usize = 0;
+    while (i < ph.len) {
+        const n = std.unicode.utf8ByteSequenceLength(ph[i]) catch 1;
+        const cp = std.unicode.utf8Decode(ph[i..][0..n]) catch 0;
+        if (cp == 0xff5c) try plain.append(cx.a, '|') else try plain.appendSlice(cx.a, ph[i..][0..n]);
+        i += n;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    i = 0;
+    while (std.mem.indexOfPos(u8, s, i, ph)) |at| {
+        try out.appendSlice(cx.a, s[i..at]);
+        try out.appendSlice(cx.a, plain.items);
+        i = at + ph.len;
+    }
+    try out.appendSlice(cx.a, s[i..]);
+    return out.items;
+}
+
 /// Whether any message's content list holds an image part.
 fn hasImages(list: Value) bool {
     for (list.array) |message| {
@@ -309,13 +332,18 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
         if (!isRole(role)) return cx.refuse("message role must be system, developer, user, assistant or tool");
         if (with_images) {
             const im = images.?;
+            // a message's own text holding the placeholder is escaped to plain text: its special id would
+            // otherwise add image tokens the prompt's span count does not know
+            var obj: *json.Object = message.object;
+            for ([_][]const u8{ "content", "reasoning_content" }) |key| if (obj.get(key)) |v| if (v == .string and std.mem.indexOf(u8, v.string, im.placeholder) != null) {
+                obj = try withField(cx, obj, key, .{ .string = try escape(cx, v.string, im.placeholder) });
+            };
             // media other than the content's images is refused as ever
-            const rest = try json.copyObject(cx.a, message.object);
+            const rest = try json.copyObject(cx.a, obj);
             _ = rest.orderedRemove("content");
             if (fields.hasMedia(.{ .object = rest })) return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
-            for ([_][]const u8{ "content", "reasoning_content" }) |key| if (message.get(key)) |v| if (v == .string and std.mem.indexOf(u8, v.string, im.placeholder) != null) return cx.refuse(image_text_refusal);
-            const content = message.get("content");
-            var item: *json.Object = message.object;
+            const content = obj.get("content");
+            var item: *json.Object = obj;
             if (content != null and content.? == .array) {
                 const r = role.?.string;
                 if (!std.mem.eql(u8, r, "user") and !std.mem.eql(u8, r, "tool")) for (content.?.array) |part| if (isImagePart(part)) return cx.refuse(image_role_refusal);
@@ -331,12 +359,11 @@ pub fn normalizeImages(cx: *Cx, messages: ?Value, late_system: []const u8, needs
                     if (!typed or fields.hasMedia(part)) return cx.refuse(text_only_refusal);
                     const t = part.get("text") orelse return cx.refuse("image input: a text part needs a text string");
                     if (t != .string) return cx.refuse("image input: a text part needs a text string");
-                    if (std.mem.indexOf(u8, t.string, im.placeholder) != null) return cx.refuse(image_text_refusal);
-                    try text.appendSlice(cx.a, t.string);
+                    try text.appendSlice(cx.a, try escape(cx, t.string, im.placeholder));
                 }
-                item = try withField(cx, message.object, "content", .{ .string = text.items });
+                item = try withField(cx, obj, "content", .{ .string = text.items });
             } else if (content == null or content.? == .null) {
-                item = try withField(cx, message.object, "content", .{ .string = "" });
+                item = try withField(cx, obj, "content", .{ .string = "" });
             } else if (content.? != .string) {
                 return cx.refuse("message content must be text or an array of text parts");
             }
@@ -535,4 +562,20 @@ test "a conversation keeps its shape when the template does not need the rule" {
     try std.testing.expectEqual(@as(usize, 2), out.array.len);
     try std.testing.expectEqualStrings("assistant", out.array[0].get("role").?.string);
     try std.testing.expectEqualStrings("tool", out.array[1].get("role").?.string);
+}
+
+test "a message's own text holding the image placeholder is escaped" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    var cx: Cx = .{ .a = arena.allocator() };
+    const ph = "<\u{ff5c}deepseek_image\u{ff5c}>";
+    var images: Images = .{ .placeholder = ph };
+    const messages = (try json.parseText(cx.a,
+        "[{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"see <\u{ff5c}deepseek_image\u{ff5c}> above\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,aGVsbG8=\"}}]}]"
+    )).ok;
+    const out = try normalizeImages(&cx, messages, "system", false, &images);
+    const text = out.array[0].get("content").?.string;
+    // the image part's own placeholder stays; the text's is escaped to plain ASCII bars
+    try std.testing.expectEqualStrings("see <|deepseek_image|> above\n\n" ++ ph, text);
+    try std.testing.expectEqual(@as(usize, 1), images.list.items.len);
 }
