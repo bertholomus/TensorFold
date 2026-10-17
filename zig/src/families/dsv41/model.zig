@@ -27,6 +27,7 @@ const comm_mod = @import("comm.zig");
 const link = @import("link.zig");
 const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
+const sampling = @import("sampling.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 2048;
@@ -111,6 +112,10 @@ pub const Model = struct {
     host_pos: []i64,
     ids64: []i64,
     vocab: usize,
+    gpu_candidates: bool,
+    candidate_scratch: u64,
+    candidate_out: u64,
+    candidate_host: []sampling.Candidate,
     logits: []f32, // round.max_rows rows of logits on the host
     amax: u64, // u32 [round.max_rows]: a round's greedy tokens on the device (roundArgmax)
     amax_host: [round.max_rows]u32 = undefined,
@@ -168,6 +173,9 @@ pub const Model = struct {
         m.timer = null;
         m.ptimer = null;
         m.t_enqueue = 0;
+        m.clk_ph = @splat(0);
+        m.clk_cnt = @splat(0);
+        m.clk_rounds = 0;
         m.t_forward = 0;
         m.t_absorb = 0;
         m.dpool = null;
@@ -288,6 +296,10 @@ pub const Model = struct {
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
         m.amax = try m.arena.take(round.max_rows * 4);
+        m.gpu_candidates = if (std.c.getenv("TF_DS_GPU_CANDIDATES")) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
+        m.candidate_scratch = 0;
+        m.candidate_out = 0;
+        m.candidate_host = &.{};
         if (o.graphs) m.graphs = round.Graphs.init(gpa);
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
@@ -336,6 +348,13 @@ pub const Model = struct {
         m.ids64 = try a.alloc(i64, chunk_rows);
         m.vocab = sp.world * (if (m.two) |t| t.hw[0] + t.hw[1] else m.w.head.n); // 2D: both pairs' vocabulary parts
         m.logits = try a.alloc(f32, round.max_rows * m.vocab);
+        if (m.gpu_candidates and m.rank == 0) {
+            const bytes = round.max_rows * sampling.max_candidates * @sizeOf(sampling.Candidate);
+            m.candidate_scratch = try m.arena.take(bytes * ((m.vocab + 4095) / 4096));
+            m.candidate_out = try m.arena.take(bytes);
+            m.candidate_host = try a.alloc(sampling.Candidate, round.max_rows * sampling.max_candidates);
+        }
+
         return m;
     }
 
@@ -740,6 +759,18 @@ pub const Model = struct {
         try m.stream.synchronize();
         try d.check(d.api.cuMemcpyDtoH_v2(&m.amax_host, m.amax, R * 4), "cuMemcpyDtoH");
         return m.amax_host[0..R];
+    }
+
+    /// Null means a nonfinite row requires the unchanged host path.
+    pub fn roundCandidates(m: *Model, R: usize, k: usize) !?[]const sampling.Candidate {
+        std.debug.assert(m.gpu_candidates and m.rank == 0 and R <= round.max_rows);
+        try m.ops.candidateRows(m.stream, m.rd.logits, m.vocab, R, k, m.candidate_scratch, m.candidate_out);
+        try m.stream.synchronize();
+        try m.ctx.d.check(m.ctx.d.api.cuMemcpyDtoH_v2(m.candidate_host.ptr, m.candidate_out, R * k * @sizeOf(sampling.Candidate)), "cuMemcpyDtoH candidates");
+        const result = m.candidate_host[0 .. R * k];
+        for (result) |c| if (c.id == 0xfffffffe) return null;
+        for (result) |c| if (c.id >= m.vocab) return error.BadCandidates;
+        return result;
     }
 
     pub fn roundLogits(m: *Model, R: usize) ![]const f32 {

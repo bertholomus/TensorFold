@@ -174,6 +174,25 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
     return @intCast(t);
 }
 
+/// Candidate ids remain global vocabulary ids; sampling math stays on the host.
+fn drawCandidates(row: []const sampling.Candidate, position: u64, s: ?lanes.Sampling) !u32 {
+    const sm = s orelse return row[0].id;
+    if (sm.temperature <= 0) return row[0].id;
+    var values: [sampling.max_candidates]f32 = undefined;
+    var ids: [sampling.max_candidates]i64 = undefined;
+    for (row, 0..) |c, i| {
+        values[i] = c.value;
+        ids[i] = c.id;
+    }
+    return @intCast(try sampling.sampleCandidates(values[0..row.len], ids[0..row.len], position, .{
+        .seed = sm.seed,
+        .temperature = sm.temperature,
+        .top_k = sm.top_k,
+        .top_p = sm.top_p,
+        .min_p = sm.min_p,
+    }));
+}
+
 /// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
 /// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
 pub const Profile = struct {
@@ -562,7 +581,17 @@ pub const Lanes = struct {
             };
         }
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
-        const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
+        var count: usize = 1;
+        var eligible = m.gpu_candidates and !greedy;
+        for (windows) |w| if (w.stream.sampling) |sm| {
+            if (sm.temperature > 0) {
+                if (sm.top_k == 0 or sm.top_k > sampling.max_candidates - sampling.margin) eligible = false;
+                count = @max(count, @as(usize, @min(sm.top_k, sampling.max_candidates - sampling.margin)) + sampling.margin);
+            }
+        };
+        count = @min(count, m.vocab);
+        const candidates = if (eligible) try m.roundCandidates(rows.ids.len, count) else null;
+        const logits: []const f32 = if (greedy or candidates != null) &.{} else try m.roundLogits(rows.ids.len);
         const t3 = m.now();
         defer if (self.prof) |*p| {
             p.send += t1 - t0;
@@ -577,7 +606,7 @@ pub const Lanes = struct {
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else if (candidates) |cs| try drawCandidates(cs[(row0 + r) * count ..][0..count], w.positions[r], w.stream.sampling) else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);

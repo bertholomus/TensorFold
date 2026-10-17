@@ -37,6 +37,7 @@ pub const Ops = struct {
     copy16: cuda.Function,
     argmax_rows: cuda.Function,
     gpu_clock: cuda.Function,
+    candidates: cuda.Function,
 
     /// The three images (cuda.kernels.torch_pointwise, torch_movement and dsv41_ops, or the fatbins' bytes).
     pub fn load(d: *const cuda.Driver, pointwise: []const u8, movement: []const u8, family: []const u8) !Ops {
@@ -68,6 +69,7 @@ pub const Ops = struct {
             .copy16 = try fm.function("tf_ds_copy_rows16_kernel"),
             .argmax_rows = try fm.function("tf_ds_argmax_rows_kernel"),
             .gpu_clock = try fm.function("tf_ds_clock_kernel"),
+            .candidates = try fm.function("tf_ds_candidates_kernel"),
         };
     }
 
@@ -290,6 +292,24 @@ pub const Ops = struct {
         a.add(@as(c_int, @intCast(n)));
         a.add(out);
         try go(o.argmax_rows, s, rows, 1024, &a);
+    }
+
+    /// Exact top-k candidates: independent vocabulary tiles, then their union.
+    pub fn candidateRows(o: *const Ops, s: cuda.Stream, logits: u64, n: usize, rows: usize, k: usize, scratch: u64, out: u64) !void {
+        std.debug.assert(k > 0 and k <= 64 and k <= n);
+        const tiles = (n + 4095) / 4096;
+        for (0..2) |stage| {
+            var a: cuda.Args = .{};
+            a.add(logits);
+            a.add(scratch);
+            a.add(if (stage == 0) scratch else out);
+            a.add(@as(u64, n));
+            a.add(@as(c_int, @intCast(n)));
+            a.add(@as(c_int, @intCast(k)));
+            a.add(@as(c_int, @intCast(tiles)));
+            a.add(@as(c_int, @intCast(stage)));
+            try cuda.launch.launch(o.candidates, .{ .grid = .{ .x = @intCast(if (stage == 0) tiles else 1), .y = @intCast(rows) }, .block = .{ .x = 256 } }, s, &a);
+        }
     }
 
     /// The GPU clock (ns) into buf[i] when the stream reaches it (a profile).
