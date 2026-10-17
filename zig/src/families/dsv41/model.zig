@@ -159,6 +159,8 @@ pub const Model = struct {
     two: ?prompt2d.Two = null,
     rdma_rings: ?ring2d.Rings = null,
     neighbor_gather: ?neighbor.Gather = null,
+    // watchPeers: a peer rank that stops stops this one too (link.Watch)
+    watch: link.Watch = .{},
 
     /// Loads rank o.rank's weights from the lane's rank cache, links the ranks (rank 0 listens on o.port), opens NCCL
     /// and sets up every buffer. Needs `ctx` current on this thread.
@@ -213,6 +215,7 @@ pub const Model = struct {
         m.two = null;
         m.rdma_rings = null;
         m.neighbor_gather = null;
+        m.watch = .{};
         const d = ctx.d;
         m.cfg = try Config.read(a, io, o.model_dir);
         const c = &m.cfg;
@@ -436,6 +439,7 @@ pub const Model = struct {
         }
         if (m.rdma_mod) |*x| x.unload();
         m.comm.deinit();
+        m.watch.stop(); // (still watching up to here: a wait above on a rank that went ends this process)
         m.fan.close();
         m.w.deinit();
         m.cache_file.close(m.io);
@@ -486,6 +490,23 @@ pub const Model = struct {
     /// Rank 0's links to its followers: rank 1's, or ranks 1-3's on the four-node split.
     pub fn followers(m: *const Model) []const ?link.Link {
         return m.fan.links[0 .. m.world - 1];
+    }
+
+    /// From here on a peer rank that stops stops this one too, with a line that names it (link.Watch): rank 0 watches
+    /// its followers, a follower rank 0. The server's rank 0 and the lane followers watch; rank 0's done (Lanes.deinit),
+    /// a follower reading it (follow) and close end the watch.
+    pub fn watchPeers(m: *Model) !void {
+        if (m.world < 2 or m.watch.thread != null) return;
+        m.watch = .{ .rank = m.rank };
+        if (m.rank == 0) {
+            for (m.followers(), 1..) |l, r| if (l) |x| try m.watch.add(x, @intCast(r));
+        } else try m.watch.add(m.peer(), 0);
+        try m.watch.start();
+    }
+
+    /// Ends watchPeers' watch: this process ends its links itself now.
+    pub fn unwatch(m: *Model) void {
+        m.watch.stop();
     }
 
     pub fn drafting(m: *const Model) bool {

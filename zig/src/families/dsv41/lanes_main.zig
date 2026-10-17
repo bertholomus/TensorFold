@@ -170,7 +170,11 @@ pub fn main(init: std.process.Init) !u8 {
             }
             w.flush() catch {};
         };
+        // rank 0 stopping stops this rank too (a wait on it inside an exchange would never end)
+        m.watchPeers() catch |err| std.debug.print("dsv41: rank {d} cannot watch rank 0: {s}\n", .{ o.rank, @errorName(err) });
         dsv41.lanes.follow(gpa, m) catch |err| {
+            // (on stderr too: rank 0's log then names this rank, and this line says why)
+            std.debug.print("dsv41: rank {d} stopped following rank 0: {s}\n", .{ o.rank, @errorName(err) });
             try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });
             try w.flush();
             return 1;

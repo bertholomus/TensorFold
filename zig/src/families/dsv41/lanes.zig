@@ -409,7 +409,10 @@ pub const Lanes = struct {
             self.gpa.destroy(sn);
         }
         self.snaps.deinit(self.gpa);
-        if (self.peer != null) self.send(.done) catch {};
+        if (self.peer != null) {
+            self.m.unwatch(); // (the followers end on done: their links close)
+            self.send(.done) catch {};
+        }
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
@@ -1227,7 +1230,10 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     b.free();
                 }
             },
-            .done => return,
+            .done => {
+                m.unwatch(); // (rank 0 closes its link after done)
+                return;
+            },
         }
     }
 }
