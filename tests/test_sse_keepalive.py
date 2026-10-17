@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -78,7 +79,9 @@ def test_zero_turns_it_off(tmp_path, monkeypatch):
 
 
 def test_off_unless_set():
+    here = Path(__file__).parent              # the child imports this checkout's src, installed or not
     env = {k: v for k, v in os.environ.items() if k != "TF_SSE_KEEPALIVE_S"}
+    env["PYTHONPATH"] = os.pathsep.join([str(here.parent / "src"), str(here)])
     out = subprocess.run([sys.executable, "-c", "from tensorfold.cuda import http; print(http.KEEPALIVE)"], env=env,
                          capture_output=True, text=True, timeout=120, check=True)
     assert float(out.stdout.split()[-1]) == 0.0
