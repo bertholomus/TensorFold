@@ -5,6 +5,7 @@ request's keys. Off, and wherever the window stays at or above the cut, the choi
 import pytest
 
 pytest.importorskip("torch")
+pytest.importorskip("triton")
 
 from tensorfold.families.deepseek_v41.cuda import model
 

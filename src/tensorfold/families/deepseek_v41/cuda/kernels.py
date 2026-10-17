@@ -1431,10 +1431,11 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
                 comp, idx: torch.Tensor | None, pos: torch.Tensor, scale: float, window: int,
                 out: torch.Tensor | None = None, wbase: torch.Tensor | None = None,
                 cbase: torch.Tensor | None = None, ring_rows: int | None = None,
-                rot: tuple | None = None) -> torch.Tensor:
+                rot: tuple | None = None, one_split: bool = False) -> torch.Tensor:
     """q [R, H, HD] bf16 -> o [R, H, HD]; window keys from ``wsrc`` (a ring: slot = position % size; else linear from
     position wlo[0]); compressed keys comp[idx[r, j]] (idx -1 = none). ``comp`` is a bf16 [N, HD] tensor or a packed
-    FP4 pair (codes uint8 [N, HD/2], E4M3 scales uint8 [N, HD/16])."""
+    FP4 pair (codes uint8 [N, HD/2], E4M3 scales uint8 [N, HD/16]). ``one_split``: a few rows of a prompt chunk run
+    as one split, so they get the bits the same rows get in a longer chunk."""
 
     rows, h, hd = q.shape
     if out is None:
@@ -1445,7 +1446,7 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
     codes, scales = (comp if packed else (comp, None)) if has else (wsrc, None)
     n_idx = idx.shape[1] if has else 0
     # decode / verify windows split the keys (parallelism for a few rows); prompt chunks have rows enough
-    sp = ATTN_SPLITS if rows <= DECODE_ROWS else 1
+    sp = ATTN_SPLITS if rows <= DECODE_ROWS and not one_split else 1
     groups = h // hb
     final = sp == 1
     picks = triton.cdiv(n_idx, bn) if has else 0

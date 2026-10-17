@@ -1051,7 +1051,10 @@ class Model:
                 shared["topk"] = cidx
             cidx = shared["topk"]
             comp = sc.comp[src]
-        o = K.sparse_attn(q, lay.sink, wsrc, wlo, ring_mode, comp, cidx, pos, hd ** -0.5, c.window)
+        # a chunk the floor sends to the gather path runs as one split, as a longer chunk's rows do (its bits)
+        one_split = not ring_mode and n <= K.DECODE_ROWS
+        o = K.sparse_attn(q, lay.sink, wsrc, wlo, ring_mode, comp, cidx, pos, hd ** -0.5, c.window,
+                          one_split=one_split)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
         if not ring_mode:
             keep = min(n, R)
