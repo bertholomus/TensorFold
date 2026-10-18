@@ -509,6 +509,14 @@ pub const Model = struct {
         m.watch.stop();
     }
 
+    /// Whether this rank's GPU context has failed for good: after a fault in a kernel (an illegal address, a trap)
+    /// every later call returns that fault, the stream's query too (which logs it); a context that survived a failed
+    /// call answers done or busy.
+    pub fn contextFailed(m: *Model) bool {
+        _ = m.stream.done() catch return true;
+        return false;
+    }
+
     pub fn drafting(m: *const Model) bool {
         return m.dr != null;
     }

@@ -1075,9 +1075,13 @@ pub fn survivals(conf: []const f32, out: []f64) void {
 }
 
 /// A primitive this rank refused: rank 0 runs the same one on the same inputs and refuses it at the same step (its
-/// request ends with the error), so the follower reports it and takes the next frame instead of ending.
-fn refused(err: anyerror) void {
+/// request ends with the error), so the follower reports it and takes the next frame instead of ending. A GPU fault
+/// (an illegal address, a trap) is this rank's alone: rank 0 runs on into its next exchange and waits there for this
+/// rank, whose context runs nothing after the fault (tp2 #25). So a CUDA failure that left the context failed ends
+/// the follower: its link closes, and rank 0's watch stops rank 0 with a line that names this rank.
+fn refused(m: anytype, err: anyerror) error{GpuContextFailed}!void {
     std.debug.print("{{\"follow_refused\": \"{s}\"}}\n", .{@errorName(err)});
+    if (err == error.CudaFailed and m.contextFailed()) return error.GpuContextFailed;
 }
 
 /// A follower's verify times with Model.prof (a profile on ranks 1-3: rounds, issue and wall ns summed).
@@ -1133,7 +1137,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
-                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                m.fillBegin(slot, @intCast(base)) catch |err| try refused(m, err);
                 m.fill_seq = seqs[slot].items;
             },
             .fill_chunk => {
@@ -1142,7 +1146,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
                 if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
-                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
+                _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| try refused(m, err);
             },
             .verify => {
                 const nw = try r.int(u32);
@@ -1158,7 +1162,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     wins[k] = .{ .slot = s, .base = base, .end = end, .start = start, .absorb = absorb, .ids = win_ids[k].items };
                 }
                 const rows = try built.build(gpa, &seqs, wins[0..nw]);
-                m.verify(rows, built.absorb[0..nw]) catch |err| refused(err);
+                m.verify(rows, built.absorb[0..nw]) catch |err| try refused(m, err);
                 if (m.prof) {
                     follow_prof.rounds += 1;
                     follow_prof.enqueue += m.t_enqueue;
@@ -1177,7 +1181,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                     q0[i] = try r.int(i64);
                     slots[i] = try r.int(i64);
                 }
-                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| refused(err);
+                m.pass(tokens[0..n], q0[0..n], slots[0..n], steps) catch |err| try refused(m, err);
             },
             .fill_images => {
                 const count = try r.int(u32);
@@ -1196,7 +1200,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (off != img_rows.items.len or off + piece.len > total or piece.len == 0) return error.BadFrame;
                 try img_rows.appendSlice(gpa, piece);
                 if (img_rows.items.len == total) {
-                    m.setImages(spans.items, img_rows.items) catch |err| refused(err);
+                    m.setImages(spans.items, img_rows.items) catch |err| try refused(m, err);
                     img_rows.clearRetainingCapacity();
                 }
             },
@@ -1207,7 +1211,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 var b = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
                 m.snapCopy(s, b.ptr, true) catch |err| {
                     b.free();
-                    refused(err);
+                    try refused(m, err);
                     continue;
                 };
                 try kept.put(gpa, id, b);
@@ -1220,8 +1224,8 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const to: usize = @intCast(try r.int(u64));
                 const at: usize = @intCast(try r.int(u64));
                 const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
-                if (from != to) m.copyExtent(from, to, at) catch |err| refused(err);
-                m.snapCopy(s, b.ptr, false) catch |err| refused(err);
+                if (from != to) m.copyExtent(from, to, at) catch |err| try refused(m, err);
+                m.snapCopy(s, b.ptr, false) catch |err| try refused(m, err);
             },
             .snap_drop => {
                 const id = try r.int(u64);
@@ -1236,6 +1240,26 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             },
         }
     }
+}
+
+test "a CUDA failure that left the context failed ends the follower, any other refusal does not" {
+    const Probe = struct {
+        failed: bool,
+        asked: usize = 0,
+        pub fn contextFailed(p: *@This()) bool {
+            p.asked += 1;
+            return p.failed;
+        }
+    };
+    var gone: Probe = .{ .failed = true };
+    try std.testing.expectError(error.GpuContextFailed, refused(&gone, error.CudaFailed));
+    var alive: Probe = .{ .failed = false }; // a failed call the context survived: refused as before
+    try refused(&alive, error.CudaFailed);
+    try std.testing.expectEqual(@as(usize, 1), alive.asked);
+    var other: Probe = .{ .failed = true }; // rank 0 refuses these too: the context is not asked
+    try refused(&other, error.MissingTritonVariant);
+    try refused(&other, error.OutOfDeviceMemory);
+    try std.testing.expectEqual(@as(usize, 0), other.asked);
 }
 
 test "draft chances are the prefix survivals chooseK sums" {
