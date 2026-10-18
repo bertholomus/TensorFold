@@ -424,7 +424,7 @@ pub fn main(init: std.process.Init) !u8 {
         var devices: std.ArrayList([]const u8) = .empty;
         var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
         while (dit.next()) |d| try devices.append(a, d);
-        rdma_rings = try dsv41.ring2d.Rings.open(gpa, io, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 5 }, &comm, stream);
+        rdma_rings = try dsv41.ring2d.Rings.open(gpa, io, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = dsv41.rdma.rdmaGid() }, &comm, stream);
         two.?.rings = &rdma_rings.?;
     }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };

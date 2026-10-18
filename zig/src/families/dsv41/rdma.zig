@@ -28,6 +28,12 @@ const host_register_devicemap = 0x02;
 
 pub const Error = error{ VerbsFailed, PostFailed, BadInfo, TooLarge, Failed, NoHostRegister } || cuda.Error || fabric.verbs.Error || std.posix.MMapError || std.Thread.SpawnError;
 
+/// TF_RDMA_GID: the RDMA rings' source GID index (the port's RoCE v2 IPv4 entry); 5 as served on the recipe authors' nodes.
+pub fn rdmaGid() u8 {
+    const v = std.c.getenv("TF_RDMA_GID") orelse return 5;
+    return std.fmt.parseInt(u8, std.mem.span(v), 10) catch 5;
+}
+
 /// The Python build's switches, with their defaults (TF_RDMA_SLOTS, TF_RDMA_STAGE_BLOCKS, ..., TF_RDMA_PDL as served).
 pub const Settings = struct {
     slots: u32 = 4,
