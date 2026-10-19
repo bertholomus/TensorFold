@@ -41,6 +41,7 @@ pub const Engine = struct {
     filling: ?*Stream = null, // a stream whose prompt pass runs in pieces between the others' rounds (not live yet)
     fill_chunks: u32 = 0, // a piece's chunks (backend prefill_part; 0: a prompt pass runs whole inside addStream)
     fill_rounds: u32 = 4, // the live streams' rounds between two pieces
+    fill_first: u32 = 0, // the first piece's chunks (0: fill_chunks): a short prompt then runs whole
     rounds_since: u32 = 0,
 
     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
@@ -87,7 +88,7 @@ pub const Engine = struct {
         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
         if (e.filling != null) return error.FillBusy;
         if (e.fill_chunks > 0 and e.backend.vtable.prefill_part != null and e.activeCount() > 0) {
-            if (!try e.piece(s)) {
+            if (!try e.piece(s, if (e.fill_first > 0) e.fill_first else e.fill_chunks)) {
                 e.filling = s;
                 e.rounds_since = 0;
                 return;
@@ -99,8 +100,8 @@ pub const Engine = struct {
         try e.started(s);
     }
 
-    fn piece(e: *Engine, s: *Stream) !bool {
-        return e.backend.vtable.prefill_part.?(e.backend.ptr, s, e.fill_chunks) catch |err| {
+    fn piece(e: *Engine, s: *Stream, chunks: u32) !bool {
+        return e.backend.vtable.prefill_part.?(e.backend.ptr, s, chunks) catch |err| {
             if (err == error.Cancelled) e.backend.release(s);
             return err;
         };
@@ -113,7 +114,7 @@ pub const Engine = struct {
         if (e.activeCount() > 0 and e.rounds_since < e.fill_rounds) return false;
         _ = e.arena.reset(.retain_capacity);
         e.rounds_since = 0;
-        const done = e.piece(s) catch |err| {
+        const done = e.piece(s, e.fill_chunks) catch |err| {
             e.filling = null;
             return err;
         };

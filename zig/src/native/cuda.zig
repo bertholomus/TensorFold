@@ -192,9 +192,10 @@ const Host = struct {
         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
         errdefer h.core.deinit();
         // TF_FILL_CHUNKS=N: a prompt pass runs N chunks at a time while other streams decode, TF_FILL_ROUNDS of their
-        // rounds between (a backend with prefill_part; unset or 0: each pass whole, the others waiting)
+        // rounds between, its first piece TF_FILL_FIRST chunks (a backend with prefill_part; unset or 0: each pass whole)
         h.core.fill_chunks = envInt("TF_FILL_CHUNKS") orelse 0;
         h.core.fill_rounds = envInt("TF_FILL_ROUNDS") orelse h.core.fill_rounds;
+        h.core.fill_first = envInt("TF_FILL_FIRST") orelse 0; // the first piece's chunks: a prompt that short runs whole
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
