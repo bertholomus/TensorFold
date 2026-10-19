@@ -485,7 +485,8 @@ pub const Lanes = struct {
         try seq.resize(gpa, len);
         for (seq.items, ids) |*q, id| q.* = @intCast(id);
         // images: each span's positions dead in the sequence (negative: no Engram n-gram reaches into or across one),
-        // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start
+        // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start; an image
+        // the kept state holds whole needs no rows (the pass resumes past it)
         var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
         defer spans.deinit(gpa);
         var rows: std.ArrayList(u8) = .empty;
@@ -493,6 +494,7 @@ pub const Lanes = struct {
         if (s.lane_images.len > 0) {
             const image_id = m.cfg.image_token orelse return error.NoVision;
             const row_bytes = m.cfg.hidden * 2;
+            const resume_at: usize = if (kept) |sn| sn.at else 0;
             var at_row: usize = 0;
             for (s.lane_images) |img| {
                 if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
@@ -500,6 +502,7 @@ pub const Lanes = struct {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                     q.* = -1;
                 }
+                if (@as(usize, img.at) + img.tokens <= resume_at) continue;
                 if (img.rows) {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
