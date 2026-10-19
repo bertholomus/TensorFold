@@ -476,6 +476,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .structures = loaded.backend.vtable.first_masked != null,
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision) else null,
         .lane_vision = if (@hasField(@TypeOf(loaded), "lane_vision")) loaded.lane_vision else null,
+        .fill_rounds = if (@hasField(@TypeOf(loaded), "fill_rounds")) loaded.fill_rounds else 0,
         .efforts = familyEfforts(F),
     }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;

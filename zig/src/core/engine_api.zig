@@ -249,6 +249,9 @@ pub const Info = struct {
     prompt_logprobs: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
+    /// The live streams' rounds the lane host runs between two steps of a prompt pass (0: a step every turn of its
+    /// loop, a round between); none waits while no stream decodes.
+    fill_rounds: u32 = 0,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
     /// The policy the engine runs under, one line (`/health` shows it); empty: none.

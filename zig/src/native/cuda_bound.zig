@@ -110,6 +110,7 @@ pub fn vtable(comptime H: type, v: be.Backend.VTable) be.Backend.VTable {
         }.f else null,
         .prompt_rows = v.prompt_rows,
         .reports_fill = v.reports_fill, // the family's fill-progress reporting reaches the CUDA wrapper
+        .prefill_one = v.prefill_one, // and its one pass at a time
         .release = struct {
             fn f(p: *anyopaque, s: *lanes.Stream) void {
                 const x = H.bind(p);
@@ -128,7 +129,7 @@ test "every entry the family's backend gives is forwarded, and none it leaves ou
     };
     var fake: lanes.fake.Fake = .{ .gpa = std.testing.allocator, .prefill_chunks = 3 };
     defer fake.deinit();
-    for ([_]be.Backend{ fake.backend(), fake.stepped() }) |b| {
+    for ([_]be.Backend{ fake.backend(), fake.stepped(), fake.steppedOne() }) |b| {
         const w = vtable(H, b.vtable.*);
         const info = @typeInfo(be.Backend.VTable).@"struct";
         inline for (info.field_names, info.field_types) |name, T| {

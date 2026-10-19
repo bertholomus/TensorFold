@@ -32,6 +32,7 @@ pub const LaneHost = struct {
     queued: std.ArrayList(*Job) = .empty,
     admitted: std.ArrayList(*Job) = .empty,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
+    fill_since: u32 = 0, // the rounds since a prompt pass's last step (Info.fill_rounds)
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
@@ -296,6 +297,12 @@ pub const LaneHost = struct {
             h.unlock();
             return false;
         }
+        // a backend that holds one prompt pass at a time admits the next request once the pass ends: its lookup then
+        // finds what that pass kept, and nothing keeps before its own pass, as with a pass run whole
+        if (h.core.backend.vtable.prefill_one and h.filling.items.len > 0) {
+            h.unlock();
+            return false;
+        }
         if (h.full_wait) |n| {
             const active = h.core.activeCount();
             if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
@@ -403,10 +410,13 @@ pub const LaneHost = struct {
     }
 
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
+    /// A pass that began waits out Info.fill_rounds of those rounds between two of its steps (none when none decodes).
     fn fillOne(h: *LaneHost) void {
         if (h.filling.items.len == 0) return;
         const at = fill.next(h);
         const job = h.filling.items[at];
+        if (job.fill_began and h.fill_since < h.info_.fill_rounds and h.core.activeCount() > 0) return;
+        h.fill_since = 0;
         const first = !job.fill_began;
         job.fill_began = true;
         const done = h.core.fillStream(&job.stream, first) catch |e| {
@@ -416,6 +426,11 @@ pub const LaneHost = struct {
                     fill.unfill(h, job);
                     break :blk h.requeue(job);
                 },
+                // a pass the pool cannot place yet while other streams run waits for one of them, as admitOne's does
+                error.ContextFull => if (first and h.core.activeCount() > 0) blk: {
+                    fill.unfill(h, job);
+                    break :blk h.requeueFull(job);
+                } else h.drop(job, h.words(e)),
                 else => h.drop(job, h.words(e)),
             };
             return;
@@ -621,6 +636,7 @@ pub const LaneHost = struct {
                 ends.failAll(h, @errorName(e));
                 continue;
             };
+            h.fill_since +|= 1;
             var i: usize = 0;
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];

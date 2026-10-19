@@ -102,6 +102,9 @@ pub const Backend = struct {
         prompt_rows: bool = false,
         /// The backend stores `Stream.fill_at` as its pass runs: the status reader may count its fill totals.
         reports_fill: bool = false,
+        /// `prefill_step` holds one prompt pass at a time: while a pass fills, the host admits no other request, so
+        /// the next one comes in (and looks up its kept state) once the pass ends.
+        prefill_one: bool = false,
         /// The stream left the rounds: free its caches and held drafts.
         release: *const fn (ptr: *anyopaque, s: *Stream) void,
     };
