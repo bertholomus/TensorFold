@@ -152,17 +152,31 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
-/// The first extent of `size` in [0, cap) clear of `live` and of the kept states ([base, at, end] each): clear of their
-/// whole extents (rows and tail) where one fits so, else of their rows only.
+/// Room left past a kept state's extent while placements fit so, for its conversation's next turn to resume in place.
+pub const growth_rows = 16 * model.chunk_rows;
+
+/// The first fit of `size` clear of `live` and of kept extents plus growth_rows, else of their extents, else of their rows.
 pub fn placeSoft(gpa: std.mem.Allocator, live: []const [2]usize, kept: []const [3]usize, size: usize, cap: usize) !?usize {
     var used: std.ArrayList([2]usize) = .empty;
     defer used.deinit(gpa);
     try used.appendSlice(gpa, live);
+    for (kept) |k| try used.append(gpa, .{ k[0], @max(k[2], k[0] + k[1]) + growth_rows });
+    if (place(used.items, size, cap)) |b| return b;
+    used.shrinkRetainingCapacity(live.len);
     for (kept) |k| try used.append(gpa, .{ k[0], @max(k[2], k[0] + k[1]) });
     if (place(used.items, size, cap)) |b| return b;
     used.shrinkRetainingCapacity(live.len);
     for (kept) |k| try used.append(gpa, .{ k[0], k[0] + k[1] });
     return place(used.items, size, cap);
+}
+
+test "a placement leaves a kept state room to grow while one fits so" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    const kept = [_][3]usize{.{ 0, 48 * c, 50 * c }}; // rows [0, 48c), its stream's extent to 50c
+    try std.testing.expectEqual(@as(?usize, 50 * c + growth_rows), try placeSoft(gpa, &.{}, &kept, 4 * c, 128 * c));
+    // no room past the growth: flush against the extent, as before
+    try std.testing.expectEqual(@as(?usize, 50 * c), try placeSoft(gpa, &.{}, &kept, 4 * c, 50 * c + growth_rows));
 }
 
 test "a kept state's tail stays free while a placement fits elsewhere" {
@@ -273,6 +287,13 @@ pub const Snap = struct {
     wanted: u64 = 0, // when a request first waited for the live stream that holds these rows (placeKept; 0: none)
     end: usize = 0, // the extent end of the stream that kept it (placement holds [base, end) back while room allows)
 };
+
+/// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
+const note_rows = 32 * model.chunk_rows;
+
+fn noteStale(sn: *const Snap, why: []const u8) void {
+    if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
+}
 
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
@@ -444,6 +465,7 @@ pub const Lanes = struct {
             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
         }
         if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+            if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} found no room to move to ({d} positions); the prompt runs from 0", .{ sn.at, sn.base, size });
             kept = null;
             s.reuse_failed = true;
         };
@@ -772,13 +794,14 @@ pub const Lanes = struct {
             const victim = for (self.snaps.items) |sn| {
                 if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
+            noteStale(victim, "a placement needed its room (oldest first)");
             victim.stale = true;
         }
     }
 
-    /// Whether a kept state other than `except` and its siblings (the same stream's other marks) has rows in [lo, hi).
+    /// Whether a kept state other than `except` and its shorter siblings has rows in [lo, hi); a longer one may be another conversation's.
     fn keptOver(self: *const Lanes, lo: usize, hi: usize, except: *const Snap) bool {
-        for (self.snaps.items) |sn| if (sn != except and !sn.stale and sn.base != except.base and sn.base < hi and lo < sn.base + sn.at) return true;
+        for (self.snaps.items) |sn| if (sn != except and !sn.stale and (sn.base != except.base or sn.at > except.at) and sn.base < hi and lo < sn.base + sn.at) return true;
         return false;
     }
 
@@ -792,6 +815,7 @@ pub const Lanes = struct {
     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
     fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
         for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
+            if (!sn.stale) noteStale(sn, "a stream writes over its rows");
             sn.stale = true;
         };
     }
@@ -1085,7 +1109,8 @@ test "retained histories preserve their replay and output reservations (PR #10: 
     var snapshots: [8]Snap = undefined;
     for (&snapshots, 0..) |*sn, i| {
         const base = try ln.placeKept(&.{}, 102400, null);
-        try std.testing.expectEqual(i * 102400, base);
+        try std.testing.expectEqual(i * (102400 + growth_rows), base); // each with room to grow while the pool allows
+
         sn.* = .{ .id = i, .at = 98304, .base = base, .end = base + 102400, .buf = undefined };
         try ln.snaps.append(std.testing.allocator, sn);
     }
@@ -1095,13 +1120,28 @@ test "retained histories preserve their replay and output reservations (PR #10: 
         ln.staleOver(sn.base + sn.at, sn.end, sn);
     }
     for (snapshots) |sn| try std.testing.expect(!sn.stale);
-    // A larger continuation relocates into free room instead of overwriting the next cached prefix.
-    try std.testing.expect(ln.keptOver(snapshots[0].at, 104448, &snapshots[0]));
-    try std.testing.expectEqual(@as(usize, 819200), try ln.placeKept(&.{}, 104448, null));
+    // a larger continuation resumes in place within its room to grow
+    try std.testing.expect(!ln.keptOver(snapshots[0].at, 104448, &snapshots[0]));
+    // past that room it would overwrite the next cached prefix, so it relocates
+    try std.testing.expect(ln.keptOver(snapshots[0].at, 102400 + growth_rows + 2048, &snapshots[0]));
     // At genuine capacity pressure, kept states may still be evicted; a live range never is.
     const live = [_][2]usize{.{ 0, 102400 }};
     try std.testing.expectEqual(@as(usize, 102400), try ln.placeKept(&live, 409600, null));
-    try std.testing.expect(ln.snaps.items[1].stale and ln.snaps.items[4].stale);
-    try std.testing.expect(!ln.snaps.items[5].stale);
+    try std.testing.expect(ln.snaps.items[1].stale and ln.snaps.items[3].stale);
+    try std.testing.expect(!ln.snaps.items[4].stale);
     try std.testing.expect(!ln.snaps.items[0].stale); // its rows lie in the live stream: that stream holds the room
+}
+
+test "a prefix two conversations share: the second one resuming it in place would stale the first one's later marks" {
+    var m: Model = undefined;
+    m.pool_cap = 1 << 20;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer ln.snaps.deinit(std.testing.allocator);
+    // the first conversation's extent holds the shared prefix's mark (system prompt and tools) and its own later one
+    var shared: Snap = .{ .id = 0, .at = 18432, .base = 0, .end = 430080, .buf = undefined };
+    var later: Snap = .{ .id = 1, .at = 395264, .base = 0, .end = 430080, .buf = undefined };
+    try ln.snaps.append(std.testing.allocator, &shared);
+    try ln.snaps.append(std.testing.allocator, &later);
+    try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
+    try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
 }
