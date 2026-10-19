@@ -12,6 +12,11 @@ rank's own slice copied while the writes are on the wire, unrolled ring loads; T
 TF_RDMA_STAGE_FENCE / TF_RDMA_OWN_EARLY / TF_RDMA_COLLECT_UNROLL = 0 each restore c100's way. TF_RDMA_SLOTS (default 4)
 sets the ring slots (2 halves the pinned rings; any count >= 2 is safe: a rank stages gather q + 2 only after its own
 collect of q + 1, which needs the peer's data of q + 1, sent after the peer's collect of q).
+
+v6: quiet, the proxy thread naps instead of spinning a core forever. Once TF_RDMA_IDLE_S (default 2; 0: never) pass
+with nothing staged or completed it sleeps TF_RDMA_NAP_US (default 100) between looks, and the next doorbell or
+completion has it spin again: a decode round's gathers never see a nap, the first gather after a quiet spell waits one
+at most (``RdmaGather.idle_stats``: naps taken, wakes from them).
 """
 
 from __future__ import annotations
@@ -24,13 +29,18 @@ from pathlib import Path
 
 import torch
 
+# TF_RDMA_IDLE_S (default 2; 0: the proxy never naps): the quiet spell after which the proxy naps; TF_RDMA_NAP_US
+# (default 100): a nap
+IDLE_S = max(0.0, float(os.environ.get("TF_RDMA_IDLE_S") or 2.0))
+NAP_US = max(1, int(os.environ.get("TF_RDMA_NAP_US") or 100))
+
 
 @lru_cache(maxsize=1)
 def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_rdma_gather_v5", sources=[str(here / "rdma_gather.cu")],
+    return load(name="tensorfold_rdma_gather_v6", sources=[str(here / "rdma_gather.cu")],
                 extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
 
 
@@ -73,7 +83,7 @@ class RdmaGather:
         try:
             if slots < 2:
                 raise ValueError(f"TF_RDMA_SLOTS must be at least 2 (got {slots})")
-            self.h = ext.create(rank, world, self.max_bytes, slots, self.devices, gid, cpu)
+            self.h = ext.create(rank, world, self.max_bytes, slots, self.devices, gid, cpu, int(IDLE_S * 1e6), NAP_US)
             info = pickle.dumps((ext.local_info(self.h), slots, self.max_bytes))
         except Exception as exc:           # noqa: BLE001  (published, so every rank refuses together)
             error, info = f"{type(exc).__name__}: {exc}", b""
@@ -108,6 +118,11 @@ class RdmaGather:
 
     def failure(self) -> str:
         return self.ext.failure(self.h)
+
+    def idle_stats(self) -> tuple:
+        """(the quiet spells its proxy went to napping in, the wakes from them): host memory only, no CUDA call."""
+
+        return tuple(self.ext.idle_stats(self.h))
 
     def abort(self, why: str) -> None:
         """A peer is gone: every gather on this rank (captured ones too) stops waiting and returns at once."""

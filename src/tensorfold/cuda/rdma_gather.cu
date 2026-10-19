@@ -25,6 +25,12 @@
 // - TF_RDMA_OWN_EARLY (default 1): the staging kernel copies this rank's own slice to the output after the doorbell,
 //   while the writes are on the wire, so the collecting kernel copies only the peers' slices after its wait.
 // - TF_RDMA_COLLECT_UNROLL (default 1): the collecting kernel keeps up to four ring loads in flight a thread.
+//
+// v6: quiet, the proxy naps. Once ``idle_us`` passes with nothing staged or completed it sleeps ``nap_us`` between
+// looks (its timer slack 1 us, so a nap is about that long), and the first doorbell or completion has it spin again. A
+// spinning proxy is a core at 100% on each rank for as long as the engine runs, on boxes whose CPU and GPU share one
+// package's heat; a decode round's gathers come microseconds apart, so they never see a nap, and the first gather after
+// a quiet spell waits at most one (``idle_stats``: naps taken, wakes from them). ``idle_us`` 0: it never naps.
 
 #include <torch/extension.h>
 #include <pybind11/stl.h>
@@ -36,8 +42,10 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <atomic>
 #include <cstring>
@@ -120,6 +128,8 @@ struct Gather {
     std::atomic<bool> running{false};
     std::atomic<int> failed{0};
     char why[256] = {0};
+    int64_t idle_us = 0, nap_us = 100;    // the quiet spell after which the proxy naps, and a nap (0: never naps)
+    std::atomic<uint64_t> naps{0}, wakes{0};
 
     ~Gather() {
         running.store(false);
@@ -292,8 +302,14 @@ void proxy_loop(Gather* gp) {
             if (g.nics[d].qps[p]) owner.push_back({g.nics[d].qps[p]->qp_num, p});
     ibv_wc wc[64];
     const volatile uint64_t* doorbell = g.doorbell;
+    const bool naps = g.idle_us > 0;
+    if (naps) prctl(PR_SET_TIMERSLACK, 1000UL, 0, 0, 0);   // (a nap of nap_us, not the default slack's 50 us more)
+    auto quiet_since = std::chrono::steady_clock::now();
+    uint64_t quiet = 0;                                    // loops with nothing done since the last thing done
+    bool drowsy = false;
     while (g.running.load(std::memory_order_relaxed)) {
         const uint64_t ring = *doorbell;
+        bool busy = posted < ring;
         while (posted < ring) {
             const uint64_t q = posted + 1;
             const int slot = (int)(q % g.slots);
@@ -331,6 +347,7 @@ void proxy_loop(Gather* gp) {
                 fail(g, "ibv_poll_cq failed");
                 return;
             }
+            busy = busy || k > 0;
             for (int i = 0; i < k; ++i) {
                 if (wc[i].status != IBV_WC_SUCCESS) {
                     fail(g, std::string("RDMA completion: ") + ibv_wc_status_str(wc[i].status));
@@ -369,6 +386,24 @@ void proxy_loop(Gather* gp) {
                     if (++done[slot] == (g.world - 1) * nd) __atomic_store_n(g.sent + slot, q, __ATOMIC_RELEASE);
                 }
             }
+        }
+        if (!naps) continue;
+        if (busy) {
+            if (drowsy) g.wakes.fetch_add(1, std::memory_order_relaxed);
+            drowsy = false;
+            quiet = 0;
+            continue;
+        }
+        if (drowsy) {
+            std::this_thread::sleep_for(std::chrono::microseconds(g.nap_us));
+            continue;
+        }
+        if (++quiet == 1) {
+            quiet_since = std::chrono::steady_clock::now();    // (a quiet spell starts)
+        } else if ((quiet & 1023) == 0 &&
+                   std::chrono::steady_clock::now() - quiet_since > std::chrono::microseconds(g.idle_us)) {
+            drowsy = true;
+            g.naps.fetch_add(1, std::memory_order_relaxed);
         }
     }
 }
@@ -432,7 +467,7 @@ Nic open_nic(const std::string& name, Gather& g, int world, int rank) {
 }
 
 int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, const std::vector<std::string>& devices,
-               int64_t gid_index, int64_t cpu) {
+               int64_t gid_index, int64_t cpu, int64_t idle_us, int64_t nap_us) {
     TORCH_CHECK(world >= 2 && rank >= 0 && rank < world, "rdma gather: rank ", rank, " of ", world);
     TORCH_CHECK(max_bytes > 0 && max_bytes % 64 == 0, "rdma gather: max_bytes must be a positive multiple of 64");
     TORCH_CHECK(!devices.empty(), "rdma gather: name at least one RDMA device");
@@ -443,6 +478,8 @@ int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, co
     g->max_bytes = (size_t)max_bytes;
     g->gid_index = (int)gid_index;
     g->cpu = (int)cpu;
+    g->idle_us = std::max<int64_t>(0, idle_us);
+    g->nap_us = std::max<int64_t>(1, nap_us);
     const size_t send_b = (size_t)slots * max_bytes, recv_b = (size_t)slots * world * max_bytes;
     const size_t meta_b = ((size_t)slots * world + 1 + 2 * (size_t)slots + 1) * 8;
     g->host_reg = env_int("TF_RDMA_HOST_REG", 1) ? 1 : 0;
@@ -589,6 +626,12 @@ void abort_all(int64_t h, const std::string& why) {
 
 void configure(int64_t h, bool probing) { get(h).probing = probing; }
 
+// (quiet spells the proxy went to napping in, wakes from them): the idle back-off's count. Host memory only, no CUDA.
+std::vector<int64_t> idle_stats(int64_t h) {
+    Gather& g = get(h);
+    return {(int64_t)g.naps.load(), (int64_t)g.wakes.load()};
+}
+
 // (stage, doorbell -> every flag, copy-out) mean ns over the probed gathers, and their count
 std::vector<double> probes(int64_t h) {
     Gather& g = get(h);
@@ -656,5 +699,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("abort", &abort_all);
     m.def("configure", &configure);
     m.def("probes", &probes);
+    m.def("idle_stats", &idle_stats);
     m.def("gather", &gather);
 }
