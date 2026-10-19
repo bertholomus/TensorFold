@@ -100,8 +100,7 @@ pub const LaneHost = struct {
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.request.lane_images.len > 0) return; // a kept state is keyed by tokens: a lane image's are its placeholder's
-            if (job.host.cache) |store| _ = store.keepBorn(job.request.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request));
+            if (job.host.cache) |store| _ = store.keepBorn(job.request.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request)); // a lane image's rows keyed by its digest
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -329,7 +328,7 @@ pub const LaneHost = struct {
         if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.cancel(job); // other work came first: it never ran
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (r.lane_images.len == 0) if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+        if (keyed(r)) if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -460,6 +459,12 @@ pub const LaneHost = struct {
         return if (h.decoded_rows) r.decode_spans else &.{};
     }
 
+    /// A request the prompt cache can key: a lane image's positions hold its placeholder, so its rows count only with
+    /// a key that spells them (the server's, one word a position).
+    fn keyed(r: *const Request) bool {
+        return r.lane_images.len == 0 or r.cache_key.len == r.prompt.len;
+    }
+
     /// A prompt-only pass on a `warm_turns` engine: the backend prefills, the cache keeps its end (a mark, if keyed on)
     fn warmPass(h: *LaneHost, job: *Job, began: i96) bool {
         const be = h.core.backend;
@@ -469,7 +474,7 @@ pub const LaneHost = struct {
             return h.cancel(job);
         };
         h.prefilled(job, began);
-        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0) store.keepBorn(job.request.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
+        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0 and keyed(job.request)) store.keepBorn(job.request.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
         be.release(&job.stream);
         h.remove(job);
         h.finish(job, .length, "");
