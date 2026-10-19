@@ -51,6 +51,8 @@ pub const Request = struct {
     prompt: []const u32,
     /// The prompt's images in order, each span inside the prompt (its positions hold the image token).
     images: []const Image = &.{},
+    /// The tokens the prompt cache matches, each image span spelled by its image's digest; empty: the prompt itself.
+    cache_key: []const u32 = &.{},
     max_tokens: u32,
     sampling: ?Sampling = null,
     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
@@ -76,6 +78,11 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+
+    /// What the prompt cache matches and keeps under: `cache_key`, or the prompt when it has none.
+    pub fn cacheKey(r: *const Request) []const u32 {
+        return if (r.cache_key.len > 0) r.cache_key else r.prompt;
+    }
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };

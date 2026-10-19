@@ -10,7 +10,8 @@ const api = @import("engine_api");
 const Value = json.Value;
 const Cx = errors.Cx;
 
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{} };
+/// With images, `cache_key` is what the prompt cache matches: the ids with each image span spelled by its digest.
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{} };
 
 pub const isTitle = messages_mod.isTitleRequest;
 
@@ -52,23 +53,26 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         .ids => |ids| return .{ .ids = ids },
     };
     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
-    if (input.images.len > 0) return spans(srv, cx, prompt, input.images); // (no kept history: the cache keys tokens)
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
+    if (input.images.len > 0) return spans(srv, cx, prompt, history_len, input.images);
     return .{ .ids = prompt, .history_len = history_len };
 }
 
 /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
 /// the payload the engine reads), the images in prompt order.
-fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) errors.Refused!Rendered {
+fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []const []const u8) errors.Refused!Rendered {
     const vision = srv.info.vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
     var out: std.ArrayList(u32) = .empty;
+    var key: std.ArrayList(u32) = .empty;
     var placed: std.ArrayList(api.Image) = .empty;
-    for (ids) |id| {
+    var history_extra: usize = 0;
+    for (ids, 0..) |id, i| {
         if (id != vision.token) {
             try out.append(cx.a, id);
+            try key.append(cx.a, id);
             continue;
         }
         const k = placed.items.len;
@@ -80,9 +84,34 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
         };
         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
+        try spellImage(cx.a, &key, prep.payload, prep.tokens);
+        if (i < history_len) history_extra += prep.tokens - 1;
     }
     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
-    return .{ .ids = out.items, .images = placed.items };
+    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
+}
+
+/// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's digest.
+fn spellImage(a: std.mem.Allocator, key: *std.ArrayList(u32), payload: []const u8, tokens: u32) !void {
+    const h = std.hash.Wyhash.hash(0, payload);
+    for (0..tokens) |j| try key.append(a, 0x8000_0000 | @as(u32, @truncate((h +% @as(u64, j) *% 0x9e37_79b9_7f4a_7c15) >> 33)));
+}
+
+test "an image span's key depends on the image and the position, never on the vocabulary" {
+    const a = std.testing.allocator;
+    var one: std.ArrayList(u32) = .empty;
+    defer one.deinit(a);
+    var same: std.ArrayList(u32) = .empty;
+    defer same.deinit(a);
+    var other: std.ArrayList(u32) = .empty;
+    defer other.deinit(a);
+    try spellImage(a, &one, "the same pixels", 64);
+    try spellImage(a, &same, "the same pixels", 64);
+    try spellImage(a, &other, "other pixels", 64);
+    try std.testing.expectEqualSlices(u32, one.items, same.items);
+    try std.testing.expect(!std.mem.eql(u32, one.items, other.items));
+    for (one.items) |id| try std.testing.expect(id >= 0x8000_0000);
+    try std.testing.expect(one.items[0] != one.items[1]);
 }
 
 /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
