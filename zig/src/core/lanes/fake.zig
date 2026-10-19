@@ -23,6 +23,7 @@ const Lane = struct {
     held: std.ArrayList(u32) = .empty, // drafts for the next round
     base: usize = 0, // the history length before the last verify
     rows: std.ArrayList(u32) = .empty, // the last verify's row tokens
+    pieces: usize = 0, // the prompt pass's chunks run so far (prefill_part)
 };
 
 pub const Fake = struct {
@@ -55,7 +56,7 @@ pub const Fake = struct {
     }
 
     pub fn backend(x: *Fake) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_part = prefillPart, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
     }
 
     fn self(ptr: *anyopaque) *Fake {
@@ -99,6 +100,18 @@ pub const Fake = struct {
 
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
         const x = self(ptr);
+        try x.open(s);
+        if (!try x.pieces(s, std.math.maxInt(usize))) unreachable;
+    }
+
+    /// The same pass, `chunks` of its prefill_chunks a call.
+    fn prefillPart(ptr: *anyopaque, s: *Stream, chunks: usize) anyerror!bool {
+        const x = self(ptr);
+        if (!x.lanes.contains(s)) try x.open(s);
+        return x.pieces(s, chunks);
+    }
+
+    fn open(x: *Fake, s: *Stream) !void {
         if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
         if (x.refuse_full > 0 and x.lanes.count() > 0 and !x.lanes.contains(s)) {
             x.refuse_full -= 1;
@@ -107,13 +120,20 @@ pub const Fake = struct {
         const got = try x.lanes.getOrPut(x.gpa, s);
         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
         got.value_ptr.* = .{};
-        const chunks = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
-        for (0..chunks) |chunk| {
+    }
+
+    fn pieces(x: *Fake, s: *Stream, chunks: usize) !bool {
+        const l = x.lanes.getPtr(s).?;
+        const total = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
+        var ran: usize = 0;
+        while (l.pieces < total and ran < chunks) : (ran += 1) {
             x.prefill_count += 1;
-            if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, chunk);
+            if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, l.pieces);
+            l.pieces += 1;
             if (s.isCancelled()) return error.Cancelled;
         }
-        const h = &got.value_ptr.history;
+        if (l.pieces < total) return false;
+        const h = &l.history;
         s.cached = 0;
         if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
             const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
@@ -124,6 +144,7 @@ pub const Fake = struct {
             try h.append(x.gpa, t);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
         }
+        return true;
     }
 
     /// A copy of the stream's cache at `at` tokens (the prompt pass stands there), for core/prompt_cache.zig.

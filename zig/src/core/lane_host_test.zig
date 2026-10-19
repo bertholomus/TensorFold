@@ -213,3 +213,88 @@ test "after a long prompt pass, a stream near its max_tokens ends before the nex
     // the first request (64 tokens: within finish_left) ended before the second's first token
     try std.testing.expect(seq.a_done.? < seq.b_first.?);
 }
+
+test "a prompt pass in pieces: a decoding stream keeps its rounds between them, and the reply is the whole pass's" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    const Watch = struct {
+        mutex: std.Io.Mutex = .init,
+        a: usize = 0, // the first request's tokens delivered so far
+        seen: std.ArrayList(usize) = .empty, // that count at each chunk of a prompt pass
+        b: std.ArrayList(u32) = .empty,
+        a_done: bool = false,
+        b_done: bool = false,
+        fn hook(ctx: *anyopaque, _: *lanes.stream.Stream, _: usize) void {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            w.mutex.lockUncancelable(std.testing.io);
+            defer w.mutex.unlock(std.testing.io);
+            w.seen.append(gpa, w.a) catch {};
+        }
+        fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
+            const w: *@This() = @ptrCast(@alignCast(ctx));
+            w.mutex.lockUncancelable(std.testing.io);
+            defer w.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .tokens => |t| if (id == 1) {
+                    w.a += t.len;
+                } else w.b.appendSlice(gpa, t) catch {},
+                .finished => if (id == 1) {
+                    w.a_done = true;
+                } else {
+                    w.b_done = true;
+                },
+                else => {},
+            }
+        }
+        fn until(w: *@This(), comptime what: enum { a_decodes, b_done, a_done }) !void {
+            for (0..20000) |_| {
+                w.mutex.lockUncancelable(std.testing.io);
+                const ok = switch (what) {
+                    .a_decodes => w.a > 0,
+                    .b_done => w.b_done,
+                    .a_done => w.a_done,
+                };
+                w.mutex.unlock(std.testing.io);
+                if (ok) return;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+            return error.Timeout;
+        }
+    };
+    var w: Watch = .{};
+    defer w.seen.deinit(gpa);
+    defer w.b.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = Watch.hook, .prefill_hook_ctx = &w };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    core.fill_chunks = 1;
+    core.fill_rounds = 2;
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+    try host.start();
+    defer host.stop();
+    const e = host.engine();
+    const pa = [_]u32{ 2, 7, 1, 8 };
+    const pb = [_]u32{ 3, 1, 4, 1, 5 };
+    try e.submit(1, &.{ .prompt = &pa, .max_tokens = 1_000_000 }, .{ .ctx = &w, .event = Watch.event });
+    try w.until(.a_decodes);
+    try e.submit(2, &.{ .prompt = &pb, .max_tokens = 8 }, .{ .ctx = &w, .event = Watch.event });
+    try w.until(.b_done);
+    e.cancel(1);
+    try w.until(.a_done);
+    // the first pass ran whole (nothing decoded yet); the second in six pieces, the first stream decoding between them
+    try std.testing.expectEqual(@as(usize, 12), w.seen.items.len);
+    for (w.seen.items[0..6]) |n| try std.testing.expectEqual(@as(usize, 0), n);
+    for (w.seen.items[7..12], w.seen.items[6..11]) |now, before| try std.testing.expect(now > before);
+    // the second reply is the fake's own continuation of its prompt
+    var history: std.ArrayList(u32) = .empty;
+    defer history.deinit(gpa);
+    try history.appendSlice(gpa, &pb);
+    try std.testing.expectEqual(@as(usize, 8), w.b.items.len);
+    for (w.b.items) |t| {
+        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
+        try history.append(gpa, t);
+    }
+}

@@ -38,6 +38,10 @@ pub const Engine = struct {
     steps: u64 = 0,
     arena: std.heap.ArenaAllocator, // a round's temporaries
     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
+    filling: ?*Stream = null, // a stream whose prompt pass runs in pieces between the others' rounds (not live yet)
+    fill_chunks: u32 = 0, // a piece's chunks (backend prefill_part; 0: a prompt pass runs whole inside addStream)
+    fill_rounds: u32 = 4, // the live streams' rounds between two pieces
+    rounds_since: u32 = 0,
 
     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
         return .{
@@ -75,14 +79,52 @@ pub const Engine = struct {
         return n;
     }
 
-    /// Prefill a stream, draw its first token and ask for its first drafts; it takes part from the next round.
+    /// Prefill a stream, draw its first token and ask for its first drafts; it takes part from the next round. While
+    /// other streams decode and the backend runs passes in pieces, only the first piece runs here: the stream is then
+    /// `filling` and fillStep runs the rest between rounds.
     pub fn addStream(e: *Engine, s: *Stream) !void {
         _ = e.arena.reset(.retain_capacity);
         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
-        e.backend.prefill(s) catch |err| {
+        if (e.filling != null) return error.FillBusy;
+        if (e.fill_chunks > 0 and e.backend.vtable.prefill_part != null and e.activeCount() > 0) {
+            if (!try e.piece(s)) {
+                e.filling = s;
+                e.rounds_since = 0;
+                return;
+            }
+        } else e.backend.prefill(s) catch |err| {
             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
             return err;
         };
+        try e.started(s);
+    }
+
+    fn piece(e: *Engine, s: *Stream) !bool {
+        return e.backend.vtable.prefill_part.?(e.backend.ptr, s, e.fill_chunks) catch |err| {
+            if (err == error.Cancelled) e.backend.release(s);
+            return err;
+        };
+    }
+
+    /// The filling stream's next piece once the live streams had their rounds (at once when none decodes); true when
+    /// its prompt pass ended and it joined the rounds. On an error the stream is no longer filling.
+    pub fn fillStep(e: *Engine) !bool {
+        const s = e.filling orelse return false;
+        if (e.activeCount() > 0 and e.rounds_since < e.fill_rounds) return false;
+        _ = e.arena.reset(.retain_capacity);
+        e.rounds_since = 0;
+        const done = e.piece(s) catch |err| {
+            e.filling = null;
+            return err;
+        };
+        if (!done) return false;
+        e.filling = null;
+        try e.started(s);
+        return true;
+    }
+
+    /// A prompt pass ended: the first token, the first drafts, and the rounds from the next one.
+    fn started(e: *Engine, s: *Stream) !void {
         if (s.isCancelled()) { // cancelled in its last chunk: no first token
             e.backend.release(s);
             return error.Cancelled;
@@ -129,6 +171,7 @@ pub const Engine = struct {
 
     /// Release a cancelled stream between rounds: no pending draws or drafts.
     pub fn discard(e: *Engine, s: *Stream) void {
+        if (e.filling == s) e.filling = null;
         s.finished = true;
         s.reason = .cancelled;
         for (e.live.items, 0..) |x, i| {
@@ -146,6 +189,7 @@ pub const Engine = struct {
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
         e.steps += 1;
+        if (e.filling != null) e.rounds_since += 1;
         var live: std.ArrayList(*Stream) = .empty;
         for (e.live.items) |s| {
             if (!s.finished and !s.paused) try live.append(a, s);

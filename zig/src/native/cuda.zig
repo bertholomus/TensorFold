@@ -191,6 +191,10 @@ const Host = struct {
         h.clock = .{ .io = io };
         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
         errdefer h.core.deinit();
+        // TF_FILL_CHUNKS=N: a prompt pass runs N chunks at a time while other streams decode, TF_FILL_ROUNDS of their
+        // rounds between (a backend with prefill_part; unset or 0: each pass whole, the others waiting)
+        h.core.fill_chunks = envInt("TF_FILL_CHUNKS") orelse 0;
+        h.core.fill_rounds = envInt("TF_FILL_ROUNDS") orelse h.core.fill_rounds;
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
@@ -215,6 +219,12 @@ const Host = struct {
                     return x.inner.vtable.prefill(x.inner.ptr, s);
                 }
             }.f,
+            .prefill_part = if (v.prefill_part != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream, chunks: usize) anyerror!bool {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_part.?(x.inner.ptr, s, chunks);
+                }
+            }.f else null,
             .first = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
                     const x = bind(p);
@@ -285,6 +295,11 @@ const Host = struct {
         return .{ .ptr = h, .vtable = &h.vtable };
     }
 };
+
+fn envInt(name: [*:0]const u8) ?u32 {
+    const v = std.c.getenv(name) orelse return null;
+    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch null;
+}
 
 /// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
