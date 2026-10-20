@@ -144,7 +144,7 @@ fn refusal(cx: *Cx, v: api.Vision, i: usize, err: anyerror) errors.Refused {
 }
 
 /// A quoted marker's stand-in while the template renders: two private-use code points, the second naming the marker.
-const sentinel = "\u{F0000}";
+pub const sentinel = "\u{F0000}";
 
 /// The image markers' text (Vision.markers), longest first so one never matches inside another.
 pub fn markerText(text: model_text.Text, a: std.mem.Allocator, v: api.Vision) ![]const []const u8 {

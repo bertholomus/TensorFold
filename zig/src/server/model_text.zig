@@ -42,6 +42,9 @@ pub const Text = struct {
         encode_plain: ?*const fn (ctx: *anyopaque, a: Allocator, text: []const u8) Error![]u32 = null,
         /// A token's own bytes (a partial UTF-8 sequence kept whole) for logprob rows; null: the tokenizer can't say.
         token_bytes: ?*const fn (ctx: *anyopaque, a: Allocator, id: u32) Allocator.Error!?[]u8 = null,
+        /// Every added token's text (tokenizer.json's added_tokens), which TENSORFOLD_PLAIN_SPECIALS keeps as ordinary
+        /// text where a message's sender wrote it; null: none are known.
+        added_text: ?*const fn (ctx: *anyopaque) []const []const u8 = null,
     };
 
     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
@@ -73,6 +76,12 @@ pub const Text = struct {
     pub fn tokenBytes(t: Text, a: Allocator, id: u32) Allocator.Error!?[]u8 {
         const f = t.vtable.token_bytes orelse return null;
         return f(t.ctx, a, id);
+    }
+
+    /// The added tokens' text, or none when this text cannot say.
+    pub fn addedText(t: Text) []const []const u8 {
+        const f = t.vtable.added_text orelse return &.{};
+        return f(t.ctx);
     }
 
     pub fn eosIds(t: Text) []const u32 {

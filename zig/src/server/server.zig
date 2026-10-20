@@ -15,6 +15,7 @@ const responses = @import("responses.zig");
 const grammar = @import("grammar.zig");
 const clock = @import("clock.zig");
 const prompt = @import("prompt.zig");
+const specials = @import("specials.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_grammar = @import("tool_grammar.zig");
 const chunk_plan = @import("chunk_plan.zig");
@@ -58,6 +59,9 @@ pub const Config = struct {
     seed_salt: i64 = 0,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
+    /// TENSORFOLD_PLAIN_SPECIALS=1: an added token's text that users, tools or search results wrote, or a tool call
+    /// carries, is ordinary text in the prompt (specials.zig); off, every prompt is the template's text tokenized whole.
+    plain_specials: bool = false,
     /// Null keeps every reply identical to a server that has no compaction.
     compact_at: ?CompactAt = null,
     /// Tokens of the recent tail kept whole. Null uses min(20000, a quarter of the window).
@@ -90,6 +94,8 @@ pub const Server = struct {
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
+    /// The markers a sender's text keeps as text (Config.plain_specials); null: off.
+    shield: ?*const specials.Shield = null,
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
     /// The engine's numbers for its efforts (Info.efforts); empty: the template hears the names.
@@ -148,6 +154,11 @@ pub const Server = struct {
             std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
+        if (config.plain_specials) {
+            const sh = try a.create(specials.Shield);
+            sh.* = try specials.Shield.init(a, text, srv.info.vision);
+            srv.shield = sh;
+        }
         if (text.tokenId("</think>")) |end| {
             const lead = try text.encode(a, "\n", false);
             const trail = try text.encode(a, "\n\n", false);

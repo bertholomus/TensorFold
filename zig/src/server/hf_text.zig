@@ -19,6 +19,7 @@ pub const HfText = struct {
     eos: []const u32 = &.{},
     prefix: []const u32 = &.{}, // the post-processor's tokens before a text (add_special_tokens)
     suffix: []const u32 = &.{},
+    added: []const []const u8 = &.{}, // every added token's text (Text.addedText)
 
     /// Loads ``dir``'s tokenizer.json, chat template, special tokens and end-of-sequence ids; a failure's reason in `problem` (from `pa`).
     pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, template_override: ?[]const u8, pa: Allocator, problem: *[]const u8) !*HfText {
@@ -34,6 +35,9 @@ pub const HfText = struct {
         errdefer t.tok.deinit();
         // each request renders its chat up to three times, and a chat's earlier messages come back every turn
         t.tok.memo = try tokenizer.Memo.create(gpa, 64 << 20);
+        const added = try a.alloc([]const u8, t.tok.added.len);
+        for (t.tok.added, added) |x, *s| s.* = x.content;
+        t.added = added;
         const config = readJson(io, a, dir, "tokenizer_config.json");
         const model_config = readJson(io, a, dir, "config.json");
         if (template_override) |path| {
@@ -212,7 +216,12 @@ pub const HfText = struct {
             .special = specialFn,
             .token_bytes = tokenBytesFn,
             .encode_plain = encodePlainFn,
+            .added_text = addedTextFn,
         } };
+    }
+
+    fn addedTextFn(ctx: *anyopaque) []const []const u8 {
+        return self(ctx).added;
     }
 
     fn specialFn(ctx: *anyopaque, id: u32) bool {
