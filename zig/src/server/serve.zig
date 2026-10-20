@@ -115,14 +115,14 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SSE_KEEPALIVE={s}: whole seconds (0: off)\n", .{t});
         return 1;
     } else 0;
-    const loop_windows: u32 = if (env(s, "TENSORFOLD_LOOP_WINDOWS")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
-        std.debug.print("tensorfold: TENSORFOLD_LOOP_WINDOWS={s}: a whole number of windows (0: exact cycles only)\n", .{t});
-        return 1;
-    } else 10;
     const stats_every: u32 = if (env(s, "TENSORFOLD_STATS_EVERY")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
         std.debug.print("tensorfold: TENSORFOLD_STATS_EVERY={s}: whole seconds (0: off)\n", .{t});
         return 1;
     } else 0;
+    const loop_windows: u32 = if (env(s, "TENSORFOLD_LOOP_WINDOWS")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
+        std.debug.print("tensorfold: TENSORFOLD_LOOP_WINDOWS={s}: a whole number of windows (0: exact cycles only)\n", .{t});
+        return 1;
+    } else 10;
     const config: server_mod.Config = .{
         .served_name = s.served,
         .model_dir = s.model_dir,
@@ -135,12 +135,12 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .loop_windows = loop_windows,
         .keep_warm_s = args.keep_warm,
         .sse_keepalive_ms = std.math.mul(u32, keepalive_s, 1000) catch std.math.maxInt(u32),
+        .stats_every_s = stats_every,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
         .vision_urls = args.vision_urls,
         .seed_salt = salt,
         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
-        .stats_every_s = stats_every,
         .dashboard = args.dashboard,
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,

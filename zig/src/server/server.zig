@@ -49,6 +49,9 @@ pub const Config = struct {
     /// TENSORFOLD_SSE_KEEPALIVE (seconds): a stream that sent nothing for this long (a long prompt's prefill) sends an
     /// SSE comment, so a client's idle timer does not drop it; 0: never (the stream's bytes as before).
     sse_keepalive_ms: u32 = 0,
+    /// TENSORFOLD_STATS_EVERY (seconds): as requests finish, a stats line at most this often on what finished since the
+    /// last (tokens a round, drafts kept, the draft head's chains by depth); 0: none. Replies are the same either way.
+    stats_every_s: u32 = 0,
     dashboard: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,
@@ -58,9 +61,6 @@ pub const Config = struct {
     seed_salt: i64 = 0,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
-    /// TENSORFOLD_STATS_EVERY (seconds): as requests finish, a stats line at most this often on what finished since the
-    /// last (tokens a round, drafts kept, the draft head's chains by depth); 0: none. Replies are the same either way.
-    stats_every_s: u32 = 0,
     /// Null keeps every reply identical to a server that has no compaction.
     compact_at: ?CompactAt = null,
     /// Tokens of the recent tail kept whole. Null uses min(20000, a quarter of the window).
