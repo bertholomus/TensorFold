@@ -170,8 +170,8 @@ pub const Chunk = struct {
     n: usize = 0,
     start: usize = 0,
     ids: u64, // int64 [cap]
-    pos: u64, // int64 [n]: start .. start + n (after a replay cut a view into pos0, pos[first:])
-    pos0: u64, // int64 [cap]: the chunk's positions as begin() wrote them
+    pos: u64, // int64 [n]: start .. start + n (pos0; a replay cut uploads pos[first:] there)
+    pos0: u64, // int64 [cap]: the chunk's positions (begin() writes them, a replay cut its rows')
     h: u64, // bf16 [cap, hc, D]: the streams
     h_alt: u64, // their second buffer (hc_pre_pf writes the posted streams there)
     x: u64, // bf16 [cap, D]: a block's input rows
@@ -1340,9 +1340,9 @@ fn aioGather(aio: *engram_aio.Aio, t: engram_io.Table, ids: []const i64, out_w: 
 
 /// The decoder's bounded replay at its first layer (_forward_k's `replay`, CED's prefill): the layer's attention mixes
 /// (the pending MoE post fused in) and its kv-source update over every row of the chunk, then the chunk cut to its rows
-/// at positions >= replay, the streams and their pre copied down (h[first:], pre[first:]). The decoder layers then run
-/// on those rows with no window key before replay and this layer's update done. False: an encoder-only chunk (no
-/// row at or past replay), which ends here.
+/// at positions >= replay, the streams and their pre copied down (h[first:], pre[first:]) and their positions uploaded
+/// (pos[first:]). The decoder layers then run on those rows with no window key before replay and this layer's update
+/// done. False: an encoder-only chunk (no row at or past replay), which ends here.
 pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usize, replay: usize, host_pos: []i64) !bool {
     try attnMixes(e, ch, li);
     if (e.w.layers[li].comp_wkv == null) return error.NoKvSource;
@@ -1360,9 +1360,11 @@ pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
     std.mem.swap(u64, &ch.pre, &ch.pre_f);
     ch.start += first;
     ch.n = n;
-    // pos[first:]: a view, first * 8 bytes in (its alignment is the one the served kernels were specialized for)
-    _ = host_pos;
-    ch.pos += first * 8;
+    // pos[first:] into the chunk's own buffer (256-byte aligned), not a view first * 8 bytes in: with first odd the view
+    // sits 8 bytes off 16, an alignment the kit's ring-mode attention has no kernel for (MissingTritonVariant on a
+    // resumed image prompt). The same positions, written in the stream's order after this layer's reads of the old ones.
+    try upload(e, ch.pos0, host_pos[first..].ptr, n * 8);
+    ch.pos = ch.pos0;
     return true;
 }
 
