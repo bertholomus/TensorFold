@@ -455,6 +455,37 @@ test "structured output: where the grammar spells its own text, its drafts fill 
     }
 }
 
+test "the head's chains by depth add up to its drafts and kept drafts, each depth keeping no more than it reached" {
+    for ([_]?Sampling{ null, .{ .seed = 4, .temperature = 0.8, .top_k = 0, .top_p = 0.9 } }) |sampling| {
+        var cfg = try model();
+        defer cfg.deinit(gpa);
+        var target: fake.Fake = .{ .gpa = gpa };
+        defer target.deinit();
+        var clock: fake.FixedClock = .{};
+        var engine = Engine.init(gpa, &cfg, target.backend(), clock.clock());
+        defer engine.deinit();
+        var p = try SuffixLookup.init(gpa, .{ .min_match = 1000 }); // no copies: every draft is the head's chain
+        defer p.deinit();
+        var s = try sm.Stream.init(gpa, .{ .id = "s", .prompt = &p1, .max_new = 80, .eos = &.{96}, .sampling = sampling, .proposer = p.proposer() });
+        defer s.deinit(gpa);
+        try engine.addStream(&s);
+        while (engine.activeCount() > 0) try engine.step();
+        var drafted: u64 = 0;
+        var kept: u64 = 0;
+        for (s.depths, 0..) |d, j| {
+            drafted += d.drafted;
+            kept += d.kept;
+            try std.testing.expect(d.kept <= d.reached and d.reached <= d.drafted);
+            if (j > 0) try std.testing.expect(d.drafted <= s.depths[j - 1].drafted and d.reached <= s.depths[j - 1].kept);
+        }
+        try std.testing.expectEqual(s.drafted, drafted);
+        try std.testing.expectEqual(s.accepted, kept);
+        // every chain reaches its first draft; the fake head misses one draft in five, so some chain stops short
+        try std.testing.expectEqual(s.depths[0].drafted, s.depths[0].reached);
+        try std.testing.expect(s.depths[1].drafted > 0 and kept < drafted);
+    }
+}
+
 test "a family that keeps copies to shared rounds proposes none for a lone stream" {
     for ([_]bool{ true, false }) |lone_copies| {
         var cfg = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .lone_copies = lone_copies }, 16, 15);

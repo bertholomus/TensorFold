@@ -58,6 +58,9 @@ pub const Config = struct {
     seed_salt: i64 = 0,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
+    /// TENSORFOLD_STATS_EVERY (seconds): as requests finish, a stats line at most this often on what finished since the
+    /// last (tokens a round, drafts kept, the draft head's chains by depth); 0: none. Replies are the same either way.
+    stats_every_s: u32 = 0,
     /// Null keeps every reply identical to a server that has no compaction.
     compact_at: ?CompactAt = null,
     /// Tokens of the recent tail kept whole. Null uses min(20000, a quarter of the window).
@@ -307,11 +310,15 @@ pub const Server = struct {
         return null;
     }
 
-    /// Counts one finished request for /metrics.
-    pub fn noteRequest(srv: *Server, prompt_len: usize, cached: usize, generated: usize, drafted: u64, accepted: u64, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
+    /// Counts one finished request for /metrics, then writes the stats line when its interval has passed.
+    pub fn noteRequest(srv: *Server, prompt_len: usize, cached: usize, generated: usize, drafted: u64, accepted: u64, depths: []const api.DraftDepth, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
         const now = clock.nowNs(srv.io);
         const tpot = srv.metrics.tpotValue(first, last, generated);
         srv.metrics.note(srv.io, prompt_len, cached, generated, drafted, accepted, rounds, @max(0, clock.seconds(now - received)), if (first) |f| clock.seconds(f - received) else null, if (first) |f| @max(0, clock.seconds(now - f)) else null, prefill, tpot);
+        srv.metrics.noteDepths(srv.io, depths);
+        if (srv.config.stats_every_s == 0) return;
+        var buf: [1024]u8 = undefined;
+        if (srv.metrics.statsLine(srv.io, now, @as(i96, srv.config.stats_every_s) * std.time.ns_per_s, &buf)) |text| log.line("{s}", .{text});
     }
 
     /// Accepts connections until ``stop`` is set, each on its own thread.

@@ -425,6 +425,15 @@ The readings vLLM also has are repeated under its names (`num_requests_running`,
 `tensorfold:` prefix for the metric name. `client_disconnections_total` (requests the client walked away from)
 and `preemptions_total` (background work that gave up a lane to a later request) are published where the
 server counts those events, and never at a fabricated zero.
+An engine that counts its draft head's chains by depth (the lane engines) adds, once it has counted one,
+`mtp_depth_drafted_total`, `mtp_depth_reached_total` and `mtp_depth_accepted_total` with a `depth` label (1: the
+first draft): the chains of finished requests that drafted that deep, those that kept every draft above it, and those
+that kept its draft too. `mtp_depth_accepted_total` over `mtp_depth_drafted_total` is the accept rate at that depth
+(DeepInfer's per-position rate); over `mtp_depth_reached_total`, the rate of a draft whose drafts above were all kept
+(the rate the depth rule learns). The kept counts repeat as vLLM's `spec_decode_num_accepted_tokens_per_pos_total`
+(`position` 0: depth 1). `TENSORFOLD_STATS_EVERY=<seconds>` (0, the default: off) also writes a stats line to the
+server log, at most that often as requests finish, on what finished since the last line: tokens a round, drafts
+kept, and the chains' rates by depth. Replies are the same with or without it.
 An engine that keeps prompt states between requests (Flash Next and GLM-5.3-Flash unless `--prompt-cache-gib 0`)
 adds `prompt_tokens_cached_total` (already vLLM's name), the prompt tokens of finished requests restored from a kept
 state, and repeats it with `prompt_tokens_total` as vLLM's `prefix_cache_hits_total` and `prefix_cache_queries_total`.
