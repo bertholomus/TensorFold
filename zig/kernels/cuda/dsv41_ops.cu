@@ -511,3 +511,5 @@ extern "C" __global__ void tf_ds_vspan_kernel(const unsigned char* types, const 
         out[i] = ty == 1 ? rows[(long long)row_of[t] * dim + c] : ty == 0 ? start[c] : ty == 2 ? newline[c] : end[c];
     }
 }
+
+#include "dsv41_candidates.cuh"
