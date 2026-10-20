@@ -283,7 +283,7 @@ pub const Server = struct {
             var err: [512]u8 = undefined;
             const c = a.create(api.grammar.Compiler) catch break :blk "out of memory";
             c.* = api.grammar.Compiler.open(srv.io, a, tok, vocab.?, srv.eos, &err) catch |e| break :blk switch (e) {
-                error.NoGrammarLibrary => "the server cannot load " ++ api.grammar.library ++ " (xgrammar; zig build grammar)",
+                error.NoGrammarLibrary => "the server cannot load " ++ api.grammar.library ++ " (xgrammar; zig build grammar, or name the file in " ++ api.grammar.env ++ ")",
                 else => a.dupe(u8, std.mem.sliceTo(&err, 0)) catch "out of memory",
             };
             srv.grammars = c;

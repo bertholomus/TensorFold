@@ -23,7 +23,8 @@ var lib: ?Fns = null;
 var lib_failed = false;
 var lib_mutex: std.atomic.Mutex = .unlocked;
 
-/// The library from the server's ../lib (an archive's lib, zig build grammar's), beside it, else the loader's path.
+/// The library: the file TENSORFOLD_GRAMMAR_LIB names, else the server's ../lib (an archive's lib, zig build
+/// grammar's), beside it, then the loader's path.
 fn load(io: std.Io, a: Allocator) ?Fns {
     while (!lib_mutex.tryLock()) std.atomic.spinLoopHint();
     defer lib_mutex.unlock();
@@ -36,7 +37,12 @@ fn load(io: std.Io, a: Allocator) ?Fns {
         std.fs.path.join(a, &.{ exe, library }) catch return null,
         library,
     };
-    var dl = for (names) |name| {
+    var named = [1][]const u8{""};
+    const tries: []const []const u8 = if (std.c.getenv(env)) |p| blk: {
+        named[0] = std.mem.span(p);
+        break :blk &named;
+    } else &names;
+    var dl = for (tries) |name| {
         break std.DynLib.open(name) catch continue;
     } else return null;
     var f: Fns = undefined;
@@ -51,6 +57,9 @@ fn load(io: std.Io, a: Allocator) ?Fns {
 
 /// The library's file name, for the refusal when it cannot be loaded.
 pub const library = if (builtin.os.tag == .macos) "libtfgrammar.dylib" else "libtfgrammar.so";
+
+/// The environment variable naming the libtfgrammar file to load (the only one tried when it is set).
+pub const env = "TENSORFOLD_GRAMMAR_LIB";
 
 /// libtfgrammar's kinds in order: structural_tag is xgrammar's JSON form (a tool call's markup around its arguments).
 pub const Kind = enum(u8) { json, json_schema, regex, choice, grammar, structural_tag };
@@ -475,4 +484,56 @@ test "a chain grows past its last kept row with the grammar's own drafts, never 
     // forced rows never grow
     const f = try c.window(a, &.{ 9, 5 }, &.{ -1, 0 }, true, 16);
     try std.testing.expectEqual(@as(usize, 0), f.extra.len);
+}
+
+test "the file TENSORFOLD_GRAMMAR_LIB names, through the engine's calls: a choice's masks, a refusal, a rollback, the stop" {
+    // opt-in: TENSORFOLD_GRAMMAR_LIB=<a libtfgrammar build> TF_GRAMMAR_TOKENIZER=<a checkpoint's tokenizer.json>
+    // TF_GRAMMAR_VOCAB=<its logits' width> TF_GRAMMAR_STOP=<its eos id>
+    if (std.c.getenv(env) == null) return error.SkipZigTest;
+    const path = std.testing.environ.getPosix("TF_GRAMMAR_TOKENIZER") orelse return error.SkipZigTest;
+    const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
+    const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(256 << 20));
+    var err: [512]u8 = undefined;
+    var c = try Compiler.open(io, a, text, vocab, &.{stop}, &err);
+    defer c.close();
+    try std.testing.expectEqual(@as(usize, (vocab + 31) / 32), c.words);
+    try std.testing.expectError(error.Grammar, c.compile(io, .regex, "(unclosed", &err));
+    try std.testing.expect(std.mem.sliceTo(&err, 0).len > 0);
+    const g = try c.compile(io, .choice, "[\"yes\", \"no\"]", &err);
+    defer g.free();
+    const r = (try g.matcher()).rules();
+    defer r.vtable.free(r.ptr);
+    const first = try a.alloc(u32, c.words);
+    const words = try a.alloc(u32, c.words);
+    const has = struct {
+        fn has(w: []const u32, t: u32) bool {
+            return (w[t / 32] >> @intCast(t % 32)) & 1 == 1;
+        }
+    }.has;
+    try r.vtable.fill(r.ptr, first);
+    try std.testing.expect(!has(first, stop)); // a choice comes before the stop
+    try std.testing.expect(!try r.vtable.accept(r.ptr, stop)); // a forbidden token is refused
+    try r.vtable.fill(r.ptr, words);
+    try std.testing.expectEqualSlices(u32, first, words); // and the matcher stays where it was
+    var taken: usize = 0;
+    while (!r.vtable.terminated(r.ptr)) : (taken += 1) {
+        if (taken == 16) return error.TestUnexpectedResult;
+        try r.vtable.fill(r.ptr, words);
+        const t: u32 = if (has(words, stop)) stop else for (words, 0..) |w, i| {
+            if (w != 0) break @intCast(i * 32 + @ctz(w));
+        } else return error.TestUnexpectedResult;
+        try std.testing.expect(try r.vtable.accept(r.ptr, t));
+        if (taken == 0) { // a rollback gives the first mask back
+            try r.vtable.rollback(r.ptr, 1);
+            try r.vtable.fill(r.ptr, words);
+            try std.testing.expectEqualSlices(u32, first, words);
+            try std.testing.expect(try r.vtable.accept(r.ptr, t));
+        }
+    }
+    try std.testing.expect(taken >= 2); // a choice's tokens, then the stop
 }
