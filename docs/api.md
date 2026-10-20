@@ -262,9 +262,10 @@ The native server enforces the same fields with the same grammars through `libtf
 xgrammar v0.2.8's C++ library (`zig/src/grammar/tf_grammar.cc`). Release archives ship it in `lib/` beside `bin/` for
 macOS arm64, Linux x86_64 and Linux aarch64; from source, `zig build grammar -Dxgrammar=DIR` builds it from an xgrammar
 v0.2.8 checkout (`git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar`) into
-`zig-out/native/lib` on macOS and `zig-out/lib` on Linux. The server looks in `../lib` beside its binary, then beside
-it, then on the loader's path, and loads it at the first structured request; without it, everything else serves and a
-structured request gets HTTP 400. Nemotron (Metal and CUDA) and Qwen3.5-2B (Metal) enforce it; other native engines
+`zig-out/native/lib` on macOS and `zig-out/lib` on Linux. The server loads the file `TENSORFOLD_GRAMMAR_LIB` names
+when it is set, else it looks in `../lib` beside its binary, then beside it, then on the loader's path, and loads it at
+the first structured request; without it, everything else serves and a structured request gets HTTP 400. Nemotron
+(Metal and CUDA) and Qwen3.5-2B (Metal) enforce it; other native engines
 answer a structured request with HTTP 400. Drafting stays on: the drafts the head holds on the GPU come back to the host
 before each verify, the grammar cuts the ones it rejects and drafts the text it forces itself (a key, closing markup),
 and each row's logits are masked before its draw, so drafted, `"draft": false` and concurrent replies are the same.
