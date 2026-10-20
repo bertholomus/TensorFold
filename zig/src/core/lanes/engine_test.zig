@@ -17,6 +17,7 @@ const Case = struct {
     sampling: ?Sampling = null,
     drafts: bool = true,
     think_budget: u32 = 0,
+    call_gate: ?sm.CallGate.Hook = null,
     logprobs: ?u8 = null,
     classes: ?Classes = null, // structured output under this test grammar
     eos: []const u32 = &.{96},
@@ -116,7 +117,7 @@ fn run(cases: []const Case) ![][]u32 {
             g.* = given;
             k.* = .init(g.rules(), (fake.vocab + 31) / 32, given.after);
         }
-        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = c.eos, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .logprobs = c.logprobs, .grammar = if (c.classes != null) k else null });
+        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = c.eos, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91, .logprobs = c.logprobs, .grammar = if (c.classes != null) k else null, .call_gate = c.call_gate });
     }
     defer for (streams, proposers) |*s, *p| {
         s.deinit(gpa);
@@ -474,4 +475,68 @@ test "a family that keeps copies to shared rounds proposes none for a lone strea
         engine.alone = true;
         try std.testing.expectEqual(lone_copies, (try win.copyProposal(&engine, &s)).tokens.len >= 2);
     }
+}
+
+test "call gates preserve target history across drafted, serial and shared rounds" {
+    const fixture = @import("call_gate_test.zig");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dummy: u8 = 0;
+    var gates: [4]sm.CallGate.Gate = undefined;
+    for (&gates) |*gate| gate.* = sm.CallGate.Gate.init(a, fixture.spec, fixture.Codec.codec(&dummy), &.{});
+    const serial = try run(&.{.{ .prompt = &p1, .drafts = false, .max_new = 90, .call_gate = gates[0].hook() }});
+    defer free(serial);
+    const drafted = try run(&.{.{ .prompt = &p1, .max_new = 90, .call_gate = gates[1].hook() }});
+    defer free(drafted);
+    const shared = try run(&.{
+        .{ .prompt = &p1, .max_new = 90, .call_gate = gates[2].hook() },
+        .{ .prompt = &p2, .max_new = 90, .call_gate = gates[3].hook() },
+    });
+    defer free(shared);
+    try std.testing.expectEqualSlices(u32, serial[0], drafted[0]);
+    try std.testing.expectEqualSlices(u32, serial[0], shared[0]);
+    var solo_gate = sm.CallGate.Gate.init(a, fixture.spec, fixture.Codec.codec(&dummy), &.{});
+    const solo = try run(&.{.{ .prompt = &p2, .max_new = 90, .call_gate = solo_gate.hook() }});
+    defer free(solo);
+    try std.testing.expectEqualSlices(u32, solo[0], shared[1]);
+    const lead = try fixture.Codec.encode(&dummy, a, fixture.spec.lead);
+    const prefix = try std.mem.concat(a, u32, &.{ &.{ '<', 1000 }, lead });
+    try std.testing.expectEqualSlices(u32, prefix, serial[0][0..prefix.len]);
+    // Once the function name ends, every subsequent sample must use exactly the committed history.
+    var history: std.ArrayList(u32) = .empty;
+    defer history.deinit(gpa);
+    try history.appendSlice(gpa, &p1);
+    var name_ended = false;
+    var checked: usize = 0;
+    for (serial[0], 0..) |t, i| {
+        if (name_ended) {
+            try std.testing.expectEqual(fake.next(history.items, null, history.items.len), t);
+            checked += 1;
+        }
+        if (i >= prefix.len and t == '"') name_ended = true;
+        try history.append(gpa, t);
+    }
+    try std.testing.expect(checked > 3);
+}
+
+test "call gate survives thinking budget cuts and respects the output limit" {
+    const fixture = @import("call_gate_test.zig");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var dummy: u8 = 0;
+    var spec = fixture.spec;
+    spec.think_open = 90;
+    spec.think_end = 91;
+    var gates: [3]sm.CallGate.Gate = undefined;
+    for (&gates) |*gate| gate.* = sm.CallGate.Gate.init(a, spec, fixture.Codec.codec(&dummy), &.{90});
+    const drafted = try run(&.{.{ .prompt = &p2, .max_new = 90, .think_budget = 3, .call_gate = gates[0].hook() }});
+    defer free(drafted);
+    const serial = try run(&.{.{ .prompt = &p2, .max_new = 90, .think_budget = 3, .drafts = false, .call_gate = gates[1].hook() }});
+    defer free(serial);
+    try std.testing.expectEqualSlices(u32, serial[0], drafted[0]);
+    const short = try run(&.{.{ .prompt = &p2, .max_new = 2, .call_gate = gates[2].hook() }});
+    defer free(short);
+    try std.testing.expectEqual(@as(usize, 2), short[0].len);
 }

@@ -477,6 +477,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision) else null,
         .lane_vision = if (@hasField(@TypeOf(loaded), "lane_vision")) loaded.lane_vision else null,
         .efforts = familyEfforts(F),
+        .call_gates = F == dsv41.native,
     }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };

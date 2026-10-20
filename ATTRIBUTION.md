@@ -53,3 +53,19 @@ ourselves are not listed.
 - "DeepSeek", "DeepSeek-V4.1-Flash" and "DeepSeek-V4.1-Flash-1017" belong to DeepSeek. "DGX Spark" and "GB10" belong to NVIDIA. We use the names
   only to say what this branch runs and on what hardware.
 - This branch is not affiliated with or endorsed by DeepSeek, NVIDIA, the TensorFold authors, Mia-AiLab or MiaAI-Lab.
+
+## Native DeepSeek required-tool prefix gate
+
+`zig/src/core/lanes/call_gate.zig` and its regression fixtures adapt the Python
+call gate and DSML tests from Elevatormusic/TensorFold PR #1, commit
+`003dd66273313d7d69d5675097e873e3af39ffd0`, under Apache-2.0:
+https://github.com/Elevatormusic/TensorFold/pull/1
+
+The Zig port adds request-local hooks, native lane integration, and explicit
+errors for invalid correction state. The rendered-template probe recognizes the
+separate `<` text head and `｜DSML｜` token. Existing TensorFold copyright and
+license notices remain applicable. This is prefix/name enforcement, not JSON
+argument-schema enforcement.
+
+Jayleaton's native DeepSeek grammar implementation was consulted as an
+architectural reference; no xgrammar or backend code was copied from that fork.

@@ -1,0 +1,277 @@
+{
+  "profiles": {
+    "0-base": {
+      "burst_tps": 132.6409170849111,
+      "burst_repetitions": [
+        133.65128802716237,
+        132.91054583763008,
+        132.59406779758848,
+        132.48123450831213,
+        132.1282995703259,
+        132.0800667684477
+      ],
+      "steady_tps": 148.3,
+      "sustained_tps": 169.88,
+      "steady": {
+        "streams": 4,
+        "seconds": 30,
+        "max_tokens": 256,
+        "set": "a",
+        "requests": 19,
+        "aggregate_tps": 148.3,
+        "per_stream_tps_p50": 47.5,
+        "per_stream_tps_p95": 61.543,
+        "per_stream_tps_p05": 22.921,
+        "ttft_s_p50": 0.206,
+        "ttft_s_p95": 0.429
+      },
+      "sustained": {
+        "streams": 4,
+        "seconds": 90,
+        "max_tokens": 256,
+        "set": "b",
+        "requests": 62,
+        "aggregate_tps": 169.88,
+        "per_stream_tps_p50": 51.641,
+        "per_stream_tps_p95": 83.021,
+        "per_stream_tps_p05": 25.997,
+        "ttft_s_p50": 0.156,
+        "ttft_s_p95": 0.273
+      }
+    },
+    "1-candidate": {
+      "burst_tps": 132.9428278370476,
+      "burst_repetitions": [
+        132.36725036958143,
+        133.6823153140167,
+        132.03482926114978,
+        133.5584290061675,
+        133.48077877508268,
+        132.5333642962874
+      ],
+      "steady_tps": 148.08,
+      "sustained_tps": 169.82,
+      "steady": {
+        "streams": 4,
+        "seconds": 30,
+        "max_tokens": 256,
+        "set": "a",
+        "requests": 19,
+        "aggregate_tps": 148.08,
+        "per_stream_tps_p50": 47.938,
+        "per_stream_tps_p95": 61.306,
+        "per_stream_tps_p05": 22.981,
+        "ttft_s_p50": 0.199,
+        "ttft_s_p95": 0.49
+      },
+      "sustained": {
+        "streams": 4,
+        "seconds": 90,
+        "max_tokens": 256,
+        "set": "b",
+        "requests": 62,
+        "aggregate_tps": 169.82,
+        "per_stream_tps_p50": 51.509,
+        "per_stream_tps_p95": 82.905,
+        "per_stream_tps_p05": 26.065,
+        "ttft_s_p50": 0.156,
+        "ttft_s_p95": 0.24
+      }
+    },
+    "2-base": {
+      "burst_tps": 132.15785629131187,
+      "burst_repetitions": [
+        132.2480853294622,
+        132.0944595596113,
+        132.3703780960966,
+        131.99234697534195,
+        132.14958934645915,
+        132.09227844090003
+      ],
+      "steady_tps": 147.64,
+      "sustained_tps": 169.8,
+      "steady": {
+        "streams": 4,
+        "seconds": 30,
+        "max_tokens": 256,
+        "set": "a",
+        "requests": 19,
+        "aggregate_tps": 147.64,
+        "per_stream_tps_p50": 47.369,
+        "per_stream_tps_p95": 61.097,
+        "per_stream_tps_p05": 22.875,
+        "ttft_s_p50": 0.192,
+        "ttft_s_p95": 0.483
+      },
+      "sustained": {
+        "streams": 4,
+        "seconds": 90,
+        "max_tokens": 256,
+        "set": "b",
+        "requests": 62,
+        "aggregate_tps": 169.8,
+        "per_stream_tps_p50": 50.894,
+        "per_stream_tps_p95": 82.959,
+        "per_stream_tps_p05": 26.059,
+        "ttft_s_p50": 0.156,
+        "ttft_s_p95": 0.21
+      }
+    },
+    "3-candidate": {
+      "burst_tps": 132.67876691467984,
+      "burst_repetitions": [
+        131.90364845944518,
+        133.04801901148596,
+        132.23347262613427,
+        133.3805526886387,
+        133.53948264666187,
+        131.96742605571302
+      ],
+      "steady_tps": 147.38,
+      "sustained_tps": 169.35,
+      "steady": {
+        "streams": 4,
+        "seconds": 30,
+        "max_tokens": 256,
+        "set": "a",
+        "requests": 19,
+        "aggregate_tps": 147.38,
+        "per_stream_tps_p50": 46.852,
+        "per_stream_tps_p95": 61.137,
+        "per_stream_tps_p05": 22.581,
+        "ttft_s_p50": 0.196,
+        "ttft_s_p95": 0.432
+      },
+      "sustained": {
+        "streams": 4,
+        "seconds": 90,
+        "max_tokens": 256,
+        "set": "b",
+        "requests": 60,
+        "aggregate_tps": 169.35,
+        "per_stream_tps_p50": 50.628,
+        "per_stream_tps_p95": 82.754,
+        "per_stream_tps_p05": 26.093,
+        "ttft_s_p50": 0.157,
+        "ttft_s_p95": 0.243
+      }
+    }
+  },
+  "pooled": {
+    "burst_tps": {
+      "base": 132.3993866881115,
+      "forced_tool_patch": 132.81079737586373,
+      "change_percent": 0.3107345872540801
+    },
+    "steady_tps": {
+      "base": 147.97,
+      "forced_tool_patch": 147.73000000000002,
+      "change_percent": -0.16219503953502912
+    },
+    "sustained_tps": {
+      "base": 169.84,
+      "forced_tool_patch": 169.58499999999998,
+      "change_percent": -0.15014130946774396
+    }
+  },
+  "cross_build_exact_utf8_replies": 96,
+  "cross_build_exact_token_replies": 36,
+  "scope": "ordinary requests: forced gate unused; identical source base and runtime; two loads per profile; practical measurement, not a statistical bound",
+  "active_tools": {
+    "pass": true,
+    "exact_tokens_across_choices": true,
+    "mean_tps": {
+      "auto": 201.56557242418165,
+      "required": 200.90695584002935,
+      "named": 201.28669127920435
+    },
+    "calls": 84,
+    "streams": 4,
+    "warmups_per_choice": 1,
+    "measured_bursts_per_choice": 6,
+    "temperature": 0,
+    "max_tokens": 256,
+    "thinking": false,
+    "description": "Call save_numbers with label batch0 through batch3 and every integer from 1 through 30 in order; validate complete calls and compare tokens; alternate auto/required/named order each repetition."
+  },
+  "source": {
+    "base": "b8b115e7ed6c86d81b7575caa6f3d4ade52b323c",
+    "candidate": "253c38ca4a30fca8e0fe242d5599844e84cc187c",
+    "production_patch_sha256": "56bafbd0c5038961fba165d55fd99b03657cd4146619e85d262221e07c980807",
+    "external_build_adapter_sha256": "de740aa4db2ac6548adf35351bbc13da222774a8c2eab87a61dcd4824456d928",
+    "build_adapter_scope": "adds executable target for unchanged production dsv41 lanes; same adapter in both source archives",
+    "production_family_transport_changes_between_profiles": false,
+    "tested_zig_tree": "12ad2fa7f1d21e85fa47129c2a5d97b8dee315a0"
+  },
+  "binaries": {
+    "base": {
+      "tensorfold-native": "deb87918014aabad4cc002fb680ae4236cb60c53c73f29b841f008064f4a155a",
+      "tf-dsv41-lanes": "3e211ab74be8470742347b8af247efe04aefc277bef14ccc60a6b6e1ab4e9ba9"
+    },
+    "candidate": {
+      "tensorfold-native": "ed479ca40f0f1744e55ef9b790a0df46b4dad6356fcb3969d95f823c7cfce840",
+      "tf-dsv41-lanes": "2f135afdbb2fc2e68a9c12696935ad6d885a974056a7afd2a55c94e22236b0f8"
+    }
+  },
+  "runtime": {
+    "gpu": "4 x NVIDIA GB10",
+    "backend": "native Zig CUDA TP4 DSpark",
+    "compiler": "Zig 0.17.0",
+    "target": "aarch64-linux-gnu.2.28",
+    "optimize": "fast",
+    "sm": 121,
+    "checkpoint": "bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-4.0bpw",
+    "checkpoint_revision": "a2f91e2794923d0beebebe0d267fb3468eaf0b65",
+    "engram_revision": "1bae0e1088993b9b82de08f59de5be5a34e42170",
+    "context": 1048576,
+    "parallel": 16,
+    "max_tokens": 32768,
+    "window": 2097152,
+    "round_rows": 48,
+    "served_depth": "solo",
+    "neighbor_rdma": true,
+    "gid_index": 3,
+    "nccl": "2.30.7 patched",
+    "nccl_sha256": "1cdf5f3e2d617d5c07a87903eb8849d5bd7758f6c900455d613a2e0eb289d63e",
+    "os": "Ubuntu 24.04 (rank 1: 24.04.3 LTS; ranks 0, 2, 3: 24.04.4 LTS)",
+    "kernels_by_rank": [
+      "6.17.0-1029-nvidia",
+      "6.17.0-1032-nvidia",
+      "6.17.0-1022-nvidia",
+      "6.17.0-1022-nvidia"
+    ]
+  },
+  "workloads": {
+    "order": [
+      "base",
+      "candidate",
+      "base",
+      "candidate"
+    ],
+    "burst": {
+      "set": "a",
+      "streams": 4,
+      "tokens": 256,
+      "warmups": 1,
+      "reps": 6
+    },
+    "steady": {
+      "set": "a",
+      "streams": 4,
+      "tokens": 256,
+      "seconds": 30
+    },
+    "sustained": {
+      "set": "b",
+      "streams": 4,
+      "tokens": 256,
+      "seconds": 90
+    },
+    "client_sha256": "f5f24b1e105e6d073e26b780983be3f4654219b986290e1f6a106c1955232bc5",
+    "client_source": "https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10/blob/9af1f4567ee49ec2a31f68975982093277e7090d/tools/kit_bench.py"
+  },
+  "feature_cases": {
+    "serial_pass": 14,
+    "concurrent_pass": 4
+  }
+}
