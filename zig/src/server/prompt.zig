@@ -57,8 +57,13 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
     return ids;
 }
 
-/// The template's ids for `messages`; with image input, a marker the text spells is ordinary text (images.zig).
+/// The template's ids for `messages`; with image input, a marker the text spells is ordinary text (images.zig), and
+/// with TENSORFOLD_PLAIN_SPECIALS an added token's text a sender wrote (specials.zig).
 fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error![]u32 {
+    if (srv.shield) |sh| if (try sh.apply(a, messages)) |quoted| {
+        const text = try srv.text.render(a, quoted, options, problem);
+        return images.encodeShielded(srv.text, a, text, sh.markers);
+    };
     const v = srv.info.vision orelse return srv.text.renderIds(a, messages, options, problem);
     const markers = try images.markerText(srv.text, a, v);
     const text = try srv.text.render(a, try images.shield(a, messages, markers), options, problem);
