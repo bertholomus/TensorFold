@@ -220,7 +220,8 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
             pr.* = try nodeChances(e, p.stream, n);
         }
     }
-    const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, e.rule.overheadMs(plans.len, anySampled(plans)), @max(plans.len, e.cfg.batch_rows));
+    const overhead = soloHeadOverhead(e.cfg.solo_head_overhead_ms, e.rule.overheadMs(plans.len, anySampled(plans)), e.alone, plans.len, if (plans.len > 0) plans[0].kind else .none);
+    const counts = try alloc.allocate(a, fixed, probs, &e.cfg.shared_costs, overhead, @max(plans.len, e.cfg.batch_rows));
     for (plans, probs, counts) |*p, chances, c| {
         if (p.kind == .head) p.stream.granted = c;
         if (chances.len == 0 or c == chances.len) continue;
@@ -326,4 +327,19 @@ pub fn tokens(e: *Engine, w: be.Window, o: be.Verified) ![]u32 {
     @memcpy(out[1 .. 1 + w.held], o.drafts[0..w.held]);
     @memcpy(out[1 + w.held ..], w.tokens);
     return out;
+}
+
+// Only an opted-in, truly solo head window uses the fixed overhead.
+fn soloHeadOverhead(fixed: ?f64, observed: f64, alone: bool, streams: usize, kind: Kind) f64 {
+    if (alone and streams == 1 and kind == .head) return fixed orelse observed;
+    return observed;
+}
+test "fixed cost excludes shared, copied, forced and unconfigured windows" {
+    try std.testing.expectEqual(@as(f64, 3.5), soloHeadOverhead(3.5, 8.0, true, 1, .head));
+    try std.testing.expectEqual(@as(f64, 8.0), soloHeadOverhead(null, 8.0, true, 1, .head));
+    try std.testing.expectEqual(@as(f64, 8.0), soloHeadOverhead(3.5, 8.0, false, 1, .head));
+    try std.testing.expectEqual(@as(f64, 8.0), soloHeadOverhead(3.5, 8.0, true, 2, .head));
+    for ([_]Kind{ .copy, .forced, .fill, .none }) |kind| {
+        try std.testing.expectEqual(@as(f64, 8.0), soloHeadOverhead(3.5, 8.0, true, 1, kind));
+    }
 }

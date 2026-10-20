@@ -12,6 +12,7 @@ pub const default_prior = [_]f64{ 0.85, 0.75, 0.7, 0.65, 0.6, 0.55, 0.5, 0.5, 0.
 
 /// What a backend reports about its loaded model: the attributes the Python engine reads at setup.
 pub const Model = struct {
+    solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
     exact_width: u32 = 1, // the widest window that reproduces one-token steps bit for bit
     first_copy_rows: u32 = 0, // a lone stream's first copy window (0: the exact width)
     gpu_tokens: bool = false, // one-token rounds may run a step ahead (pipelined)
@@ -37,6 +38,7 @@ pub const Model = struct {
 };
 
 pub const Config = struct {
+    solo_head_overhead_ms: ?f64 = null, // fixed overhead for a lone head window; null keeps the live estimate
     family_width: u32,
     max_copy: u32,
     first_copy: u32,
@@ -70,6 +72,9 @@ pub const Config = struct {
 
     pub fn init(gpa: Allocator, m: Model, max_rows: u32, max_draft: u32) !Config {
         if (max_rows < 1) return error.BadMaxRows;
+        if (m.solo_head_overhead_ms) |cost| {
+            if (!std.math.isFinite(cost) or cost < 0.0) return error.BadSoloHeadOverhead;
+        }
         const width: u32 = @max(1, @min(@max(m.exact_width, 1), max_rows));
         const max_copy = width - 1;
         const first_rows: i64 = if (m.first_copy_rows != 0) m.first_copy_rows else width;
@@ -121,6 +126,7 @@ pub const Config = struct {
             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
             .mtp_step_ms = m.mtp_step_ms,
             .k = .{ .depth_rate = if (m.depth_rate > 0) m.depth_rate else (Constants{}).depth_rate },
+            .solo_head_overhead_ms = m.solo_head_overhead_ms,
         };
     }
 
@@ -144,4 +150,20 @@ test "setup derives widths like Python" {
     var steady = try Config.init(gpa, .{ .exact_width = 16, .mtp = true, .speculate = true, .drafts = 4, .depth_rate = 0.08 }, 16, 15);
     defer steady.deinit(gpa);
     try std.testing.expectEqual(@as(f64, 0.08), steady.k.depth_rate);
+}
+
+test "solo allowance is opt-in and preserved by setup" {
+    const a = std.testing.allocator;
+    var original = try Config.init(a, .{}, 8, 7);
+    defer original.deinit(a);
+    try std.testing.expect(original.solo_head_overhead_ms == null);
+    var selected = try Config.init(a, .{ .solo_head_overhead_ms = 3.5 }, 8, 7);
+    defer selected.deinit(a);
+    try std.testing.expectEqual(@as(?f64, 3.5), selected.solo_head_overhead_ms);
+}
+test "solo allowance rejects invalid costs before allocating" {
+    for ([_]f64{ -1.0, std.math.inf(f64), std.math.nan(f64) }) |cost| {
+        try std.testing.expectError(error.BadSoloHeadOverhead,
+            Config.init(std.testing.allocator, .{ .solo_head_overhead_ms = cost }, 8, 7));
+    }
 }

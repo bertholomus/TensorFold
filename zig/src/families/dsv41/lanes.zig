@@ -453,6 +453,7 @@ pub const Lanes = struct {
             .drafts = if (self.m.dr) |dr| @intCast(dr.n) else 1,
             .window_costs = self.wc[0..],
             .mtp_step_ms = draft.draft_ms,
+            .solo_head_overhead_ms = if (drafting) draft.draft_ms else null, // the Python engine's fixed draft allowance
             .streams_exact = true,
             .hidden_rows = true,
             .batch_rows = @intCast(self.m.eng.round_rows),
