@@ -58,6 +58,10 @@ pub const Config = struct {
     seed_salt: i64 = 0,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
+    /// TENSORFOLD_REPLY_IDS=1: a reply's think block opens and closes, and its call blocks open, only where their
+    /// marker tokens decoded (reply_text.Marks), so a reply that spells a marker in ordinary tokens keeps it as words;
+    /// off, replies are read by their text alone.
+    reply_ids: bool = false,
     /// Null keeps every reply identical to a server that has no compaction.
     compact_at: ?CompactAt = null,
     /// Tokens of the recent tail kept whole. Null uses min(20000, a quarter of the window).
@@ -90,6 +94,8 @@ pub const Server = struct {
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
+    /// The marker tokens a reply's parse reads by id (Config.reply_ids); empty: off.
+    reply_pieces: []const reply_text.Marks.Piece = &.{},
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
     /// The engine's numbers for its efforts (Info.efforts); empty: the template hears the names.
@@ -148,6 +154,7 @@ pub const Server = struct {
             std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
+        if (config.reply_ids) srv.reply_pieces = try replyPieces(a, text, srv.markers);
         if (text.tokenId("</think>")) |end| {
             const lead = try text.encode(a, "\n", false);
             const trail = try text.encode(a, "\n\n", false);
@@ -406,6 +413,23 @@ fn number(v: ?Value) ?f64 {
 fn seedBits(v: Value) u64 {
     if (v != .int) return 0;
     if (std.fmt.parseInt(i128, v.int, 10)) |n| return @truncate(@as(u128, @bitCast(n))) else |_| return 0;
+}
+
+/// The marker tokens a reply's parse reads by id (Config.reply_ids): each think or call marker the parse looks for
+/// that this tokenizer holds as one token, and DSML's marker inside DeepSeek's call tags.
+fn replyPieces(a: Allocator, text: model_text.Text, markers: reply_text.Markers) ![]const reply_text.Marks.Piece {
+    var out: std.ArrayList(reply_text.Marks.Piece) = .empty;
+    var pieces: std.ArrayList([]const u8) = .empty;
+    try pieces.appendSlice(a, &.{ markers.open, markers.close, "<think>", "\u{ff5c}DSML\u{ff5c}" });
+    for (reply_text.calls) |c| try pieces.appendSlice(a, &c);
+    for (pieces.items) |piece| {
+        if (piece.len == 0) continue;
+        const id = text.tokenId(piece) orelse continue;
+        for (out.items) |p| {
+            if (p.id == id) break;
+        } else try out.append(a, .{ .text = piece, .id = id });
+    }
+    return out.items;
 }
 
 /// ``template_late_system``: "system" when the template keeps a later system message in place, else "user".

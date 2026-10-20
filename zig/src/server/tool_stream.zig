@@ -56,6 +56,9 @@ pub const Streamer = struct {
     dsml_seen: bool = false,
     buffered_start: usize = 0,
     buffered_close: []const u8 = "",
+    /// The reply's marks for the text the next ``feed`` reads (TENSORFOLD_REPLY_IDS; set before each feed): a DSML
+    /// opener spelled in ordinary tokens opens no call. Null: every opener is read as its text.
+    marks: ?*const reply_text.Marks = null,
 
     pub fn init(a: Allocator, tools: []const Value) Allocator.Error!Streamer {
         var s: Streamer = .{ .a = a, .schemas = try tool_params.schemas(a, tools), .tools = tools };
@@ -120,14 +123,14 @@ pub const Streamer = struct {
                         s.pos = end + dsml_close.len;
                         s.searched = s.pos;
                         s.dsml_start = null;
-                        const parsed = try tool_parse.parse(s.a, text[start..s.pos], s.tools, null);
+                        const parsed = try tool_parse.parseMarked(s.a, text[start..s.pos], s.tools, null, s.marks);
                         if (parsed.calls) |calls| try s.emitCalls(calls, out);
                     }
                     if (text.len < s.searched) s.searched = s.pos;
                     const from = @min(text.len, @max(s.pos, s.searched -| (dsml_open.len - 1)));
                     var at = from;
                     while (std.mem.indexOfScalarPos(u8, text, at, '<')) |start| {
-                        if (std.mem.startsWith(u8, text[start..], dsml_open)) {
+                        if (std.mem.startsWith(u8, text[start..], dsml_open) and (s.marks == null or s.marks.?.real(text, start, dsml_open))) {
                             s.dsml_seen = true;
                             s.dsml_start = start;
                             s.pos = start + dsml_open.len;

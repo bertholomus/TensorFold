@@ -45,6 +45,12 @@ fn find(hay: []const u8, needle: []const u8, from: usize) ?usize {
     return std.mem.indexOfPos(u8, hay, from, needle);
 }
 
+/// ``find`` of a call block's opener where it is markup (``reply_text.Marks``); null marks: ``find``.
+fn markup(hay: []const u8, needle: []const u8, from: usize, marks: ?*const reply_text.Marks) ?usize {
+    if (from > hay.len) return null;
+    return reply_text.findMarkup(hay, from, needle, marks);
+}
+
 /// Python's ``\w`` on one byte, non-ASCII bytes counting as letters.
 fn word(ch: u8) bool {
     return std.ascii.isAlphanumeric(ch) or ch == '_' or ch >= 0x80;
@@ -56,13 +62,14 @@ fn allSpace(s: []const u8) bool {
     return strip(s).len == 0;
 }
 
-/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it.
-fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
+/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it. With marks, a
+/// DSML block whose opener is spelled in ordinary tokens is no block.
+fn envelopes(a: Allocator, text: []const u8, marks: ?*const reply_text.Marks) Allocator.Error![]Envelope {
     var found: std.ArrayList(Envelope) = .empty;
     var pos: usize = 0;
-    var dsml = find(text, dsml_open, 0); // the DSML opener at or after `pos`, searched again only once `pos` passes it
+    var dsml = markup(text, dsml_open, 0, marks); // the DSML opener at or after `pos`, searched again only once `pos` passes it
     while (findCI(text, "<tool_call>", pos)) |s| {
-        if (dsml != null and dsml.? < pos) dsml = find(text, dsml_open, pos);
+        if (dsml != null and dsml.? < pos) dsml = markup(text, dsml_open, pos, marks);
         if (dsml) |outer| if (outer < s) {
             pos = (find(text, dsml_close, outer + dsml_open.len) orelse break) + dsml_close.len;
             continue;
@@ -91,14 +98,14 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
         pos = e + 12;
     }
     pos = 0;
-    while (find(text, dsml_open, pos)) |s| {
+    while (markup(text, dsml_open, pos, marks)) |s| {
         const e = find(text, dsml_close, s + dsml_open.len);
         const end = if (e) |at| at + dsml_close.len else text.len;
         try found.append(a, .{ .start = s, .end = end, .payload = text[s..end], .complete = e != null });
         pos = end;
     }
     pos = 0;
-    while (find(text, dsml41_open, pos)) |s| {
+    while (markup(text, dsml41_open, pos, marks)) |s| {
         const e = find(text, dsml41_close, s + dsml41_open.len) orelse break;
         try found.append(a, .{ .start = s, .end = e + dsml41_close.len, .payload = text[s .. e + dsml41_close.len] });
         pos = e + dsml41_close.len;
@@ -117,6 +124,11 @@ fn envelopes(a: Allocator, text: []const u8) Allocator.Error![]Envelope {
 
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
 pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
+    return parseMarked(a, text, tools, max_calls, null);
+}
+
+/// ``parse`` with the reply's marks (TENSORFOLD_REPLY_IDS): a DSML block spelled in ordinary tokens stays content.
+pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize, marks: ?*const reply_text.Marks) Allocator.Error!Parsed {
     if (tools.len == 0) return .{ .content = text, .calls = null };
     var known: std.StringArrayHashMapUnmanaged([]const u8) = .empty;
     for (tools) |tool| {
@@ -125,7 +137,7 @@ pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?u
     }
     if (try bareCalls(a, text, &known, max_calls)) |calls| return .{ .content = "", .calls = calls };
     const schemas = try tool_params.schemas(a, tools);
-    const envs = try envelopes(a, text);
+    const envs = try envelopes(a, text, marks);
     if (envs.len == 0) return .{ .content = text, .calls = null };
     var calls: std.ArrayList(Value) = .empty;
     var residue: std.ArrayList(u8) = .empty;

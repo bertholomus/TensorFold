@@ -32,6 +32,71 @@ fn find(text: []const u8, tag: []const u8) ?usize {
     return findTag(text, 0, tag);
 }
 
+/// Where a reply's marker tokens decoded (TENSORFOLD_REPLY_IDS): a marker token's text in a tag is markup only at the
+/// offset its own token decoded to, so the same text spelled in ordinary tokens (a reply quoting a think end or a DSML
+/// call) stays words. Null marks read every tag as its text does.
+pub const Marks = struct {
+    base: [*]const u8, // the decoded reply the offsets count in
+    len: usize,
+    at: []const Mark, // in reply order
+    pieces: []const Piece, // the marker tokens (Server.reply_pieces)
+
+    pub const Mark = struct { offset: usize, id: u32 };
+    pub const Piece = struct { text: []const u8, id: u32 };
+
+    /// Whether `tag` at `text[i..]` is markup: each marker token's text in it lies where that token decoded. Text
+    /// outside the decoded reply (a copy) reads as its text does.
+    pub fn real(m: *const Marks, text: []const u8, i: usize, tag: []const u8) bool {
+        const p = @intFromPtr(text.ptr);
+        const b = @intFromPtr(m.base);
+        if (p < b or p > b + m.len) return true;
+        const at = p - b + i;
+        for (m.pieces) |piece| {
+            var k: usize = 0;
+            while (std.mem.indexOfPos(u8, tag, k, piece.text)) |j| : (k = j + piece.text.len) {
+                if (!m.has(at + j, piece.id)) return false;
+            }
+        }
+        return true;
+    }
+
+    fn has(m: *const Marks, offset: usize, id: u32) bool {
+        for (m.at) |x| {
+            if (x.offset == offset and x.id == id) return true;
+            if (x.offset > offset) return false;
+        }
+        return false;
+    }
+};
+
+/// ``findTag`` of a tag where it is markup (``Marks.real``); null marks: ``findTag``.
+pub fn findMarkup(text: []const u8, from: usize, tag: []const u8, marks: ?*const Marks) ?usize {
+    const m = marks orelse return findTag(text, from, tag);
+    var at = from;
+    while (findTag(text, at, tag)) |i| {
+        if (m.real(text, i, tag)) return i;
+        at = i + 1;
+    }
+    return null;
+}
+
+fn startsMarkup(text: []const u8, tag: []const u8, marks: ?*const Marks) bool {
+    return std.mem.startsWith(u8, text, tag) and (marks == null or marks.?.real(text, 0, tag));
+}
+
+/// Appends where `tokens[from..]`'s marker tokens decoded: each one's text ends the decode of the tokens through it
+/// (`text`: the model's tokenizer; each decode is `scratch`'s and freed at once).
+pub fn markTokens(a: Allocator, scratch: Allocator, text: anytype, pieces: []const Marks.Piece, tokens: []const u32, from: usize, out: *std.ArrayList(Marks.Mark)) Allocator.Error!void {
+    for (tokens[from..], from..) |t, j| {
+        const piece = for (pieces) |p| {
+            if (p.id == t) break p;
+        } else continue;
+        const through = try text.decode(scratch, tokens[0 .. j + 1]);
+        defer scratch.free(through);
+        if (std.mem.endsWith(u8, through, piece.text)) try out.append(a, .{ .offset = through.len - piece.text.len, .id = t });
+    }
+}
+
 pub fn isChannel(m: Markers) bool {
     return std.mem.eql(u8, m.close, channel_markers.close);
 }
@@ -52,12 +117,17 @@ pub const Split = struct { reasoning: []const u8, answer: []const u8 };
 
 /// (reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
 pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers) Allocator.Error!Split {
+    return splitThinkingMarked(a, full, finished, m, null);
+}
+
+/// ``splitThinking`` with the reply's marks: a marker spelled in ordinary tokens neither opens nor closes the block.
+pub fn splitThinkingMarked(a: Allocator, full: []const u8, finished: bool, m: Markers, marks: ?*const Marks) Allocator.Error!Split {
     var text = full;
-    if (m.open.len > 0 and !std.mem.startsWith(u8, text, m.open)) {
-        if (find(text, m.open)) |start| if (start > 0) {
+    if (m.open.len > 0 and !startsMarkup(text, m.open, marks)) {
+        if (findMarkup(text, 0, m.open, marks)) |start| if (start > 0) {
             var prefix = text[0..start];
             prefix = prefix[0 .. prefix.len - partialTag(prefix, m.open)]; // a stray partial opener
-            const inner = try splitThinking(a, text[start..], finished, m);
+            const inner = try splitThinkingMarked(a, text[start..], finished, m, marks);
             return .{ .reasoning = inner.reasoning, .answer = try std.mem.concat(a, u8, &.{ prefix, inner.answer }) };
         };
         if (!finished) {
@@ -69,20 +139,20 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
     }
     if (m.open.len > 0) {
         text = trimNewlines(text[m.open.len..]);
-    } else if (std.mem.startsWith(u8, text, think_open)) {
+    } else if (startsMarkup(text, think_open, marks)) {
         text = trimNewlines(text[think_open.len..]);
     } else if (!finished and std.mem.startsWith(u8, think_open, text)) {
         return .{ .reasoning = "", .answer = "" }; // held while the reply may still be writing that opener
     }
-    if (find(text, m.close)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
+    if (findMarkup(text, 0, m.close, marks)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
     var call: ?usize = null;
-    for (calls) |c| if (find(text, c[0])) |at| {
+    for (calls) |c| if (findMarkup(text, 0, c[0], marks)) |at| {
         if (call == null or at < call.?) call = at;
     };
     if (call) |at| {
         // a call written before the block closes: held while the block may still close, the answer if the reply ends
         if (!finished) return .{ .reasoning = text[0..at], .answer = "" };
-        for (calls) |c| if (std.mem.startsWith(u8, text[at..], c[0]) and find(text[at..], c[1]) != null)
+        for (calls) |c| if (startsMarkup(text[at..], c[0], marks) and find(text[at..], c[1]) != null)
             return .{ .reasoning = text[0..at], .answer = text[at..] };
         return .{ .reasoning = text, .answer = "" };
     }
@@ -96,21 +166,31 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
 
 /// Hides tool-call blocks and partial opening tags while streaming, so calls arrive as deltas instead.
 pub fn hideToolCalls(a: Allocator, text: []const u8, finished: bool) Allocator.Error![]const u8 {
+    return hideToolCallsMarked(a, text, finished, null);
+}
+
+/// ``hideToolCalls`` with the reply's marks: a block whose opener is spelled in ordinary tokens is prose.
+pub fn hideToolCallsMarked(a: Allocator, text: []const u8, finished: bool, marks: ?*const Marks) Allocator.Error![]const u8 {
     var out: std.ArrayList(u8) = .empty;
-    return hideInto(a, &out, text, finished);
+    return hideIntoMarked(a, &out, text, finished, marks);
 }
 
 /// ``hideToolCalls`` into ``out`` (cleared first); text without a call block comes back as a slice of ``text``.
 pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool) Allocator.Error![]const u8 {
+    return hideIntoMarked(a, out, text, finished, null);
+}
+
+/// ``hideInto`` with the reply's marks (``hideToolCallsMarked``).
+pub fn hideIntoMarked(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool, marks: ?*const Marks) Allocator.Error![]const u8 {
     out.clearRetainingCapacity();
     var pos: usize = 0;
     var next: [calls.len]?usize = undefined; // each opener at or after `pos`, searched again only once `pos` passes it
-    for (calls, &next) |c, *n| n.* = findTag(text, 0, c[0]);
+    for (calls, &next) |c, *n| n.* = findMarkup(text, 0, c[0], marks);
     while (true) {
         var start: ?usize = null;
         var which: usize = 0;
         for (calls, &next, 0..) |c, *n, i| {
-            if (n.* != null and n.*.? < pos) n.* = findTag(text, pos, c[0]);
+            if (n.* != null and n.*.? < pos) n.* = findMarkup(text, pos, c[0], marks);
             if (n.*) |at| if (start == null or at < start.?) {
                 start = at;
                 which = i;
@@ -140,7 +220,12 @@ pub fn heldBack(text: []const u8, tools: bool) []const u8 {
 
 /// ``hideToolCalls`` of a finished reply; once a call is hidden, the prose's trailing whitespace stays unsent too.
 pub fn finishedProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
-    const prose = try hideToolCalls(a, text, true);
+    return finishedProseMarked(a, text, null);
+}
+
+/// ``finishedProse`` with the reply's marks (``hideToolCallsMarked``).
+pub fn finishedProseMarked(a: Allocator, text: []const u8, marks: ?*const Marks) Allocator.Error![]const u8 {
+    const prose = try hideToolCallsMarked(a, text, true, marks);
     return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
 }
 
@@ -383,4 +468,63 @@ test "a reply that writes its own think opener keeps the tag out of its reasonin
         try std.testing.expectEqualStrings("Plan.\n", s.reasoning);
         try std.testing.expectEqualStrings("Done.", s.answer);
     }
+}
+
+test "with marks, a think end or a DSML opener spelled in ordinary tokens stays words" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pieces = [_]Marks.Piece{ .{ .text = "</think>", .id = 7 }, .{ .text = "\u{ff5c}DSML\u{ff5c}", .id = 9 } };
+    // the reasoning quotes the tag in ordinary tokens; the block ends where the token decoded
+    const reply = "a </think> b</think>\n\nanswer";
+    const end = std.mem.lastIndexOf(u8, reply, "</think>").?;
+    const marks: Marks = .{ .base = reply.ptr, .len = reply.len, .at = &.{.{ .offset = end, .id = 7 }}, .pieces = &pieces };
+    const s = try splitThinkingMarked(a, reply, true, think_markers, &marks);
+    try std.testing.expectEqualStrings("a </think> b", s.reasoning);
+    try std.testing.expectEqualStrings("answer", s.answer);
+    try std.testing.expectEqualStrings("a ", (try splitThinking(a, reply, true, think_markers)).reasoning); // by text
+    // while it streams, the quoted tag is reasoning too, and nothing is answer before the token
+    const part = reply[0 .. end - 1];
+    const held = try splitThinkingMarked(a, part, false, think_markers, &marks);
+    try std.testing.expectEqualStrings("a </think> ", held.reasoning);
+    try std.testing.expectEqualStrings("", held.answer);
+    // a DSML block spelled in ordinary tokens is prose; at its token's place it is a call, hidden
+    const prose = "Use <\u{ff5c}DSML\u{ff5c} calls>x</\u{ff5c}DSML\u{ff5c} calls> like this.";
+    const none: Marks = .{ .base = prose.ptr, .len = prose.len, .at = &.{}, .pieces = &pieces };
+    try std.testing.expectEqualStrings(prose, try hideToolCallsMarked(a, prose, true, &none));
+    try std.testing.expectEqualStrings(prose, try finishedProseMarked(a, prose, &none));
+    try std.testing.expectEqualStrings("Use  like this.", try hideToolCalls(a, prose, true));
+    const at = std.mem.indexOf(u8, prose, "\u{ff5c}DSML\u{ff5c}").?;
+    const real: Marks = .{ .base = prose.ptr, .len = prose.len, .at = &.{.{ .offset = at, .id = 9 }}, .pieces = &pieces };
+    try std.testing.expectEqualStrings("Use  like this.", try hideToolCallsMarked(a, prose, true, &real));
+    // a copy outside the decoded reply reads as its text does
+    const copy = try a.dupe(u8, prose);
+    try std.testing.expectEqualStrings("Use  like this.", try hideToolCallsMarked(a, copy, true, &none));
+}
+
+test "a reply's marks lie where each marker token's text ends the decode through it" {
+    const Fake = struct {
+        pub fn decode(_: @This(), a: Allocator, ids: []const u32) Allocator.Error![]u8 {
+            var out: std.ArrayList(u8) = .empty;
+            for (ids) |t| try out.appendSlice(a, switch (t) {
+                7 => "</think>",
+                1 => "<",
+                2 => "/think>",
+                else => "x",
+            });
+            return out.toOwnedSlice(a);
+        }
+    };
+    const gpa = std.testing.allocator;
+    const pieces = [_]Marks.Piece{.{ .text = "</think>", .id = 7 }};
+    var out: std.ArrayList(Marks.Mark) = .empty;
+    defer out.deinit(gpa);
+    // "x" "<" "/think>" "x" "</think>" "x": the spelled tag is no mark, the token at byte 10 is
+    const tokens = [_]u32{ 3, 1, 2, 3, 7, 3 };
+    try markTokens(gpa, gpa, Fake{}, &pieces, &tokens, 0, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
+    try std.testing.expectEqual(Marks.Mark{ .offset = 10, .id = 7 }, out.items[0]);
+    // a stream scans only the tokens it has not scanned
+    try markTokens(gpa, gpa, Fake{}, &pieces, &tokens, tokens.len, &out);
+    try std.testing.expectEqual(@as(usize, 1), out.items.len);
 }
