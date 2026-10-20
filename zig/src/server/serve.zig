@@ -126,6 +126,13 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_PLAIN_SPECIALS={s}: 1 (on) or 0 (off)\n", .{t});
         return 1;
     } else false;
+    const reply_ids = if (env(s, "TENSORFOLD_REPLY_IDS")) |t| blk: {
+        const v = std.mem.trim(u8, t, " ");
+        if (std.mem.eql(u8, v, "1")) break :blk true;
+        if (v.len == 0 or std.mem.eql(u8, v, "0")) break :blk false;
+        std.debug.print("tensorfold: TENSORFOLD_REPLY_IDS={s}: 1 (on) or 0 (off)\n", .{t});
+        return 1;
+    } else false;
     const config: server_mod.Config = .{
         .served_name = s.served,
         .model_dir = s.model_dir,
@@ -144,6 +151,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .seed_salt = salt,
         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
         .plain_specials = plain_specials,
+        .reply_ids = reply_ids,
         .dashboard = args.dashboard,
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,
@@ -190,6 +198,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     if (s.recall) |r| recall_routes.line(r);
     if (srv.shield) |sh| log.line("plain specials on (TENSORFOLD_PLAIN_SPECIALS): the text of {d} added tokens is ordinary text where users, tools or search results wrote it and in tool calls; the template's own markers keep their ids", .{sh.added});
+    if (reply_ids) log.line("reply ids on (TENSORFOLD_REPLY_IDS): a reply's think block opens and closes, and its tool calls open, only at their {d} marker tokens; the same text spelled in ordinary tokens stays words", .{srv.reply_pieces.len});
     if (srv.cortheon) |c| log.line("cortheon on: chat requests get Cortheon's reasoning program, web research before building, and cortheon_search/cortheon_fetch run here ({s}); a request can send \"cortheon\": false", .{c.engine});
     live.columns_env = env(s, "COLUMNS");
     var ticker: live.Ticker = .{ .engine = s.engine };
