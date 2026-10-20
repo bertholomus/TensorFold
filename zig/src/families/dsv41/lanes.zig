@@ -12,7 +12,10 @@
 //! positional, so keep only checks that a path is a prefix. Rank 0 runs the core; before each primitive it sends rank
 //! 1 the primitive's inputs over the ranks' link, and rank 1 (follow) runs the same primitive: both ranks issue the
 //! same kernels and collectives in the same order. The drafted reply is the serial one: every row is drawn with its
-//! stream's key at its own position, whatever the round's composition.
+//! stream's key at its own position, whatever the round's composition. Structured output: a stream with a grammar
+//! draws each row among its mask's tokens (the row with the others at -inf, drawn as any row), its first token from
+//! the prompt's last row the prompt pass kept for it (first_masked), and the round loop reads its held drafts as host
+//! tokens (held) to walk them through the grammar; rank 1 runs the same rounds, the masks are rank 0's alone.
 const std = @import("std");
 const lanes = @import("lanes");
 const model = @import("model.zig");
@@ -220,6 +223,29 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
     return @intCast(t);
 }
 
+/// A row's draw among a grammar's allowed tokens (token t: bit t % 32 of word t / 32, lanes/grammar.zig): the row
+/// with every other token at -inf (written into `buf`, the row's width), drawn as `draw` draws any row.
+pub fn drawMasked(buf: []f32, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
+    var allowed = false;
+    for (buf, row, 0..) |*x, v, id| {
+        const on = lanes.grammar.allows(mask, id);
+        x.* = if (on) v else -std.math.inf(f32);
+        allowed = allowed or on;
+    }
+    if (!allowed) return error.NoAllowedToken;
+    return draw(buf, position, s);
+}
+
+/// A row's mask width in words: one bit a token.
+pub fn maskWords(vocab: usize) usize {
+    return (vocab + 31) / 32;
+}
+
+/// A window's masks: none, or each row's bits (rows x words).
+fn masksFit(w: be.Window, words: usize) bool {
+    return w.masks.len == 0 or w.masks.len == w.rows() * words;
+}
+
 /// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
 /// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
 pub const Profile = struct {
@@ -304,6 +330,11 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
+    // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
+    // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
+    first_row: []f32 = &.{},
+    first_of: ?*const lanes.Stream = null,
+    masked: []f32 = &.{},
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -325,6 +356,8 @@ pub const Lanes = struct {
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
+        self.gpa.free(self.first_row);
+        self.gpa.free(self.masked);
     }
 
     pub fn backend(self: *Lanes) be.Backend {
@@ -337,6 +370,8 @@ pub const Lanes = struct {
             .keep = keepFn,
             .draft = draftFn,
             .probabilities = probabilitiesFn,
+            .first_masked = firstMaskedFn,
+            .held = heldFn,
             .release = releaseFn,
         } };
     }
@@ -564,6 +599,12 @@ pub const Lanes = struct {
         }
         const token = try draw(logits, len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
+        // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
+        if (s.grammar != null) {
+            self.first_row = try gpa.realloc(self.first_row, logits.len);
+            @memcpy(self.first_row, logits);
+            self.first_of = s;
+        }
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -571,6 +612,30 @@ pub const Lanes = struct {
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (position != s.prompt_len) return error.PositionMismatch;
         return l.first;
+    }
+
+    /// `first` among a grammar's tokens: the prompt's last row (the prompt pass kept it for the stream) drawn again
+    /// with the other tokens at -inf, at the same keyed position.
+    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const self = of(ptr);
+        _ = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (position != s.prompt_len) return error.PositionMismatch;
+        if (self.first_of != s) return error.NoPromptRow;
+        return self.take(try self.drawAllowed(self.first_row, position, s.sampling, mask));
+    }
+
+    /// The held drafts as host tokens in window order (a grammar walks them): draft holds them when its pass ends.
+    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+        const self = of(ptr);
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (out.len > l.nheld) return error.HeldMismatch;
+        @memcpy(out, l.held[0..out.len]);
+    }
+
+    /// drawMasked into the backend's row.
+    fn drawAllowed(self: *Lanes, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
+        self.masked = try self.gpa.realloc(self.masked, row.len);
+        return drawMasked(self.masked, row, position, s, mask);
     }
 
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -593,6 +658,8 @@ pub const Lanes = struct {
         if (windows.len > max_streams) return error.WindowTooWide;
         var ids: [max_streams][max_rows]i32 = undefined;
         var wins: [max_streams]Win = undefined;
+        const words = maskWords(m.vocab);
+        var masked = false;
         for (windows, 0..) |w, k| {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
@@ -601,6 +668,8 @@ pub const Lanes = struct {
             const start: usize = @intCast(w.stream.cache_len);
             for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
             if (w.held > l.nheld) return error.HeldMismatch;
+            if (!masksFit(w, words)) return error.BadMasks;
+            masked = masked or w.masks.len > 0;
             ids[k][0] = @intCast(w.pending);
             for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
@@ -623,8 +692,8 @@ pub const Lanes = struct {
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
         const t2 = m.now();
-        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
-        var greedy = true;
+        // every row greedy and none masked: the device's argmax (R tokens back); else the logits for the host's draws
+        var greedy = !masked;
         for (windows) |w| {
             if (w.stream.sampling) |sm| if (sm.temperature > 0) {
                 greedy = false;
@@ -646,7 +715,10 @@ pub const Lanes = struct {
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else if (w.masks.len > 0)
+                try self.drawAllowed(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling, w.masks[r * words ..][0..words])
+            else
+                try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
@@ -853,6 +925,7 @@ pub const Lanes = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
+        if (self.first_of == s) self.first_of = null;
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
     }
@@ -1086,4 +1159,107 @@ test "greedy draws take the first largest logit" {
     const row = [_]f32{ 0.5, 2.0, -1.0, 2.0 };
     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, null));
     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, .{ .seed = 3, .temperature = 0 }));
+}
+
+/// A test row: token i's logit from splitmix64(i + 1) (exact in f32, a few ties).
+fn testRow(row: []f32) void {
+    for (row, 0..) |*x, i| {
+        var z: u64 = @as(u64, i + 1) *% 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        x.* = @as(f32, @floatFromInt((z ^ (z >> 31)) >> 52)) / 256.0 - 8.0;
+    }
+}
+
+test "a masked draw is the row's draw with the other tokens at -inf, and never a disallowed token" {
+    const V = 1000;
+    var row: [V]f32 = undefined;
+    testRow(&row);
+    var buf: [V]f32 = undefined;
+    var off: [V]f32 = undefined;
+    var mask: [maskWords(V)]u32 = @splat(0);
+    for (0..V) |i| if (i % 7 == 3 or i % 250 == 1) {
+        mask[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+    };
+    for (&off, row, 0..) |*o, v, i| o.* = if (lanes.grammar.allows(&mask, i)) v else -std.math.inf(f32);
+    const all: [maskWords(V)]u32 = @splat(std.math.maxInt(u32));
+    const settings = [_]?lanes.Sampling{
+        null,
+        .{ .seed = 5, .temperature = 0 },
+        .{ .seed = 11, .temperature = 1.0, .top_k = 1 },
+        .{ .seed = 12, .temperature = 1.0, .top_k = 20, .top_p = 0.95 },
+        .{ .seed = 13, .temperature = 0.7, .top_k = 56, .top_p = 0.9, .min_p = 0.05 },
+        .{ .seed = 14, .temperature = 1.3, .top_k = 40, .top_p = 1.0 },
+    };
+    for (settings) |s| for ([_]u64{ 0, 17, 4096, 1 << 20 }) |position| {
+        const got = try drawMasked(&buf, &row, position, s, &mask);
+        try std.testing.expect(lanes.grammar.allows(&mask, got));
+        try std.testing.expectEqual(try draw(&off, position, s), got);
+        // every token allowed: the row's own draw
+        try std.testing.expectEqual(try draw(&row, position, s), try drawMasked(&buf, &row, position, s, &all));
+    };
+    // greedy: the first largest allowed logit
+    var best: ?usize = null;
+    for (row, 0..) |v, i| if (lanes.grammar.allows(&mask, i) and (best == null or v > row[best.?])) {
+        best = i;
+    };
+    try std.testing.expectEqual(@as(u32, @intCast(best.?)), try drawMasked(&buf, &row, 3, null, &mask));
+    // one token allowed: that token at any sampling
+    var one: [maskWords(V)]u32 = @splat(0);
+    one[999 / 32] = @as(u32, 1) << (999 % 32);
+    for (settings) |s| try std.testing.expectEqual(@as(u32, 999), try drawMasked(&buf, &row, 9, s, &one));
+    // nothing allowed: no draw
+    try std.testing.expectError(error.NoAllowedToken, drawMasked(&buf, &row, 9, null, &@as([maskWords(V)]u32, @splat(0))));
+}
+
+test "a stream with a grammar draws its first token from the kept prompt row, and its held drafts read back as host tokens" {
+    const gpa = std.testing.allocator;
+    var ln: Lanes = .{ .gpa = gpa, .m = undefined, .peer = null };
+    defer ln.deinit();
+    const b = ln.backend();
+    try std.testing.expect(b.vtable.first_masked != null and b.vtable.held != null);
+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 8, .sampling = .{ .seed = 7, .temperature = 0.8, .top_k = 20, .top_p = 0.95 } });
+    defer s.deinit(gpa);
+    try ln.streams.put(gpa, &s, .{ .slot = 0, .base = 0, .end = model.chunk_rows });
+    ln.used[0] = true;
+    var row: [1000]f32 = undefined;
+    testRow(&row);
+    var mask: [maskWords(1000)]u32 = @splat(0);
+    for ([_]usize{ 4, 100, 640, 999 }) |t| mask[t / 32] |= @as(u32, 1) << @intCast(t % 32);
+    // no kept row (the stream had no grammar at its prompt pass): no masked draw
+    try std.testing.expectError(error.NoPromptRow, b.vtable.first_masked.?(b.ptr, &s, 3, &mask));
+    ln.first_row = try gpa.dupe(f32, &row);
+    ln.first_of = &s;
+    try std.testing.expectError(error.PositionMismatch, b.vtable.first_masked.?(b.ptr, &s, 2, &mask));
+    var buf: [1000]f32 = undefined;
+    const want = try drawMasked(&buf, &row, 3, s.sampling, &mask);
+    try std.testing.expectEqual(want, try b.read(try b.vtable.first_masked.?(b.ptr, &s, 3, &mask)));
+    // the drafts the last pass held, in window order
+    const l = ln.streams.getPtr(&s).?;
+    l.held[0..3].* = .{ 50, 51, 52 };
+    l.nheld = 3;
+    var out: [2]u32 = undefined;
+    try b.vtable.held.?(b.ptr, &s, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 50, 51 }, &out);
+    var four: [4]u32 = undefined;
+    try std.testing.expectError(error.HeldMismatch, b.vtable.held.?(b.ptr, &s, &four));
+    // a released stream's row is no one's
+    b.release(&s);
+    try std.testing.expect(ln.first_of == null);
+}
+
+test "a window's masks are none or every row's bits" {
+    const gpa = std.testing.allocator;
+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 4 });
+    defer s.deinit(gpa);
+    const words = maskWords(129280);
+    try std.testing.expectEqual(@as(usize, 4040), words);
+    const bits: [3 * 4040]u32 = @splat(1);
+    const w: be.Window = .{ .stream = &s, .pending = 1, .held = 0, .tokens = &.{ 2, 3 }, .parents = null, .positions = &.{ 2, 3, 4 } };
+    try std.testing.expect(masksFit(w, words));
+    var with = w;
+    with.masks = &bits;
+    try std.testing.expect(masksFit(with, words));
+    with.masks = bits[0 .. 2 * words];
+    try std.testing.expect(!masksFit(with, words));
 }
