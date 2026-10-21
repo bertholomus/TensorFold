@@ -7,7 +7,8 @@ The Linux binaries target baseline x86_64 or aarch64 with glibc 2.28 or later. T
 At this source revision, Nemotron's Metal kernels and draft vocabulary are embedded in the executable.
 It does not load an adjacent Nemotron coop metallib. `lib/` holds `libtfgrammar` (`.dylib` on macOS, `.so` on Linux,
 built against the same OS floor as the binary), which structured output and required tool calls load at their first
-request; without it, those requests get HTTP 400 and everything else serves. It is xgrammar v0.2.8 (Apache-2.0) with
+request (the file `TENSORFOLD_GRAMMAR_LIB` names takes its place when set); without it, those requests get HTTP 400
+and everything else serves. It is xgrammar v0.2.8 (Apache-2.0) with
 dlpack (Apache-2.0) and picojson (BSD-2-Clause); their notices are in `LICENSES/` and `THIRD_PARTY_NOTICES.md`.
 CUDA `.cu` fatbins are embedded at build time from the qualified directory supplied to the release build.
 JPEG pictures need libjpeg-turbo 3.1.4.1's `libturbojpeg`, which the archives do not include: the server loads it at the

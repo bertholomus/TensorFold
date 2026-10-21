@@ -25,6 +25,10 @@ pub const Reason = enum {
 
 pub const Mode = enum { pipe, drain, verify, exit };
 
+/// One depth of the head's chains: rounds whose chain drafted that deep, those that reached it (kept every draft above
+/// it), and those that kept its draft too (engine_api.DraftDepth).
+pub const Depth = struct { drafted: u32 = 0, reached: u32 = 0, kept: u32 = 0 };
+
 pub const loop_max_period: usize = 8;
 pub const loop_min_run: usize = 256;
 pub const loop_warm_in: usize = 64;
@@ -208,6 +212,7 @@ pub const Stream = struct {
     rounds: u64 = 0,
     drafted: u64 = 0,
     accepted: u64 = 0,
+    depths: [shape.max_depth]Depth = @splat(.{}), // the head's chains by depth (noteDepths)
     branch_rows: u64 = 0, // suffix-match branch rows verified (lanes/fill.zig)
     branch_accepted: u64 = 0, // of those, rows on the accepted path
     graft_hit: f64 = 1, // recent share of grafted rows kept; a read of the chain that grafted none counts as a miss
@@ -373,6 +378,17 @@ pub const Stream = struct {
         return std.mem.indexOfScalar(u32, s.eos, token) != null;
     }
 
+    /// One head chain of `drafted` drafts, the target keeping its first `kept`, counted at each depth it drafted (a
+    /// draft deeper than the counts counts at the last).
+    pub fn noteDepths(s: *Stream, drafted: usize, kept: usize) void {
+        for (0..drafted) |j| {
+            const d = &s.depths[@min(j, s.depths.len - 1)];
+            d.drafted += 1;
+            d.reached += @intFromBool(kept >= j);
+            d.kept += @intFromBool(kept > j);
+        }
+    }
+
     /// Each held tree lane whose parent row the round reached: the target took it or not (its depth and rank).
     pub fn observeLanes(s: *Stream, l: *const shape.Shape, path: []const u32) void {
         var on: [256]bool = @splat(false);
@@ -477,6 +493,21 @@ test "commit stops at eos and length" {
     try std.testing.expectEqual(@as(usize, 2), try s.commit(gpa, &.{ 5, 9, 7 }, &.{}));
     try std.testing.expectEqualSlices(u32, &.{ 5, 9 }, s.emitted());
     try std.testing.expect(s.finished and s.reason == .stop);
+}
+
+test "a head chain counts at each depth it drafted: reached while the drafts above it were kept, kept with its own" {
+    const gpa = std.testing.allocator;
+    var s = try Stream.init(gpa, .{ .id = "a", .prompt = &.{ 1, 2 }, .max_new = 3, .eos = &.{9} });
+    defer s.deinit(gpa);
+    s.noteDepths(3, 1); // the second draft missed: the third was drafted, never reached
+    s.noteDepths(2, 2); // both kept
+    s.noteDepths(4, 0); // the first missed
+    const want = [_]Depth{ .{ .drafted = 3, .reached = 3, .kept = 2 }, .{ .drafted = 3, .reached = 2, .kept = 1 }, .{ .drafted = 2, .reached = 0, .kept = 0 }, .{ .drafted = 1, .reached = 0, .kept = 0 } };
+    try std.testing.expectEqualSlices(Depth, &want, s.depths[0..4]);
+    try std.testing.expectEqual(Depth{}, s.depths[4]);
+    // a chain deeper than the counts adds its deeper drafts at the last depth
+    s.noteDepths(shape.max_depth + 2, shape.max_depth + 2);
+    try std.testing.expectEqual(Depth{ .drafted = 3, .reached = 3, .kept = 3 }, s.depths[shape.max_depth - 1]);
 }
 
 test "a logprob stream lands a row with each token it lands, and refuses tokens without rows" {

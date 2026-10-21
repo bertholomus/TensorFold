@@ -28,6 +28,11 @@ pub const Snapshots = struct {
         /// Make the live state `saved`'s: the next prompt chunk starts at its position.
         restore: *const fn (ptr: *anyopaque, owner: ?*anyopaque, saved: Saved) anyerror!void,
         drop: *const fn (ptr: *anyopaque, saved: Saved) void,
+        /// Whether the family resumes `saved` for a prompt of `len` tokens: find passes a state it refuses over for
+        /// an earlier one (null: every state find matches).
+        resumes: ?*const fn (ptr: *anyopaque, saved: Saved, len: u32) bool = null,
+        /// Whether `saved` still holds its state: one that lost it leaves lookup when find meets it (null: always).
+        live: ?*const fn (ptr: *anyopaque, saved: Saved) bool = null,
         /// The storage a kept state holds: new storage up to `bytes`, or the spare storage it took (null: `bytes`).
         charged: ?*const fn (ptr: *anyopaque, saved: Saved) u64 = null,
         /// Free storage the family keeps for later saves, inside the budget (null: none).
@@ -232,9 +237,23 @@ pub const Store = struct {
             const n = e.tokens.len;
             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
             if (!modes.equal(e.decode_spans, spans, e.at)) continue;
+            if (!s.familyResumes(e, prompt.len)) continue;
             best = e;
         }
         return best;
+    }
+
+    /// Whether the family resumes `e` for a prompt of `len` tokens. A state that lost its rows also leaves lookup now,
+    /// as `expired` makes it leave (its storage goes at the next safe boundary); one this prompt only ends too near
+    /// stays for the longer prompts of the conversation that kept it.
+    fn familyResumes(s: *Store, e: *Entry, len: usize) bool {
+        const f = s.family.vtable.resumes orelse return true;
+        if (f(s.family.ptr, e.saved, @intCast(len))) return true;
+        if (s.family.vtable.live) |g| if (!g(s.family.ptr, e.saved)) {
+            e.expired = true;
+            s.counts.evicted += 1;
+        };
+        return false;
     }
 
     /// Restore the longest prefix matching tokens and canonical spans, then plan prompt-cache marks.

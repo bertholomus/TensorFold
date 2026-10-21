@@ -342,7 +342,7 @@ const Run = struct {
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
-        const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
+        const parsed = try tool_parse.parseMarked(r.a, reply.content, tools, r.plan.policy.maxCalls(), if (reply.marks) |*m| m else null);
         const calls = (if (r.turn != null) cortheon.clientCalls(parsed.calls) else parsed.calls) orelse {
             if (r.plan.policy.single or parsed.calls != null) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
             return null;

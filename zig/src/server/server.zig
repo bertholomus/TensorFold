@@ -15,6 +15,7 @@ const responses = @import("responses.zig");
 const grammar = @import("grammar.zig");
 const clock = @import("clock.zig");
 const prompt = @import("prompt.zig");
+const specials = @import("specials.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_grammar = @import("tool_grammar.zig");
 const chunk_plan = @import("chunk_plan.zig");
@@ -49,6 +50,9 @@ pub const Config = struct {
     /// TENSORFOLD_SSE_KEEPALIVE (seconds): a stream that sent nothing for this long (a long prompt's prefill) sends an
     /// SSE comment, so a client's idle timer does not drop it; 0: never (the stream's bytes as before).
     sse_keepalive_ms: u32 = 0,
+    /// TENSORFOLD_STATS_EVERY (seconds): as requests finish, a stats line at most this often on what finished since the
+    /// last (tokens a round, drafts kept, the draft head's chains by depth); 0: none. Replies are the same either way.
+    stats_every_s: u32 = 0,
     dashboard: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,
@@ -58,6 +62,13 @@ pub const Config = struct {
     seed_salt: i64 = 0,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
+    /// TENSORFOLD_PLAIN_SPECIALS=1: an added token's text that users, tools or search results wrote, or a tool call
+    /// carries, is ordinary text in the prompt (specials.zig); off, every prompt is the template's text tokenized whole.
+    plain_specials: bool = false,
+    /// TENSORFOLD_REPLY_IDS=1: a reply's think block opens and closes, and its call blocks open, only where their
+    /// marker tokens decoded (reply_text.Marks), so a reply that spells a marker in ordinary tokens keeps it as words;
+    /// off, replies are read by their text alone.
+    reply_ids: bool = false,
     /// Null keeps every reply identical to a server that has no compaction.
     compact_at: ?CompactAt = null,
     /// Tokens of the recent tail kept whole. Null uses min(20000, a quarter of the window).
@@ -90,6 +101,10 @@ pub const Server = struct {
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
+    /// The markers a sender's text keeps as text (Config.plain_specials); null: off.
+    shield: ?*const specials.Shield = null,
+    /// The marker tokens a reply's parse reads by id (Config.reply_ids); empty: off.
+    reply_pieces: []const reply_text.Marks.Piece = &.{},
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
     /// The engine's numbers for its efforts (Info.efforts); empty: the template hears the names.
@@ -148,6 +163,12 @@ pub const Server = struct {
             std.mem.indexOf(u8, source, "thinking_mode") != null;
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(source);
+        if (config.plain_specials) {
+            const sh = try a.create(specials.Shield);
+            sh.* = try specials.Shield.init(a, text, srv.info.vision, if (srv.info.lane_vision) |v| v.placeholder else null);
+            srv.shield = sh;
+        }
+        if (config.reply_ids) srv.reply_pieces = try replyPieces(a, text, srv.markers);
         if (text.tokenId("</think>")) |end| {
             const lead = try text.encode(a, "\n", false);
             const trail = try text.encode(a, "\n\n", false);
@@ -272,7 +293,7 @@ pub const Server = struct {
             var err: [512]u8 = undefined;
             const c = a.create(api.grammar.Compiler) catch break :blk "out of memory";
             c.* = api.grammar.Compiler.open(srv.io, a, tok, vocab.?, srv.eos, &err) catch |e| break :blk switch (e) {
-                error.NoGrammarLibrary => "the server cannot load " ++ api.grammar.library ++ " (xgrammar; zig build grammar)",
+                error.NoGrammarLibrary => "the server cannot load " ++ api.grammar.library ++ " (xgrammar; zig build grammar, or name the file in " ++ api.grammar.env ++ ")",
                 else => a.dupe(u8, std.mem.sliceTo(&err, 0)) catch "out of memory",
             };
             srv.grammars = c;
@@ -307,11 +328,15 @@ pub const Server = struct {
         return null;
     }
 
-    /// Counts one finished request for /metrics.
-    pub fn noteRequest(srv: *Server, prompt_len: usize, cached: usize, generated: usize, drafted: u64, accepted: u64, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
+    /// Counts one finished request for /metrics, then writes the stats line when its interval has passed.
+    pub fn noteRequest(srv: *Server, prompt_len: usize, cached: usize, generated: usize, drafted: u64, accepted: u64, depths: []const api.DraftDepth, rounds: u64, received: i96, first: ?i96, last: ?i96, prefill: ?f64) void {
         const now = clock.nowNs(srv.io);
         const tpot = srv.metrics.tpotValue(first, last, generated);
         srv.metrics.note(srv.io, prompt_len, cached, generated, drafted, accepted, rounds, @max(0, clock.seconds(now - received)), if (first) |f| clock.seconds(f - received) else null, if (first) |f| @max(0, clock.seconds(now - f)) else null, prefill, tpot);
+        srv.metrics.noteDepths(srv.io, depths);
+        if (srv.config.stats_every_s == 0) return;
+        var buf: [1024]u8 = undefined;
+        if (srv.metrics.statsLine(srv.io, now, @as(i96, srv.config.stats_every_s) * std.time.ns_per_s, &buf)) |text| log.line("{s}", .{text});
     }
 
     /// Accepts connections until ``stop`` is set, each on its own thread.
@@ -406,6 +431,23 @@ fn number(v: ?Value) ?f64 {
 fn seedBits(v: Value) u64 {
     if (v != .int) return 0;
     if (std.fmt.parseInt(i128, v.int, 10)) |n| return @truncate(@as(u128, @bitCast(n))) else |_| return 0;
+}
+
+/// The marker tokens a reply's parse reads by id (Config.reply_ids): each think or call marker the parse looks for
+/// that this tokenizer holds as one token, and DSML's marker inside DeepSeek's call tags.
+fn replyPieces(a: Allocator, text: model_text.Text, markers: reply_text.Markers) ![]const reply_text.Marks.Piece {
+    var out: std.ArrayList(reply_text.Marks.Piece) = .empty;
+    var pieces: std.ArrayList([]const u8) = .empty;
+    try pieces.appendSlice(a, &.{ markers.open, markers.close, "<think>", "\u{ff5c}DSML\u{ff5c}" });
+    for (reply_text.calls) |c| try pieces.appendSlice(a, &c);
+    for (pieces.items) |piece| {
+        if (piece.len == 0) continue;
+        const id = text.tokenId(piece) orelse continue;
+        for (out.items) |p| {
+            if (p.id == id) break;
+        } else try out.append(a, .{ .text = piece, .id = id });
+    }
+    return out.items;
 }
 
 /// ``template_late_system``: "system" when the template keeps a later system message in place, else "user".

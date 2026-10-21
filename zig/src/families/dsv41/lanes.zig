@@ -12,7 +12,10 @@
 //! positional, so keep only checks that a path is a prefix. Rank 0 runs the core; before each primitive it sends rank
 //! 1 the primitive's inputs over the ranks' link, and rank 1 (follow) runs the same primitive: both ranks issue the
 //! same kernels and collectives in the same order. The drafted reply is the serial one: every row is drawn with its
-//! stream's key at its own position, whatever the round's composition.
+//! stream's key at its own position, whatever the round's composition. Structured output: a stream with a grammar
+//! draws each row among its mask's tokens (the row with the others at -inf, drawn as any row), its first token from
+//! the prompt's last row the prompt pass kept for it (first_masked), and the round loop reads its held drafts as host
+//! tokens (held) to walk them through the grammar; rank 1 runs the same rounds, the masks are rank 0's alone.
 const std = @import("std");
 const lanes = @import("lanes");
 const model = @import("model.zig");
@@ -152,17 +155,31 @@ fn markEnds(marks: []const u32, at: usize) bool {
     return false;
 }
 
-/// The first extent of `size` in [0, cap) clear of `live` and of the kept states ([base, at, end] each): clear of their
-/// whole extents (rows and tail) where one fits so, else of their rows only.
+/// Room left past a kept state's extent while placements fit so, for its conversation's next turn to resume in place.
+pub const growth_rows = 16 * model.chunk_rows;
+
+/// The first fit of `size` clear of `live` and of kept extents plus growth_rows, else of their extents, else of their rows.
 pub fn placeSoft(gpa: std.mem.Allocator, live: []const [2]usize, kept: []const [3]usize, size: usize, cap: usize) !?usize {
     var used: std.ArrayList([2]usize) = .empty;
     defer used.deinit(gpa);
     try used.appendSlice(gpa, live);
+    for (kept) |k| try used.append(gpa, .{ k[0], @max(k[2], k[0] + k[1]) + growth_rows });
+    if (place(used.items, size, cap)) |b| return b;
+    used.shrinkRetainingCapacity(live.len);
     for (kept) |k| try used.append(gpa, .{ k[0], @max(k[2], k[0] + k[1]) });
     if (place(used.items, size, cap)) |b| return b;
     used.shrinkRetainingCapacity(live.len);
     for (kept) |k| try used.append(gpa, .{ k[0], k[0] + k[1] });
     return place(used.items, size, cap);
+}
+
+test "a placement leaves a kept state room to grow while one fits so" {
+    const c = model.chunk_rows;
+    const gpa = std.testing.allocator;
+    const kept = [_][3]usize{.{ 0, 48 * c, 50 * c }}; // rows [0, 48c), its stream's extent to 50c
+    try std.testing.expectEqual(@as(?usize, 50 * c + growth_rows), try placeSoft(gpa, &.{}, &kept, 4 * c, 128 * c));
+    // no room past the growth: flush against the extent, as before
+    try std.testing.expectEqual(@as(?usize, 50 * c), try placeSoft(gpa, &.{}, &kept, 4 * c, 50 * c + growth_rows));
 }
 
 test "a kept state's tail stays free while a placement fits elsewhere" {
@@ -220,6 +237,29 @@ pub fn draw(row: []const f32, position: u64, s: ?lanes.Sampling) !u32 {
     return @intCast(t);
 }
 
+/// A row's draw among a grammar's allowed tokens (token t: bit t % 32 of word t / 32, lanes/grammar.zig): the row
+/// with every other token at -inf (written into `buf`, the row's width), drawn as `draw` draws any row.
+pub fn drawMasked(buf: []f32, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
+    var allowed = false;
+    for (buf, row, 0..) |*x, v, id| {
+        const on = lanes.grammar.allows(mask, id);
+        x.* = if (on) v else -std.math.inf(f32);
+        allowed = allowed or on;
+    }
+    if (!allowed) return error.NoAllowedToken;
+    return draw(buf, position, s);
+}
+
+/// A row's mask width in words: one bit a token.
+pub fn maskWords(vocab: usize) usize {
+    return (vocab + 31) / 32;
+}
+
+/// A window's masks: none, or each row's bits (rows x words).
+fn masksFit(w: be.Window, words: usize) bool {
+    return w.masks.len == 0 or w.masks.len == w.rows() * words;
+}
+
 /// Where rank 0's backend calls spend their time (ns, summed; --profile): a round's frame to rank 1, its forward
 /// and absorb (synchronized apart), the logits' copy to the host and the draws; the drafter passes; the prefills.
 pub const Profile = struct {
@@ -274,6 +314,41 @@ pub const Snap = struct {
     end: usize = 0, // the extent end of the stream that kept it (placement holds [base, end) back while room allows)
 };
 
+/// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
+const note_rows = 32 * model.chunk_rows;
+
+fn noteStale(sn: *const Snap, why: []const u8) void {
+    if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
+}
+
+/// Why a kept state does not restore for a prompt (Lanes.refusal).
+const Refusal = enum {
+    dropped, // the prompt cache freed it
+    stale, // a stream wrote over its rows
+    short, // the prompt ends at or before it
+    off_chunk, // it is not at a chunk end
+    near_end, // the prompt ends within the window past it: its replay starts before the state
+
+    fn says(r: Refusal) []const u8 {
+        return switch (r) {
+            .dropped => "it was dropped",
+            .stale => "a stream wrote over its rows",
+            .short => "the prompt ends at or before it",
+            .off_chunk => "it is not at a chunk end",
+            .near_end => "the prompt ends within the window past it",
+        };
+    }
+};
+
+/// Every kept state a prompt does not resume says why in the log, whatever its length (a dropped one is not read).
+fn noteRefusal(sn: *const Snap, len: usize, why: Refusal, then: []const u8) void {
+    if (why == .dropped) return std.log.info("dsv41: a prompt of {d} tokens resumes no kept state: {s}; {s}", .{ len, why.says(), then });
+    std.log.info("dsv41: a prompt of {d} tokens does not resume the kept state of {d} tokens at {d}: {s}; {s}", .{ len, sn.at, sn.base, why.says(), then });
+}
+
+/// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
+const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false };
+
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
 const held_wait_ns: u64 = 10 * std.time.ns_per_s;
@@ -304,6 +379,17 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
+    fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
+    // TF_FILL_CHUNKS: a prompt pass runs this many chunks a step of the lane core's (prefill_step, one pass at a time),
+    // the other streams' rounds between its steps; its first step TF_FILL_FIRST chunks (0: as many), so a prompt that
+    // short runs whole. 0: each pass whole, as served
+    fill_chunks: usize = 0,
+    fill_first: usize = 0,
+    // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
+    // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
+    first_row: []f32 = &.{},
+    first_of: ?*const lanes.Stream = null,
+    masked: []f32 = &.{},
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -325,21 +411,34 @@ pub const Lanes = struct {
         self.streams.deinit(self.gpa);
         for (&self.seqs) |*q| q.deinit(self.gpa);
         self.wire.deinit(self.gpa);
+        self.gpa.free(self.first_row);
+        self.gpa.free(self.masked);
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = &.{
-            .prefill = prefillFn,
-            .first = firstFn,
-            .queue = queueFn,
-            .read = readFn,
-            .verify = verifyFn,
-            .keep = keepFn,
-            .draft = draftFn,
-            .probabilities = probabilitiesFn,
-            .release = releaseFn,
-        } };
+        return .{ .ptr = self, .vtable = if (self.fill_chunks > 0) &steps_vt else &whole_vt };
     }
+
+    const whole_vt: be.Backend.VTable = .{
+        .prefill = prefillFn,
+        .first = firstFn,
+        .queue = queueFn,
+        .read = readFn,
+        .verify = verifyFn,
+        .keep = keepFn,
+        .draft = draftFn,
+        .probabilities = probabilitiesFn,
+        .first_masked = firstMaskedFn,
+        .held = heldFn,
+        .release = releaseFn,
+    };
+    // a pass in steps, one at a time: `fill` and the followers' read-ahead hold one pass
+    const steps_vt: be.Backend.VTable = vt: {
+        var v = whole_vt;
+        v.prefill_step = prefillStepFn;
+        v.prefill_one = true;
+        break :vt v;
+    };
 
     /// The facts the round loop reads: windows of the pending row and up to the drafter's block, several streams'
     /// windows in one forward of at most 16 rows (four streams), the drafter's chances, the served lane's round ms.
@@ -404,14 +503,76 @@ pub const Lanes = struct {
     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
     /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+        if (!try of(ptr).prefillPart(s, std.math.maxInt(usize))) return error.FillUnfinished;
+    }
+
+    /// One step of the prompt pass (opened at its first): fill_first chunks first, then fill_chunks a step; true once
+    /// it reached the head and drew the first token.
+    fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
+        return self.prefillPart(s, if (self.fill == null and self.fill_first > 0) self.fill_first else self.fill_chunks);
+    }
+
+    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
         const m = self.m;
-        const gpa = self.gpa;
         const t0 = m.now();
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
-            p.prefills += 1;
         };
+        if (self.fill) |f| {
+            if (f.s != s) return error.FillBusy;
+        } else try self.fillOpen(s);
+        errdefer self.fill = null;
+        const f = &self.fill.?;
+        const seq = self.seqs[f.slot].items;
+        m.fill_seq = seq;
+        // a round may run before the next piece: the read-ahead done and the prompt's ids gone, as rank 1 does at its frame
+        defer {
+            m.joinAhead();
+            m.fill_seq = &.{};
+        }
+        var ran: usize = 0;
+        while (f.start < f.len and ran < chunks) : (ran += 1) {
+            const start = f.start;
+            const len = f.len;
+            if (start > 0 and s.isCancelled()) return error.Cancelled;
+            const n = @min(model.chunk_rows, len - start);
+            if (try self.begin(.fill_chunk)) {
+                try self.wire.int(self.gpa, u64, start);
+                try self.wire.int(self.gpa, u32, @intCast(n));
+                try self.wire.int(self.gpa, u64, f.replay);
+                try self.flush();
+            }
+            f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
+            f.start += n;
+            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
+        }
+        if (f.start < f.len) return false;
+        const done = f.*;
+        self.fill = null;
+        if (self.prof) |*p| p.prefills += 1;
+        if (!done.head) return error.NoPromptLogits;
+        const logits = try m.promptLogitsHost();
+        if (logits_sha) {
+            var dg: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
+            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
+        }
+        const token = try draw(logits, done.len, s.sampling);
+        self.streams.getPtr(s).?.first = self.take(token);
+        // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
+        if (s.grammar != null) {
+            self.first_row = try self.gpa.realloc(self.first_row, logits.len);
+            @memcpy(self.first_row, logits);
+            self.first_of = s;
+        }
+        return true;
+    }
+
+    /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
+    fn fillOpen(self: *Lanes, s: *lanes.Stream) !void {
+        const m = self.m;
+        const gpa = self.gpa;
         const ids = s.prompt();
         const len = ids.len;
         if (len == 0) return error.EmptyPrompt;
@@ -433,14 +594,17 @@ pub const Lanes = struct {
         var moved = false;
         if (s.reuse.saved) |p| {
             const sn: *Snap = @ptrCast(@alignCast(p));
-            // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
-            if (s.lane_images.len == 0 and self.usable(sn, len)) {
+            // (the cache matched the images before its rows by their digests: its image rows are this prompt's)
+            if (self.refusal(sn, len)) |why| {
+                noteRefusal(sn, len, why, "it runs from 0");
+                s.reuse_failed = true;
+            } else {
                 kept = sn;
                 // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
                 // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
                 // the Python lane's _place resumes "here" only in a free extent)
                 moved = sn.base + size > m.pool_cap or clashes(taken[0..nt], sn.base, sn.base + size) or self.keptOver(sn.base + sn.at, sn.base + size, sn);
-            } else s.reuse_failed = true;
+            }
         }
         const base = if (kept != null and !moved) kept.?.base else try self.placeKept(taken[0..nt], size, kept);
         if (kept) |sn| {
@@ -448,6 +612,7 @@ pub const Lanes = struct {
             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
         }
         if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+            if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} found no room to move to ({d} positions); the prompt runs from 0", .{ sn.at, sn.base, size });
             kept = null;
             s.reuse_failed = true;
         };
@@ -463,7 +628,8 @@ pub const Lanes = struct {
         try seq.resize(gpa, len);
         for (seq.items, ids) |*q, id| q.* = @intCast(id);
         // images: each span's positions dead in the sequence (negative: no Engram n-gram reaches into or across one),
-        // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start
+        // its rows ready (a gate's) or the tower's (rank 0), all of them sent to rank 1 after the fill's start; an image
+        // the kept state holds whole needs no rows (the pass resumes past it)
         var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
         defer spans.deinit(gpa);
         var rows: std.ArrayList(u8) = .empty;
@@ -471,6 +637,7 @@ pub const Lanes = struct {
         if (s.lane_images.len > 0) {
             const image_id = m.cfg.image_token orelse return error.NoVision;
             const row_bytes = m.cfg.hidden * 2;
+            const resume_at: usize = if (kept) |sn| sn.at else 0;
             var at_row: usize = 0;
             for (s.lane_images) |img| {
                 if (img.tokens == 0 or @as(usize, img.at) + img.tokens > len) return error.BadImageSpan;
@@ -478,6 +645,7 @@ pub const Lanes = struct {
                     if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                     q.* = -1;
                 }
+                if (@as(usize, img.at) + img.tokens <= resume_at) continue;
                 if (img.rows) {
                     if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                     try rows.appendSlice(gpa, img.bytes);
@@ -536,34 +704,7 @@ pub const Lanes = struct {
         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
         // kept prompt), each at the chunk end at or before it
         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        var head = false;
-        m.fill_seq = seq.items;
-        defer {
-            m.joinAhead();
-            m.fill_seq = &.{};
-        }
-        while (start < len) {
-            if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = @min(model.chunk_rows, len - start);
-            if (try self.begin(.fill_chunk)) {
-                try self.wire.int(gpa, u64, start);
-                try self.wire.int(gpa, u32, @intCast(n));
-                try self.wire.int(gpa, u64, replay);
-                try self.flush();
-            }
-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
-            start += n;
-            if (s.lane_images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
-        }
-        if (!head) return error.NoPromptLogits;
-        const logits = try m.promptLogitsHost();
-        if (logits_sha) {
-            var dg: [32]u8 = undefined;
-            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
-            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
-        }
-        const token = try draw(logits, len, s.sampling);
-        self.streams.getPtr(s).?.first = self.take(token);
+        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -571,6 +712,30 @@ pub const Lanes = struct {
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (position != s.prompt_len) return error.PositionMismatch;
         return l.first;
+    }
+
+    /// `first` among a grammar's tokens: the prompt's last row (the prompt pass kept it for the stream) drawn again
+    /// with the other tokens at -inf, at the same keyed position.
+    fn firstMaskedFn(ptr: *anyopaque, s: *lanes.Stream, position: u64, mask: []const u32) anyerror!u64 {
+        const self = of(ptr);
+        _ = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (position != s.prompt_len) return error.PositionMismatch;
+        if (self.first_of != s) return error.NoPromptRow;
+        return self.take(try self.drawAllowed(self.first_row, position, s.sampling, mask));
+    }
+
+    /// The held drafts as host tokens in window order (a grammar walks them): draft holds them when its pass ends.
+    fn heldFn(ptr: *anyopaque, s: *lanes.Stream, out: []u32) anyerror!void {
+        const self = of(ptr);
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        if (out.len > l.nheld) return error.HeldMismatch;
+        @memcpy(out, l.held[0..out.len]);
+    }
+
+    /// drawMasked into the backend's row.
+    fn drawAllowed(self: *Lanes, row: []const f32, position: u64, s: ?lanes.Sampling, mask: []const u32) !u32 {
+        self.masked = try self.gpa.realloc(self.masked, row.len);
+        return drawMasked(self.masked, row, position, s, mask);
     }
 
     fn queueFn(ptr: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -593,6 +758,8 @@ pub const Lanes = struct {
         if (windows.len > max_streams) return error.WindowTooWide;
         var ids: [max_streams][max_rows]i32 = undefined;
         var wins: [max_streams]Win = undefined;
+        const words = maskWords(m.vocab);
+        var masked = false;
         for (windows, 0..) |w, k| {
             if (w.parents != null) return error.TreesNotBuilt;
             const l = self.streams.getPtr(w.stream) orelse return error.UnknownStream;
@@ -601,6 +768,8 @@ pub const Lanes = struct {
             const start: usize = @intCast(w.stream.cache_len);
             for (w.positions, 0..) |p, r| if (p != start + 1 + r) return error.PositionMismatch;
             if (w.held > l.nheld) return error.HeldMismatch;
+            if (!masksFit(w, words)) return error.BadMasks;
+            masked = masked or w.masks.len > 0;
             ids[k][0] = @intCast(w.pending);
             for (l.held[0..w.held], 0..) |t, j| ids[k][1 + j] = @intCast(t);
             for (w.tokens, 0..) |t, j| ids[k][1 + w.held + j] = @intCast(t);
@@ -623,8 +792,8 @@ pub const Lanes = struct {
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
         const t2 = m.now();
-        // every row greedy: the device's argmax (R tokens back); else the logits for the host's draws
-        var greedy = true;
+        // every row greedy and none masked: the device's argmax (R tokens back); else the logits for the host's draws
+        var greedy = !masked;
         for (windows) |w| {
             if (w.stream.sampling) |sm| if (sm.temperature > 0) {
                 greedy = false;
@@ -646,7 +815,10 @@ pub const Lanes = struct {
         const V = m.vocab;
         for (windows, out, 0..) |w, *o, k| {
             const row0 = self.built.wins[k].row;
-            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            for (0..w.rows()) |r| o.sampled[r] = if (greedy) tokens[row0 + r] else if (w.masks.len > 0)
+                try self.drawAllowed(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling, w.masks[r * words ..][0..words])
+            else
+                try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
@@ -743,11 +915,16 @@ pub const Lanes = struct {
         return true;
     }
 
-    /// Whether a kept state still restores for a prompt of `len` tokens: live, not stale, a chunk end before the
-    /// prompt's replay (the rows before it ran the encoder layers alone, as a fresh pass of this prompt runs them).
-    fn usable(self: *const Lanes, sn: *const Snap, len: usize) bool {
-        if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return false;
-        return !sn.stale and sn.at > 0 and sn.at < len and sn.at % model.chunk_rows == 0 and sn.at <= len -| self.m.cfg.window;
+    /// Why a kept state does not restore for a prompt of `len` tokens (null: it does): it restores while live, not
+    /// stale, at a chunk end before the prompt's replay (the rows before it ran the encoder layers alone, as a fresh
+    /// pass of this prompt runs them).
+    fn refusal(self: *const Lanes, sn: *const Snap, len: usize) ?Refusal {
+        if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return .dropped;
+        if (sn.stale) return .stale;
+        if (sn.at == 0 or sn.at >= len) return .short;
+        if (sn.at % model.chunk_rows != 0) return .off_chunk;
+        if (sn.at > len -| self.m.cfg.window) return .near_end;
+        return null;
     }
 
     /// The first extent that fits around the live streams and the kept states. Kept states give their room oldest
@@ -783,13 +960,14 @@ pub const Lanes = struct {
             const victim = for (self.snaps.items) |sn| {
                 if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
             } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
+            noteStale(victim, "a placement needed its room (oldest first)");
             victim.stale = true;
         }
     }
 
-    /// Whether a kept state other than `except` and its siblings (the same stream's other marks) has rows in [lo, hi).
+    /// Whether a kept state other than `except` and its shorter siblings has rows in [lo, hi); a longer one may be another conversation's.
     fn keptOver(self: *const Lanes, lo: usize, hi: usize, except: *const Snap) bool {
-        for (self.snaps.items) |sn| if (sn != except and !sn.stale and sn.base != except.base and sn.base < hi and lo < sn.base + sn.at) return true;
+        for (self.snaps.items) |sn| if (sn != except and !sn.stale and (sn.base != except.base or sn.at > except.at) and sn.base < hi and lo < sn.base + sn.at) return true;
         return false;
     }
 
@@ -803,6 +981,7 @@ pub const Lanes = struct {
     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
     fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
         for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
+            if (!sn.stale) noteStale(sn, "a stream writes over its rows");
             sn.stale = true;
         };
     }
@@ -838,6 +1017,21 @@ pub const Lanes = struct {
         return error.BackendRestores; // the prompt pass restores, before its first chunk
     }
 
+    /// Whether a kept state restores for a prompt of `len` tokens: the prompt cache passes one that does not over for
+    /// an earlier state (the prompt pass would refuse it, and the prompt would run from 0).
+    pub fn snapResumesFn(ptr: *anyopaque, saved: *anyopaque, len: u32) bool {
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        const why = of(ptr).refusal(sn, len) orelse return true;
+        noteRefusal(sn, len, why, "the prompt cache looks for an earlier one");
+        return false;
+    }
+
+    /// Whether a kept state still holds its rows: one a stream wrote over leaves the prompt cache.
+    pub fn snapLiveFn(ptr: *anyopaque, saved: *anyopaque) bool {
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        return std.mem.indexOfScalar(*Snap, of(ptr).snaps.items, sn) != null and !sn.stale;
+    }
+
     pub fn snapDropFn(ptr: *anyopaque, saved: *anyopaque) void {
         const self = of(ptr);
         const sn: *Snap = @ptrCast(@alignCast(saved));
@@ -853,6 +1047,12 @@ pub const Lanes = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
+        if (self.fill) |f| if (f.s == s) {
+            self.m.joinAhead();
+            self.m.fill_seq = &.{};
+            self.fill = null;
+        };
+        if (self.first_of == s) self.first_of = null;
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
     }
@@ -934,6 +1134,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const n: usize = try r.int(u32);
                 const replay: usize = @intCast(try r.int(u64));
                 if (start + n > seqs[slot].items.len) return error.BadChunk;
+                if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
             },
             .verify => {
@@ -1086,4 +1287,133 @@ test "greedy draws take the first largest logit" {
     const row = [_]f32{ 0.5, 2.0, -1.0, 2.0 };
     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, null));
     try std.testing.expectEqual(@as(u32, 1), try draw(&row, 9, .{ .seed = 3, .temperature = 0 }));
+}
+
+test "a prefix two conversations share: the second one resuming it in place would stale the first one's later marks" {
+    var m: Model = undefined;
+    m.pool_cap = 1 << 20;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer ln.snaps.deinit(std.testing.allocator);
+    // the first conversation's extent holds the shared prefix's mark (system prompt and tools) and its own later one
+    var shared: Snap = .{ .id = 0, .at = 18432, .base = 0, .end = 430080, .buf = undefined };
+    var later: Snap = .{ .id = 1, .at = 395264, .base = 0, .end = 430080, .buf = undefined };
+    try ln.snaps.append(std.testing.allocator, &shared);
+    try ln.snaps.append(std.testing.allocator, &later);
+    try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
+    try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+}
+
+test "TF_FILL_CHUNKS steps a prompt pass in the lane core, one pass at a time; unset, each pass runs whole" {
+    var m: Model = undefined;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    const whole = ln.backend().vtable;
+    try std.testing.expect(whole.prefill_step == null and !whole.prefill_one);
+    ln.fill_chunks = 2;
+    const steps = ln.backend().vtable;
+    try std.testing.expect(steps.prefill_step != null and steps.prefill_one);
+    // every other entry the same as served
+    try std.testing.expect(steps.prefill == whole.prefill and steps.verify == whole.verify and steps.release == whole.release and steps.draft == whole.draft);
+}
+
+/// A test row: token i's logit from splitmix64(i + 1) (exact in f32, a few ties).
+fn testRow(row: []f32) void {
+    for (row, 0..) |*x, i| {
+        var z: u64 = @as(u64, i + 1) *% 0x9E3779B97F4A7C15;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        x.* = @as(f32, @floatFromInt((z ^ (z >> 31)) >> 52)) / 256.0 - 8.0;
+    }
+}
+
+test "a masked draw is the row's draw with the other tokens at -inf, and never a disallowed token" {
+    const V = 1000;
+    var row: [V]f32 = undefined;
+    testRow(&row);
+    var buf: [V]f32 = undefined;
+    var off: [V]f32 = undefined;
+    var mask: [maskWords(V)]u32 = @splat(0);
+    for (0..V) |i| if (i % 7 == 3 or i % 250 == 1) {
+        mask[i / 32] |= @as(u32, 1) << @intCast(i % 32);
+    };
+    for (&off, row, 0..) |*o, v, i| o.* = if (lanes.grammar.allows(&mask, i)) v else -std.math.inf(f32);
+    const all: [maskWords(V)]u32 = @splat(std.math.maxInt(u32));
+    const settings = [_]?lanes.Sampling{
+        null,
+        .{ .seed = 5, .temperature = 0 },
+        .{ .seed = 11, .temperature = 1.0, .top_k = 1 },
+        .{ .seed = 12, .temperature = 1.0, .top_k = 20, .top_p = 0.95 },
+        .{ .seed = 13, .temperature = 0.7, .top_k = 56, .top_p = 0.9, .min_p = 0.05 },
+        .{ .seed = 14, .temperature = 1.3, .top_k = 40, .top_p = 1.0 },
+    };
+    for (settings) |s| for ([_]u64{ 0, 17, 4096, 1 << 20 }) |position| {
+        const got = try drawMasked(&buf, &row, position, s, &mask);
+        try std.testing.expect(lanes.grammar.allows(&mask, got));
+        try std.testing.expectEqual(try draw(&off, position, s), got);
+        // every token allowed: the row's own draw
+        try std.testing.expectEqual(try draw(&row, position, s), try drawMasked(&buf, &row, position, s, &all));
+    };
+    // greedy: the first largest allowed logit
+    var best: ?usize = null;
+    for (row, 0..) |v, i| if (lanes.grammar.allows(&mask, i) and (best == null or v > row[best.?])) {
+        best = i;
+    };
+    try std.testing.expectEqual(@as(u32, @intCast(best.?)), try drawMasked(&buf, &row, 3, null, &mask));
+    // one token allowed: that token at any sampling
+    var one: [maskWords(V)]u32 = @splat(0);
+    one[999 / 32] = @as(u32, 1) << (999 % 32);
+    for (settings) |s| try std.testing.expectEqual(@as(u32, 999), try drawMasked(&buf, &row, 9, s, &one));
+    // nothing allowed: no draw
+    try std.testing.expectError(error.NoAllowedToken, drawMasked(&buf, &row, 9, null, &@as([maskWords(V)]u32, @splat(0))));
+}
+
+test "a stream with a grammar draws its first token from the kept prompt row, and its held drafts read back as host tokens" {
+    const gpa = std.testing.allocator;
+    var ln: Lanes = .{ .gpa = gpa, .m = undefined, .peer = null };
+    defer ln.deinit();
+    const b = ln.backend();
+    try std.testing.expect(b.vtable.first_masked != null and b.vtable.held != null);
+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 8, .sampling = .{ .seed = 7, .temperature = 0.8, .top_k = 20, .top_p = 0.95 } });
+    defer s.deinit(gpa);
+    try ln.streams.put(gpa, &s, .{ .slot = 0, .base = 0, .end = model.chunk_rows });
+    ln.used[0] = true;
+    var row: [1000]f32 = undefined;
+    testRow(&row);
+    var mask: [maskWords(1000)]u32 = @splat(0);
+    for ([_]usize{ 4, 100, 640, 999 }) |t| mask[t / 32] |= @as(u32, 1) << @intCast(t % 32);
+    // no kept row (the stream had no grammar at its prompt pass): no masked draw
+    try std.testing.expectError(error.NoPromptRow, b.vtable.first_masked.?(b.ptr, &s, 3, &mask));
+    ln.first_row = try gpa.dupe(f32, &row);
+    ln.first_of = &s;
+    try std.testing.expectError(error.PositionMismatch, b.vtable.first_masked.?(b.ptr, &s, 2, &mask));
+    var buf: [1000]f32 = undefined;
+    const want = try drawMasked(&buf, &row, 3, s.sampling, &mask);
+    try std.testing.expectEqual(want, try b.read(try b.vtable.first_masked.?(b.ptr, &s, 3, &mask)));
+    // the drafts the last pass held, in window order
+    const l = ln.streams.getPtr(&s).?;
+    l.held[0..3].* = .{ 50, 51, 52 };
+    l.nheld = 3;
+    var out: [2]u32 = undefined;
+    try b.vtable.held.?(b.ptr, &s, &out);
+    try std.testing.expectEqualSlices(u32, &.{ 50, 51 }, &out);
+    var four: [4]u32 = undefined;
+    try std.testing.expectError(error.HeldMismatch, b.vtable.held.?(b.ptr, &s, &four));
+    // a released stream's row is no one's
+    b.release(&s);
+    try std.testing.expect(ln.first_of == null);
+}
+
+test "a window's masks are none or every row's bits" {
+    const gpa = std.testing.allocator;
+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{1}, .max_new = 4 });
+    defer s.deinit(gpa);
+    const words = maskWords(129280);
+    try std.testing.expectEqual(@as(usize, 4040), words);
+    const bits: [3 * 4040]u32 = @splat(1);
+    const w: be.Window = .{ .stream = &s, .pending = 1, .held = 0, .tokens = &.{ 2, 3 }, .parents = null, .positions = &.{ 2, 3, 4 } };
+    try std.testing.expect(masksFit(w, words));
+    var with = w;
+    with.masks = &bits;
+    try std.testing.expect(masksFit(with, words));
+    with.masks = bits[0 .. 2 * words];
+    try std.testing.expect(!masksFit(with, words));
 }

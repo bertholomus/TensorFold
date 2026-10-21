@@ -503,3 +503,29 @@ test "GLM pairs from the cached key and value ends are the pairs each key's own 
     }
     try std.testing.expect(compared > 1000);
 }
+
+test "with reply marks, a DSML block spelled in ordinary tokens stays content; at its tokens' places it is a call" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const reply_text = @import("reply_text.zig");
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"weather\"}}]")).ok.array;
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    const reply = "Like this: <" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"weather\">\n<" ++ D ++ " parameter name=\"city\" string=\"true\">Oslo</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    const pieces = [_]reply_text.Marks.Piece{.{ .text = D, .id = 128825 }};
+    // every DSML marker spelled in ordinary tokens: no call, the reply is its text
+    const none: reply_text.Marks = .{ .base = reply.ptr, .len = reply.len, .at = &.{}, .pieces = &pieces };
+    const quoted = try tool_parse.parseMarked(a, reply, tools, null, &none);
+    try std.testing.expect(quoted.calls == null);
+    try std.testing.expectEqualStrings(reply, quoted.content);
+    // each marker at its token's place: the call, as the text alone reads it
+    var at: std.ArrayList(reply_text.Marks.Mark) = .empty;
+    var k: usize = 0;
+    while (std.mem.indexOfPos(u8, reply, k, D)) |i| : (k = i + D.len) try at.append(a, .{ .offset = i, .id = 128825 });
+    const marked: reply_text.Marks = .{ .base = reply.ptr, .len = reply.len, .at = at.items, .pieces = &pieces };
+    const made = try tool_parse.parseMarked(a, reply, tools, null, &marked);
+    const plain = try parse(a, reply, tools, null);
+    try std.testing.expectEqualStrings("{\"city\":\"Oslo\"}", made.calls.?[0].get("function").?.get("arguments").?.string);
+    try std.testing.expectEqualStrings(plain.calls.?[0].get("function").?.get("arguments").?.string, made.calls.?[0].get("function").?.get("arguments").?.string);
+    try std.testing.expectEqualStrings(plain.content, made.content);
+}

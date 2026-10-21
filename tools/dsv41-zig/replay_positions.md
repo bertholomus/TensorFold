@@ -8,6 +8,11 @@ host positions into the existing aligned `pos0`, in the existing stream order.
 Even cuts and chunks larger than `tri.decode_rows` keep the view. No kernel
 math, replay geometry, capture metadata or alignment checks change.
 
+Since v0.3.0 this branch carries the served line's `replayCut`, which uploads
+the surviving positions into the aligned `pos0` for every cut, not only the
+small odd ones: the same positions, always in the chunk's own buffer. The CPU
+test below follows it (one upload and `pos == pos0` for every cut).
+
 ## CPU regression (no model or CUDA required)
 
 Use Zig 0.17.0, as pinned in `.zig-version`:

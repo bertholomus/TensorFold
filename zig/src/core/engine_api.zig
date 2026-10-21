@@ -55,6 +55,9 @@ pub const Structure = struct {
     after: ?u32 = null,
     /// The server's compiler, which has compiled `text` once already (the engine's compile is then a cache hit).
     compiler: ?*grammar.Compiler = null,
+    /// Tokens the reply never draws while the grammar holds it, unless a row allows nothing else (a forced DSML call:
+    /// the marker spelled in plain characters, so that every marker is its own token).
+    ban: []const u32 = &.{},
 };
 
 pub const grammar = lanes.grammar;
@@ -188,11 +191,21 @@ pub const VisionOpen = struct { image_tokens: u32 = 4096, image_tokens_set: bool
 
 pub const Reason = enum { stop, length, cancelled, failed };
 
+/// Depths the per-depth draft counts keep (the lane engine's deepest head chain); a deeper draft counts at the last.
+pub const draft_depths = 16;
+
+/// One depth of a draft head's chains: the rounds whose chain drafted that deep, those that reached the depth (kept
+/// every draft above it), and those that kept its draft too. kept / drafted is DeepInfer's per-position accept rate
+/// (deepinfer/engine/stats_logger.py:211-236); kept / reached, the rate the depth rule learns (lanes/depth.zig).
+pub const DraftDepth = struct { drafted: u32 = 0, reached: u32 = 0, kept: u32 = 0 };
+
 /// What a finished reply's rounds did, for its runtime fields and /metrics.
 pub const Stats = struct {
     rounds: u64 = 0,
     drafted: u64 = 0,
     accepted: u64 = 0,
+    /// The draft head's chains by depth (index 0: the first draft); all zero where the engine does not count them.
+    depths: [draft_depths]DraftDepth = @splat(.{}),
     /// The narrowest verify window of the reply's rounds (drafted replies: 2 or more).
     min_rows: u32 = 0,
     prefill_widths: []const u32 = &.{},
@@ -249,6 +262,9 @@ pub const Info = struct {
     prompt_logprobs: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
+    /// The live streams' rounds the lane host runs between two steps of a prompt pass (0: a step every turn of its
+    /// loop, a round between); none waits while no stream decodes.
+    fill_rounds: u32 = 0,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
     /// The policy the engine runs under, one line (`/health` shows it); empty: none.

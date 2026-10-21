@@ -32,6 +32,7 @@ pub const LaneHost = struct {
     queued: std.ArrayList(*Job) = .empty,
     admitted: std.ArrayList(*Job) = .empty,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
+    fill_since: u32 = 0, // the rounds since a prompt pass's last step (Info.fill_rounds)
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
@@ -100,8 +101,7 @@ pub const LaneHost = struct {
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.request.lane_images.len > 0) return; // a kept state is keyed by tokens: a lane image's are its placeholder's
-            if (job.host.cache) |store| _ = store.keepBorn(job.request.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request));
+            if (job.host.cache) |store| _ = store.keepBorn(job.request.cacheKey(), job.request.bornLen(), at, s, job.request.chunks, job.host.spans(job.request)); // a lane image's rows keyed by its digest
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -269,7 +269,7 @@ pub const LaneHost = struct {
         job.reported();
         h.gpa.free(job.marks);
         const s = &job.stream;
-        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .loop_novelty = s.loop_novelty, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .depths = depthsOf(s), .min_rows = s.min_rows, .loop_period = s.loop_period, .loop_novelty = s.loop_novelty, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         const told = if (job.started) recalls.finished(h, job, reason, stats) else stats;
         emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message } });
         if (job.started) {
@@ -294,6 +294,12 @@ pub const LaneHost = struct {
         h.lock();
         // a stale device takes no reply: `learn.refuse` ends the queued ones instead
         if (h.stale or h.queued.items.len == 0 or h.admitted.items.len >= @min(h.info_.lanes, h.memory_lanes orelse h.info_.lanes)) {
+            h.unlock();
+            return false;
+        }
+        // a backend that holds one prompt pass at a time admits the next request once the pass ends: its lookup then
+        // finds what that pass kept, and nothing keeps before its own pass, as with a pass run whole
+        if (h.core.backend.vtable.prefill_one and h.filling.items.len > 0) {
             h.unlock();
             return false;
         }
@@ -329,7 +335,7 @@ pub const LaneHost = struct {
         if (r.background and r.max_tokens == 0 and h.warm_quiet > 0 and !h.quiet(job)) return h.cancel(job); // other work came first: it never ran
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (r.lane_images.len == 0) if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+        if (keyed(r)) if (h.cache) |store| if (r.prompt_logprobs == null and !r.untaught) if (store.lookupRewind(h.gpa, r.cacheKey(), r.bornLen(), r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -404,10 +410,13 @@ pub const LaneHost = struct {
     }
 
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
+    /// A pass that began waits out Info.fill_rounds of those rounds between two of its steps (none when none decodes).
     fn fillOne(h: *LaneHost) void {
         if (h.filling.items.len == 0) return;
         const at = fill.next(h);
         const job = h.filling.items[at];
+        if (job.fill_began and h.fill_since < h.info_.fill_rounds and h.core.activeCount() > 0) return;
+        h.fill_since = 0;
         const first = !job.fill_began;
         job.fill_began = true;
         const done = h.core.fillStream(&job.stream, first) catch |e| {
@@ -417,6 +426,11 @@ pub const LaneHost = struct {
                     fill.unfill(h, job);
                     break :blk h.requeue(job);
                 },
+                // a pass the pool cannot place yet while other streams run waits for one of them, as admitOne's does
+                error.ContextFull => if (first and h.core.activeCount() > 0) blk: {
+                    fill.unfill(h, job);
+                    break :blk h.requeueFull(job);
+                } else h.drop(job, h.words(e)),
                 else => h.drop(job, h.words(e)),
             };
             return;
@@ -430,7 +444,10 @@ pub const LaneHost = struct {
     /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
     fn constraint(h: *LaneHost, st: api.Structure) !*lanes.grammar.Constraint {
         const c = st.compiler orelse return error.NoGrammarCompiler;
-        return c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
+        const k = try c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
+        errdefer k.deinit(h.gpa);
+        if (st.ban.len > 0) k.ban = try h.gpa.dupe(u32, st.ban);
+        return k;
     }
 
     /// Whether an admitted stream decodes within finish_left tokens of its max_tokens (the lock held).
@@ -460,6 +477,12 @@ pub const LaneHost = struct {
         return if (h.decoded_rows) r.decode_spans else &.{};
     }
 
+    /// A request the prompt cache can key: a lane image's positions hold its placeholder, so its rows count only with
+    /// a key that spells them (the server's, one word a position).
+    fn keyed(r: *const Request) bool {
+        return r.lane_images.len == 0 or r.cache_key.len == r.prompt.len;
+    }
+
     /// A prompt-only pass on a `warm_turns` engine: the backend prefills, the cache keeps its end (a mark, if keyed on)
     fn warmPass(h: *LaneHost, job: *Job, began: i96) bool {
         const be = h.core.backend;
@@ -469,7 +492,7 @@ pub const LaneHost = struct {
             return h.cancel(job);
         };
         h.prefilled(job, began);
-        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0) store.keepBorn(job.request.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
+        if (h.cache) |store| _ = if (!job.request.untaught and store.rules.lookahead == 0 and keyed(job.request)) store.keepBorn(job.request.cacheKey(), job.request.bornLen(), @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request)) else false;
         be.release(&job.stream);
         h.remove(job);
         h.finish(job, .length, "");
@@ -616,6 +639,7 @@ pub const LaneHost = struct {
                 ends.failAll(h, @errorName(e));
                 continue;
             };
+            h.fill_since +|= 1;
             var i: usize = 0;
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];
@@ -626,6 +650,18 @@ pub const LaneHost = struct {
         }
     }
 };
+
+/// A stream's head chains by depth as a reply's stats carry them (a depth past the API's counts adds to its last).
+fn depthsOf(s: *const lanes.Stream) [api.draft_depths]api.DraftDepth {
+    var out: [api.draft_depths]api.DraftDepth = @splat(.{});
+    for (s.depths, 0..) |d, j| {
+        const o = &out[@min(j, out.len - 1)];
+        o.drafted += d.drafted;
+        o.reached += d.reached;
+        o.kept += d.kept;
+    }
+    return out;
+}
 
 test {
     _ = @import("lane_host_test.zig");

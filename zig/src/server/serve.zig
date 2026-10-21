@@ -115,10 +115,28 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SSE_KEEPALIVE={s}: whole seconds (0: off)\n", .{t});
         return 1;
     } else 0;
+    const stats_every: u32 = if (env(s, "TENSORFOLD_STATS_EVERY")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
+        std.debug.print("tensorfold: TENSORFOLD_STATS_EVERY={s}: whole seconds (0: off)\n", .{t});
+        return 1;
+    } else 0;
     const loop_windows: u32 = if (env(s, "TENSORFOLD_LOOP_WINDOWS")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
         std.debug.print("tensorfold: TENSORFOLD_LOOP_WINDOWS={s}: a whole number of windows (0: exact cycles only)\n", .{t});
         return 1;
     } else 10;
+    const plain_specials = if (env(s, "TENSORFOLD_PLAIN_SPECIALS")) |t| blk: {
+        const v = std.mem.trim(u8, t, " ");
+        if (std.mem.eql(u8, v, "1")) break :blk true;
+        if (v.len == 0 or std.mem.eql(u8, v, "0")) break :blk false;
+        std.debug.print("tensorfold: TENSORFOLD_PLAIN_SPECIALS={s}: 1 (on) or 0 (off)\n", .{t});
+        return 1;
+    } else false;
+    const reply_ids = if (env(s, "TENSORFOLD_REPLY_IDS")) |t| blk: {
+        const v = std.mem.trim(u8, t, " ");
+        if (std.mem.eql(u8, v, "1")) break :blk true;
+        if (v.len == 0 or std.mem.eql(u8, v, "0")) break :blk false;
+        std.debug.print("tensorfold: TENSORFOLD_REPLY_IDS={s}: 1 (on) or 0 (off)\n", .{t});
+        return 1;
+    } else false;
     const config: server_mod.Config = .{
         .served_name = s.served,
         .model_dir = s.model_dir,
@@ -131,11 +149,14 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .loop_windows = loop_windows,
         .keep_warm_s = args.keep_warm,
         .sse_keepalive_ms = std.math.mul(u32, keepalive_s, 1000) catch std.math.maxInt(u32),
+        .stats_every_s = stats_every,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
         .vision_urls = args.vision_urls,
         .seed_salt = salt,
         .request_log = env(s, "TENSORFOLD_REQUEST_LOG"),
+        .plain_specials = plain_specials,
+        .reply_ids = reply_ids,
         .dashboard = args.dashboard,
         .compact_at = if (args.compact_auto) .{ .auto = {} } else if (args.compact_fraction) |f| .{ .fraction = f } else null,
         .compact_keep = args.compact_keep,
@@ -178,9 +199,15 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         s.served,                                                   args.host,                                                                                   port,   shownSampling(a, s.sampling),
         if (args.no_drafts or srv.info.plain_only) "off" else "on", if (window > 0) std.fmt.bufPrint(&window_text, "{d}", .{window}) catch "?" else "unlimited", loaded,
     });
+    if (stats_every > 0) {
+        srv.metrics.startLines(io, now);
+        log.line("stats line on (TENSORFOLD_STATS_EVERY): at most every {d}s as requests finish, what finished since the last: tokens a round, drafts kept, and the draft head's chains by depth (kept of drafted, kept when reached)", .{stats_every});
+    }
     if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     if (s.recall) |r| recall_routes.line(r);
+    if (srv.shield) |sh| log.line("plain specials on (TENSORFOLD_PLAIN_SPECIALS): the text of {d} added tokens is ordinary text where users, tools or search results wrote it and in tool calls; the template's own markers keep their ids", .{sh.added});
+    if (reply_ids) log.line("reply ids on (TENSORFOLD_REPLY_IDS): a reply's think block opens and closes, and its tool calls open, only at their {d} marker tokens; the same text spelled in ordinary tokens stays words", .{srv.reply_pieces.len});
     if (srv.cortheon) |c| log.line("cortheon on: chat requests get Cortheon's reasoning program, web research before building, and cortheon_search/cortheon_fetch run here ({s}); a request can send \"cortheon\": false", .{c.engine});
     live.columns_env = env(s, "COLUMNS");
     var ticker: live.Ticker = .{ .engine = s.engine };

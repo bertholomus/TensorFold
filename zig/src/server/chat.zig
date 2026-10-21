@@ -68,6 +68,9 @@ pub const Reply = struct {
     logprobs: ?Value = null,
     /// ``choices[0].prompt_logprobs`` (vLLM's form) for a request that asked; null otherwise.
     prompt_logprobs: ?Value = null,
+    /// Where the reply's marker tokens decoded in the text ``content`` slices (Config.reply_ids), for the call
+    /// parse; null: off, the calls are read from the text alone.
+    marks: ?reply_text.Marks = null,
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
@@ -209,7 +212,7 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
     var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .token_ids = input.token_ids, .sent_ns = nowNs(io), .lp = if (request.logprobs != null) .{} else null };
-    defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+    defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, &box.stats.depths, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
         if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
@@ -259,6 +262,8 @@ const Generation = struct {
     collected: std.ArrayList(u32) = .empty,
     token_ids: bool = false, // the request asked for its ids back (Input.token_ids)
     visible: reply_text.Incremental = .{},
+    marks: std.ArrayList(reply_text.Marks.Mark) = .empty, // where the decode buffer's marker tokens decoded (Config.reply_ids)
+    marked: usize = 0, // the decode buffer's tokens already looked at for them
     hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
     streamed: reply_text.Shown = .{}, // what content streamed, kept apart from the decode buffer that grows under slices
     streamed_reasoning: reply_text.Shown = .{},
@@ -293,6 +298,15 @@ const Generation = struct {
         return false;
     }
 
+    /// The streamed reply's marks over its decode buffer `all` (Config.reply_ids); null when off.
+    fn streamMarks(g: *Generation, all: []const u8) Allocator.Error!?reply_text.Marks {
+        if (g.srv.reply_pieces.len == 0) return null;
+        const tokens = g.visible.tokens.items;
+        try reply_text.markTokens(g.a, g.srv.gpa, g.srv.text, g.srv.reply_pieces, tokens, g.marked, &g.marks);
+        g.marked = tokens.len;
+        return .{ .base = all.ptr, .len = all.len, .at = g.marks.items, .pieces = g.srv.reply_pieces };
+    }
+
     /// Commits a round's tokens as ``LaneStream.commit`` would, then streams what they add.
     fn commit(g: *Generation, chunk: []const u32) Failure!void {
         var landed: usize = 0;
@@ -324,9 +338,11 @@ const Generation = struct {
         const all = try g.visible.extend(g.a, g.srv.text, decodeText, fresh.items);
         const text = g.stops.visible(all, true);
         if (g.visible.pending()) return; // a character still split across tokens
+        const marks = try g.streamMarks(all);
+        const mp: ?*const reply_text.Marks = if (marks) |*mk| mk else null;
         var answer = text;
         if (g.thinking) {
-            const split = try reply_text.splitThinking(g.a, text, false, g.srv.markers);
+            const split = try reply_text.splitThinkingMarked(g.a, text, false, g.srv.markers, mp);
             const piece = g.streamed_reasoning.after(split.reasoning, true);
             if (piece.len > 0) {
                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
@@ -334,7 +350,7 @@ const Generation = struct {
             }
             answer = split.answer;
         }
-        const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
+        const shown = if (g.calls != null) try reply_text.hideIntoMarked(g.a, &g.hidden, answer, false, mp) else answer;
         const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
         const delta = g.streamed.after(vis, !copied);
@@ -344,6 +360,8 @@ const Generation = struct {
         }
         if (g.calls) |*c| {
             var out: std.ArrayList(Value) = .empty;
+            c.marks = mp;
+            defer c.marks = null;
             try c.feed(answer, &out); // never the reasoning: a call it mentions is not made
             for (out.items) |d| try g.emit(sink, d);
         }
@@ -441,10 +459,17 @@ const Generation = struct {
         // closed before the think split, so a call ending an unclosed think block is the answer
         const close = try g.closeCall(visible);
         const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
+        // the marker tokens' places in the decode, which `text` begins with
+        const marks: ?reply_text.Marks = if (g.srv.reply_pieces.len == 0) null else blk: {
+            var at: std.ArrayList(reply_text.Marks.Mark) = .empty;
+            try reply_text.markTokens(a, g.srv.gpa, g.srv.text, g.srv.reply_pieces, content_tokens, 0, &at);
+            break :blk .{ .base = text.ptr, .len = text.len, .at = at.items, .pieces = g.srv.reply_pieces };
+        };
+        const mp: ?*const reply_text.Marks = if (marks) |*mk| mk else null;
         var content: []const u8 = text;
         var reasoning: ?[]const u8 = null;
         if (g.thinking) {
-            const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
+            const split = try reply_text.splitThinkingMarked(a, text, true, g.srv.markers, mp);
             const r = reply_text.pyStrip(split.reasoning);
             reasoning = if (r.len > 0) r else null;
             content = split.answer;
@@ -457,13 +482,15 @@ const Generation = struct {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
+            const shown = if (g.calls != null) try reply_text.finishedProseMarked(a, content, mp) else content;
             const sent = g.streamed.text.items;
             const rest = if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) shown[sent.len..] else "";
             if (g.lp) |*l| (if (try l.delta(g.srv, a, g.thinking, g.ignore_eos, g.collected.items, rest, shown.len, true)) |d| try g.emit(sink, d)) else if (rest.len > 0) try g.emit(sink, .{ .string = rest });
             if (g.calls) |*c| if (close.len > 0) {
                 // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
                 var out: std.ArrayList(Value) = .empty;
+                c.marks = mp;
+                defer c.marks = null;
                 try c.feed(if (g.thinking) content else text, &out);
                 for (out.items) |d| try g.emit(sink, d);
             };
@@ -532,6 +559,7 @@ const Generation = struct {
             .effort = effort,
             .logprobs = if (g.lp) |l| try @import("logprobs.zig").value(g.srv, cx, a, g.thinking, content_tokens, l.rows.items) else null,
             .prompt_logprobs = if (m.prompt_rows) |r| try @import("logprobs.zig").promptValue(g.srv, a, r) else null,
+            .marks = marks,
         };
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});

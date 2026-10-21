@@ -601,6 +601,10 @@ pub const Model = struct {
 
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
         if (slot >= m.streams) return error.BadSlot;
+        if (m.eh) |*eh| { // rows read ahead for another prompt are not this one's, even at the same positions
+            eh.ahead_start = std.math.maxInt(usize);
+            eh.ahead_ready = .{ false, false };
+        }
         m.spans.clearRetainingCapacity();
         m.ch.spans = &.{};
         m.view = try m.caches.view(&m.eng, slot, base);
@@ -641,7 +645,9 @@ pub const Model = struct {
                 ahead.?.join();
                 ahead = null;
             }
-            if (ahead == null) {
+            // rows read ahead that ended before a round or a piece's end are this chunk's when they cover it, both layers
+            const whole = eh.ahead_start == start and eh.ahead_n == n and eh.ahead_err == null and eh.ahead_ready[0] and (c.engram_layers.slice().len < 2 or eh.ahead_ready[1]);
+            if (ahead == null and !whole) {
                 eh.ahead_start = start;
                 eh.ahead_n = n;
                 eh.ahead_ready = .{ false, false };

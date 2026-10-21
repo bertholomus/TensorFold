@@ -54,7 +54,8 @@ fn check(origin: usize, remaining: usize, noncontiguous: bool) !void {
     try std.testing.expect(try replayCut(&e, &ch, &cs, &sh, 0, origin + first, &host));
     try std.testing.expectEqual(origin + first, ch.start);
     try std.testing.expectEqual(remaining, ch.n);
-    const fixed = first % 2 != 0 and remaining <= 16;
+    // This branch's replayCut uploads every cut's surviving positions into pos0 (replay_positions.md).
+    const fixed = first > 0;
     if (remaining <= 16) try std.testing.expectEqual(@as(u64, 0), ch.pos % 16);
     try std.testing.expectEqual(@as(usize, if (fixed) 1 else 0), uploads);
     try std.testing.expectEqual(if (fixed) base else base + first * 8, ch.pos);

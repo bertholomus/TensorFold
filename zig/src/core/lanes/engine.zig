@@ -351,7 +351,9 @@ pub const Engine = struct {
                     const chain = if (p.branch_from > 0) ds[0..p.branch_from] else ds[0..own_end];
                     var chain_kept: usize = 0;
                     for (path[1..]) |r| chain_kept += @intFromBool((p.branch_from == 0 or r < p.branch_from) and r < own_end);
-                    try e.rule.observeDepth(win.who(s), std.mem.max(u32, chain), @intCast(chain_kept));
+                    const deepest = std.mem.max(u32, chain);
+                    try e.rule.observeDepth(win.who(s), deepest, @intCast(chain_kept));
+                    s.noteDepths(deepest, chain_kept); // the same chain, counted for the stats (Stream.depths)
                 }
                 var kept_branch: u64 = 0; // the context's graft rows kept, then Recall's
                 var kept_recall: u64 = 0;

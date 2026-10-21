@@ -42,11 +42,26 @@ pub const Fake = struct {
     live: usize = 0,
     spare_bytes: u64 = 0,
     peer: ?*Peer = null, // speed-up mode's rank 1: it keeps the same states and drops them only when a request names them
+    window: u32 = 0, // checked(): a state resumes a prompt only this many tokens or more before its end
+    dead_at: u32 = 0, // checked(): the state at this position lost its rows (0: none)
 
     pub const State = struct { at: u32, sum: u64 };
 
     pub fn snapshots(f: *Fake) Snapshots {
         return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn } };
+    }
+    /// With the family's own resume check: a state resumes a prompt only `window` tokens or more before its end, and
+    /// the state at `dead_at` lost its rows.
+    pub fn checked(f: *Fake) Snapshots {
+        return .{ .ptr = f, .vtable = &.{ .bytes = bytesFn, .save = saveFn, .restore = restoreFn, .drop = dropFn, .resumes = resumesFn, .live = liveFn } };
+    }
+    fn resumesFn(ptr: *anyopaque, saved: Saved, len: u32) bool {
+        const st: *State = @ptrCast(@alignCast(saved));
+        return liveFn(ptr, saved) and st.at + of(ptr).window <= len;
+    }
+    fn liveFn(ptr: *anyopaque, saved: Saved) bool {
+        const st: *State = @ptrCast(@alignCast(saved));
+        return st.at != of(ptr).dead_at;
     }
     /// With learned states on disk: a state's position and sum in one file.
     pub fn learned(f: *Fake) Snapshots {
@@ -189,7 +204,7 @@ pub const Fake = struct {
 
     /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
     pub fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
-        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .fail_write = f.fail_write, .writes = f.writes, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
+        if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .fail_write = f.fail_write, .writes = f.writes, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer, .window = f.window, .dead_at = f.dead_at };
         if (f.peer) |p| p.in_pass = true;
         defer if (f.peer) |p| {
             p.in_pass = false;
