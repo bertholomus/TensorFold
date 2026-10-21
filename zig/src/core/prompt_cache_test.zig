@@ -419,3 +419,55 @@ test "a dead state leaves lookup at once and storage at the next safe boundary" 
     try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
 }
+
+test "a state the family does not resume for a prompt that ends too near it: an earlier one resumes, and it stays for its own conversation" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa, .window = 3 }; // as DeepSeek's window: a state resumes a prompt 3 or more tokens before its end
+    var s = Store.init(gpa, f.checked(), .{ .min_prompt = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 2, &.{}, &.{}, null, &.{})); // keeps 2
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    var p = try s.begin(a, &t2, 5, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 2), p.from);
+    try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p)); // keeps 5
+    const five = s.find(&t2, &.{}, &.{}).?;
+    try std.testing.expectEqual(@as(u32, 5), five.at);
+    const near = [_]u32{ 1, 2, 3, 4, 5, 6, 7 }; // ends 2 past the state at 5: the family refuses it, the one at 2 resumes
+    p = try s.begin(a, &near, 2, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 2), p.from);
+    try std.testing.expectEqual(fresh(&near), f.pass(&s, &near, p));
+    try std.testing.expectEqual(five, s.find(&t2, &.{}, &.{}).?); // the state at 5 stays for t2's conversation
+    try std.testing.expectEqual(@as(u64, 2), s.counts.hits);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.evicted);
+    try std.testing.expectEqual(@as(usize, 2), f.live);
+}
+
+test "a state that lost its rows: an earlier one resumes, and the lost one leaves the store" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.checked(), .{ .min_prompt = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 2, &.{}, &.{}, null, &.{})); // keeps 2
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9 };
+    _ = f.pass(&s, &t2, try s.begin(a, &t2, 5, &.{}, &.{}, null, &.{})); // keeps 5
+    try std.testing.expectEqual(@as(usize, 2), f.live);
+    f.dead_at = 5; // another stream wrote over its rows
+    const t3 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const p = try s.begin(a, &t3, 2, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 2), p.from);
+    try std.testing.expectEqual(fresh(&t3), f.pass(&s, &t3, p));
+    try std.testing.expectEqual(@as(u64, 1), s.counts.evicted);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.failed);
+    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len); // its restore's release reclaimed the lost one
+    try std.testing.expectEqual(@as(usize, 1), f.live);
+    try std.testing.expectEqual(@as(u32, 2), s.find(&t2, &.{}, &.{}).?.at);
+}

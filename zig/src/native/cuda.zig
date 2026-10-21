@@ -428,7 +428,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     }
     // a family that keeps prompt states its own way (Loaded.snaps) gets a store over them, as before 1.0.12
     if (h.store == null and cache > 0) if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
-        h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop };
+        h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop, .resumes = if (@hasField(@TypeOf(sn), "resumes")) sn.resumes else null, .live = if (@hasField(@TypeOf(sn), "live")) sn.live else null };
         const store = try gpa.create(api.prompt_cache.Store);
         store.* = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, cache);
         h.store = store;
