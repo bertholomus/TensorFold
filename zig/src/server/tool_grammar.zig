@@ -6,6 +6,7 @@ const errors = @import("errors.zig");
 const prompt = @import("prompt.zig");
 const tool_specs = @import("tool_specs.zig");
 const Server = @import("server.zig").Server;
+const Text = @import("model_text.zig").Text;
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -60,7 +61,24 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
     const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object) or DeepSeek's DSML calls, and this one does not: send \"auto\"");
     const text = try build(cx.a, s, tools, parallel);
-    return srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
+    var out = try srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
+    out.ban = try spelled(cx.a, srv.text, s);
+    return out;
+}
+
+/// The tokens a forced DSML call never draws: "\u{ff5c}", where the tokenizer holds the marker as one token. The
+/// grammar holds the block's text, so a sampled reply could start a marker in plain characters, and the model then
+/// writes its closing tags with a second space ("</" ++ marker ++ "  parameter>", after the marker it takes for its
+/// token): the parameter never closes, and the reply runs to max_tokens as text. With "\u{ff5c}" banned every marker
+/// is its token, as the model writes it unforced and as the template renders it.
+fn spelled(a: Allocator, text: Text, s: Style) Allocator.Error![]const u32 {
+    if (dsmlOf(s) == null) return &.{};
+    const token = text.tokenId(marker) orelse return &.{};
+    const bar = text.encode(a, "\u{ff5c}", false) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return &.{},
+    };
+    return if (bar.len == 1 and bar[0] != token) bar else &.{};
 }
 
 /// The structural tag's JSON text (xgrammar's form).
@@ -197,6 +215,59 @@ test "a DSML grammar holds every call in one block, each invoke's parameters in 
     const v4 = try build(a, .dsml, tools.array[0..1], false);
     try std.testing.expect(std.mem.indexOf(u8, v4, "\"value\":\"<" ++ marker ++ "tool_calls>\\n\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, v4, "\"style\":\"deepseek_xml\"") != null);
+}
+
+test "a forced DSML call's marker is its token: spelled in plain characters, the reply's parameter never closes; with the ban the token follows \"<\"" {
+    // opt-in, as the test below: TF_GRAMMAR_DIR, TF_GRAMMAR_TEMPLATE, TF_GRAMMAR_VOCAB, TF_GRAMMAR_STOP and libtfgrammar
+    const dir = std.testing.environ.getPosix("TF_GRAMMAR_DIR") orelse return error.SkipZigTest;
+    const template = std.testing.environ.getPosix("TF_GRAMMAR_TEMPLATE") orelse return error.SkipZigTest;
+    const vocab = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_VOCAB") orelse return error.SkipZigTest, 10);
+    const stop = try std.fmt.parseInt(u32, std.testing.environ.getPosix("TF_GRAMMAR_STOP") orelse return error.SkipZigTest, 10);
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var problem: []const u8 = "";
+    const hf = try @import("hf_text.zig").HfText.load(gpa, io, dir, template, a, &problem);
+    defer hf.deinit();
+    const text = hf.text();
+    const tok = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "tokenizer.json" }), a, .limited(256 << 20));
+    var err: [512]u8 = undefined;
+    var c = try api.grammar.Compiler.open(io, a, tok, vocab, &.{stop}, &err);
+    defer c.close();
+
+    const tools = (try json.parse(a, "[{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}}]")).ok.array;
+    const g = try build(a, .dsml41, tools, true);
+    const dsml = text.tokenId(marker).?;
+    const bar = try spelled(a, text, .dsml41);
+    try std.testing.expectEqual(@as(usize, 1), bar.len);
+    try std.testing.expectEqualStrings("\u{ff5c}", try text.decode(a, bar));
+    try std.testing.expectEqual(@as(usize, 0), (try spelled(a, text, .xml)).len);
+
+    // the reply a sampled forced call wrote on the served lane ("Hello there.", temperature 1): the markers in plain
+    // characters, the closing tags with two spaces; the grammar takes all of it as the parameter's value, never the end
+    const reply = "<" ++ marker ++ " calls>\n<" ++ marker ++ " invoke name=\"get_weather\">\n<" ++ marker ++ " parameter name=\"city\" string=\"true\">London</" ++ marker ++ "  parameter>\n</" ++ marker ++ "  invoke>\n</" ++ marker ++ "  calls> \n\nHello! How can I help you today?";
+    const plain = try text.encodePlain(a, reply);
+    try std.testing.expect(std.mem.indexOfScalar(u32, plain, dsml) == null and std.mem.indexOfScalar(u32, plain, bar[0]) != null);
+    const w = try walk(&c, io, g, plain, stop);
+    try std.testing.expect(w.taken == plain.len and !w.ended);
+
+    // the row after "<": the marker's token and its first character, then the token alone with the ban
+    const k = try c.constraint(gpa, io, .structural_tag, g, null);
+    defer k.deinit(gpa);
+    const lt = try text.encode(a, "<", false);
+    try std.testing.expect(lt.len == 1 and try k.follow(lt[0]));
+    const open = (try k.next(a)).?;
+    try std.testing.expect(api.grammar.allows(open, dsml) and api.grammar.allows(open, bar[0]));
+    k.ban = try gpa.dupe(u32, bar);
+    const banned = (try k.next(a)).?;
+    try std.testing.expect(api.grammar.allows(banned, dsml) and !api.grammar.allows(banned, bar[0]));
+    // the template's own call still walks to the stop: the ban takes nothing it writes
+    const own = try text.encode(a, "<" ++ marker ++ " calls>\n<" ++ marker ++ " invoke name=\"get_weather\">\n<" ++ marker ++ " parameter name=\"city\" string=\"true\">London</" ++ marker ++ " parameter>\n</" ++ marker ++ " invoke>\n</" ++ marker ++ " calls>", false);
+    try std.testing.expect(std.mem.indexOfScalar(u32, own, bar[0]) == null);
+    const done = try walk(&c, io, g, own, stop);
+    try std.testing.expect(done.taken == own.len and done.ended);
 }
 
 /// How far a reply's ids walk in a grammar: the ids it takes, and whether it then takes the stop and ends.

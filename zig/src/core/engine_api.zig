@@ -55,6 +55,9 @@ pub const Structure = struct {
     after: ?u32 = null,
     /// The server's compiler, which has compiled `text` once already (the engine's compile is then a cache hit).
     compiler: ?*grammar.Compiler = null,
+    /// Tokens the reply never draws while the grammar holds it, unless a row allows nothing else (a forced DSML call:
+    /// the marker spelled in plain characters, so that every marker is its own token).
+    ban: []const u32 = &.{},
 };
 
 pub const grammar = lanes.grammar;

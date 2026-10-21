@@ -444,7 +444,10 @@ pub const LaneHost = struct {
     /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
     fn constraint(h: *LaneHost, st: api.Structure) !*lanes.grammar.Constraint {
         const c = st.compiler orelse return error.NoGrammarCompiler;
-        return c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
+        const k = try c.constraint(h.gpa, h.io, @fromBackingInt(@intCast(@backingInt(st.kind))), st.text, st.after);
+        errdefer k.deinit(h.gpa);
+        if (st.ban.len > 0) k.ban = try h.gpa.dupe(u32, st.ban);
+        return k;
     }
 
     /// Whether an admitted stream decodes within finish_left tokens of its max_tokens (the lock held).

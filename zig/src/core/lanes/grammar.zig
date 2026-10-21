@@ -194,6 +194,7 @@ pub const Constraint = struct {
     words: usize,
     after: ?u32, // with thinking on, the grammar starts at the token after this one
     active: bool,
+    ban: []const u32 = &.{}, // tokens no row allows while another is allowed (the constraint's own, freed with it)
 
     pub fn init(rules: Rules, words: usize, after: ?u32) Constraint {
         return .{ .rules = rules, .words = words, .after = after, .active = after == null };
@@ -201,6 +202,7 @@ pub const Constraint = struct {
 
     pub fn deinit(c: *Constraint, gpa: Allocator) void {
         c.rules.vtable.free(c.rules.ptr);
+        if (c.ban.len > 0) gpa.free(c.ban);
         gpa.destroy(c);
     }
 
@@ -227,11 +229,27 @@ pub const Constraint = struct {
         return bits;
     }
 
-    /// The next token's bits at the matcher's place; a row that allows nothing is a dead grammar, never a draw.
+    /// The next token's bits at the matcher's place, the banned tokens cleared where the row allows another; a row that
+    /// allows nothing is a dead grammar, never a draw.
     fn fill(c: *Constraint, bits: []u32) !void {
         try c.rules.vtable.fill(c.rules.ptr, bits);
+        if (c.ban.len > 0 and c.allowsOther(bits)) for (c.ban) |t| if (t / 32 < bits.len) {
+            bits[t / 32] &= ~(@as(u32, 1) << @intCast(t % 32));
+        };
         for (bits) |w| if (w != 0) return;
         return error.GrammarDeadEnd;
+    }
+
+    /// Whether a row allows a token outside the ban.
+    fn allowsOther(c: *const Constraint, bits: []const u32) bool {
+        for (bits, 0..) |w, i| {
+            var rest = w;
+            for (c.ban) |t| if (t / 32 == i) {
+                rest &= ~(@as(u32, 1) << @intCast(t % 32));
+            };
+            if (rest != 0) return true;
+        }
+        return false;
     }
 
     /// Rows of `tokens` (row 0 pending) an accepted path can use, with bits; `forced` keeps rows, unmasked past a miss.
@@ -484,6 +502,58 @@ test "a chain grows past its last kept row with the grammar's own drafts, never 
     // forced rows never grow
     const f = try c.window(a, &.{ 9, 5 }, &.{ -1, 0 }, true, 16);
     try std.testing.expectEqual(@as(usize, 0), f.extra.len);
+}
+
+test "a ban clears its tokens from a row that allows another token, and keeps a row that allows only them" {
+    const gpa = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // a grammar that takes 4 or 5 at every step
+    const Either = struct {
+        taken: usize = 0,
+        fn rules(e: *@This()) Rules {
+            return .{ .ptr = e, .vtable = &.{ .accept = acceptFn, .rollback = rollbackFn, .terminated = terminatedFn, .fill = fillFn, .drafts = draftsFn, .free = freeFn } };
+        }
+        fn acceptFn(ptr: *anyopaque, token: u32) anyerror!bool {
+            const e: *@This() = @ptrCast(@alignCast(ptr));
+            if (token != 4 and token != 5) return false;
+            e.taken += 1;
+            return true;
+        }
+        fn rollbackFn(ptr: *anyopaque, n: usize) anyerror!void {
+            const e: *@This() = @ptrCast(@alignCast(ptr));
+            e.taken -= n;
+        }
+        fn terminatedFn(_: *anyopaque) bool {
+            return false;
+        }
+        fn fillFn(_: *anyopaque, words: []u32) anyerror!void {
+            @memset(words, 0);
+            words[0] = 1 << 4 | 1 << 5;
+        }
+        fn draftsFn(_: *anyopaque, _: []u32) anyerror!usize {
+            return 0;
+        }
+        fn freeFn(_: *anyopaque) void {}
+    };
+    var either: Either = .{};
+    var c: Constraint = .init(either.rules(), 1, null);
+    try std.testing.expectEqualSlices(u32, &.{1 << 4 | 1 << 5}, (try c.next(a)).?);
+    c.ban = &.{4};
+    try std.testing.expectEqualSlices(u32, &.{1 << 5}, (try c.next(a)).?);
+    // every row of a window, the walk rolled back
+    const w = try c.window(a, &.{ 9, 5 }, &.{ -1, 0 }, false, 1);
+    try std.testing.expectEqualSlices(u32, &.{ 1 << 5, 1 << 5 }, w.masks);
+    try std.testing.expectEqual(@as(usize, 0), either.taken);
+    // a row whose every allowed token is banned keeps them: the grammar has no other way on
+    c.ban = &.{ 4, 5 };
+    try std.testing.expectEqualSlices(u32, &.{1 << 4 | 1 << 5}, (try c.next(a)).?);
+    var seq: Sequence = .{ .want = &.{5}, .stop = 2, .gpa = gpa };
+    defer seq.log.deinit(gpa);
+    var s: Constraint = .init(seq.rules(), 1, null);
+    s.ban = &.{5};
+    try std.testing.expectEqualSlices(u32, &.{1 << 5}, (try s.next(a)).?);
 }
 
 test "the file TENSORFOLD_GRAMMAR_LIB names, through the engine's calls: a choice's masks, a refusal, a rollback, the stop" {
