@@ -163,7 +163,6 @@ test "solo allowance is opt-in and preserved by setup" {
 }
 test "solo allowance rejects invalid costs before allocating" {
     for ([_]f64{ -1.0, std.math.inf(f64), std.math.nan(f64) }) |cost| {
-        try std.testing.expectError(error.BadSoloHeadOverhead,
-            Config.init(std.testing.allocator, .{ .solo_head_overhead_ms = cost }, 8, 7));
+        try std.testing.expectError(error.BadSoloHeadOverhead, Config.init(std.testing.allocator, .{ .solo_head_overhead_ms = cost }, 8, 7));
     }
 }

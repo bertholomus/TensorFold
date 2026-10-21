@@ -32,6 +32,7 @@
 //!   TF_FILL_ROUNDS, TF_FILL_FIRST               rounds between (TF_FILL_ROUNDS of them, 4 unless set); its first
 //!                                               piece TF_FILL_FIRST chunks (unset: N), so a prompt that short runs
 //!                                               whole. One pass at a time. Unset or 0: each pass whole
+//!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -172,6 +173,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (getenv("TF_FILL_CHUNKS")) |t| st.lanes.fill_chunks = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
     if (getenv("TF_FILL_FIRST")) |t| st.lanes.fill_first = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
     const fill_rounds: u32 = if (getenv("TF_FILL_ROUNDS")) |t| std.fmt.parseInt(u32, t, 10) catch return error.BadFill else 4;
+    st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
     st.vision = null;
     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
