@@ -165,7 +165,7 @@ pub const Server = struct {
         srv.needs_user_after_tool = needsUserAfterTool(source);
         if (config.plain_specials) {
             const sh = try a.create(specials.Shield);
-            sh.* = try specials.Shield.init(a, text, srv.info.vision);
+            sh.* = try specials.Shield.init(a, text, srv.info.vision, if (srv.info.lane_vision) |v| v.placeholder else null);
             srv.shield = sh;
         }
         if (config.reply_ids) srv.reply_pieces = try replyPieces(a, text, srv.markers);

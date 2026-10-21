@@ -31,6 +31,12 @@ pub const isTitle = messages_mod.isTitleRequest;
 
 /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
 pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
+    return renderIdsOf(srv, cx, messages, tools, thinking, effort, generation, false);
+}
+
+/// renderIds; `lane_images`: the messages hold the request's image parts as the lane's placeholder (normalizeImages),
+/// which TENSORFOLD_PLAIN_SPECIALS keeps as the template's.
+fn renderIdsOf(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool, lane_images: bool) errors.Refused![]const u32 {
     const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalizeWith(cx, messages, srv.late_system, srv.needs_user_after_tool, .of(srv.info.vision)));
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
@@ -40,7 +46,7 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
         .reasoning_effort = if (thinking) effort else null,
         .reasoning_effort_value = if (thinking) srv.effortValue(effort) else null,
     };
-    var ids = render(srv, cx.a, normalized, options, &problem) catch |e| switch (e) {
+    var ids = render(srv, cx.a, normalized, options, lane_images, &problem) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.Template => return cx.fail(.server, "{s}", .{problem}),
     };
@@ -58,9 +64,10 @@ pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, t
 }
 
 /// The template's ids for `messages`; with image input, a marker the text spells is ordinary text (images.zig), and
-/// with TENSORFOLD_PLAIN_SPECIALS an added token's text a sender wrote (specials.zig).
-fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error![]u32 {
-    if (srv.shield) |sh| if (try sh.apply(a, messages)) |quoted| {
+/// with TENSORFOLD_PLAIN_SPECIALS an added token's text a sender wrote (specials.zig; `lane_images`: the lane's
+/// placeholders are the request's image parts, kept).
+fn render(srv: *Server, a: std.mem.Allocator, messages: Value, options: model_text.RenderOptions, lane_images: bool, problem: *[]const u8) model_text.Error![]u32 {
+    if (srv.shield) |sh| if (try sh.apply(a, messages, lane_images)) |quoted| {
         const text = try srv.text.render(a, quoted, options, problem);
         return images.encodeShielded(srv.text, a, text, sh.markers);
     };
@@ -114,7 +121,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
-    const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+    const prompt = try renderIdsOf(srv, cx, input.messages, input.tools, thinking, effort, true, input.lane_images.len > 0);
     if (input.lane_images.len > 0) return laneSpans(srv, cx, prompt, input.lane_images); // (no kept history: the cache keys tokens)
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;

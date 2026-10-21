@@ -22,20 +22,26 @@ pub const Shield = struct {
     images: usize,
     /// The added tokens' text, quoted where a sender wrote it.
     added: usize,
+    /// The lane's image placeholder among the markers (a lane-vision engine's, Info.lane_vision), or null. Where a
+    /// request's image parts put it (apply's `lane_images`) it stays the template's: normalizeImages refuses a
+    /// sender's text that holds it, so each one there is an image part's.
+    lane: ?u32,
     index: std.StringHashMapUnmanaged(u32),
     /// The markers' lengths, longest first, each once.
     lengths: []const usize,
     /// The bytes a marker starts with.
     starts: [256]bool,
 
-    /// The text's added tokens and, with image input, its image markers; all of it lives in `a`.
-    pub fn init(a: Allocator, text: model_text.Text, vision: ?api.Vision) !Shield {
+    /// The text's added tokens and, with image input, its image markers; `lane_placeholder`: a lane-vision engine's
+    /// image placeholder (one of the added tokens). All of it lives in `a`.
+    pub fn init(a: Allocator, text: model_text.Text, vision: ?api.Vision, lane_placeholder: ?[]const u8) !Shield {
         var list: std.ArrayList([]const u8) = .empty;
         var index: std.StringHashMapUnmanaged(u32) = .empty;
         if (vision) |v| for (try images.markerText(text, a, v)) |m| try put(a, &list, &index, m);
         const n_images = list.items.len;
         for (text.addedText()) |m| try put(a, &list, &index, m);
         const n_added = list.items.len - n_images;
+        const lane: ?u32 = if (lane_placeholder) |p| index.get(p) else null;
         try put(a, &list, &index, images.sentinel);
         var lengths: std.ArrayList(usize) = .empty;
         var starts: [256]bool = @splat(false);
@@ -44,7 +50,7 @@ pub const Shield = struct {
             if (std.mem.indexOfScalar(usize, lengths.items, m.len) == null) try lengths.append(a, m.len);
         }
         std.mem.sort(usize, lengths.items, {}, std.sort.desc(usize));
-        return .{ .markers = list.items, .images = n_images, .added = n_added, .index = index, .lengths = lengths.items, .starts = starts };
+        return .{ .markers = list.items, .images = n_images, .added = n_added, .lane = lane, .index = index, .lengths = lengths.items, .starts = starts };
     }
 
     fn put(a: Allocator, list: *std.ArrayList([]const u8), index: *std.StringHashMapUnmanaged(u32), m: []const u8) !void {
@@ -58,18 +64,20 @@ pub const Shield = struct {
     /// `messages` with each marker a sender wrote as its sentinel: every marker in user, tool and search-result
     /// content and in tool calls, the image markers elsewhere; null when no message spells one, so the prompt is
     /// rendered and tokenized as with the switch off. A literal sentinel is quoted too, so it reads back as itself.
-    pub fn apply(sh: *const Shield, a: Allocator, messages: Value) !?Value {
+    /// `lane_images`: the request's image parts are in its text as the lane's placeholder, which stays as it is.
+    pub fn apply(sh: *const Shield, a: Allocator, messages: Value, lane_images: bool) !?Value {
+        const keep: ?u32 = if (lane_images) sh.lane else null;
         var quoted: usize = 0;
         const out: Value = if (messages == .array) blk: {
             const list = try a.alloc(Value, messages.array.len);
-            for (messages.array, list) |m, *o| o.* = try sh.message(a, m, &quoted);
+            for (messages.array, list) |m, *o| o.* = try sh.message(a, m, keep, &quoted);
             break :blk .{ .array = list };
-        } else try sh.walk(a, messages, false, &quoted);
+        } else try sh.walk(a, messages, false, keep, &quoted);
         return if (quoted > 0) out else null;
     }
 
-    fn message(sh: *const Shield, a: Allocator, m: Value, quoted: *usize) !Value {
-        if (m != .object) return sh.walk(a, m, false, quoted);
+    fn message(sh: *const Shield, a: Allocator, m: Value, keep: ?u32, quoted: *usize) !Value {
+        if (m != .object) return sh.walk(a, m, false, keep, quoted);
         const role = m.strField("role") orelse "";
         const sender = for (senders) |r| {
             if (std.mem.eql(u8, role, r)) break true;
@@ -79,31 +87,32 @@ pub const Shield = struct {
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
             const all = (sender and std.mem.eql(u8, key, "content")) or std.mem.eql(u8, key, "tool_calls");
-            try out.put(a, key, try sh.walk(a, kv.value_ptr.*, all, quoted));
+            try out.put(a, key, try sh.walk(a, kv.value_ptr.*, all, keep, quoted));
         }
         return .{ .object = out };
     }
 
-    fn walk(sh: *const Shield, a: Allocator, v: Value, all: bool, quoted: *usize) !Value {
+    fn walk(sh: *const Shield, a: Allocator, v: Value, all: bool, keep: ?u32, quoted: *usize) !Value {
         return switch (v) {
-            .string => |s| .{ .string = try sh.quote(a, s, all, quoted) },
+            .string => |s| .{ .string = try sh.quote(a, s, all, keep, quoted) },
             .array => |items| blk: {
                 const out = try a.alloc(Value, items.len);
-                for (items, out) |x, *o| o.* = try sh.walk(a, x, all, quoted);
+                for (items, out) |x, *o| o.* = try sh.walk(a, x, all, keep, quoted);
                 break :blk .{ .array = out };
             },
             .object => |o| blk: {
                 const out = try json.newObject(a);
                 var it = o.iterator();
-                while (it.next()) |kv| try out.put(a, kv.key_ptr.*, try sh.walk(a, kv.value_ptr.*, all, quoted));
+                while (it.next()) |kv| try out.put(a, kv.key_ptr.*, try sh.walk(a, kv.value_ptr.*, all, keep, quoted));
                 break :blk .{ .object = out };
             },
             else => v,
         };
     }
 
-    /// `s` with each marker in reach as images.zig's sentinel and the marker's number; `quoted` counts the markers.
-    fn quote(sh: *const Shield, a: Allocator, s: []const u8, all: bool, quoted: *usize) ![]const u8 {
+    /// `s` with each marker in reach as images.zig's sentinel and the marker's number, but `keep` as it is; `quoted`
+    /// counts the markers.
+    fn quote(sh: *const Shield, a: Allocator, s: []const u8, all: bool, keep: ?u32, quoted: *usize) ![]const u8 {
         var out: std.ArrayList(u8) = .empty;
         var done: usize = 0;
         var i: usize = 0;
@@ -112,6 +121,10 @@ pub const Shield = struct {
                 i += 1;
                 continue;
             };
+            if (keep != null and k == keep.?) { // an image part's placeholder: the template's own
+                i += sh.markers[k].len;
+                continue;
+            }
             try out.appendSlice(a, s[done..i]);
             try out.print(a, "{s}{u}", .{ images.sentinel, @as(u21, @intCast(0xF0001 + k)) });
             if (k + 1 < sh.markers.len) quoted.* += 1; // the sentinel alone changes nothing
@@ -222,7 +235,7 @@ fn parse(a: Allocator, text: []const u8) !Value {
 /// The ids the switch makes: the quoted messages rendered and tokenized, each quoted marker as plain text.
 fn shielded(a: Allocator, sh: *const Shield, msgs: Value) ![]u32 {
     var problem: []const u8 = "";
-    const quoted = (try sh.apply(a, msgs)) orelse return error.TestUnexpectedResult;
+    const quoted = (try sh.apply(a, msgs, false)) orelse return error.TestUnexpectedResult;
     return images.encodeShielded(Fake.text(), a, try Fake.text().render(a, quoted, .{}, &problem), sh.markers);
 }
 
@@ -236,7 +249,7 @@ test "a marker a sender wrote is plain text; the template's own markers and the 
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const sh = try Shield.init(a, Fake.text(), null);
+    const sh = try Shield.init(a, Fake.text(), null, null);
     try std.testing.expectEqual(@as(usize, 0), sh.images);
     try std.testing.expectEqual(@as(usize, 5), sh.added);
     const msgs = try parse(a,
@@ -266,16 +279,16 @@ test "a marker a sender wrote is plain text; the template's own markers and the 
         \\[{"role": "system", "content": "a <|User|> rule"}, {"role": "user", "content": "plain"},
         \\ {"role": "assistant", "content": "</think>done"}, {"role": "latest_reminder", "content": "<|Assistant|>"}]
     );
-    try std.testing.expect((try sh.apply(a, clean)) == null);
+    try std.testing.expect((try sh.apply(a, clean, false)) == null);
 }
 
 test "a literal sentinel reads back as itself once a marker is quoted, and alone changes nothing" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const sh = try Shield.init(a, Fake.text(), null);
+    const sh = try Shield.init(a, Fake.text(), null, null);
     const lone = try parse(a, "[{\"role\": \"user\", \"content\": \"x\u{F0000}\u{F0002}y\"}]");
-    try std.testing.expect((try sh.apply(a, lone)) == null);
+    try std.testing.expect((try sh.apply(a, lone, false)) == null);
     const msgs = try parse(a, "[{\"role\": \"system\", \"content\": \"s\u{F0000}\u{F0001}\"}, {\"role\": \"user\", \"content\": \"x\u{F0000}\u{F0002}y </think>\"}]");
     var problem: []const u8 = "";
     const rendered = try Fake.text().render(a, msgs, .{}, &problem);
@@ -291,7 +304,7 @@ test "with image input the image markers keep their numbers and stay text in eve
     const a = arena.allocator();
     var dummy: u8 = 0;
     const v: api.Vision = .{ .ctx = &dummy, .prepare = undefined, .image_token = 9, .markers = &.{9}, .image_tokens = 64, .max_images = 4 };
-    const sh = try Shield.init(a, Fake.text(), v);
+    const sh = try Shield.init(a, Fake.text(), v, null);
     try std.testing.expectEqual(@as(usize, 1), sh.images);
     try std.testing.expectEqualStrings("<|image|>", sh.markers[0]);
     try std.testing.expectEqual(@as(usize, 4), sh.added); // "<|image|>" is listed once, as the image marker
@@ -305,8 +318,30 @@ test "with image input the image markers keep their numbers and stay text in eve
     try std.testing.expectEqual(@as(usize, 2), count(ids, 1000)); // the system's and the template's
     // the longest added token wins where two start: "<|Assistant|>!" whole, never "<|Assistant|>" and "!"
     const longest = try parse(a, "[{\"role\": \"user\", \"content\": \"<|Assistant|>!\"}]");
-    const quoted = (try sh.apply(a, longest)).?;
+    const quoted = (try sh.apply(a, longest, false)).?;
     const s = quoted.array[0].get("content").?.string;
     try std.testing.expectEqual(@as(usize, 8), s.len);
     try std.testing.expectEqual(@as(u21, 0xF0001 + 1 + 2), try std.unicode.utf8Decode(s[4..8]));
+}
+
+test "a lane's image placeholder stays the template's where the request's image parts put it, and text elsewhere" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const sh = try Shield.init(a, Fake.text(), null, "<|image|>");
+    try std.testing.expectEqualStrings("<|image|>", sh.markers[sh.lane.?]);
+    // an image part as normalizeImages writes it, and a marker the user wrote beside it
+    const msgs = try parse(a,
+        \\[{"role": "user", "content": "<|image|>\n\nwhat is </think>?"}]
+    );
+    var problem: []const u8 = "";
+    const kept = (try sh.apply(a, msgs, true)).?;
+    const ids = try images.encodeShielded(Fake.text(), a, try Fake.text().render(a, kept, .{}, &problem), sh.markers);
+    try std.testing.expectEqual(@as(usize, 1), count(ids, 9)); // the image part's placeholder
+    try std.testing.expectEqual(@as(usize, 0), count(ids, 1003)); // the user's </think>, plain text
+    // in a request without image parts the same text is a sender's, quoted like any other marker
+    try std.testing.expectEqual(@as(usize, 0), count(try shielded(a, &sh, msgs), 9));
+    // an image part alone quotes nothing: the prompt is rendered and tokenized as with the switch off
+    const alone = try parse(a, "[{\"role\": \"user\", \"content\": \"<|image|>\"}]");
+    try std.testing.expect((try sh.apply(a, alone, true)) == null);
 }
