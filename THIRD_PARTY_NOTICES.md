@@ -156,6 +156,12 @@ family splits each layer over two pairs of nodes. Its one-launch gate / up for t
 module (`experts_grouped.cuh` of the Python line, whose header credits ExLlamaV3, MIT License, Copyright (c) 2025
 Turboderp, text below), its arithmetic unchanged; the file's header says so. The branch's ATTRIBUTION.md lists every
 outside source of the family.
+
+Its structured output and forced tool calls (`zig/src/server/tool_grammar.zig` and the family's grammar rounds) run
+on libtfgrammar, described below; a deployment's kernel kit carries it built for aarch64 Linux
+(`grammar/libtfgrammar.so`, with xgrammar's and dlpack's licenses and xgrammar's notice beside it; not in this
+repository).
+
 ## Vendored code and weights
 
 In the Python engine, frozen at 0.6.6, `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified
