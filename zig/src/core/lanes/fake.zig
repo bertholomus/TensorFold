@@ -85,6 +85,11 @@ pub const Fake = struct {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true } };
     }
 
+    /// `stepped` as a backend that holds one prompt pass at a time (`prefill_one`).
+    pub fn steppedOne(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .reports_fill = true, .prefill_one = true } };
+    }
+
     fn self(ptr: *anyopaque) *Fake {
         return @ptrCast(@alignCast(ptr));
     }

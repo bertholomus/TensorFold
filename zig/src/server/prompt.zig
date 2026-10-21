@@ -7,6 +7,7 @@ const messages_mod = @import("messages.zig");
 const model_text = @import("model_text.zig");
 const chat = @import("chat.zig");
 const images = @import("images.zig");
+const image_key = @import("image_key.zig");
 const Server = @import("server.zig").Server;
 const Value = json.Value;
 const Cx = errors.Cx;
@@ -122,11 +123,11 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         .ids => |ids| return .{ .ids = ids },
     };
     const prompt = try renderIdsOf(srv, cx, input.messages, input.tools, thinking, effort, true, input.lane_images.len > 0);
-    if (input.lane_images.len > 0) return laneSpans(srv, cx, prompt, input.lane_images); // (no kept history: the cache keys tokens)
-    const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
+    const history = try renderIdsOf(srv, cx, input.messages, input.tools, thinking, effort, false, input.lane_images.len > 0);
     var history_len: usize = 0;
     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
+    if (input.lane_images.len > 0) return laneSpans(srv, cx, prompt, history_len, input.lane_images); // no rewind kept, as --vision
     // --vision: placeholders expanded to image tokens before the window, chunks and cache see it; no rewind kept
     if (try images.expand(srv.info.vision, if (srv.config.vision_urls) images.Fetch.network(srv.io) else null, srv.text, cx, input.messages, prompt, history_len)) |x| return .{ .ids = x.ids, .history_len = x.history_len, .images = x.images, .cache_key = x.cache_key };
     const count = if (input.messages == .array) input.messages.array.len else 0;
@@ -155,13 +156,23 @@ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tool
 
 /// Each image placeholder of the rendered prompt as its image's span (the lane-vision family's prepare: the span's
 /// length and the payload the engine reads), the images in prompt order.
-fn laneSpans(srv: *Server, cx: *Cx, ids: []const u32, lane_images: []const []const u8) errors.Refused!Rendered {
+fn laneSpans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, lane_images: []const []const u8) errors.Refused!Rendered {
     const vision = srv.info.lane_vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
+    return placeSpans(cx, vision, ids, history_len, lane_images);
+}
+
+/// laneSpans with the engine's vision: the cache key spells each span by its payload's digest, and the history
+/// (`history_len` ids) ends past its images' spans.
+fn placeSpans(cx: *Cx, vision: api.LaneVision, ids: []const u32, history_len: usize, lane_images: []const []const u8) errors.Refused!Rendered {
     var out: std.ArrayList(u32) = .empty;
+    var key: std.ArrayList(u32) = .empty;
     var placed: std.ArrayList(api.LaneImage) = .empty;
-    for (ids) |id| {
+    var history_end: usize = 0;
+    for (ids, 0..) |id, i| {
+        if (i == history_len) history_end = out.items.len;
         if (id != vision.token) {
             try out.append(cx.a, id);
+            try key.append(cx.a, id);
             continue;
         }
         const k = placed.items.len;
@@ -173,9 +184,81 @@ fn laneSpans(srv: *Server, cx: *Cx, ids: []const u32, lane_images: []const []con
         };
         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
         try out.appendNTimes(cx.a, vision.token, prep.tokens);
+        try spellRows(cx.a, &key, prep.payload, prep.tokens);
     }
     if (placed.items.len != lane_images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
-    return .{ .ids = out.items, .lane_images = placed.items };
+    return .{ .ids = out.items, .lane_images = placed.items, .cache_key = key.items, .history_len = if (history_len > 0) history_end else 0 };
+}
+
+/// A lane image's span as the cache key spells it, in image_key.zig's words: its first two rows carry 62 bits of its
+/// payload's Blake3 digest whole (the payload is what the engine reads: one payload, one span of rows), the others a
+/// hash of those bits and the row. (Blake3: a few milliseconds for the largest payload, and no crafted collisions.)
+fn spellRows(a: std.mem.Allocator, key: *std.ArrayList(u32), payload: []const u8, tokens: u32) !void {
+    var d: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash(payload, &d, .{});
+    const h = std.mem.readInt(u64, d[0..8], .little) & ((1 << 62) - 1);
+    for (0..tokens) |j| try key.append(a, switch (j) {
+        0 => image_key.open(h),
+        1 => image_key.close(h),
+        else => image_key.row(h, j),
+    });
+}
+
+test "a lane image's key words name its payload and their rows, past every vocabulary's ids" {
+    const a = std.testing.allocator;
+    var one: std.ArrayList(u32) = .empty;
+    defer one.deinit(a);
+    var same: std.ArrayList(u32) = .empty;
+    defer same.deinit(a);
+    var other: std.ArrayList(u32) = .empty;
+    defer other.deinit(a);
+    try spellRows(a, &one, "the same pixels", 64);
+    try spellRows(a, &same, "the same pixels", 64);
+    try spellRows(a, &other, "other pixels", 64);
+    try std.testing.expectEqual(@as(usize, 64), one.items.len);
+    try std.testing.expectEqualSlices(u32, one.items, same.items);
+    try std.testing.expect(one.items[0] != other.items[0] or one.items[1] != other.items[1]); // the digest's 62 bits whole
+    try std.testing.expect(!std.mem.eql(u32, one.items[2..], other.items[2..]));
+    for (one.items) |id| try std.testing.expect(id >= 0x8000_0000);
+    try std.testing.expect(one.items[2] != one.items[3]);
+}
+
+test "lane images: each placeholder its span, the key one word a position, the history past its images" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Three = struct { // each image three rows, its payload its bytes
+        fn prepare(_: *anyopaque, al: std.mem.Allocator, bytes: []const u8, _: *[]const u8) api.LaneVision.PrepareError!api.LaneVision.Prepared {
+            return .{ .tokens = 3, .payload = try al.dupe(u8, bytes) };
+        }
+    };
+    var dummy: u8 = 0;
+    const v: api.LaneVision = .{ .ctx = &dummy, .placeholder = "<image>", .token = 7, .prepare = Three.prepare };
+    var cx: Cx = .{ .a = a };
+    // a history [1, 2, image A, 4] then this turn's [image B, 5]
+    const ids = [_]u32{ 1, 2, 7, 4, 7, 5 };
+    const x = try placeSpans(&cx, v, &ids, 4, &.{ "A", "B" });
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 7, 7, 7, 4, 7, 7, 7, 5 }, x.ids);
+    try std.testing.expectEqual(@as(usize, 6), x.history_len);
+    try std.testing.expectEqual(@as(usize, 2), x.lane_images.len);
+    try std.testing.expectEqual(@as(u32, 2), x.lane_images[0].at);
+    try std.testing.expectEqual(@as(u32, 6), x.lane_images[1].at);
+    try std.testing.expectEqual(x.ids.len, x.cache_key.len);
+    var rows_a: std.ArrayList(u32) = .empty;
+    try spellRows(a, &rows_a, "A", 3);
+    var rows_b: std.ArrayList(u32) = .empty;
+    try spellRows(a, &rows_b, "B", 3);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, x.cache_key[0..2]);
+    try std.testing.expectEqualSlices(u32, rows_a.items, x.cache_key[2..5]);
+    try std.testing.expectEqual(@as(u32, 4), x.cache_key[5]);
+    try std.testing.expectEqualSlices(u32, rows_b.items, x.cache_key[6..9]);
+    try std.testing.expectEqual(@as(u32, 5), x.cache_key[9]);
+    // another first image: the same ids, a key that parts at the image
+    const y = try placeSpans(&cx, v, &ids, 4, &.{ "C", "B" });
+    try std.testing.expectEqualSlices(u32, x.ids, y.ids);
+    try std.testing.expectEqual(@as(?usize, 2), std.mem.indexOfDiff(u32, x.cache_key, y.cache_key));
+    // no history: none kept past the images either
+    try std.testing.expectEqual(@as(usize, 0), (try placeSpans(&cx, v, &ids, 0, &.{ "A", "B" })).history_len);
 }
 
 /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.
