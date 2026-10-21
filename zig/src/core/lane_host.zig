@@ -269,7 +269,7 @@ pub const LaneHost = struct {
         job.reported();
         h.gpa.free(job.marks);
         const s = &job.stream;
-        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .min_rows = s.min_rows, .loop_period = s.loop_period, .loop_novelty = s.loop_novelty, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
+        const stats: Stats = if (job.started) .{ .rounds = s.rounds, .drafted = s.drafted, .accepted = s.accepted, .depths = depthsOf(s), .min_rows = s.min_rows, .loop_period = s.loop_period, .loop_novelty = s.loop_novelty, .prefill_seconds = if (job.prefilled) |done| @as(f64, @floatFromInt(@as(i64, @intCast(@max(0, done - job.began))))) / 1e9 else null } else .{};
         const told = if (job.started) recalls.finished(h, job, reason, stats) else stats;
         emit(job, .{ .finished = .{ .reason = reason, .stats = told, .message = message } });
         if (job.started) {
@@ -626,6 +626,18 @@ pub const LaneHost = struct {
         }
     }
 };
+
+/// A stream's head chains by depth as a reply's stats carry them (a depth past the API's counts adds to its last).
+fn depthsOf(s: *const lanes.Stream) [api.draft_depths]api.DraftDepth {
+    var out: [api.draft_depths]api.DraftDepth = @splat(.{});
+    for (s.depths, 0..) |d, j| {
+        const o = &out[@min(j, out.len - 1)];
+        o.drafted += d.drafted;
+        o.reached += d.reached;
+        o.kept += d.kept;
+    }
+    return out;
+}
 
 test {
     _ = @import("lane_host_test.zig");

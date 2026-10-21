@@ -115,6 +115,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         std.debug.print("tensorfold: TENSORFOLD_SSE_KEEPALIVE={s}: whole seconds (0: off)\n", .{t});
         return 1;
     } else 0;
+    const stats_every: u32 = if (env(s, "TENSORFOLD_STATS_EVERY")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
+        std.debug.print("tensorfold: TENSORFOLD_STATS_EVERY={s}: whole seconds (0: off)\n", .{t});
+        return 1;
+    } else 0;
     const loop_windows: u32 = if (env(s, "TENSORFOLD_LOOP_WINDOWS")) |t| std.fmt.parseInt(u32, std.mem.trim(u8, t, " "), 10) catch {
         std.debug.print("tensorfold: TENSORFOLD_LOOP_WINDOWS={s}: a whole number of windows (0: exact cycles only)\n", .{t});
         return 1;
@@ -145,6 +149,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .loop_windows = loop_windows,
         .keep_warm_s = args.keep_warm,
         .sse_keepalive_ms = std.math.mul(u32, keepalive_s, 1000) catch std.math.maxInt(u32),
+        .stats_every_s = stats_every,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
         .vision_urls = args.vision_urls,
@@ -194,6 +199,10 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         s.served,                                                   args.host,                                                                                   port,   shownSampling(a, s.sampling),
         if (args.no_drafts or srv.info.plain_only) "off" else "on", if (window > 0) std.fmt.bufPrint(&window_text, "{d}", .{window}) catch "?" else "unlimited", loaded,
     });
+    if (stats_every > 0) {
+        srv.metrics.startLines(io, now);
+        log.line("stats line on (TENSORFOLD_STATS_EVERY): at most every {d}s as requests finish, what finished since the last: tokens a round, drafts kept, and the draft head's chains by depth (kept of drafted, kept when reached)", .{stats_every});
+    }
     if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     if (s.recall) |r| recall_routes.line(r);
