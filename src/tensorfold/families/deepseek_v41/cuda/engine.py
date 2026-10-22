@@ -7,6 +7,7 @@ samples: drafted output equals serial output, at temperature 0 and above.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -114,6 +115,7 @@ class DsEngine:
         self.max_rows = drafts + 1
         self.model.rope_cap = self.limit + self.max_rows + 8      # every cache reads the same RoPE table
         self.eos = (int(json.loads((Path(model_dir) / "config.json").read_text()).get("eos_token_id", 1)),)
+        self.model_dir = Path(model_dir)              # a reply's grammar compiles from its tokenizer on every rank
         self.request = threading.local()
         self.quiet = False
         # --parallel N: up to N requests decoded together (multi.MultiDecoder), each in a slot of one cache pool
@@ -161,10 +163,27 @@ class DsEngine:
                 self.scheduler = Scheduler(self.multi, max_streams=int(parallel))
                 print(f"[tensorfold] --parallel {int(parallel)}: {int(parallel)} streams share one window of "
                       f"{self.multi.extents.total} tokens (an extent each)", flush=True)
+        self._grammar_compiler()
         self._memory_ceiling()
         if rank == 0:
             print(f"[tensorfold] DeepSeek-V4.1 engine ready: {world} rank(s), context {self.limit}, "
                   f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}", flush=True)
+
+    def _grammar_compiler(self) -> None:
+        """With xgrammar installed, the grammar compiler (its tokenizer tables, ~124 MiB of host memory at a 129K
+        vocabulary) is built before the memory ceiling, so the host floor counts it; the server's requests share it."""
+
+        import importlib.util
+
+        if importlib.util.find_spec("xgrammar") is None:
+            return
+        from tensorfold.engine import grammar
+
+        t0 = time.perf_counter()
+        grammar.compiler(self, self.model_dir, self.eos)
+        if self.rank == 0:
+            print(f"[tensorfold] structured output: grammar compiler ready ({time.perf_counter() - t0:.1f}s)",
+                  flush=True)
 
     def _memory_ceiling(self) -> None:
         """After the warm-up, torch may grow only while the host keeps TF_DS_MEM_FLOOR_GIB (default 2; 0: no ceiling)
@@ -310,16 +329,23 @@ class DsEngine:
             self.nccl.all_gather(buf, allv)
         return [int(v) for v in allv[:count].tolist()]
 
+    @property
+    def supports_logprobs(self) -> bool:
+        return True                                    # rank 0 holds the gathered logits: it reads them alone
+
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None, vision=None, **_: Any) -> dict[str, Any]:
-        if constraint is not None:
-            raise ValueError("structured output is not served by the DeepSeek-V4.1 engine yet")
+                 constraint=None, vision=None, probabilities=None, **_: Any) -> dict[str, Any]:
+        from tensorfold.engine.grammar import pack
+
+        if probabilities is not None and constraint is not None:
+            raise ValueError("logprobs do not support structured output")
         stop_eos = bool(getattr(self.request, "stop_eos", True))
         if self.scheduler is not None:
             if vision is not None and getattr(vision, "spans", None) and self.tower is None:
                 raise ValueError("image input needs the server started with --vision")
             return self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft), on_tokens,
-                                         stop_eos=stop_eos, vision=vision)
+                                         stop_eos=stop_eos, vision=vision, constraint=constraint,
+                                         probabilities=probabilities)
         positions, rows = [], None
         if vision is not None and getattr(vision, "spans", None):
             if self.tower is None:
@@ -329,18 +355,23 @@ class DsEngine:
                 raise ValueError("an image span lies past the prompt")
             rows = torch.cat([self.tower.span_rows(pic) for _, pic in vision.spans])
         seed = (sampling.seed if sampling else 0) & ((1 << 63) - 1)
+        packed = pack(constraint)                      # (before any share: a grammar that cannot go fails here alone)
         header = [max_tokens, int(stop_eos), int(draft), seed, *_f64(sampling.temperature if sampling else 0.0),
                   int(sampling.top_k) if sampling else 0, *_f64(sampling.top_p if sampling else 1.0),
-                  *_f64(sampling.min_p if sampling else 0.0), len(positions)]
+                  *_f64(sampling.min_p if sampling else 0.0), len(positions), int(constraint is not None)]
         self._share(header)
         self._share(list(prompt))
         image = None
         if positions:
             self._share(positions)
             image = (positions, self._share_rows(rows, len(positions)))
-        return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, draft, image=image)
+        if constraint is not None:                     # the request's grammar: the other ranks compile the same
+            self._share(packed)
+        return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, draft, image=image,
+                         constraint=constraint, probabilities=probabilities)
 
     def follow(self) -> None:
+        from tensorfold.engine import grammar
         from tensorfold.engine.exact_sampling import Sampling
 
         if self.multi is not None:
@@ -349,16 +380,52 @@ class DsEngine:
             self.multi.follow(Link(self.nccl.store, rank=self.rank, world=self.world, host=self._master))
             return
         while True:
-            (max_tokens, stop_eos, draft, seed, t0, t1, top_k, p0, p1, m0, m1, n_img) = self._share(None)
+            (max_tokens, stop_eos, draft, seed, t0, t1, top_k, p0, p1, m0, m1, n_img, shaped) = self._share(None)
             prompt = self._share(None)
             image = None
             if n_img:
                 positions = self._share(None)
                 image = (positions, self._share_rows(None, n_img))
+            constraint = None
+            if shaped:                                 # compiled here as on rank 0
+                packed = self._share(None)
+                try:
+                    constraint = grammar.compiler(self, self.model_dir, self.eos).follow(packed)
+                except Exception as exc:               # noqa: BLE001  (rank 0 compiled it: the request fails)
+                    constraint = Uncompiled(packed, exc)
             temperature = _f64_back(t0, t1)
             sampling = (Sampling(seed, temperature, top_k, _f64_back(p0, p1), _f64_back(m0, m1))
                         if temperature > 0 else None)
-            self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, bool(draft), image=image)
+            try:
+                self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, bool(draft), image=image,
+                          constraint=constraint)
+            except grammar.GrammarError:               # every rank failed the request at the same step
+                pass
+
+    def _all(self, ok: bool) -> bool:
+        """Whether ``ok`` holds on every rank (one small all-gather: every rank calls it at the same point)."""
+
+        mine = torch.tensor([int(ok)], dtype=torch.int64, device="cuda")
+        every = torch.empty((self.world,), dtype=torch.int64, device="cuda")
+        self.nccl.all_gather(mine, every)
+        return bool(every.all())
+
+    @contextlib.contextmanager
+    def _grammar_step(self, constraint):
+        """A step of the reply's grammar that ends the same way on every rank: each rank runs its own grammar, and one
+        that failed on any rank fails the request on all of them (they then serve the next request together)."""
+
+        from tensorfold.engine.grammar import GrammarError
+
+        failed = None
+        try:
+            yield
+        except GrammarError as exc:
+            failed = exc
+        if constraint is not None and self.world > 1 and not self._all(failed is None) and failed is None:
+            failed = GrammarError("the reply's grammar failed on another rank")
+        if failed is not None:
+            raise failed
 
     # -- one request -----------------------------------------------------------------------------------------------
     def _sample(self, logits: torch.Tensor, positions: list[int], sampling) -> list[int]:
@@ -446,8 +513,12 @@ class DsEngine:
         return last
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable,
-             draft: bool, image: tuple | None = None) -> dict[str, Any]:
-        """``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16)."""
+             draft: bool, image: tuple | None = None, constraint=None, probabilities=None) -> dict[str, Any]:
+        """``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16); ``constraint``:
+        the reply's grammar (``tensorfold.engine.grammar``), every rank walking and masking the same rows;
+        ``probabilities`` (rank 0): the reply's tokens' log probabilities, from the rows that chose them."""
+        from tensorfold.cuda.logprobs import capture
+
         m = self.model
         eos = self.eos if stop_eos else ()
         if len(prompt) + max_tokens > self.limit:
@@ -466,14 +537,25 @@ class DsEngine:
         last = self.prefill(sc, dc, prompt, image)
         self.last_prefill_logits = last
         torch.cuda.empty_cache()          # a long prompt's chunk buffers back to the node (unified memory)
-        first = self._sample(last, [len(prompt)], sampling)[0]
+        if probabilities is not None:                  # (rank 0 alone: a refused row fails the reply at its end)
+            probabilities = Kept(probabilities)
+        with self._grammar_step(constraint):
+            if constraint is not None:                 # the first token's row, under the reply's grammar
+                with torch.inference_mode():           # the mask writes in place: logits are inference tensors
+                    constraint.mask(last)
+            first = self._sample(last, [len(prompt)], sampling)[0]
+            if constraint is not None:
+                constraint.advance([first])
+        capture(last, [first], [len(prompt)], probabilities)
         stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0}
         t1 = time.perf_counter()
         if use_drafts:
-            out, st = self._spec(sc, dc, first, max_tokens, sampling, eos, on_tokens)
+            out, st = self._spec(sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint, probabilities)
             stats.update(rounds=st[0], drafted=st[1], accepted=st[2], **self.last_spec_times)
         else:
-            out = self._serial(sc, first, max_tokens, sampling, eos, on_tokens)
+            out = self._serial(sc, first, max_tokens, sampling, eos, on_tokens, constraint, probabilities)
+        if probabilities is not None and probabilities.error is not None:
+            raise probabilities.error
         dt = time.perf_counter() - t1
         stats.update(decode_s=dt, tokens=len(out), tokens_per_second=(len(out) - 1) / dt if dt > 0 else 0.0,
                      sha256=hashlib.sha256(json.dumps(out).encode()).hexdigest()[:16])
@@ -484,17 +566,27 @@ class DsEngine:
                      if use_drafts else ""), flush=True)
         return stats
 
-    def _serial(self, sc, first, max_tokens, sampling, eos, on_tokens) -> list[int]:
+    def _serial(self, sc, first, max_tokens, sampling, eos, on_tokens, constraint=None, probabilities=None) -> list[int]:
+        from tensorfold.cuda.logprobs import capture
+
         out = [first]
         on_tokens([first])
         tok = first
-        while len(out) < max_tokens and tok not in eos:
+        # a grammar's end ends the reply, with ignore_eos too (past it nothing is masked)
+        while len(out) < max_tokens and tok not in eos and not (constraint is not None and constraint.finished):
             p = sc.length
             if self.runner is not None:
                 lg, _ = self.runner.forward(sc, [tok], p, False)
             else:
                 lg = self.model.forward(sc, torch.tensor([tok], dtype=torch.long, device="cuda"), p, host_ids=[tok])
-            tok = self._sample(lg, [p + 1], sampling)[0]
+            with self._grammar_step(constraint):
+                if constraint is not None:
+                    with torch.inference_mode():
+                        constraint.mask(lg)
+                tok = self._sample(lg, [p + 1], sampling)[0]
+                if constraint is not None:
+                    constraint.advance([tok])
+            capture(lg, [tok], [p + 1], probabilities)
             out.append(tok)
             on_tokens([tok])
         return out
@@ -519,8 +611,11 @@ class DsEngine:
                 best, best_v = k, v
         return best
 
-    def _spec(self, sc, dc, first, max_tokens, sampling, eos, on_tokens):
-        """Drafts verified k at a time against the target's keyed samples (the serial rule)."""
+    def _spec(self, sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint=None, probabilities=None):
+        """Drafts verified k at a time against the target's keyed samples (the serial rule); a grammar cuts the
+        drafts it rules out and masks the rows it keeps; ``probabilities`` reads the kept tokens' own rows."""
+
+        from tensorfold.cuda.logprobs import capture
 
         m, d = self.model, self.drafter
         out = [first]
@@ -528,7 +623,7 @@ class DsEngine:
         tok = first
         rounds = drafted = accepted = 0
         t_draft = t_verify = t_absorb = 0.0
-        while len(out) < max_tokens and tok not in eos:
+        while len(out) < max_tokens and tok not in eos and not (constraint is not None and constraint.finished):
             P = sc.length
             ta = time.perf_counter()
             if self.runner is not None:
@@ -541,6 +636,11 @@ class DsEngine:
             if ADAPTIVE and kk > 1:
                 kk = self._choose_k(_conf, kk, (tb - ta) * 1000)
             window = [tok] + drafts[:kk]
+            rows = None
+            if constraint is not None:                 # the chain cut at its first draft the grammar rules out
+                with self._grammar_step(constraint):
+                    rows = constraint.window(window, list(range(-1, len(window) - 1)))
+                window, kk = rows.tokens, len(rows.tokens) - 1
             if self.runner is not None:
                 lg, tapt = self.runner.forward(sc, window, P, True)
                 taps = [tapt]
@@ -548,6 +648,9 @@ class DsEngine:
                 taps = []
                 lg = m.forward(sc, torch.tensor(window, dtype=torch.long, device="cuda"), P, all_logits=True,
                                taps=taps, host_ids=window)
+            if rows is not None:
+                with torch.inference_mode():
+                    constraint.mask(lg, rows)
             target = self._sample(lg, [P + 1 + i for i in range(kk + 1)], sampling)
             tc = time.perf_counter()
             t_verify += tc - tb
@@ -569,6 +672,10 @@ class DsEngine:
                     new = new[:i + 1]
                     break
             new = new[:max_tokens - len(out)]
+            if constraint is not None:
+                with self._grammar_step(constraint):
+                    constraint.advance(new)
+            capture(lg[:len(new)], new, [P + 1 + i for i in range(len(new))], probabilities)
             out += new
             on_tokens(new)
             tok = out[-1]
@@ -604,3 +711,42 @@ def _f64(x: float) -> list[int]:
 
 def _f64_back(lo: int, hi: int) -> float:
     return struct.unpack("<d", struct.pack("<2i", int(lo), int(hi)))[0]
+
+
+class Kept:
+    """Rank 0's ``Probabilities`` for one reply: a batch of rows it refuses (one not finite, a replay that changed) is
+    kept as ``error`` instead of raised, so the ranks stay in step and only that request fails."""
+
+    def __init__(self, probabilities) -> None:
+        self.p, self.error = probabilities, None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.p, name)
+
+    def add(self, *args: Any) -> None:
+        if self.error is None:
+            try:
+                self.p.add(*args)
+            except RuntimeError as exc:
+                self.error = exc
+
+
+class Uncompiled:
+    """A reply's grammar rank 0 compiled and this rank could not: it ``pack``s as rank 0's, so the request's steps
+    match, and its first step fails, which fails the request on every rank (they settle each grammar step together)."""
+
+    finished = False
+
+    def __init__(self, packed: list[int], error: Exception) -> None:
+        from tensorfold.engine.grammar import KINDS, Spec
+
+        self.spec = Spec(KINDS[int(packed[0])], bytes(int(v) for v in packed[2:]).decode())
+        self.think_end = int(packed[1]) - 1 if int(packed[1]) else None
+        self.error = error
+
+    def window(self, *_: Any) -> Any:
+        from tensorfold.engine.grammar import GrammarError
+
+        raise GrammarError(f"this rank could not compile the reply's grammar: {self.error}")
+
+    mask = advance = window

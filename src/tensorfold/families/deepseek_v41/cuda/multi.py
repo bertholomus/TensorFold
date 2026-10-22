@@ -24,9 +24,13 @@ verify window in one forward a round, each reply exactly its solo run.
   boundary. Only prompt rows are kept (a verify round's rows are not a prompt chunk's bits); with replay prefill the
   boundary stays a window below the prompt's end (the decoder layers' rows there are the prompt's own). Kept entries
   give their room back, oldest first, whenever an admission needs it.
+- **Grammars.** A reply's grammar (``tensorfold.engine.grammar``) rides in its admission and every rank compiles it:
+  each round it cuts the drafts it rules out and masks the rows it keeps, the same rows on every rank, and the ranks
+  check the cut windows before the forward.
+- **Logprobs.** Rank 0 reads a reply's kept tokens' log probabilities from the rows that chose them
+  (``tensorfold.cuda.logprobs``): the same values with drafts or without, beside any other streams.
 
 Ported from our GLM-5.3 fork's ``glm_moe_dsa/cuda/multi.py`` (the same design, pipeline/CONCURRENCY-DESIGN.md).
-Structured output and logprobs are not served with ``--parallel``.
 """
 
 from __future__ import annotations
@@ -38,8 +42,10 @@ import time
 
 import torch
 
+from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
+from tensorfold.engine.grammar import GrammarError, pack
 
 from ..ops import HostIds
 from .model import RAW
@@ -532,6 +538,36 @@ class MultiDecoder:
         mine = torch.tensor([1.0 if ok else 0.0, 0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
         return all(row[0] == 1.0 for row in self.m.comm.gather(mine).tolist())
 
+    def _read(self, s: Stream, logits, tokens: list[int], positions: list[int]) -> bool:
+        """Rank 0 reads ``s``'s log probabilities; rows its Probabilities refuse fail ``s`` alone (False). The other
+        ranks take its tokens and end it at rank 0's finish, which follows every step."""
+
+        if s.probabilities is None:
+            return True
+        from .engine import Kept
+
+        kept = Kept(s.probabilities)
+        capture(logits, tokens, positions, kept)
+        if kept.error is None:
+            return True
+        s.error, s.done, s.finished = kept.error, True, time.perf_counter()
+        return False
+
+    def _fail_elsewhere(self, streams: list[Stream]) -> list[Stream]:
+        """Each rank runs its own grammars: the live ones of ``streams`` whose grammar failed on another rank fail here
+        too, so no rank steps a request another one ended. Returns those."""
+
+        if self.e.world < 2 or self._all(all(s.error is None for s in streams)):
+            return []
+        out = []
+        for s in streams:                                # (rare) which ones: a gather each, the same order everywhere
+            held = self._all(s.error is None)
+            if not held and not s.done:
+                s.error = GrammarError("the reply's grammar failed on another rank")
+                s.done, s.finished = True, time.perf_counter()
+                out.append(s)
+        return out
+
     def _shape(self) -> list:
         return [self.next_id, list(self.free), list(self.extents.gaps),
                 [[s.sid, s.st.index, s.st.sc.length, len(s.out), bool(s.done)] for s in self.streams.values()],
@@ -759,8 +795,6 @@ class MultiDecoder:
     def admit(self, s: Stream) -> None:
         """A request into the lowest free slot: its prompt fills the slot now, then it decodes in the rounds."""
 
-        if s.constraint is not None or s.probabilities is not None:
-            raise ValueError("structured output and logprobs are not served with --parallel on DeepSeek-V4.1")
         room = self.extents.total - len(s.prompt) - self.max_rows - 8 - 4
         if room < 1:
             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.extents.total}-token "
@@ -780,7 +814,7 @@ class MultiDecoder:
             if far is not None:
                 reuse = ["disk", far[0], far[1]]
         self._send(["admit", list(s.prompt), s.count, _pack(s.sampling), bool(s.draft), bool(s.stop_eos), index,
-                    positions, reuse])
+                    positions, reuse, pack(s.constraint)])
         self._admit(s, index, positions, reuse)
 
     def _need(self, s: Stream) -> int:
@@ -798,7 +832,7 @@ class MultiDecoder:
         self._step(True)
         try:
             self._agree("admission", [self._shape(), list(s.prompt), s.count, _pack(s.sampling), bool(s.draft),
-                                      bool(s.stop_eos), index, positions, reuse])
+                                      bool(s.stop_eos), index, positions, reuse, pack(s.constraint)])
             self.ticks += 1
             need = self._need(s)
             disk = bool(reuse) and reuse[0] == "disk"
@@ -908,11 +942,28 @@ class MultiDecoder:
                 return []
             self.filling.remove(s)
             s.steps = None
-            first = e._sample(last, [len(s.prompt)], s.sampling)[0]
+            first, failed = None, None
+            try:
+                if s.constraint is not None:             # the first token's row, under the reply's grammar
+                    with torch.inference_mode():         # the mask writes in place: logits are inference tensors
+                        s.constraint.mask(last)
+                first = e._sample(last, [len(s.prompt)], s.sampling)[0]
+                if s.constraint is not None:
+                    s.constraint.advance([first])
+            except GrammarError as exc:                  # this request ends with its error, the others go on
+                failed = exc
             s.started = time.perf_counter()
             s.pending = first
             self.streams[s.sid] = s
+            if failed is not None:
+                s.error, s.done, s.finished = failed, True, time.perf_counter()
+            if s.constraint is not None:
+                self._fail_elsewhere([s])
+            if s.done or not self._read(s, last, [first], [len(s.prompt)]):
+                return [s]
             s.take([first], self._ends(s))
+            if not s.done and s.constraint is not None and s.constraint.finished:
+                s.done, s.finished = True, time.perf_counter()   # its grammar's end, with ignore_eos too
             return [s] if s.done else []
         except Exception as exc:
             self._broken(exc)
@@ -1065,6 +1116,23 @@ class MultiDecoder:
                         self.k_hist.setdefault(len(live), [0] * 8)[kk] += 1
                     proposed[s.sid] = r[:kk]
                     confs[s.sid] = cf
+            grammars, failed = {}, []
+            for s in live:                               # a grammar cuts the drafts no accepted path can hold
+                if s.constraint is not None:
+                    chain = [s.pending] + list(proposed.get(s.sid, []))
+                    try:
+                        grammars[s.sid] = s.constraint.window(chain, list(range(-1, len(chain) - 1)))
+                    except GrammarError as exc:          # this request ends with its error, the others go on
+                        s.error, s.done, s.finished = exc, True, time.perf_counter()
+                        failed.append(s)
+                        continue
+                    proposed[s.sid] = grammars[s.sid].tokens[1:]
+            if grammars or failed:                       # every rank cut the same windows, before the forward
+                failed += self._fail_elsewhere([s for s in live if s.constraint is not None])
+                live = [s for s in live if not s.done]
+                self._agree("grammar window", [[s.sid, len(proposed.get(s.sid, []))] for s in live])
+                if not live:
+                    return failed
             mark()
             for s in live:
                 sc = s.st.sc
@@ -1092,6 +1160,9 @@ class MultiDecoder:
             absorbs = []
             for (s, P, drafts), (_, _, _, _, window, _) in zip(kept, windows):
                 n = len(window)
+                if s.sid in grammars:                    # this stream's rows, each under its grammar
+                    with torch.inference_mode():
+                        s.constraint.mask(logits[r0:r0 + n], grammars[s.sid])
                 target = e._sample(logits[r0:r0 + n], [P + 1 + i for i in range(n)], s.sampling)
                 a = 0
                 while a < len(drafts) and drafts[a] == target[a]:
@@ -1121,13 +1192,30 @@ class MultiDecoder:
                         new = new[:i + 1]
                         break
                 new = new[:s.count - len(s.out)]
+                if s.constraint is not None:
+                    try:
+                        s.constraint.advance(new)
+                    except GrammarError as exc:
+                        s.error, s.done, s.finished = exc, True, time.perf_counter()
+                        done.append(s)
+                        r0 += n
+                        continue
+                if not self._read(s, logits[r0:r0 + len(new)], new, [P + 1 + i for i in range(len(new))]):
+                    done.append(s)
+                    r0 += n
+                    continue
                 s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
                 s.pending = new[-1]
                 s.take(new, ends)
+                if not s.done and s.constraint is not None and s.constraint.finished:
+                    s.done, s.finished = True, time.perf_counter()   # its grammar's end, with ignore_eos too
                 tokens += len(new)
                 r0 += n
                 if s.done:
                     done.append(s)
+            shaped = [s for s, _, _ in kept if s.constraint is not None]
+            if shaped:
+                done += self._fail_elsewhere(shaped)
             if CONF_LOG:
                 self.conf_rounds += 1
                 if self.conf_rounds % 200 == 0 and e.rank == 0:
@@ -1184,7 +1272,7 @@ class MultiDecoder:
                           f"drafts {1000 * st[3] / r:.1f} forward {1000 * st[4] / r:.1f} sample {1000 * st[5] / r:.1f} "
                           f"absorb {1000 * st[6] / r:.1f}", flush=True)
             self.round_end = time.perf_counter()
-            return done
+            return failed + done
         except Exception as exc:
             self._broken(exc)
             raise
@@ -1262,6 +1350,10 @@ class MultiDecoder:
     def follow(self, link: Link) -> None:
         """A follower rank: rank 0's steps, in order, forever (or until the link or the lane breaks)."""
 
+        from tensorfold.engine import grammar
+
+        from .engine import Uncompiled
+
         while True:
             op = link.receive()
             _ht("op received")
@@ -1270,8 +1362,13 @@ class MultiDecoder:
             kind = op[0]
             try:
                 if kind == "admit":
-                    _, prompt, count, sampling, draft, stop_eos, index, positions, reuse = op
+                    _, prompt, count, sampling, draft, stop_eos, index, positions, reuse, packed = op
                     s = Stream(list(prompt), int(count), _unpack(sampling), draft=bool(draft), stop_eos=bool(stop_eos))
+                    if packed:                           # compiled here as on rank 0
+                        try:
+                            s.constraint = grammar.compiler(self.e, self.e.model_dir, self.e.eos).follow(packed)
+                        except Exception as exc:         # noqa: BLE001  (rank 0 compiled it: the request fails)
+                            s.constraint = Uncompiled(packed, exc)
                     s.emit = lambda new: None
                     s.keys = None
                     self._admit(s, int(index), list(positions), reuse)
