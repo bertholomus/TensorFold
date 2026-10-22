@@ -62,10 +62,47 @@ fn allSpace(s: []const u8) bool {
     return strip(s).len == 0;
 }
 
-/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it. With marks, a
+/// The first DeepSeek-V4.1 calls opener at or after `from` that opens a block, or null: markup, and not inside a
+/// DeepSeek-V4 block that opened first (its argument's text).
+fn open41(text: []const u8, from: usize, marks: ?*const reply_text.Marks) ?usize {
+    var at = from;
+    while (markup(text, dsml41_open, at, marks)) |s| {
+        const v4 = markup(text, dsml_open, at, marks) orelse return s;
+        if (v4 > s) return s;
+        at = (find(text, dsml_close, v4 + dsml_open.len) orelse return null) + dsml_close.len; // unclosed, it runs to the end
+    }
+    return null;
+}
+
+/// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it. DeepSeek-V4.1's
+/// calls blocks are read first, from their own tags, and the other forms only in the text around them: a <tool_call> in
+/// the prose or in an argument moves no block's bounds. An unclosed one stays text, whole, as V4's does. With marks, a
 /// DSML block whose opener is spelled in ordinary tokens is no block.
 fn envelopes(a: Allocator, text: []const u8, marks: ?*const reply_text.Marks) Allocator.Error![]Envelope {
     var found: std.ArrayList(Envelope) = .empty;
+    var gap: usize = 0;
+    while (open41(text, gap, marks)) |s| {
+        try tagged(a, text[gap..s], gap, marks, &found);
+        const e = find(text, dsml41_close, s + dsml41_open.len);
+        const end = if (e) |at| at + dsml41_close.len else text.len;
+        try found.append(a, .{ .start = s, .end = end, .payload = text[s..end], .complete = e != null });
+        gap = end;
+    }
+    try tagged(a, text[gap..], gap, marks, &found);
+    std.mem.sort(Envelope, found.items, {}, struct {
+        fn less(_: void, x: Envelope, y: Envelope) bool {
+            if (x.start != y.start) return x.start < y.start;
+            if (x.end != y.end) return x.end < y.end;
+            return std.mem.order(u8, x.payload, y.payload) == .lt;
+        }
+    }.less);
+    var kept: std.ArrayList(Envelope) = .empty;
+    for (found.items) |env| if (kept.items.len == 0 or env.start >= kept.items[kept.items.len - 1].end) try kept.append(a, env);
+    return kept.items;
+}
+
+/// The envelopes other than DeepSeek-V4.1's blocks in ``text``, a stretch of the reply that starts at ``base``.
+fn tagged(a: Allocator, text: []const u8, base: usize, marks: ?*const reply_text.Marks, out: *std.ArrayList(Envelope)) Allocator.Error!void {
     var pos: usize = 0;
     var dsml = markup(text, dsml_open, 0, marks); // the DSML opener at or after `pos`, searched again only once `pos` passes it
     while (findCI(text, "<tool_call>", pos)) |s| {
@@ -75,7 +112,7 @@ fn envelopes(a: Allocator, text: []const u8, marks: ?*const reply_text.Marks) Al
             continue;
         };
         const e = findCI(text, "</tool_call>", s + 11) orelse break;
-        try found.append(a, .{ .start = s, .end = e + 12, .payload = strip(text[s + 11 .. e]) });
+        try out.append(a, .{ .start = base + s, .end = base + e + 12, .payload = strip(text[s + 11 .. e]) });
         pos = e + 12;
     }
     pos = 0;
@@ -88,38 +125,22 @@ fn envelopes(a: Allocator, text: []const u8, marks: ?*const reply_text.Marks) Al
         if (!std.ascii.startsWithIgnoreCase(text[j..], ":tool_call>")) continue;
         const closer = try std.mem.concat(a, u8, &.{ "</", text[s + 1 .. j], ":tool_call>" });
         const e = findCI(text, closer, j + 11) orelse continue;
-        try found.append(a, .{ .start = s, .end = e + closer.len, .payload = strip(text[j + 11 .. e]) });
+        try out.append(a, .{ .start = base + s, .end = base + e + closer.len, .payload = strip(text[j + 11 .. e]) });
         pos = e + closer.len;
     }
     pos = 0;
     while (find(text, "<|tool_call>", pos)) |s| {
         const e = find(text, "<tool_call|>", s + 12) orelse break;
-        try found.append(a, .{ .start = s, .end = e + 12, .payload = strip(text[s + 12 .. e]) });
+        try out.append(a, .{ .start = base + s, .end = base + e + 12, .payload = strip(text[s + 12 .. e]) });
         pos = e + 12;
     }
     pos = 0;
     while (markup(text, dsml_open, pos, marks)) |s| {
         const e = find(text, dsml_close, s + dsml_open.len);
         const end = if (e) |at| at + dsml_close.len else text.len;
-        try found.append(a, .{ .start = s, .end = end, .payload = text[s..end], .complete = e != null });
+        try out.append(a, .{ .start = base + s, .end = base + end, .payload = text[s..end], .complete = e != null });
         pos = end;
     }
-    pos = 0;
-    while (markup(text, dsml41_open, pos, marks)) |s| {
-        const e = find(text, dsml41_close, s + dsml41_open.len) orelse break;
-        try found.append(a, .{ .start = s, .end = e + dsml41_close.len, .payload = text[s .. e + dsml41_close.len] });
-        pos = e + dsml41_close.len;
-    }
-    std.mem.sort(Envelope, found.items, {}, struct {
-        fn less(_: void, x: Envelope, y: Envelope) bool {
-            if (x.start != y.start) return x.start < y.start;
-            if (x.end != y.end) return x.end < y.end;
-            return std.mem.order(u8, x.payload, y.payload) == .lt;
-        }
-    }.less);
-    var kept: std.ArrayList(Envelope) = .empty;
-    for (found.items) |env| if (kept.items.len == 0 or env.start >= kept.items[kept.items.len - 1].end) try kept.append(a, env);
-    return kept.items;
 }
 
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
@@ -189,8 +210,13 @@ pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_cal
     return .{ .content = strip(residue.items), .calls = if (calls.items.len > 0) calls.items else null };
 }
 
-/// What closes the call ``text`` ends inside (the model's end token came before its ``
-pub fn closeCall(a: Allocator, text: []const u8, tools: []const Value) Allocator.Error![]const u8 {
+/// What closes the call ``reply`` ends inside (the model's end token came before its ``
+pub fn closeCall(a: Allocator, reply: []const u8, tools: []const Value) Allocator.Error![]const u8 {
+    // a call it can close lies past the last DeepSeek-V4.1 block (``envelopes`` reads the other forms around them); a
+    // reply that ends inside one leaves that block text
+    var gap: usize = 0;
+    while (open41(reply, gap, null)) |s| gap = (find(reply, dsml41_close, s + dsml41_open.len) orelse return "") + dsml41_close.len;
+    const text = reply[gap..];
     var pos: usize = 0;
     var dsml = find(text, dsml_open, 0); // as in ``envelopes``
     // the opener ``envelopes`` leaves without a closer, so the one appended pairs with it
@@ -582,8 +608,9 @@ pub fn putBack(a: Allocator, text: []const u8, quoted: []const []const u8) Alloc
 /// DeepSeek-V4.1's calls block as the served lane reads it (reply_text.py: dsml_to_tool_calls, then parse_tool_calls on
 /// each invoke's ``<tool_call>{"name": .., "arguments": ..}</tool_call>``): every ``invoke name="N"`` up to its closer is a
 /// call of its own, text between them is dropped; its ``parameter name="K"`` values are strings, or JSON with
-/// ``string="false"`` (a string when that JSON does not parse). An offered name is a call (past ``max_calls`` it is
-/// dropped; with a limit its arguments must be finite); another name stays as the lane leaves it, its rewritten block.
+/// ``string="false"`` (a string when that JSON does not parse). An offered name, matched stripped as that parse strips
+/// it, is a call (past ``max_calls`` it is dropped; with a limit its arguments must be finite); another name stays as the
+/// lane leaves it, its rewritten block.
 fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value), residue: *std.ArrayList(u8)) Allocator.Error!void {
     var pos: usize = 0;
     while (find(block, invoke41_open, pos)) |s| {
@@ -622,7 +649,7 @@ fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHas
             try arguments.put(a, body[ns..nq], v);
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
-        const offered = known.get(try std.ascii.allocLowerString(a, name));
+        const offered = known.get(try std.ascii.allocLowerString(a, strip(name)));
         if (offered == null or (max_calls != null and !tool_params.finite(.{ .object = arguments }))) {
             if (max_calls == null) {
                 // the lane's rewrite: <tool_call> + json.dumps({"name": N, "arguments": args}, ensure_ascii=False) + </tool_call>

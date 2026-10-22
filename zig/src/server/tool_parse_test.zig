@@ -178,6 +178,38 @@ test "DeepSeek-V4.1's DSML calls, read as the served lane reads them" {
     try std.testing.expectEqualStrings("Hi.", (try parse(a, "Hi.<" ++ D ++ " calls>\n</" ++ D ++ " calls>", tools, null)).content);
     const open = "Hi.<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"weather\">";
     try std.testing.expectEqualStrings(open, (try parse(a, open, tools, null)).content);
+    // a name is matched stripped, as the lane's parse of its rewritten call strips it; a blank one stays that rewrite
+    const padded = "<" ++ D ++ " calls><" ++ D ++ " invoke name=\" weather \"><" ++ D ++ " parameter name=\"city\" string=\"true\">Oslo</" ++ D ++ " parameter></" ++ D ++ " invoke><" ++ D ++ " invoke name=\" \"></" ++ D ++ " invoke></" ++ D ++ " calls>";
+    const named = try parse(a, padded, tools, null);
+    try std.testing.expectEqual(@as(usize, 1), named.calls.?.len);
+    try std.testing.expectEqualStrings("weather", named.calls.?[0].get("function").?.get("name").?.string);
+    try std.testing.expectEqualStrings("<tool_call>{\"name\": \" \", \"arguments\": {}}</tool_call>", named.content);
+}
+
+test "a DeepSeek-V4.1 block is read from its own tags: <tool_call> text around it or in an argument moves nothing" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"weather\"}},{\"type\":\"function\",\"function\":{\"name\":\"write\"}}]")).ok.array;
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    const quoted = "a </tool_call> and <tool_call>{\"name\": \"weather\", \"arguments\": {}}</tool_call>";
+    const block = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"write\">\n<" ++ D ++ " parameter name=\"content\" string=\"true\">" ++ quoted ++ "</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    // a <tool_call> in the prose before the block, and a </tool_call> and a whole call in its argument
+    const reply = "I will not use <tool_call> here.\n\n" ++ block;
+    for ([_]?usize{ null, 1 }) |quota| {
+        const r = try parse(a, reply, tools, quota);
+        try std.testing.expectEqualStrings("I will not use <tool_call> here.", r.content);
+        try std.testing.expectEqual(@as(usize, 1), r.calls.?.len);
+        try std.testing.expectEqualStrings("write", r.calls.?[0].get("function").?.strField("name").?);
+        const args = (try json.parse(a, r.calls.?[0].get("function").?.strField("arguments").?)).ok;
+        try std.testing.expectEqualStrings(quoted, args.strField("content").?);
+    }
+    try std.testing.expectEqualStrings("", try closeCall(a, reply, tools));
+    // calls keep the reply's order: a <tool_call> call before the block comes first
+    const both = try parse(a, "<tool_call>{\"name\": \"weather\", \"arguments\": {\"city\": \"Oslo\"}}</tool_call>\n" ++ block, tools, null);
+    try std.testing.expectEqual(@as(usize, 2), both.calls.?.len);
+    try std.testing.expectEqualStrings("weather", both.calls.?[0].get("function").?.strField("name").?);
+    try std.testing.expectEqualStrings("write", both.calls.?[1].get("function").?.strField("name").?);
 }
 
 test "a GLM call's keys without values search their key and value ends once" {
@@ -239,6 +271,11 @@ test "GLM calls keep a declared name with spaces, dots, colons or unicode; an un
 const dsml_prefix = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\">" ++
     "<｜DSML｜parameter name=\"q\" string=\"true\">";
 const dsml_suffix = "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>";
+// the same call in DeepSeek-V4.1's spelling: its block holds its argument's text as V4's does
+const dsml41_prefix = "<｜DSML｜ calls><｜DSML｜ invoke name=\"lookup\">" ++
+    "<｜DSML｜ parameter name=\"q\" string=\"true\">";
+const dsml41_suffix = "</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>";
+const dsml_blocks = [_][2][]const u8{ .{ dsml_prefix, dsml_suffix }, .{ dsml41_prefix, dsml41_suffix } };
 const nested_calls = [_][]const u8{
     "<tool_call><function=lookup></function></tool_call>",
     "<tool_call><function=lookup></function>",
@@ -252,8 +289,8 @@ test "DSML parameters contain complete and unfinished legacy calls without consu
     const a = arena.allocator();
     const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
     const adjacent = "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"n\":7}}</tool_call>";
-    for (nested_calls) |literal| {
-        const text = try std.mem.concat(a, u8, &.{ "Before.", dsml_prefix, literal, dsml_suffix, adjacent, "After." });
+    for (dsml_blocks) |block| for (nested_calls) |literal| {
+        const text = try std.mem.concat(a, u8, &.{ "Before.", block[0], literal, block[1], adjacent, "After." });
         for ([_]?usize{ null, 1 }) |quota| {
             const parsed = try parse(a, text, tools, quota);
             try std.testing.expectEqual(@as(usize, if (quota == null) 2 else 1), parsed.calls.?.len);
@@ -267,7 +304,7 @@ test "DSML parameters contain complete and unfinished legacy calls without consu
             try std.testing.expectEqualStrings("Before.After.", parsed.content);
             try std.testing.expectEqualStrings("", try closeCall(a, text, tools));
         }
-    }
+    };
 }
 
 test "an unfinished DSML envelope never parses or autocompletes its nested legacy call" {
@@ -275,15 +312,15 @@ test "an unfinished DSML envelope never parses or autocompletes its nested legac
     defer arena.deinit();
     const a = arena.allocator();
     const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
-    for (nested_calls) |literal| {
-        const text = try std.mem.concat(a, u8, &.{ "Before.", dsml_prefix, literal });
+    for (dsml_blocks) |block| for (nested_calls) |literal| {
+        const text = try std.mem.concat(a, u8, &.{ "Before.", block[0], literal });
         for ([_]?usize{ null, 1 }) |quota| {
             const parsed = try parse(a, text, tools, quota);
             try std.testing.expect(parsed.calls == null);
             try std.testing.expectEqualStrings(text, parsed.content);
         }
         try std.testing.expectEqualStrings("", try closeCall(a, text, tools));
-    }
+    };
 }
 
 test "closeCall skips a closed DSML parameter's unfinished legacy opener and completes the adjacent call" {
@@ -291,13 +328,14 @@ test "closeCall skips a closed DSML parameter's unfinished legacy opener and com
     defer arena.deinit();
     const a = arena.allocator();
     const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
-    const text = dsml_prefix ++ "<tool_call><function=lookup></function>" ++ dsml_suffix ++
-        "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"n\":7}";
-    const tail = try closeCall(a, text, tools);
-    try std.testing.expectEqualStrings("}</tool_call>", tail);
-    const parsed = try parse(a, try std.mem.concat(a, u8, &.{ text, tail }), tools, null);
-    try std.testing.expectEqual(@as(usize, 2), parsed.calls.?.len);
-    try std.testing.expectEqualStrings("{\"n\":7}", parsed.calls.?[1].get("function").?.strField("arguments").?);
+    for (dsml_blocks) |block| {
+        const text = try std.mem.concat(a, u8, &.{ block[0], "<tool_call><function=lookup></function>", block[1], "<tool_call>{\"name\":\"lookup\",\"arguments\":{\"n\":7}" });
+        const tail = try closeCall(a, text, tools);
+        try std.testing.expectEqualStrings("}</tool_call>", tail);
+        const parsed = try parse(a, try std.mem.concat(a, u8, &.{ text, tail }), tools, null);
+        try std.testing.expectEqual(@as(usize, 2), parsed.calls.?.len);
+        try std.testing.expectEqualStrings("{\"n\":7}", parsed.calls.?[1].get("function").?.strField("arguments").?);
+    }
 }
 
 test "bare JSON calls keep literal unfinished DSML markers as argument data" {
