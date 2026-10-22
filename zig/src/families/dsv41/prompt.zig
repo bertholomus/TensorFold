@@ -46,6 +46,8 @@ const pruned_rows: usize = 512;
 /// The rows of one fp32 cuBLAS call in a prompt pass (the gate logits, the indexer weights): the 2048-row passes the
 /// served build makes. A longer pass splits these two calls at it, so its rows keep the served bits.
 pub const gemm_rows = 2048;
+/// The longest prompt pass the host-side row tables (vis, the compressor groups) hold.
+pub const max_pass_rows = 8192;
 pub const ring_extra = 16;
 /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
 pub const raw_rows = 64;
@@ -807,7 +809,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const src = sh.kv_layer orelse return error.NoKvSource;
         const n_comp_end = (start + n) / r;
         // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
-        var vis_host: [4096]i64 = undefined;
+        var vis_host: [max_pass_rows]i64 = undefined;
         if (n > vis_host.len) return error.ChunkTooLong;
         for (0..n) |i| vis_host[i] = @intCast((start + i + 1) / r);
         try upload(e, ch.vis, &vis_host, n * 8);
@@ -918,8 +920,8 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     }
     sh.kv_layer = li;
     // groups first // r .. and their positions group * r (the rotations _rot reads)
-    var g_host: [4096]i64 = undefined;
-    var p_host: [4096]i64 = undefined;
+    var g_host: [max_pass_rows]i64 = undefined;
+    var p_host: [max_pass_rows]i64 = undefined;
     if (full > g_host.len) return error.ChunkTooLong;
     for (0..full) |j| {
         g_host[j] = @intCast(start / r + j);
@@ -1042,7 +1044,7 @@ fn splitKeyed(e: *const Engine, ch: *Chunk, k: tri_index.IndexK, n_comp_end: usi
     const world: usize = e.comm.world;
     const sp = idx_split.span(n_comp_end, world, e.comm.rank);
     // the node's vis (host-made, as vis: the same integers on every node)
-    var vis_host: [4096]i64 = undefined;
+    var vis_host: [max_pass_rows]i64 = undefined;
     if (n > vis_host.len) return error.ChunkTooLong;
     for (0..n) |i| vis_host[i] = idx_split.nodeVis((ch.start + i + 1) / ratio, sp);
     try upload(e, ch.split_vis, &vis_host, n * 8);
