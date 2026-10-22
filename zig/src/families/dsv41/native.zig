@@ -32,8 +32,12 @@
 //!   TF_FILL_ROUNDS, TF_FILL_FIRST               rounds between (TF_FILL_ROUNDS of them, 4 unless set); its first
 //!                                               piece TF_FILL_FIRST chunks (unset: N), so a prompt that short runs
 //!                                               whole. One pass at a time. Unset or 0: each pass whole
+//!   TF_FILL_MANY=1                              with TF_FILL_CHUNKS: a request is admitted while a pass fills and
+//!                                               its pass runs between the other's pieces (fewest tokens left first)
 //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
+//!   TF_DS_PASS_ROWS=N, TF_DS_PASS_FROM=P        a prompt pass's rows at most (a multiple of 2,048 up to the build's
+//!                                               pass rows), passes of 2,048 below position P (8192 unless set)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -55,7 +59,7 @@ pub const formats: []const []const u8 = &.{"exl3-mul1"};
 pub const default_context: i64 = 262144;
 pub const max_segments: u32 = 1;
 /// The served build's prompt chunk (TF_DS_PREFILL_CHUNK).
-pub const prompt_rows: u32 = 2048;
+pub const prompt_rows: u32 = 4096;
 /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
 pub const efforts = @import("text.zig").efforts;
 
@@ -173,9 +177,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
     if (getenv("TF_FILL_CHUNKS")) |t| st.lanes.fill_chunks = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
     if (getenv("TF_FILL_FIRST")) |t| st.lanes.fill_first = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
+    st.lanes.fill_many = if (getenv("TF_FILL_MANY")) |v| !std.mem.eql(u8, v, "0") else false;
     const fill_rounds: u32 = if (getenv("TF_FILL_ROUNDS")) |t| std.fmt.parseInt(u32, t, 10) catch return error.BadFill else 4;
     st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
+    if (getenv("TF_DS_PASS_ROWS")) |t| st.lanes.pass_rows = try passRows(t);
+    if (getenv("TF_DS_PASS_FROM")) |t| st.lanes.pass_from = std.fmt.parseInt(usize, t, 10) catch return error.BadPassRows;
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
     st.vision = null;
     if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
@@ -206,6 +213,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 48",
         error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+        error.BadPassRows => "TF_DS_PASS_ROWS: a multiple of 2,048 from 2,048 to the build's pass rows; TF_DS_PASS_FROM: a position",
         error.BadFill => "TF_FILL_CHUNKS, TF_FILL_FIRST and TF_FILL_ROUNDS: whole numbers (a prompt piece's chunks of 2,048 tokens, the first piece's, the other streams' rounds between two pieces)",
         error.BadWindow => "TF_DS_WINDOW: the streams' shared positions, at least --context",
         error.SettingsDiffer => "a follower rank runs other settings than this server (the line above says which): give every rank the same TF_DS_STREAMS (the followers: --streams), TF_DS_ROUND_ROWS (--round-rows), RDMA devices, drafter, TF_DS_REPLAY_FLOOR and TF_DS_IDX_SPLIT, and every follower a --pool of at least the window (--context, or TF_DS_WINDOW)",
@@ -221,4 +229,19 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.SettingsDiffer).?, "--streams") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
+}
+
+/// TF_DS_PASS_ROWS: a multiple of the resume grid, at most the build's pass rows.
+fn passRows(t: []const u8) !usize {
+    const n = std.fmt.parseInt(usize, t, 10) catch return error.BadPassRows;
+    if (n == 0 or n % model.resume_rows != 0 or n > model.chunk_rows) return error.BadPassRows;
+    return n;
+}
+
+test "passRows takes multiples of the resume grid up to the pass rows" {
+    try std.testing.expectEqual(@as(usize, model.resume_rows), try passRows("2048"));
+    try std.testing.expectEqual(@as(usize, model.chunk_rows), try passRows("4096"));
+    try std.testing.expectError(error.BadPassRows, passRows("0"));
+    try std.testing.expectError(error.BadPassRows, passRows("3000"));
+    try std.testing.expectError(error.BadPassRows, passRows("8192"));
 }

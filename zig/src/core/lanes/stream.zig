@@ -143,6 +143,7 @@ pub const Spec = struct {
     stop_check: ?StopCheck = null,
     cancel_check: ?CancelCheck = null,
     yield_check: ?CancelCheck = null, // a background prompt pass: real work waits, so it keeps what it has and stops
+    share_check: ?CancelCheck = null, // a stepped prompt pass: other work waits, so its step ends after its chunks
     think_budget: u32 = 0,
     think_close: []const u32 = &.{},
     think_end: i64 = -1,
@@ -176,6 +177,7 @@ pub const Stream = struct {
     stop_check: ?StopCheck,
     cancel_check: ?CancelCheck,
     yield_check: ?CancelCheck,
+    share_check: ?CancelCheck = null,
     think_budget: u32,
     think_close: []const u32,
     think_end: i64,
@@ -250,6 +252,7 @@ pub const Stream = struct {
             .stop_check = spec.stop_check,
             .cancel_check = spec.cancel_check,
             .yield_check = spec.yield_check,
+            .share_check = spec.share_check,
             .think_budget = spec.think_budget,
             .think_close = spec.think_close,
             .think_end = spec.think_end,
@@ -331,6 +334,13 @@ pub const Stream = struct {
     /// Whether a background prompt pass should step aside now (false with no hook); asked before each chunk.
     pub fn yields(s: *const Stream) bool {
         const c = s.yield_check orelse return false;
+        return c.check(c.ptr);
+    }
+
+    /// Whether a stepped prompt pass ends its step after its chunks (true with no hook: every step ends there);
+    /// false while nothing else waits, so a pass alone runs on as a whole pass does. Asked after each chunk.
+    pub fn shares(s: *const Stream) bool {
+        const c = s.share_check orelse return true;
         return c.check(c.ptr);
     }
 
@@ -641,4 +651,20 @@ test "the novelty signal closes thinking, reports the window's share, and latche
     try std.testing.expectEqual(@as(?usize, null), loopCut(&whole, tokens.items));
     try std.testing.expectEqual(tokens.items.len, try whole.commit(gpa, tokens.items, &.{}));
     try std.testing.expect(whole.loop_novelty == null and whole.think_open);
+}
+
+test "shares: a stepped pass ends its step with no hook, runs on while its hook says nothing waits" {
+    const Flag = struct {
+        fn check(ptr: *anyopaque) bool {
+            return @as(*bool, @ptrCast(@alignCast(ptr))).*;
+        }
+    };
+    var waits = false;
+    var s: Stream = undefined;
+    s.share_check = null;
+    try std.testing.expect(s.shares());
+    s.share_check = .{ .ptr = &waits, .check = Flag.check };
+    try std.testing.expect(!s.shares());
+    waits = true;
+    try std.testing.expect(s.shares());
 }

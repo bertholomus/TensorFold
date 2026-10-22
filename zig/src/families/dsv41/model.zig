@@ -31,7 +31,10 @@ const rdma = @import("rdma.zig");
 const neighbor = @import("neighbor.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
-pub const chunk_rows = 2048;
+pub const chunk_rows = 4096;
+/// Rows between resume points: the served build's 2048-row grid. Kept states land on it; a pass is cut short to end at
+/// the next one it keeps, so a longer pass resumes where a 2048-row pass would.
+pub const resume_rows = 2048;
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).
@@ -139,6 +142,8 @@ pub const Model = struct {
     // Engram rows during this one (fillChunk), joined before the prompt can change (joinAhead)
     fill_seq: []const i32 = &.{},
     ahead: ?std.Thread = null,
+    // the next prompt pass's rows at most (the lanes' pass rule): the Engram read-ahead reads that many, no more
+    next_rows: usize = chunk_rows,
     view: prompt.Caches = undefined,
     // the filling prompt's image spans and their rows (setImages; cleared by fillBegin)
     spans: std.ArrayList(prompt.Span) = .empty,
@@ -641,12 +646,12 @@ pub const Model = struct {
         m.ahead = null;
         defer if (ahead) |th| th.join();
         if (m.eh) |*eh| {
-            if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
+            if (ahead != null and (eh.ahead_start != start or eh.ahead_n < n)) {
                 ahead.?.join();
                 ahead = null;
             }
             // rows read ahead that ended before a round or a piece's end are this chunk's when they cover it, both layers
-            const whole = eh.ahead_start == start and eh.ahead_n == n and eh.ahead_err == null and eh.ahead_ready[0] and (c.engram_layers.slice().len < 2 or eh.ahead_ready[1]);
+            const whole = eh.ahead_start == start and eh.ahead_n >= n and eh.ahead_err == null and eh.ahead_ready[0] and (c.engram_layers.slice().len < 2 or eh.ahead_ready[1]);
             if (ahead == null and !whole) {
                 eh.ahead_start = start;
                 eh.ahead_n = n;
@@ -684,7 +689,7 @@ pub const Model = struct {
                         ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
                 } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
                     // the next chunk's rows while this one's layers run
-                    const nn = @min(chunk_rows, m.fill_seq.len - start - n);
+                    const nn = @min(m.next_rows, m.fill_seq.len - start - n);
                     eh.ahead_start = start + n;
                     eh.ahead_n = nn;
                     eh.ahead_ready = .{ false, false };

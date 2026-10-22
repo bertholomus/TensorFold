@@ -53,6 +53,8 @@ fn start(srv: *Server, input: chat.Input, message: Value, thinking: bool, effort
         p.request.images = x.images;
         p.request.cache_key = x.cache_key;
     }
+    // a salted conversation's pass keeps its states under its salt
+    if (input.cache_salt != null) p.request.cache_key = try api.cache_salt.key(a, input.cache_salt, p.request.cacheKey());
     const id = srv.next_id.fetchAdd(1, .monotonic);
     try srv.engine.submit(id, &p.request, .{ .ctx = p, .event = Pass.event });
     handed = true;

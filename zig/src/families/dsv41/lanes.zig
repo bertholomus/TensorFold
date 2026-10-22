@@ -40,7 +40,7 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -149,14 +149,41 @@ fn clashes(used: []const [2]usize, lo: usize, hi: usize) bool {
     return false;
 }
 
-/// Whether one of the prompt cache's marks has its chunk end at `at` (each kept at the chunk end at or before it).
+/// Whether one of the prompt cache's marks has its resume point at `at` (each kept at the resume point at or before it).
 fn markEnds(marks: []const u32, at: usize) bool {
-    for (marks) |w| if (w / model.chunk_rows * model.chunk_rows == at) return true;
+    for (marks) |w| if (w / model.resume_rows * model.resume_rows == at) return true;
     return false;
 }
 
+/// A pass of `n` rows from `start` cut to end at the first state it keeps (the last resume point or a mark's), so that
+/// state stands at a pass end.
+fn cutAtKeep(marks: []const u32, last_end: usize, replay: usize, len: usize, start: usize, n: usize) usize {
+    var end = start + n;
+    if (last_end > start and last_end < end) end = last_end;
+    for (marks) |w| {
+        const k = w / model.resume_rows * model.resume_rows;
+        if (k > start and k < end and k <= replay and k < len) end = k;
+    }
+    return end - start;
+}
+
+test "cutAtKeep ends a long pass at the resume point it keeps" {
+    const r = model.resume_rows;
+    const c = model.chunk_rows;
+    // no state to keep inside: the whole pass
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{}, 0, 10 * r, 10 * r, 0, c));
+    // the last resume point inside the pass
+    try std.testing.expectEqual(@as(usize, r), cutAtKeep(&.{}, 3 * r, 10 * r, 10 * r, 2 * r, c));
+    // a mark floors to its resume point; the nearer of the two wins
+    try std.testing.expectEqual(@as(usize, r), cutAtKeep(&.{@intCast(3 * r + 5)}, 9 * r, 10 * r, 10 * r, 2 * r, c));
+    // a mark past the replay or at the prompt's end keeps nothing
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{@intCast(r)}, 0, r - 1, 10 * r, 0, c));
+    // a resume point at the pass end needs no cut
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{@intCast(c)}, c, 10 * r, 10 * r, 0, c));
+}
+
 /// Room left past a kept state's extent while placements fit so, for its conversation's next turn to resume in place.
-pub const growth_rows = 16 * model.chunk_rows;
+pub const growth_rows = 16 * model.resume_rows;
 
 /// The first fit of `size` clear of `live` and of kept extents plus growth_rows, else of their extents, else of their rows.
 pub fn placeSoft(gpa: std.mem.Allocator, live: []const [2]usize, kept: []const [3]usize, size: usize, cap: usize) !?usize {
@@ -315,7 +342,7 @@ pub const Snap = struct {
 };
 
 /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
-const note_rows = 32 * model.chunk_rows;
+const note_rows = 32 * model.resume_rows;
 
 fn noteStale(sn: *const Snap, why: []const u8) void {
     if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
@@ -349,9 +376,17 @@ fn noteRefusal(sn: *const Snap, len: usize, why: Refusal, then: []const u8) void
 /// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
 const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false };
 
+/// A parked pass's image spans and rows (TF_FILL_MANY): set again when the pass resumes after another one's pieces.
+const Images = struct { spans: std.ArrayList(@import("prompt.zig").Span) = .empty, rows: std.ArrayList(u8) = .empty };
+
 /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
 const held_wait_ns: u64 = 10 * std.time.ns_per_s;
+
+/// Below this position a prompt pass runs model.resume_rows rows: a 4096-row pass scores its own later keys in the
+/// indexer, which costs more than it saves near the prompt's start (slot pps: the 8K row 2,798 tok/s from 8192 vs
+/// 2,650 from 0; 128K 2,947 vs 2,949).
+pub const pass_from_default = 8192;
 
 /// First tokens a handle names (each prompt's draw, read back right after its prefill).
 const ring = 1024;
@@ -381,12 +416,24 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
-    fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
+    fills: [max_streams]?Fill = @splat(null), // the prompt passes that run in pieces between rounds (by slot), each from its next chunk
+    cur: ?usize = null, // the slot whose pass the model's fill state (fillBegin's view, images, read-ahead) holds
+    // TF_FILL_MANY=1 (with TF_FILL_CHUNKS): a request is admitted while a pass fills, its pass's pieces between the
+    // other's (the host gives the next piece to the fewest prompt tokens left); a switch sets the model's fill state
+    // again (fill_switch). Unset: one pass at a time, as served
+    fill_many: bool = false,
+    imgs: [max_streams]Images = @splat(.{}),
     // TF_FILL_CHUNKS: a prompt pass runs this many chunks a step of the lane core's (prefill_step, one pass at a time),
     // the other streams' rounds between its steps; its first step TF_FILL_FIRST chunks (0: as many), so a prompt that
-    // short runs whole. 0: each pass whole, as served
+    // short runs whole. A step runs on past them while nothing else waits (the stream's share_check). 0: each pass
+    // whole, as served
     fill_chunks: usize = 0,
     fill_first: usize = 0,
+    // a prompt pass's rows at most: model.resume_rows below TF_DS_PASS_FROM positions (default pass_from_default),
+    // then TF_DS_PASS_ROWS (a multiple of model.resume_rows up to model.chunk_rows; unset: model.chunk_rows). The same
+    // bits at any: a pass ends on the resume grid either way
+    pass_rows: usize = model.chunk_rows,
+    pass_from: usize = pass_from_default,
     // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
     // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
     first_row: []f32 = &.{},
@@ -415,10 +462,14 @@ pub const Lanes = struct {
         self.wire.deinit(self.gpa);
         self.gpa.free(self.first_row);
         self.gpa.free(self.masked);
+        for (&self.imgs) |*im| {
+            im.spans.deinit(self.gpa);
+            im.rows.deinit(self.gpa);
+        }
     }
 
     pub fn backend(self: *Lanes) be.Backend {
-        return .{ .ptr = self, .vtable = if (self.fill_chunks > 0) &steps_vt else &whole_vt };
+        return .{ .ptr = self, .vtable = if (self.fill_chunks == 0) &whole_vt else if (self.fill_many) &many_vt else &steps_vt };
     }
 
     const whole_vt: be.Backend.VTable = .{
@@ -441,6 +492,73 @@ pub const Lanes = struct {
         v.prefill_one = true;
         break :vt v;
     };
+    // TF_FILL_MANY: passes in steps, several at a time (`fills`, a switch between them sets the model's fill state)
+    const many_vt: be.Backend.VTable = vt: {
+        var v = whole_vt;
+        v.prefill_step = prefillStepFn;
+        break :vt v;
+    };
+
+    /// The pass `s` fills, if one runs.
+    fn fillOf(self: *Lanes, s: *const lanes.Stream) ?*Fill {
+        for (&self.fills) |*f| if (f.*) |*x| if (x.s == s) return x;
+        return null;
+    }
+
+    fn anyFill(self: *const Lanes) bool {
+        for (self.fills) |f| if (f != null) return true;
+        return false;
+    }
+
+    /// Slot `slot`'s pass ends (done, failed or released): its parked images go.
+    fn dropFill(self: *Lanes, slot: usize) void {
+        self.fills[slot] = null;
+        if (self.cur == slot) self.cur = null;
+        self.imgs[slot].spans.clearRetainingCapacity();
+        self.imgs[slot].rows.clearRetainingCapacity();
+    }
+
+    /// The model's fill state set to `f`'s pass again after another pass's pieces (TF_FILL_MANY), on every rank:
+    /// fillBegin's view, window rings and slot (its Engram read-ahead dropped: rows read for another prompt are not
+    /// this one's), then its images.
+    fn fillSwitch(self: *Lanes, f: *const Fill) !void {
+        const m = self.m;
+        const base = (self.streams.get(f.s) orelse return error.UnknownStream).base;
+        m.joinAhead();
+        m.fill_seq = &.{};
+        if (try self.begin(.fill_switch)) {
+            try self.wire.int(self.gpa, u32, @intCast(f.slot));
+            try self.wire.int(self.gpa, u64, base);
+            try self.flush();
+        }
+        try m.fillBegin(f.slot, base);
+        const im = &self.imgs[f.slot];
+        if (im.spans.items.len > 0) {
+            try self.sendImages(im.spans.items, im.rows.items);
+            try m.setImages(im.spans.items, im.rows.items);
+        }
+        self.cur = f.slot;
+    }
+
+    /// A pass's image spans and their rows to rank 1, image_piece bytes of rows a frame (a follower's frame buffer
+    /// holds 64 KiB and the ids of a full pool).
+    fn sendImages(self: *Lanes, spans: []const @import("prompt.zig").Span, rows: []const u8) !void {
+        var off: usize = 0;
+        while (off < rows.len) {
+            const n = @min(image_piece, rows.len - off);
+            if (try self.begin(.fill_images)) {
+                try self.wire.int(self.gpa, u32, @intCast(spans.len));
+                for (spans) |sp| {
+                    try self.wire.int(self.gpa, u64, sp.at);
+                    try self.wire.int(self.gpa, u64, sp.len);
+                }
+                try self.wire.int(self.gpa, u64, off);
+                try self.wire.buf.appendSlice(self.gpa, rows[off..][0..n]);
+                try self.flush();
+            }
+            off += n;
+        }
+    }
 
     /// The facts the round loop reads: windows of the pending row and up to the drafter's block, several streams'
     /// windows in one forward of at most 16 rows (four streams), the drafter's chances, the served lane's round ms.
@@ -514,7 +632,12 @@ pub const Lanes = struct {
     /// it reached the head and drew the first token.
     fn prefillStepFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!bool {
         const self = of(ptr);
-        return self.prefillPart(s, if (self.fill == null and self.fill_first > 0) self.fill_first else self.fill_chunks);
+        return self.prefillPart(s, if (self.fillOf(s) == null and self.fill_first > 0) self.fill_first else self.fill_chunks);
+    }
+
+    /// A prompt pass's rows at most when it starts at `start`.
+    pub fn passCap(self: *const Lanes, start: usize) usize {
+        return if (start < self.pass_from) model.resume_rows else self.pass_rows;
     }
 
     fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
@@ -523,11 +646,13 @@ pub const Lanes = struct {
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
         };
-        if (self.fill) |f| {
-            if (f.s != s) return error.FillBusy;
-        } else try self.fillOpen(s);
-        errdefer self.fill = null;
-        const f = &self.fill.?;
+        const f = self.fillOf(s) orelse blk: {
+            if (!self.fill_many and self.anyFill()) return error.FillBusy;
+            try self.fillOpen(s);
+            break :blk self.fillOf(s).?;
+        };
+        errdefer self.dropFill(f.slot);
+        if (self.cur != f.slot) try self.fillSwitch(f);
         const seq = self.seqs[f.slot].items;
         m.fill_seq = seq;
         // a round may run before the next piece: the read-ahead done and the prompt's ids gone, as rank 1 does at its frame
@@ -536,11 +661,13 @@ pub const Lanes = struct {
             m.fill_seq = &.{};
         }
         var ran: usize = 0;
-        while (f.start < f.len and ran < chunks) : (ran += 1) {
+        // past its chunks the pass runs on while nothing else waits (s.shares), so a pass alone runs as a whole one
+        while (f.start < f.len and (ran < chunks or !s.shares())) : (ran += 1) {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = @min(model.chunk_rows, len - start);
+            const n = cutAtKeep(s.reuse.marks, f.last_end, f.replay, len, start, @min(self.passCap(start), len - start));
+            m.next_rows = self.passCap(start + n);
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(self.gpa, u64, start);
                 try self.wire.int(self.gpa, u32, @intCast(n));
@@ -553,7 +680,7 @@ pub const Lanes = struct {
         }
         if (f.start < f.len) return false;
         const done = f.*;
-        self.fill = null;
+        self.dropFill(done.slot);
         if (self.prof) |*p| p.prefills += 1;
         if (!done.head) return error.NoPromptLogits;
         const logits = try m.promptLogitsHost();
@@ -669,25 +796,15 @@ pub const Lanes = struct {
             try self.flush();
         }
         try m.fillBegin(slot, base);
+        self.cur = slot;
         if (spans.items.len > 0) {
-            // the spans and their rows, image_piece bytes of rows a frame (a follower's frame buffer holds 64 KiB and
-            // the ids of a full pool)
-            var off: usize = 0;
-            while (off < rows.items.len) {
-                const n = @min(image_piece, rows.items.len - off);
-                if (try self.begin(.fill_images)) {
-                    try self.wire.int(gpa, u32, @intCast(spans.items.len));
-                    for (spans.items) |sp| {
-                        try self.wire.int(gpa, u64, sp.at);
-                        try self.wire.int(gpa, u64, sp.len);
-                    }
-                    try self.wire.int(gpa, u64, off);
-                    try self.wire.buf.appendSlice(gpa, rows.items[off..][0..n]);
-                    try self.flush();
-                }
-                off += n;
-            }
+            try self.sendImages(spans.items, rows.items);
             try m.setImages(spans.items, rows.items);
+            if (self.fill_many) { // kept for a switch back to this pass
+                const im = &self.imgs[slot];
+                try im.spans.appendSlice(gpa, spans.items);
+                try im.rows.appendSlice(gpa, rows.items);
+            }
         }
         const replay = len -| m.cfg.window;
         var start: usize = 0;
@@ -705,10 +822,10 @@ pub const Lanes = struct {
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
-        // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
-        // kept prompt), each at the chunk end at or before it
-        const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
-        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
+        // where this pass keeps states: the cache's marks and its last resume point before the replay (the served lane's
+        // kept prompt), each at the resume point at or before it
+        const last_end = @min(replay, len - 1) / model.resume_rows * model.resume_rows;
+        self.fills[slot] = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
     }
 
     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -926,7 +1043,7 @@ pub const Lanes = struct {
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return .dropped;
         if (sn.stale) return .stale;
         if (sn.at == 0 or sn.at >= len) return .short;
-        if (sn.at % model.chunk_rows != 0) return .off_chunk;
+        if (sn.at % model.resume_rows != 0) return .off_chunk;
         if (sn.at > len -| self.m.cfg.window) return .near_end;
         return null;
     }
@@ -1001,7 +1118,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
-        if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+        if (at == 0 or at % model.resume_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
         sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
@@ -1051,11 +1168,11 @@ pub const Lanes = struct {
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
-        if (self.fill) |f| if (f.s == s) {
+        if (self.fillOf(s)) |f| {
             self.m.joinAhead();
             self.m.fill_seq = &.{};
-            self.fill = null;
-        };
+            self.dropFill(f.slot);
+        }
         if (self.first_of == s) self.first_of = null;
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
@@ -1114,6 +1231,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             7 => .snap_drop,
             8 => .fill_images,
             9 => .done,
+            10 => .fill_switch,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
@@ -1130,6 +1248,14 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                m.fill_seq = seqs[slot].items;
+            },
+            .fill_switch => { // another pass's pieces ran: this one's fill state again (rank 0's fillSwitch)
+                slot = try r.int(u32);
+                const base = try r.int(u64);
+                if (slot >= max_streams) return error.BadSlot;
+                img_rows.clearRetainingCapacity();
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
@@ -1317,6 +1443,31 @@ test "TF_FILL_CHUNKS steps a prompt pass in the lane core, one pass at a time; u
     try std.testing.expect(steps.prefill_step != null and steps.prefill_one);
     // every other entry the same as served
     try std.testing.expect(steps.prefill == whole.prefill and steps.verify == whole.verify and steps.release == whole.release and steps.draft == whole.draft);
+    // TF_FILL_MANY: the same steps, and the host admits while a pass fills
+    ln.fill_many = true;
+    const many = ln.backend().vtable;
+    try std.testing.expect(many.prefill_step == steps.prefill_step and !many.prefill_one);
+    try std.testing.expect(many.prefill == whole.prefill and many.verify == whole.verify and many.release == whole.release and many.draft == whole.draft);
+    // without TF_FILL_CHUNKS it changes nothing: each pass whole
+    ln.fill_chunks = 0;
+    try std.testing.expect(ln.backend().vtable == &Lanes.whole_vt);
+}
+
+test "TF_FILL_MANY: each stream's pass is found by its stream, and one ending frees its slot and the model's fill state" {
+    var m: Model = undefined;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    var a: lanes.Stream = undefined;
+    var b: lanes.Stream = undefined;
+    ln.fills[2] = .{ .s = &a, .slot = 2, .len = 10, .replay = 0, .last_end = 0, .start = 2048 };
+    ln.cur = 2;
+    try std.testing.expect(ln.fillOf(&a).? == &ln.fills[2].?);
+    try std.testing.expect(ln.fillOf(&b) == null);
+    ln.fills[5] = .{ .s = &b, .slot = 5, .len = 99000, .replay = 0, .last_end = 0, .start = 0 };
+    try std.testing.expect(ln.fillOf(&b).? == &ln.fills[5].?);
+    ln.dropFill(5);
+    try std.testing.expect(ln.cur == 2 and ln.fillOf(&b) == null and ln.anyFill());
+    ln.dropFill(2);
+    try std.testing.expect(!ln.anyFill() and ln.cur == null);
 }
 
 /// A test row: token i's logit from splitmix64(i + 1) (exact in f32, a few ties).
@@ -1420,4 +1571,15 @@ test "a window's masks are none or every row's bits" {
     try std.testing.expect(masksFit(with, words));
     with.masks = bits[0 .. 2 * words];
     try std.testing.expect(!masksFit(with, words));
+}
+
+test "passCap: resume_rows below pass_from, then pass_rows" {
+    var ln: Lanes = undefined;
+    ln.pass_rows = model.chunk_rows;
+    ln.pass_from = 0;
+    try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(0));
+    ln.pass_from = 4 * model.resume_rows;
+    try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(0));
+    try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(3 * model.resume_rows));
+    try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(4 * model.resume_rows));
 }
