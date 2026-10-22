@@ -26,7 +26,9 @@ verify window in one forward a round, each reply exactly its solo run.
   give their room back, oldest first, whenever an admission needs it.
 - **Grammars.** A reply's grammar (``tensorfold.engine.grammar``) rides in its admission and every rank compiles it:
   each round it cuts the drafts it rules out and masks the rows it keeps, the same rows on every rank, and the ranks
-  check the cut windows before the forward. Logprobs are not served with ``--parallel``.
+  check the cut windows before the forward.
+- **Logprobs.** Rank 0 reads a reply's kept tokens' log probabilities from the rows that chose them
+  (``tensorfold.cuda.logprobs``): the same values with drafts or without, beside any other streams.
 
 Ported from our GLM-5.3 fork's ``glm_moe_dsa/cuda/multi.py`` (the same design, pipeline/CONCURRENCY-DESIGN.md).
 """
@@ -40,6 +42,7 @@ import time
 
 import torch
 
+from tensorfold.cuda.logprobs import capture
 from tensorfold.cuda.memory_gate import NoRoom
 from tensorfold.cuda.streams import Stream
 from tensorfold.engine.grammar import GrammarError, pack
@@ -535,6 +538,21 @@ class MultiDecoder:
         mine = torch.tensor([1.0 if ok else 0.0, 0.0, 0.0, 0.0], dtype=torch.float32, device="cuda")
         return all(row[0] == 1.0 for row in self.m.comm.gather(mine).tolist())
 
+    def _read(self, s: Stream, logits, tokens: list[int], positions: list[int]) -> bool:
+        """Rank 0 reads ``s``'s log probabilities; rows its Probabilities refuse fail ``s`` alone (False). The other
+        ranks take its tokens and end it at rank 0's finish, which follows every step."""
+
+        if s.probabilities is None:
+            return True
+        from .engine import Kept
+
+        kept = Kept(s.probabilities)
+        capture(logits, tokens, positions, kept)
+        if kept.error is None:
+            return True
+        s.error, s.done, s.finished = kept.error, True, time.perf_counter()
+        return False
+
     def _fail_elsewhere(self, streams: list[Stream]) -> list[Stream]:
         """Each rank runs its own grammars: the live ones of ``streams`` whose grammar failed on another rank fail here
         too, so no rank steps a request another one ended. Returns those."""
@@ -777,8 +795,6 @@ class MultiDecoder:
     def admit(self, s: Stream) -> None:
         """A request into the lowest free slot: its prompt fills the slot now, then it decodes in the rounds."""
 
-        if s.probabilities is not None:
-            raise ValueError("logprobs are not served with --parallel on DeepSeek-V4.1")
         room = self.extents.total - len(s.prompt) - self.max_rows - 8 - 4
         if room < 1:
             raise ValueError(f"a prompt of {len(s.prompt)} tokens leaves no room in the {self.extents.total}-token "
@@ -943,7 +959,7 @@ class MultiDecoder:
                 s.error, s.done, s.finished = failed, True, time.perf_counter()
             if s.constraint is not None:
                 self._fail_elsewhere([s])
-            if s.done:
+            if s.done or not self._read(s, last, [first], [len(s.prompt)]):
                 return [s]
             s.take([first], self._ends(s))
             if not s.done and s.constraint is not None and s.constraint.finished:
@@ -1184,6 +1200,10 @@ class MultiDecoder:
                         done.append(s)
                         r0 += n
                         continue
+                if not self._read(s, logits[r0:r0 + len(new)], new, [P + 1 + i for i in range(len(new))]):
+                    done.append(s)
+                    r0 += n
+                    continue
                 s.per_round = 0.75 * getattr(s, "per_round", 2.0) + 0.25 * len(new)
                 s.pending = new[-1]
                 s.take(new, ends)

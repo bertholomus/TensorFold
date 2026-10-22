@@ -329,16 +329,23 @@ class DsEngine:
             self.nccl.all_gather(buf, allv)
         return [int(v) for v in allv[:count].tolist()]
 
+    @property
+    def supports_logprobs(self) -> bool:
+        return True                                    # rank 0 holds the gathered logits: it reads them alone
+
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None, vision=None, **_: Any) -> dict[str, Any]:
+                 constraint=None, vision=None, probabilities=None, **_: Any) -> dict[str, Any]:
         from tensorfold.engine.grammar import pack
 
+        if probabilities is not None and constraint is not None:
+            raise ValueError("logprobs do not support structured output")
         stop_eos = bool(getattr(self.request, "stop_eos", True))
         if self.scheduler is not None:
             if vision is not None and getattr(vision, "spans", None) and self.tower is None:
                 raise ValueError("image input needs the server started with --vision")
             return self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft), on_tokens,
-                                         stop_eos=stop_eos, vision=vision, constraint=constraint)
+                                         stop_eos=stop_eos, vision=vision, constraint=constraint,
+                                         probabilities=probabilities)
         positions, rows = [], None
         if vision is not None and getattr(vision, "spans", None):
             if self.tower is None:
@@ -361,7 +368,7 @@ class DsEngine:
         if constraint is not None:                     # the request's grammar: the other ranks compile the same
             self._share(packed)
         return self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, draft, image=image,
-                         constraint=constraint)
+                         constraint=constraint, probabilities=probabilities)
 
     def follow(self) -> None:
         from tensorfold.engine import grammar
@@ -506,9 +513,12 @@ class DsEngine:
         return last
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable,
-             draft: bool, image: tuple | None = None, constraint=None) -> dict[str, Any]:
+             draft: bool, image: tuple | None = None, constraint=None, probabilities=None) -> dict[str, Any]:
         """``image``: (ascending positions of the prompt's image-span tokens, their rows [k, dim] bf16); ``constraint``:
-        the reply's grammar (``tensorfold.engine.grammar``), every rank walking and masking the same rows."""
+        the reply's grammar (``tensorfold.engine.grammar``), every rank walking and masking the same rows;
+        ``probabilities`` (rank 0): the reply's tokens' log probabilities, from the rows that chose them."""
+        from tensorfold.cuda.logprobs import capture
+
         m = self.model
         eos = self.eos if stop_eos else ()
         if len(prompt) + max_tokens > self.limit:
@@ -527,6 +537,8 @@ class DsEngine:
         last = self.prefill(sc, dc, prompt, image)
         self.last_prefill_logits = last
         torch.cuda.empty_cache()          # a long prompt's chunk buffers back to the node (unified memory)
+        if probabilities is not None:                  # (rank 0 alone: a refused row fails the reply at its end)
+            probabilities = Kept(probabilities)
         with self._grammar_step(constraint):
             if constraint is not None:                 # the first token's row, under the reply's grammar
                 with torch.inference_mode():           # the mask writes in place: logits are inference tensors
@@ -534,13 +546,16 @@ class DsEngine:
             first = self._sample(last, [len(prompt)], sampling)[0]
             if constraint is not None:
                 constraint.advance([first])
+        capture(last, [first], [len(prompt)], probabilities)
         stats: dict[str, Any] = {"prefill_s": time.perf_counter() - t0}
         t1 = time.perf_counter()
         if use_drafts:
-            out, st = self._spec(sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint)
+            out, st = self._spec(sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint, probabilities)
             stats.update(rounds=st[0], drafted=st[1], accepted=st[2], **self.last_spec_times)
         else:
-            out = self._serial(sc, first, max_tokens, sampling, eos, on_tokens, constraint)
+            out = self._serial(sc, first, max_tokens, sampling, eos, on_tokens, constraint, probabilities)
+        if probabilities is not None and probabilities.error is not None:
+            raise probabilities.error
         dt = time.perf_counter() - t1
         stats.update(decode_s=dt, tokens=len(out), tokens_per_second=(len(out) - 1) / dt if dt > 0 else 0.0,
                      sha256=hashlib.sha256(json.dumps(out).encode()).hexdigest()[:16])
@@ -551,7 +566,9 @@ class DsEngine:
                      if use_drafts else ""), flush=True)
         return stats
 
-    def _serial(self, sc, first, max_tokens, sampling, eos, on_tokens, constraint=None) -> list[int]:
+    def _serial(self, sc, first, max_tokens, sampling, eos, on_tokens, constraint=None, probabilities=None) -> list[int]:
+        from tensorfold.cuda.logprobs import capture
+
         out = [first]
         on_tokens([first])
         tok = first
@@ -569,6 +586,7 @@ class DsEngine:
                 tok = self._sample(lg, [p + 1], sampling)[0]
                 if constraint is not None:
                     constraint.advance([tok])
+            capture(lg, [tok], [p + 1], probabilities)
             out.append(tok)
             on_tokens([tok])
         return out
@@ -593,9 +611,11 @@ class DsEngine:
                 best, best_v = k, v
         return best
 
-    def _spec(self, sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint=None):
+    def _spec(self, sc, dc, first, max_tokens, sampling, eos, on_tokens, constraint=None, probabilities=None):
         """Drafts verified k at a time against the target's keyed samples (the serial rule); a grammar cuts the
-        drafts it rules out and masks the rows it keeps."""
+        drafts it rules out and masks the rows it keeps; ``probabilities`` reads the kept tokens' own rows."""
+
+        from tensorfold.cuda.logprobs import capture
 
         m, d = self.model, self.drafter
         out = [first]
@@ -655,6 +675,7 @@ class DsEngine:
             if constraint is not None:
                 with self._grammar_step(constraint):
                     constraint.advance(new)
+            capture(lg[:len(new)], new, [P + 1 + i for i in range(len(new))], probabilities)
             out += new
             on_tokens(new)
             tok = out[-1]
@@ -690,6 +711,24 @@ def _f64(x: float) -> list[int]:
 
 def _f64_back(lo: int, hi: int) -> float:
     return struct.unpack("<d", struct.pack("<2i", int(lo), int(hi)))[0]
+
+
+class Kept:
+    """Rank 0's ``Probabilities`` for one reply: a batch of rows it refuses (one not finite, a replay that changed) is
+    kept as ``error`` instead of raised, so the ranks stay in step and only that request fails."""
+
+    def __init__(self, probabilities) -> None:
+        self.p, self.error = probabilities, None
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.p, name)
+
+    def add(self, *args: Any) -> None:
+        if self.error is None:
+            try:
+                self.p.add(*args)
+            except RuntimeError as exc:
+                self.error = exc
 
 
 class Uncompiled:
