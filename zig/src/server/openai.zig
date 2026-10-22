@@ -151,6 +151,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     input.lane_images = images.list.items;
     if (!is_chat and input.messages.array.len == 0) input.prompt = try legacyPrompt(srv, cx, body.get("prompt"));
     input.token_ids = if (body.get("return_token_ids")) |v| v.truthy() else false;
+    input.cache_salt = try cacheSalt(cx, body);
     // ``body.get("max_tokens") or body.get("max_completion_tokens")``: both are ints or None by now
     const first = body.get("max_tokens");
     const max = if (first != null and first.?.truthy()) first else body.get("max_completion_tokens");
@@ -194,6 +195,13 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
         .policy = policy,
         .named = replyModel(srv, body),
     };
+}
+
+/// vLLM's ``cache_salt``: a non-empty string when given; null when absent or null.
+fn cacheSalt(cx: *Cx, body: Value) errors.Refused!?[]const u8 {
+    const s = body.field("cache_salt") orelse return null;
+    if (s == .string and s.string.len > 0) return s.string;
+    return cx.refuse("cache_salt must be a non-empty string if provided");
 }
 
 /// A completion's prompt as the model reads it: token ids as given, anything else as text.
