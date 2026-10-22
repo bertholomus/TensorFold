@@ -874,14 +874,14 @@ fn runChunk(run: *Run, eng: *const prompt.Engine, ch: *prompt.Chunk, caches: *co
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention in", .{li}), att, ch.x)) return false;
         prompt.attention(eng, ch, caches, shared, li, rings[li], floor, kv_done != null and kv_done.? == li) catch |err| return report(w_out, rank, li, "attention", err);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention partial", .{li}), fx.find(after, "Model.attention_k", l, "out"), ch.pa)) return false;
-        try prompt.gather(eng, ch, ch.pa, ch.ga);
+        ch.ga_rs = try prompt.gather(eng, ch, ch.pa, ch.ga);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} attention gather", .{li}), fx.find(att.?.call, "Comm.gather", null, "out"), ch.ga)) return false;
         prompt.ffnMixes(eng, ch, li) catch |err| return report(w_out, rank, li, "ffn mixes", err);
         const mo: ?*const Point = if (checked) (fx.find(att.?.call, "Model.moe", l, "in2") orelse return report(w_out, rank, li, "moe fixture", error.NoLayerFixture)) else null;
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe in", .{li}), mo, ch.x)) return false;
         prompt.moe(eng, ch, li) catch |err| return report(w_out, rank, li, "moe", err);
         if (checked and !try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe partial", .{li}), fx.find(att.?.call, "Model.moe", l, "out"), ch.pm)) return false;
-        try prompt.gather(eng, ch, ch.pm, ch.gm);
+        ch.gm_rs = try prompt.gather(eng, ch, ch.pm, ch.gm);
         if (checked) {
             const mg = fx.find(mo.?.call, "Comm.gather", null, "out") orelse return report(w_out, rank, li, "moe gather fixture", error.NoLayerFixture);
             if (!try run.check(try std.fmt.bufPrint(&label_buf, "L{d} moe gather", .{li}), mg, ch.gm)) return false;

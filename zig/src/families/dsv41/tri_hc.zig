@@ -48,7 +48,8 @@ pub fn hcPf2Ok(d: usize) bool {
 }
 
 /// The previous sublayer's post to fuse in (Python's gathered, h_out): partials [world, R, D] fp32, into h_out (not h).
-pub const Posted = struct { gathered: u64, world: usize, h_out: u64 };
+/// `rs`: the gather's rank stride in elements, 0 for rows * d (prompt.gather's return: TF_DS_2D_YX's sums give cap * d).
+pub const Posted = struct { gathered: u64, world: usize, h_out: u64, rs: usize = 0 };
 
 /// hc_pre2's `sink` (only if hcDeferOn(d)): a side stream and the event forking it; the caller joins it (rounds.py).
 pub const Sink = struct { s: cuda.Stream, fork: cuda.Event };
@@ -152,7 +153,7 @@ pub fn hcMixPf(t: Tri, h: u64, fn_w: u64, part: u64, posted: ?Posted, post: u64,
     if (posted) |ps| {
         std.debug.assert(ps.h_out != h);
         try runRows(t, "_hc_mix_pf", grid, &.{
-            p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(rows * d)),
+            p("X", "*bf16", h),       p("XO", "*bf16", ps.h_out), p("G", "*fp32", ps.gathered), aot.int("RS", @intCast(if (ps.rs != 0) ps.rs else rows * d)),
             p("POST", "*fp32", post), p("COMB", "*fp32", comb),   p("FN", "*fp32", fn_w),       p("PART", "*fp32", part),
         }, &(consts ++ [_]aot.Const{ ci("WORLD", ps.world), ci("POSTED", 1) }), rows);
         return ps.h_out;

@@ -28,6 +28,10 @@ const Comm = @import("comm.zig").Comm;
 
 const nccl = cuda.nccl;
 
+/// TF_DS_2D_YX=1 (model.zig sets it, every rank alike; off by default): prompt.gather exchanges the sublayer partials as
+/// their bf16 sums (Two.ySums) instead of the four fp32 quarters.
+pub var y_sums: bool = false;
+
 /// The split of node `g` of `world` nodes: TP over 1 or 2, the 2D split over 4.
 pub fn split(g: u32, world: u32) !plan.Split {
     return switch (world) {
@@ -335,6 +339,39 @@ pub const Two = struct {
             const pg = g / 2;
             try e.ops.copyRows(e.s, t.parts + g * n * wmax * esize, wmax * esize, dst + rr * n * row + pg * w[0] * esize, row, w[pg] * esize, n);
         }
+    }
+
+    /// TF_DS_2D_YX's prompt.gather, when y_sums is on and the chunk takes NCCL (no ring) with equal pair widths: the
+    /// pair partners swap their fp32 partials of each other's half of the rows (src [n, w]), each sums its half in TP2
+    /// rank order and rounds it to bf16 (add2Bf16: hc_mix_pf's and hc_post's y), the four nodes all-gather those halves
+    /// (bf16 [half, w] each), and dst[0] gets them widened to fp32 [n, 2 w]. dst[1] (at cap * 2 w, in every buffer of
+    /// `negs`) holds -0.0, written once (x + -0.0 == x for every x): the posting kernels' y is bit for bit the
+    /// quarters'. Bytes a node receives: 5 n w against 12 n w. False: not taken (nothing sent).
+    pub fn ySums(t: *const Two, e: *const prompt.Engine, src: u64, dst: u64, n: usize, cap: usize, neg_done: *bool, negs: []const u64) !bool {
+        if (!y_sums or n == 0 or t.ow[0] != t.ow[1]) return false;
+        if (t.rings != null and n < 64) return false;
+        const w = t.ow[0];
+        if (2 * w != e.c.hidden) return false;
+        const half = (n + 1) / 2;
+        if (half * w * 6 > t.part_bytes) return error.PartTooBig;
+        if (!neg_done.*) {
+            for (negs) |g| try prompt.fill32(e, g + cap * 2 * w * 4, 0x80000000, cap * 2 * w);
+            neg_done.* = true;
+        }
+        const mine = t.r * half;
+        const mine_n = if (t.r == 0) half else n - half;
+        const theirs = (1 - t.r) * half;
+        const theirs_n = n - mine_n;
+        const g: u32 = @intCast(t.r + 2 * t.p);
+        const recv = t.pad;
+        const own = t.pad + half * w * 4;
+        try e.comm.exchange(src + theirs * w * 4, theirs_n * w, recv, mine_n * w, .f32, g ^ 1, e.s);
+        const p0 = if (t.r == 0) src + mine * w * 4 else recv;
+        const p1 = if (t.r == 0) recv else src + mine * w * 4;
+        try e.ops.add2Bf16(e.s, p0, p1, own, mine_n * w);
+        try e.comm.allGather(own, t.parts, half * w * 2, .u8, e.s);
+        try e.ops.yWiden(e.s, t.parts, dst, n, half, w);
+        return true;
     }
 
     /// cat_rank (Comm2D.cat_rank): `src` [n, w[p]] -> `dst` [n, w0 + w1]: this node's TP2 rank's whole width, pair 0's

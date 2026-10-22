@@ -173,6 +173,7 @@ pub const Model = struct {
         m.gpa = gpa;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         try prompt.splitEnv(); // TF_DS_IDX_SPLIT: every rank alike too
+        if (std.c.getenv("TF_DS_2D_YX")) |v| prompt2d.y_sums = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         m.spans = .empty;
         m.img_buf = null;
         m.host = std.heap.ArenaAllocator.init(gpa);
@@ -683,13 +684,13 @@ pub const Model = struct {
             if (pt) |t| try t.mark(m.stream, .mix_attn);
             try prompt.attention(e, ch, &m.view, &shared, li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
             if (pt) |t| try t.mark(m.stream, .attn);
-            try prompt.gather(e, ch, ch.pa, ch.ga);
+            ch.ga_rs = try prompt.gather(e, ch, ch.pa, ch.ga);
             if (pt) |t| try t.mark(m.stream, .gather_a);
             try prompt.ffnMixes(e, ch, li);
             if (pt) |t| try t.mark(m.stream, .mix_ffn);
             try prompt.moe(e, ch, li);
             if (pt) |t| try t.mark(m.stream, .moe);
-            try prompt.gather(e, ch, ch.pm, ch.gm);
+            ch.gm_rs = try prompt.gather(e, ch, ch.pm, ch.gm);
             if (pt) |t| try t.mark(m.stream, .gather_m);
             prompt.endLayer(ch);
         }
