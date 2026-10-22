@@ -19,11 +19,11 @@ zig/src/server/sse_keepalive_test.zig, docs/recipes/deepseek-v41-neighbor.md wit
 docs/receipts/dsv41-neighbor-hardware/ and docs/receipts/dsv41-neighbor-host/, ATTRIBUTION.md and two license texts in
 LICENSES/ (PyTorch, CUTLASS) that THIRD_PARTY_NOTICES.md refers to. tools/dsv41-zig/kit/aot_pack.py is TensorFold
 1.0.2's zig/tests/cuda/nemotron/aot_pack.py, kept with a two-line header after 1.0.12 replaced it, because the kits are
-packed with it. Five of the branch's changes are contributions to this fork under the same license, kept under their
+packed with it. Seven of the branch's changes are contributions to this fork under the same license, kept under their
 authors' names: Lucas Peters (pull request #4), lepetitprince716-prog (pull request #18), Manrique (pull request #26),
-Scott Woolsey Biggart (pull request #30) and mrsergiopascal (pull request #31); two more port Manrique's pull requests
-#28 and #29 to the four-node family. ATTRIBUTION.md lists every outside source the family uses and what it took from
-each. The branch changes these upstream files:
+Scott Woolsey Biggart (pull request #30), mrsergiopascal (pull request #31) and Blackwellboy (pull requests #33 and
+#34); two more port Manrique's pull requests #28 and #29 to the four-node family. ATTRIBUTION.md lists every outside
+source the family uses and what it took from each. The branch changes these upstream files:
   README.md
   THIRD_PARTY_NOTICES.md
   docs/api.md
@@ -35,12 +35,14 @@ each. The branch changes these upstream files:
   zig/src/core/lane_host_reuse_test.zig
   zig/src/core/lane_host_test.zig
   zig/src/core/lanes/backend.zig
+  zig/src/core/lanes/config.zig
   zig/src/core/lanes/engine.zig
   zig/src/core/lanes/engine_test.zig
   zig/src/core/lanes/fake.zig
   zig/src/core/lanes/grammar.zig
   zig/src/core/lanes/recorder.zig
   zig/src/core/lanes/stream.zig
+  zig/src/core/lanes/windows.zig
   zig/src/core/prompt_cache.zig
   zig/src/core/prompt_cache_fake.zig
   zig/src/core/prompt_cache_test.zig
