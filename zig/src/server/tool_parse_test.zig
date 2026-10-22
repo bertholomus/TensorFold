@@ -323,6 +323,34 @@ test "an unfinished DSML envelope never parses or autocompletes its nested legac
     };
 }
 
+test "a <tool_call> whose text only starts with a DSML opener is no DSML block, at any length" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const reply_text = @import("reply_text.zig");
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    const pieces = [_]reply_text.Marks.Piece{.{ .text = D, .id = 128825 }};
+    var filler: [64]u8 = undefined;
+    @memset(&filler, 'x');
+    // shorter than its opener and a closer, the text's inside started past its end; longer, it lost its last bytes
+    for ([_][]const u8{ "<" ++ D ++ "tool_calls>", "<" ++ D ++ " calls>" }) |opener| for (0..filler.len) |n| {
+        const text = try std.mem.concat(a, u8, &.{ "<tool_call>", opener, filler[0..n], "</tool_call>" });
+        // as the text alone reads it, and with each DSML marker spelled in ordinary tokens (TENSORFOLD_REPLY_IDS)
+        const none: reply_text.Marks = .{ .base = text.ptr, .len = text.len, .at = &.{}, .pieces = &pieces };
+        for ([_]?*const reply_text.Marks{ null, &none }) |marks| {
+            const r = try tool_parse.parseMarked(a, text, tools, null, marks);
+            try std.testing.expect(r.calls == null);
+            try std.testing.expectEqualStrings(text, r.content);
+            try std.testing.expect((try tool_parse.parseMarked(a, text, tools, 1, marks)).calls == null);
+        }
+        try std.testing.expectEqualStrings("", try closeCall(a, text[0 .. text.len - "</tool_call>".len], tools));
+    };
+    // a whole block inside <tool_call> is still one
+    const wrapped = "<tool_call>" ++ dsml_prefix ++ "x" ++ dsml_suffix ++ "</tool_call>";
+    try std.testing.expectEqualStrings("{\"q\":\"x\"}", (try parse(a, wrapped, tools, null)).calls.?[0].get("function").?.strField("arguments").?);
+}
+
 test "closeCall skips a closed DSML parameter's unfinished legacy opener and completes the adjacent call" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();

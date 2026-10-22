@@ -143,6 +143,12 @@ fn tagged(a: Allocator, text: []const u8, base: usize, marks: ?*const reply_text
     }
 }
 
+/// ``block`` is one whole DSML block, ``open`` to ``close``. A <tool_call> whose text only starts with a DSML opener is
+/// not one: its inside, cut at the closer's length from its end, would start past its end.
+fn whole(block: []const u8, open: []const u8, close: []const u8) bool {
+    return block.len >= open.len + close.len and std.mem.startsWith(u8, block, open) and std.mem.endsWith(u8, block, close);
+}
+
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
 pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
     return parseMarked(a, text, tools, max_calls, null);
@@ -170,13 +176,13 @@ pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_cal
             try residue.appendSlice(a, text[env.start..env.end]);
             continue;
         }
-        if (std.mem.startsWith(u8, env.payload, dsml41_open)) {
+        if (whole(env.payload, dsml41_open, dsml41_close)) {
             try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
         const parsed: ?[]Call = blk: {
-            if (std.mem.startsWith(u8, env.payload, dsml_open)) {
+            if (whole(env.payload, dsml_open, dsml_close)) {
                 const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
                 break :blk dsmlCalls(a, inner) catch |e| switch (e) {
                     error.OutOfMemory => return error.OutOfMemory,
