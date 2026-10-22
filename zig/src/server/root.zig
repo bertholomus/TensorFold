@@ -21,6 +21,7 @@ test {
     _ = @import("std_options.zig");
     _ = @import("fields.zig");
     _ = @import("reply_text.zig");
+    _ = @import("dsml.zig");
     _ = @import("tool_parse.zig");
     _ = @import("tool_stream.zig");
     _ = @import("tool_params.zig");
@@ -51,6 +52,7 @@ test {
     _ = @import("stream_preflight_test.zig");
     _ = @import("sse_keepalive_test.zig");
     _ = @import("stream_dsml_test.zig");
+    _ = @import("dsml_test.zig");
     _ = @import("logprobs_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("effort_values_test.zig");

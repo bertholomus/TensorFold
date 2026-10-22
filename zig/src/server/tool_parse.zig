@@ -1,6 +1,7 @@
 //! Tool calls in a finished reply, every family's markup, as OpenAI tool_calls (``tools.parse_tool_calls_from_content``).
 const std = @import("std");
 const json = @import("json");
+const deepseek = @import("dsml.zig");
 const ids = @import("ids.zig");
 const reply_text = @import("reply_text.zig");
 const tool_params = @import("tool_params.zig");
@@ -20,20 +21,12 @@ const Envelope = struct { start: usize, end: usize, payload: []const u8, complet
 
 pub const Parsed = struct { content: []const u8, calls: ?[]Value };
 
-const dsml_open = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
-const dsml_close = "</\u{ff5c}DSML\u{ff5c}tool_calls>";
-const invoke_open = "<\u{ff5c}DSML\u{ff5c}invoke name=\"";
-const invoke_close = "</\u{ff5c}DSML\u{ff5c}invoke>";
-const param_open = "<\u{ff5c}DSML\u{ff5c}parameter name=\"";
-const param_close = "</\u{ff5c}DSML\u{ff5c}parameter>";
-// DeepSeek-V4.1's spelling (its chat template's, and the served Python lane's reply_text.py): a space after the marker,
-// the block named "calls"; read as the lane reads it (dsml41Calls)
-const dsml41_open = "<\u{ff5c}DSML\u{ff5c} calls>";
-const dsml41_close = "</\u{ff5c}DSML\u{ff5c} calls>";
-const invoke41_open = "<\u{ff5c}DSML\u{ff5c} invoke name=\"";
-const invoke41_close = "</\u{ff5c}DSML\u{ff5c} invoke>";
-const param41_open = "<\u{ff5c}DSML\u{ff5c} parameter name=\"";
-const param41_close = "</\u{ff5c}DSML\u{ff5c} parameter>";
+// DeepSeek's DSML blocks, V4's and V4.1's: what their calls are is dsml.zig's, the one reader both lines build
+const dsml_open = deepseek.v4.open;
+const dsml_close = deepseek.v4.close;
+const dsml41_open = deepseek.v41.open;
+const dsml41_close = deepseek.v41.close;
+const open41 = reply_text.open41;
 
 fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
     if (from > hay.len) return null;
@@ -61,10 +54,6 @@ const space = reply_text.isSpaceByte;
 fn allSpace(s: []const u8) bool {
     return strip(s).len == 0;
 }
-
-/// The first DeepSeek-V4.1 calls opener at or after `from` that opens a block: reply_text's, which the prose hider reads
-/// too.
-const open41 = reply_text.open41;
 
 /// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it. DeepSeek-V4.1's
 /// calls blocks are read first, from their own tags, and the other forms only in the text around them: a <tool_call> in
@@ -135,12 +124,6 @@ fn tagged(a: Allocator, text: []const u8, base: usize, marks: ?*const reply_text
     }
 }
 
-/// ``block`` is one whole DSML block, ``open`` to ``close``. A <tool_call> whose text only starts with a DSML opener is
-/// not one: its inside, cut at the closer's length from its end, would start past its end.
-fn whole(block: []const u8, open: []const u8, close: []const u8) bool {
-    return block.len >= open.len + close.len and std.mem.startsWith(u8, block, open) and std.mem.endsWith(u8, block, close);
-}
-
 /// ``parse_tool_calls_from_content``: the reply's content and its calls (null when it makes none).
 pub fn parse(a: Allocator, text: []const u8, tools: []const Value, max_calls: ?usize) Allocator.Error!Parsed {
     return parseMarked(a, text, tools, max_calls, null);
@@ -168,19 +151,17 @@ pub fn parseMarked(a: Allocator, text: []const u8, tools: []const Value, max_cal
             try residue.appendSlice(a, text[env.start..env.end]);
             continue;
         }
-        if (whole(env.payload, dsml41_open, dsml41_close)) {
-            try dsml41Calls(a, env.payload[dsml41_open.len .. env.payload.len - dsml41_close.len], &known, max_calls, &calls, &residue);
+        if (deepseek.whole(env.payload, deepseek.v41) or deepseek.whole(env.payload, deepseek.v4)) {
+            const made = try deepseek.calls(a, env.payload, &known, max_calls, calls.items.len) orelse {
+                // a malformed block stays text when calls are unlimited, and drops out of a one-call reply
+                if (max_calls == null) try residue.appendSlice(a, text[env.start..env.end]);
+                continue;
+            };
+            for (made) |c| try calls.append(a, try openaiCall(a, c.name, c.arguments));
             continue;
         }
         if (max_calls) |m| if (calls.items.len >= m) continue;
         const parsed: ?[]Call = blk: {
-            if (whole(env.payload, dsml_open, dsml_close)) {
-                const inner = env.payload[dsml_open.len .. env.payload.len - dsml_close.len];
-                break :blk dsmlCalls(a, inner) catch |e| switch (e) {
-                    error.OutOfMemory => return error.OutOfMemory,
-                    error.Invalid => null,
-                };
-            }
             const one = payload(a, env.payload, &schemas, max_calls != null) catch |e| switch (e) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.Invalid => break :blk null,
@@ -601,112 +582,4 @@ pub fn putBack(a: Allocator, text: []const u8, quoted: []const []const u8) Alloc
     };
     try out.appendSlice(a, text[cursor..]);
     return out.items;
-}
-
-/// DeepSeek-V4.1's calls block as the served lane reads it (reply_text.py: dsml_to_tool_calls, then parse_tool_calls on
-/// each invoke's ``<tool_call>{"name": .., "arguments": ..}</tool_call>``): every ``invoke name="N"`` up to its closer is a
-/// call of its own, text between them is dropped; its ``parameter name="K"`` values are strings, or JSON with
-/// ``string="false"`` (a string when that JSON does not parse). An offered name, matched stripped as that parse strips
-/// it, is a call (past ``max_calls`` it is dropped; with a limit its arguments must be finite); another name stays as the
-/// lane leaves it, its rewritten block.
-fn dsml41Calls(a: Allocator, block: []const u8, known: *const std.StringArrayHashMapUnmanaged([]const u8), max_calls: ?usize, calls: *std.ArrayList(Value), residue: *std.ArrayList(u8)) Allocator.Error!void {
-    var pos: usize = 0;
-    while (find(block, invoke41_open, pos)) |s| {
-        pos = s + 1;
-        const name_start = s + invoke41_open.len;
-        const q = std.mem.indexOfScalarPos(u8, block, name_start, '"') orelse continue;
-        if (q == name_start or !std.mem.startsWith(u8, block[q..], "\">")) continue;
-        const e = find(block, invoke41_close, q + 2) orelse continue;
-        pos = e + invoke41_close.len;
-        const name = block[name_start..q];
-        const body = block[q + 2 .. e];
-        const arguments = try json.newObject(a);
-        var p: usize = 0;
-        while (find(body, param41_open, p)) |ps| {
-            p = ps + 1;
-            const ns = ps + param41_open.len;
-            const nq = std.mem.indexOfScalarPos(u8, body, ns, '"') orelse continue;
-            if (nq == ns) continue;
-            var v_start = nq + 1;
-            var json_value = false;
-            if (std.mem.startsWith(u8, body[v_start..], " string=\"true\"")) {
-                v_start += " string=\"true\"".len;
-            } else if (std.mem.startsWith(u8, body[v_start..], " string=\"false\"")) {
-                v_start += " string=\"false\"".len;
-                json_value = true;
-            }
-            if (v_start >= body.len or body[v_start] != '>') continue;
-            v_start += 1;
-            const pe = find(body, param41_close, v_start) orelse continue;
-            p = pe + param41_close.len;
-            const value = body[v_start..pe];
-            const v: Value = if (json_value) switch (try json.parseText(a, value)) {
-                .ok => |parsed| parsed,
-                .err => .{ .string = value },
-            } else .{ .string = value };
-            try arguments.put(a, body[ns..nq], v);
-        }
-        if (max_calls) |m| if (calls.items.len >= m) continue;
-        const offered = known.get(try std.ascii.allocLowerString(a, strip(name)));
-        if (offered == null or (max_calls != null and !tool_params.finite(.{ .object = arguments }))) {
-            if (max_calls == null) {
-                // the lane's rewrite: <tool_call> + json.dumps({"name": N, "arguments": args}, ensure_ascii=False) + </tool_call>
-                const doc = try json.newObject(a);
-                try doc.put(a, "name", .{ .string = name });
-                try doc.put(a, "arguments", .{ .object = arguments });
-                try residue.appendSlice(a, "<tool_call>");
-                try residue.appendSlice(a, try json.stringify(a, .{ .object = doc }, .{ .ascii = false }));
-                try residue.appendSlice(a, "</tool_call>");
-            }
-            continue;
-        }
-        try calls.append(a, try openaiCall(a, offered.?, .{ .object = arguments }));
-    }
-}
-
-/// Every invoke of a DSML block, or Invalid when anything in it is not a well-formed invoke.
-fn dsmlCalls(a: Allocator, block: []const u8) Error![]Call {
-    var calls: std.ArrayList(Call) = .empty;
-    var at: usize = 0;
-    var pos: usize = 0;
-    while (find(block, invoke_open, pos)) |s| {
-        pos = s + 1;
-        const name_start = s + invoke_open.len;
-        const q = std.mem.indexOfScalarPos(u8, block, name_start, '"') orelse continue;
-        if (!std.mem.startsWith(u8, block[q..], "\">")) continue;
-        const e = find(block, invoke_close, q + 2) orelse continue;
-        if (!allSpace(block[at..s])) return error.Invalid;
-        at = e + invoke_close.len;
-        pos = at;
-        const body = block[q + 2 .. e];
-        const arguments = try json.newObject(a);
-        var p: usize = 0;
-        var kept: usize = 0;
-        var residue: std.ArrayList(u8) = .empty;
-        while (find(body, param_open, p)) |ps| {
-            p = ps + 1;
-            const ns = ps + param_open.len;
-            const nq = std.mem.indexOfScalarPos(u8, body, ns, '"') orelse continue;
-            const flag = body[nq..];
-            const is_string = std.mem.startsWith(u8, flag, "\" string=\"true\">");
-            if (!is_string and !std.mem.startsWith(u8, flag, "\" string=\"false\">")) continue;
-            const v_start = nq + (if (is_string) "\" string=\"true\">".len else "\" string=\"false\">".len);
-            const pe = find(body, param_close, v_start) orelse continue;
-            const value = body[v_start..pe];
-            try residue.appendSlice(a, body[kept..ps]);
-            kept = pe + param_close.len;
-            p = kept;
-            if (is_string) {
-                try arguments.put(a, body[ns..nq], .{ .string = value });
-            } else switch (try json.parseText(a, value)) {
-                .ok => |v| try arguments.put(a, body[ns..nq], v),
-                .err => return error.Invalid,
-            }
-        }
-        try residue.appendSlice(a, body[kept..]);
-        if (!allSpace(residue.items)) return error.Invalid;
-        try calls.append(a, .{ .name = strip(block[name_start..q]), .arguments = .{ .object = arguments } });
-    }
-    if (calls.items.len == 0 or !allSpace(block[at..])) return error.Invalid;
-    return calls.items;
 }
