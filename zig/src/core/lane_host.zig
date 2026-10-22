@@ -293,12 +293,21 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
     }
 
-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+    /// Prefills the next queued request (while a pass fills, the first that core.cutsIn); false if none or no lane.
     fn admitOne(h: *LaneHost) bool {
         h.lock();
-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or h.filling != null) {
+        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
             return false;
+        }
+        var at: usize = 0;
+        if (h.filling != null) {
+            at = for (h.queued.items, 0..) |j, i| {
+                if (h.core.cutsIn(j.request.prompt.len, j.request.images.len > 0)) break i;
+            } else {
+                h.unlock();
+                return false;
+            };
         }
         if (h.full_wait) |n| {
             const active = h.core.activeCount();
@@ -315,7 +324,7 @@ pub const LaneHost = struct {
             }
             h.finish_until = null;
         }
-        const job = h.queued.orderedRemove(0);
+        const job = h.queued.orderedRemove(at);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
