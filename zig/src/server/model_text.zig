@@ -1,6 +1,7 @@
 //! The tokenizer and chat template a server renders prompts and replies with (the tok and jinja branches plug in here).
 const std = @import("std");
 const json = @import("json.zig");
+const literal_tokens = @import("literal_tokens.zig");
 const Allocator = std.mem.Allocator;
 
 pub const RenderOptions = struct {
@@ -38,6 +39,8 @@ pub const Text = struct {
         template_source: *const fn (ctx: *anyopaque) []const u8,
         /// Whether an id is a special token (an added token flagged special); null: none are known.
         special: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
+        /// The added tokens a client's quoted text keeps as text (literal_tokens); null: none are kept.
+        literals: ?*const fn (ctx: *anyopaque) *const literal_tokens.Table = null,
     };
 
     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
@@ -68,10 +71,17 @@ pub const Text = struct {
         return t.vtable.render(t.ctx, a, messages, options, problem);
     }
 
-    /// The chat template's ids, as ``apply_chat_template(tokenize=True)`` gives them.
+    /// The chat template's ids (``apply_chat_template(tokenize=True)``), an added token the client quotes kept as text.
     pub fn renderIds(t: Text, a: Allocator, messages: json.Value, options: RenderOptions, problem: *[]const u8) Error![]u32 {
-        const text = try t.render(a, messages, options, problem);
-        return t.encode(a, text, false);
+        const lits = if (t.vtable.literals) |f| f(t.ctx) else null;
+        const table = lits orelse {
+            const text = try t.render(a, messages, options, problem);
+            return t.encode(a, text, false);
+        };
+        var hidden = options;
+        if (options.tools) |tools| hidden.tools = try table.hide(a, tools);
+        const text = try t.render(a, try table.hide(a, messages), hidden, problem);
+        return table.encode(a, text, t);
     }
 
     pub fn templateSource(t: Text) []const u8 {
@@ -82,5 +92,4 @@ pub const Text = struct {
         const f = t.vtable.special orelse return false;
         return f(t.ctx, id);
     }
-
 };
