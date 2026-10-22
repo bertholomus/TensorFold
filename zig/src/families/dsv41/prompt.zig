@@ -43,6 +43,9 @@ const key_elems: usize = 1 << 24;
 const pruned_rows: usize = 512;
 
 /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
+/// The rows of one fp32 cuBLAS call in a prompt pass (the gate logits, the indexer weights): the 2048-row passes the
+/// served build makes. A longer pass splits these two calls at it, so its rows keep the served bits.
+pub const gemm_rows = 2048;
 pub const ring_extra = 16;
 /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
 pub const raw_rows = 64;
@@ -970,7 +973,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         try tri_norm.rowmm2(e.t, ch.x, c.hidden, lay.idx_proj_h, ch.wl, n, c.hidden, ih);
     } else {
         try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
-        try e.blas.xwT(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
+        try e.blas.xwTRows(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih, gemm_rows);
     }
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
     const kk = @min(c.index_topk, n_comp_end);
@@ -1091,7 +1094,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     } else {
         try e.ops.toF32(e.s, ch.x, ch.xf, n * d);
         try e.ops.f16ToF32(e.s, lay.gate_w, ch.gate_f, c.experts * d);
-        try e.blas.xwT(ch.xf, ch.gate_f, ch.logits, n, d, c.experts);
+        try e.blas.xwTRows(ch.xf, ch.gate_f, ch.logits, n, d, c.experts, gemm_rows);
         try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
     }
     try routeSpans(e, ch, lay, shared_id, sl, kc);
