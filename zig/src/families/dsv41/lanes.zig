@@ -424,6 +424,11 @@ pub const Lanes = struct {
     // whole, as served
     fill_chunks: usize = 0,
     fill_first: usize = 0,
+    // a prompt pass's rows at most: model.resume_rows below TF_DS_PASS_FROM positions (0: none), then
+    // TF_DS_PASS_ROWS (a multiple of model.resume_rows up to model.chunk_rows; unset: model.chunk_rows). The same bits
+    // at any: a pass ends on the resume grid either way
+    pass_rows: usize = model.chunk_rows,
+    pass_from: usize = 0,
     // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
     // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
     first_row: []f32 = &.{},
@@ -625,6 +630,11 @@ pub const Lanes = struct {
         return self.prefillPart(s, if (self.fillOf(s) == null and self.fill_first > 0) self.fill_first else self.fill_chunks);
     }
 
+    /// A prompt pass's rows at most when it starts at `start`.
+    pub fn passCap(self: *const Lanes, start: usize) usize {
+        return if (start < self.pass_from) model.resume_rows else self.pass_rows;
+    }
+
     fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
         const m = self.m;
         const t0 = m.now();
@@ -651,7 +661,8 @@ pub const Lanes = struct {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = cutAtKeep(s.reuse.marks, f.last_end, f.replay, len, start, @min(model.chunk_rows, len - start));
+            const n = cutAtKeep(s.reuse.marks, f.last_end, f.replay, len, start, @min(self.passCap(start), len - start));
+            m.next_rows = self.passCap(start + n);
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(self.gpa, u64, start);
                 try self.wire.int(self.gpa, u32, @intCast(n));
@@ -1555,4 +1566,15 @@ test "a window's masks are none or every row's bits" {
     try std.testing.expect(masksFit(with, words));
     with.masks = bits[0 .. 2 * words];
     try std.testing.expect(!masksFit(with, words));
+}
+
+test "passCap: resume_rows below pass_from, then pass_rows" {
+    var ln: Lanes = undefined;
+    ln.pass_rows = model.chunk_rows;
+    ln.pass_from = 0;
+    try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(0));
+    ln.pass_from = 4 * model.resume_rows;
+    try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(0));
+    try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(3 * model.resume_rows));
+    try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(4 * model.resume_rows));
 }

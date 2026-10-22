@@ -1260,9 +1260,10 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     const m = n * k;
     const prof = eh.io != null;
     var tq = if (prof) pstamp(e, eh) else 0;
-    // the rows read ahead (fillChunk's thread) when they are this chunk's, else read here
+    // the rows read ahead (fillChunk's thread) when they start at this chunk and cover it (its first n rows), else
+    // read here
     var rows: []u16 = eh.rows;
-    if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) {
+    if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n >= n) {
         rows = eh.ahead_rows[l];
         eh.ahead_ready[l] = false;
     } else {
