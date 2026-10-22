@@ -84,6 +84,21 @@ fn startsMarkup(text: []const u8, tag: []const u8, marks: ?*const Marks) bool {
     return std.mem.startsWith(u8, text, tag) and (marks == null or marks.?.real(text, 0, tag));
 }
 
+/// The first DeepSeek-V4.1 calls opener at or after `from` that opens a block, or null: markup, and not inside a
+/// DeepSeek-V4 block that opened first (its argument's text). Such a block is read from its own tags: the parser, the
+/// streamer and the prose hider find it first, and the other forms only in the text around it.
+pub fn open41(text: []const u8, from: usize, marks: ?*const Marks) ?usize {
+    const v41 = calls[3];
+    const v4 = calls[2];
+    var at = from;
+    while (findMarkup(text, at, v41[0], marks)) |s| {
+        const outer = findMarkup(text, at, v4[0], marks) orelse return s;
+        if (outer > s) return s;
+        at = (findTag(text, outer + v4[0].len, v4[1]) orelse return null) + v4[1].len; // unclosed, it runs to the end
+    }
+    return null;
+}
+
 /// Appends where `tokens[from..]`'s marker tokens decoded: each one's text ends the decode of the tokens through it
 /// (`text`: the model's tokenizer; each decode is `scratch`'s and freed at once).
 pub fn markTokens(a: Allocator, scratch: Allocator, text: anytype, pieces: []const Marks.Piece, tokens: []const u32, from: usize, out: *std.ArrayList(Marks.Mark)) Allocator.Error!void {
@@ -180,12 +195,27 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
     return hideIntoMarked(a, out, text, finished, null);
 }
 
-/// ``hideInto`` with the reply's marks (``hideToolCallsMarked``).
+/// ``hideInto`` with the reply's marks (``hideToolCallsMarked``). DeepSeek-V4.1's blocks are found first (``open41``),
+/// and the other forms only in the text around them, as the parser reads a reply: a <tool_call> in the prose before a
+/// block, or in its argument, hides nothing past the block's bounds.
 pub fn hideIntoMarked(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finished: bool, marks: ?*const Marks) Allocator.Error![]const u8 {
     out.clearRetainingCapacity();
-    var pos: usize = 0;
+    var gap: usize = 0;
+    while (open41(text, gap, marks)) |s| {
+        _ = try hideForms(a, out, text, gap, s, true, marks);
+        gap = (findTag(text, s + calls[3][0].len, calls[3][1]) orelse return out.items) + calls[3][1].len;
+    }
+    return hideForms(a, out, text, gap, text.len, finished, marks);
+}
+
+/// ``hideIntoMarked``'s other forms in ``text[from..to]``, appended to ``out``. A ``to`` short of the end is a
+/// DeepSeek-V4.1 block's start: an opener whose closer would lie past it is prose. ``text`` without a block comes back
+/// as a slice of itself.
+fn hideForms(a: Allocator, out: *std.ArrayList(u8), whole: []const u8, from: usize, to: usize, finished: bool, marks: ?*const Marks) Allocator.Error![]const u8 {
+    const text = whole[0..to];
+    var pos = from;
     var next: [calls.len]?usize = undefined; // each opener at or after `pos`, searched again only once `pos` passes it
-    for (calls, &next) |c, *n| n.* = findMarkup(text, 0, c[0], marks);
+    for (calls, &next) |c, *n| n.* = findMarkup(text, from, c[0], marks);
     while (true) {
         var start: ?usize = null;
         var which: usize = 0;
@@ -202,13 +232,16 @@ pub fn hideIntoMarked(a: Allocator, out: *std.ArrayList(u8), text: []const u8, f
             if (!finished) for (calls) |c| {
                 held = @max(held, partialTag(tail, c[0]));
             };
-            if (pos == 0) return text[0 .. text.len - held];
+            if (pos == 0 and to == whole.len) return text[0 .. text.len - held];
             try out.appendSlice(a, tail[0 .. tail.len - held]);
             return out.items;
         }
         try out.appendSlice(a, text[pos..start.?]);
         const opener = calls[which][0];
-        const end = findTag(text, start.? + opener.len, calls[which][1]) orelse return out.items;
+        const end = findTag(text, start.? + opener.len, calls[which][1]) orelse {
+            if (to < whole.len) try out.appendSlice(a, text[start.?..]);
+            return out.items;
+        };
         pos = end + calls[which][1].len;
     }
 }
@@ -500,6 +533,30 @@ test "with marks, a think end or a DSML opener spelled in ordinary tokens stays 
     // a copy outside the decoded reply reads as its text does
     const copy = try a.dupe(u8, prose);
     try std.testing.expectEqualStrings("Use  like this.", try hideToolCallsMarked(a, copy, true, &none));
+}
+
+test "a <tool_call> in the prose before a DeepSeek-V4.1 block, or in its argument, hides nothing past the block's bounds" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const D = "\u{ff5c}DSML\u{ff5c}";
+    const quoted = "a </tool_call> and <tool_call>{\"name\": \"weather\", \"arguments\": {}}</tool_call>";
+    const block = "<" ++ D ++ " calls>\n<" ++ D ++ " invoke name=\"write\">\n<" ++ D ++ " parameter name=\"content\" string=\"true\">" ++ quoted ++ "</" ++ D ++ " parameter>\n</" ++ D ++ " invoke>\n</" ++ D ++ " calls>";
+    const reply = "I will not use <tool_call> here.\n\n" ++ block ++ "\nDone. <tool_call>{\"name\": \"weather\", \"arguments\": {}}</tool_call>";
+    // the prose around the block shows, as the parser reads it; the block and the call after it are hidden
+    try std.testing.expectEqualStrings("I will not use <tool_call> here.\n\n\nDone. ", try hideToolCalls(a, reply, true));
+    try std.testing.expectEqualStrings("I will not use <tool_call> here.\n\n\nDone.", try finishedProse(a, reply));
+    // while it streams, the prose shown only grows, to the whole reply's
+    var shown: []const u8 = "";
+    for (0..reply.len + 1) |n| {
+        const now = try hideToolCalls(a, reply[0..n], false);
+        try std.testing.expect(std.mem.startsWith(u8, now, shown));
+        shown = now;
+    }
+    try std.testing.expectEqualStrings("I will not use <tool_call> here.\n\n\nDone. ", shown);
+    // a block the reply has not closed hides to its end; the prose before it shows
+    const open = "I will not use <tool_call> here.\n\n" ++ block[0 .. block.len - 20];
+    try std.testing.expectEqualStrings("I will not use <tool_call> here.\n\n", try hideToolCalls(a, open, false));
 }
 
 test "a reply's marks lie where each marker token's text ends the decode through it" {

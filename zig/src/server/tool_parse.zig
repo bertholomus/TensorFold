@@ -62,17 +62,9 @@ fn allSpace(s: []const u8) bool {
     return strip(s).len == 0;
 }
 
-/// The first DeepSeek-V4.1 calls opener at or after `from` that opens a block, or null: markup, and not inside a
-/// DeepSeek-V4 block that opened first (its argument's text).
-fn open41(text: []const u8, from: usize, marks: ?*const reply_text.Marks) ?usize {
-    var at = from;
-    while (markup(text, dsml41_open, at, marks)) |s| {
-        const v4 = markup(text, dsml_open, at, marks) orelse return s;
-        if (v4 > s) return s;
-        at = (find(text, dsml_close, v4 + dsml_open.len) orelse return null) + dsml_close.len; // unclosed, it runs to the end
-    }
-    return null;
-}
+/// The first DeepSeek-V4.1 calls opener at or after `from` that opens a block: reply_text's, which the prose hider reads
+/// too.
+const open41 = reply_text.open41;
 
 /// (start, end, payload) of each tool-call block in order; a block inside an earlier one is part of it. DeepSeek-V4.1's
 /// calls blocks are read first, from their own tags, and the other forms only in the text around them: a <tool_call> in
