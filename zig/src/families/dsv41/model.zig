@@ -31,6 +31,9 @@ const rdma = @import("rdma.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 4096;
+/// Rows between resume points: the served build's 2048-row grid. Kept states land on it; a pass is cut short to end at
+/// the next one it keeps, so a longer pass resumes where a 2048-row pass would.
+pub const resume_rows = 2048;
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).

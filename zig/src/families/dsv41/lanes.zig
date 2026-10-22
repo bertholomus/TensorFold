@@ -149,14 +149,41 @@ fn clashes(used: []const [2]usize, lo: usize, hi: usize) bool {
     return false;
 }
 
-/// Whether one of the prompt cache's marks has its chunk end at `at` (each kept at the chunk end at or before it).
+/// Whether one of the prompt cache's marks has its resume point at `at` (each kept at the resume point at or before it).
 fn markEnds(marks: []const u32, at: usize) bool {
-    for (marks) |w| if (w / model.chunk_rows * model.chunk_rows == at) return true;
+    for (marks) |w| if (w / model.resume_rows * model.resume_rows == at) return true;
     return false;
 }
 
+/// A pass of `n` rows from `start` cut to end at the first state it keeps (the last resume point or a mark's), so that
+/// state stands at a pass end.
+fn cutAtKeep(marks: []const u32, last_end: usize, replay: usize, len: usize, start: usize, n: usize) usize {
+    var end = start + n;
+    if (last_end > start and last_end < end) end = last_end;
+    for (marks) |w| {
+        const k = w / model.resume_rows * model.resume_rows;
+        if (k > start and k < end and k <= replay and k < len) end = k;
+    }
+    return end - start;
+}
+
+test "cutAtKeep ends a long pass at the resume point it keeps" {
+    const r = model.resume_rows;
+    const c = model.chunk_rows;
+    // no state to keep inside: the whole pass
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{}, 0, 10 * r, 10 * r, 0, c));
+    // the last resume point inside the pass
+    try std.testing.expectEqual(@as(usize, r), cutAtKeep(&.{}, 3 * r, 10 * r, 10 * r, 2 * r, c));
+    // a mark floors to its resume point; the nearer of the two wins
+    try std.testing.expectEqual(@as(usize, r), cutAtKeep(&.{@intCast(3 * r + 5)}, 9 * r, 10 * r, 10 * r, 2 * r, c));
+    // a mark past the replay or at the prompt's end keeps nothing
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{@intCast(r)}, 0, r - 1, 10 * r, 0, c));
+    // a resume point at the pass end needs no cut
+    try std.testing.expectEqual(@as(usize, c), cutAtKeep(&.{@intCast(c)}, c, 10 * r, 10 * r, 0, c));
+}
+
 /// Room left past a kept state's extent while placements fit so, for its conversation's next turn to resume in place.
-pub const growth_rows = 16 * model.chunk_rows;
+pub const growth_rows = 16 * model.resume_rows;
 
 /// The first fit of `size` clear of `live` and of kept extents plus growth_rows, else of their extents, else of their rows.
 pub fn placeSoft(gpa: std.mem.Allocator, live: []const [2]usize, kept: []const [3]usize, size: usize, cap: usize) !?usize {
@@ -315,7 +342,7 @@ pub const Snap = struct {
 };
 
 /// Kept states this long or longer say so in the log when they go stale (their prompts then run again from 0).
-const note_rows = 32 * model.chunk_rows;
+const note_rows = 32 * model.resume_rows;
 
 fn noteStale(sn: *const Snap, why: []const u8) void {
     if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
@@ -622,7 +649,7 @@ pub const Lanes = struct {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
-            const n = @min(model.chunk_rows, len - start);
+            const n = cutAtKeep(s.reuse.marks, f.last_end, f.replay, len, start, @min(model.chunk_rows, len - start));
             if (try self.begin(.fill_chunk)) {
                 try self.wire.int(self.gpa, u64, start);
                 try self.wire.int(self.gpa, u32, @intCast(n));
@@ -777,9 +804,9 @@ pub const Lanes = struct {
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
-        // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
-        // kept prompt), each at the chunk end at or before it
-        const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
+        // where this pass keeps states: the cache's marks and its last resume point before the replay (the served lane's
+        // kept prompt), each at the resume point at or before it
+        const last_end = @min(replay, len - 1) / model.resume_rows * model.resume_rows;
         self.fills[slot] = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
     }
 
@@ -998,7 +1025,7 @@ pub const Lanes = struct {
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return .dropped;
         if (sn.stale) return .stale;
         if (sn.at == 0 or sn.at >= len) return .short;
-        if (sn.at % model.chunk_rows != 0) return .off_chunk;
+        if (sn.at % model.resume_rows != 0) return .off_chunk;
         if (sn.at > len -| self.m.cfg.window) return .near_end;
         return null;
     }
@@ -1073,7 +1100,7 @@ pub const Lanes = struct {
         const self = of(ptr);
         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
-        if (at == 0 or at % model.chunk_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+        if (at == 0 or at % model.resume_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
         sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
