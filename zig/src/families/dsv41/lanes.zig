@@ -383,6 +383,11 @@ const Images = struct { spans: std.ArrayList(@import("prompt.zig").Span) = .empt
 /// in place and every kept state stays) before other kept states give their room for a copy of it.
 const held_wait_ns: u64 = 10 * std.time.ns_per_s;
 
+/// Below this position a prompt pass runs model.resume_rows rows: a 4096-row pass scores its own later keys in the
+/// indexer, which costs more than it saves near the prompt's start (slot pps: the 8K row 2,798 tok/s from 8192 vs
+/// 2,650 from 0; 128K 2,947 vs 2,949).
+pub const pass_from_default = 8192;
+
 /// First tokens a handle names (each prompt's draw, read back right after its prefill).
 const ring = 1024;
 
@@ -424,11 +429,11 @@ pub const Lanes = struct {
     // whole, as served
     fill_chunks: usize = 0,
     fill_first: usize = 0,
-    // a prompt pass's rows at most: model.resume_rows below TF_DS_PASS_FROM positions (0: none), then
-    // TF_DS_PASS_ROWS (a multiple of model.resume_rows up to model.chunk_rows; unset: model.chunk_rows). The same bits
-    // at any: a pass ends on the resume grid either way
+    // a prompt pass's rows at most: model.resume_rows below TF_DS_PASS_FROM positions (default pass_from_default),
+    // then TF_DS_PASS_ROWS (a multiple of model.resume_rows up to model.chunk_rows; unset: model.chunk_rows). The same
+    // bits at any: a pass ends on the resume grid either way
     pass_rows: usize = model.chunk_rows,
-    pass_from: usize = 0,
+    pass_from: usize = pass_from_default,
     // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
     // drawn again among the grammar's tokens), and a row with the disallowed tokens at -inf
     first_row: []f32 = &.{},

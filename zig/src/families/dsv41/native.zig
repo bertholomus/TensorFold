@@ -37,7 +37,7 @@
 //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
 //!   TF_DS_PASS_ROWS=N, TF_DS_PASS_FROM=P        a prompt pass's rows at most (a multiple of 2,048 up to the build's
-//!                                               pass rows), passes of 2,048 below position P; the same bits
+//!                                               pass rows), passes of 2,048 below position P (8192 unless set)
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
