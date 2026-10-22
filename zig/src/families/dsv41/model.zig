@@ -170,6 +170,7 @@ pub const Model = struct {
         m.gpa = gpa;
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         try prompt.splitEnv(); // TF_DS_IDX_SPLIT: every rank alike too
+        prompt.aliasEnv(); // TF_DS_PROMPT_ALIAS: this rank's memory only
         m.spans = .empty;
         m.img_buf = null;
         m.host = std.heap.ArenaAllocator.init(gpa);

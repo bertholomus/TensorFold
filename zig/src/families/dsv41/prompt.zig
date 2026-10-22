@@ -103,6 +103,45 @@ pub const Arena = struct {
     }
 };
 
+/// TF_DS_PROMPT_ALIAS's shared regions (Chunk.init): each member's field, its region and its bytes as its own take
+/// would take them; place() takes each region once at its largest member's bytes and points every member at its start.
+/// Off: every member's own take, in the served order (the same pieces at the same places).
+const Regions = struct {
+    on: bool,
+    size: [5]usize = @splat(0),
+    at: [32]*u64 = undefined,
+    of: [32]u8 = undefined,
+    n: usize = 0,
+    used: usize = 0, // the members' bytes
+
+    fn take(r: *Regions, a: *Arena, g: u8, p: *u64, bytes: usize) !void {
+        if (!r.on) {
+            p.* = try a.take(bytes);
+            return;
+        }
+        if (r.n == r.at.len) return error.TooManySharedBuffers;
+        r.size[g] = @max(r.size[g], bytes);
+        r.at[r.n] = p;
+        r.of[r.n] = g;
+        r.n += 1;
+        r.used += bytes;
+        p.* = 0;
+    }
+
+    fn place(r: *Regions, a: *Arena) !void {
+        if (!r.on) return;
+        var base: [5]u64 = @splat(0);
+        var total: usize = 0;
+        for (r.size, &base) |s, *b| {
+            if (s == 0) continue;
+            b.* = try a.take(s);
+            total += s;
+        }
+        for (r.at[0..r.n], r.of[0..r.n]) |p, g| p.* = base[g];
+        std.log.info("the prompt pass's scratch: {d} buffers of {d} MiB in shared regions of {d} MiB (TF_DS_PROMPT_ALIAS)", .{ r.n, r.used >> 20, total >> 20 });
+    }
+};
+
 /// A RoPE kind's tables on the device: cos, sin fp32 [rows, rope_dim / 2] (ops.RopeTables' rows).
 pub const Rope = struct { cos: u64, sin: u64 };
 
@@ -281,6 +320,30 @@ pub const Chunk = struct {
         const o_lora = l0.wo_a[0].n;
         const ex = l0.experts;
         const sl = e.slots();
+        // TF_DS_PROMPT_ALIAS: the large scratch in five regions (pipeline/PASS-ALIAS-TP2.md), a region's members never
+        // live at once, each written whole by its own launches before a read:
+        //   0: ekg (the Engram gather), xs.z (the experts), ws.w (inside a GEMM), cand (a keyed indexer), gm (a MoE
+        //      gather to the next layer's first mix), ga (the attention gather to the FFN mixes), score (an indexer
+        //      from the candidate source on), xf (the index weights' and the gate's fp32 rows)
+        //   1: ek (the Engram layers), keys (a keyed indexer: before the candidate source), pool (the candidate source
+        //      to the last indexer), taps (the first tap layer to the chunk's end)
+        //   2: xs.xg, xs.xd (the experts), kv (the Engram sum), o, pa (the attention's out and partial), pm (the
+        //      experts' partial to its gather), pidx (the candidate source's blocks), iq (the index queries before fp4)
+        //   3: xs.xu (the experts), q (the queries to the sparse attention), u (wo_a to wo_b)
+        //   4: ws.xh (inside a GEMM), iq4 (the fp4 index queries, between GEMMs)
+        // Never shared: h, h_alt and x, cidx (from an indexer to the next), the experts' grouping (ids, count, counts,
+        // members), xsd (its epoch), cuBLAS's workspace, gxh, gz and the counters (rounds and the drafter), neg, every
+        // and ws.h (filled once). Region 1 needs its layers in that order; the four-node split has buffers of its own.
+        if (alias) {
+            if (e.two != null) return notPorted(@src());
+            var last: usize = 0; // the last indexer or Engram layer: the taps come after it
+            for (e.w.layers, 0..) |lay, li| {
+                if (lay.engram_wkv != null and li >= c.candidate_source) return error.PromptAliasLayers;
+                if (lay.idx_wq_b != null or lay.engram_wkv != null) last = li;
+            }
+            for (c.dspark_taps.slice()) |li| if (li <= last) return error.PromptAliasLayers;
+        }
+        var rg: Regions = .{ .on = alias };
         var ch: Chunk = undefined;
         ch.spans = &.{};
         ch.img_rows = 0;
@@ -303,13 +366,13 @@ pub const Chunk = struct {
         ch.qa = try a.take(cap * l0.wq_a.n * 2);
         ch.y = try a.take(cap * hd * 2);
         ch.qr = try a.take(cap * l0.wq_a.n * 2);
-        ch.q = try a.take(cap * hl * hd * 2);
+        try rg.take(a, 3, &ch.q, cap * hl * hd * 2);
         ch.wsrc = try a.take((c.window - 1 + cap) * hd * 2);
         ch.wlo = try a.take(8);
-        ch.o = try a.take(cap * hl * hd * 2);
-        ch.u = try a.take(cap * groups * o_lora * 2);
-        ch.pa = try a.take(cap * d * 4);
-        ch.ga = try a.take(e.world * cap * d * 4);
+        try rg.take(a, 2, &ch.o, cap * hl * hd * 2);
+        try rg.take(a, 3, &ch.u, cap * groups * o_lora * 2);
+        try rg.take(a, 2, &ch.pa, cap * d * 4);
+        try rg.take(a, 0, &ch.ga, e.world * cap * d * 4);
         ch.neg = try a.take(cap * 8);
         ch.ring_idx = try a.take((c.window + ring_extra) * 8);
         ch.rslot = try a.take(ring_extra * 8);
@@ -317,15 +380,15 @@ pub const Chunk = struct {
         ch.pl_ = try a.take(ring_extra * hl * tri_attn.attn_splits * 4);
         ch.po_ = try a.take(ring_extra * hl * tri_attn.attn_splits * hd * 4);
         ch.invalid = try a.take(4);
-        ch.xf = try a.take(cap * d * 4);
+        try rg.take(a, 0, &ch.xf, cap * d * 4);
         ch.gate_f = try a.take(c.experts * d * 4);
         ch.logits = try a.take(cap * c.experts * 4);
         ch.pick = try a.take(cap * sl * 4);
         ch.wts = try a.take(cap * sl * 4);
         ch.pick_vl = try a.take(cap * sl * 4);
         ch.wts_vl = try a.take(cap * sl * 4);
-        ch.pm = try a.take(cap * d * 4);
-        ch.gm = try a.take(e.world * cap * d * 4);
+        try rg.take(a, 2, &ch.pm, cap * d * 4);
+        try rg.take(a, 0, &ch.gm, e.world * cap * d * 4);
         // compressed layers: the smallest ratio sets the most compressed entries a row can see
         var min_ratio: usize = 0;
         for (e.w.layers) |lay| {
@@ -342,17 +405,17 @@ pub const Chunk = struct {
             ch.groups = try a.take(cap * 8);
             ch.gpos = try a.take(cap * 8);
             ch.raw_idx = try a.take(raw_rows * 8);
-            ch.iq = try a.take(cap * ih * 2);
-            ch.iq4 = try a.take(cap * ih * 2);
+            try rg.take(a, 2, &ch.iq, cap * ih * 2);
+            try rg.take(a, 4, &ch.iq4, cap * ih * 2);
             ch.wl = try a.take(cap * c.index_heads * 4);
             ch.iw = try a.take(cap * c.index_heads * 2);
             ch.vis = try a.take(cap * 8);
             ch.vis_blk = try a.take(cap * 8);
             // the indexer's row blocks keep rows * n_comp under 2^24 (model.py rb), so their keys under key_elems
             const ke: usize = @min(cap * ch.max_comp, key_elems); // (typed: @min with a comptime bound narrows)
-            ch.keys = try a.take(ke * 8);
+            try rg.take(a, 1, &ch.keys, ke * 8);
             ch.key_cap = ke;
-            ch.score = try a.take(ke * 4);
+            try rg.take(a, 0, &ch.score, ke * 4);
             ch.tmax = try a.take((ke / tri_index.tile + cap) * 8);
             ch.cidx = try a.take(cap * c.index_topk * 8);
             ch.ktop = try a.take(cap * c.index_topk * 8);
@@ -361,9 +424,9 @@ pub const Chunk = struct {
             const cb = c.candidate_block;
             ch.pool_ms = (ch.max_comp + cb - 1) / cb;
             if (ch.pool_ms > c.candidate_blocks) {
-                ch.pool = try a.take(cap * ch.pool_ms);
+                try rg.take(a, 1, &ch.pool, cap * ch.pool_ms);
                 ch.bmax = try a.take(@max(16 * ch.pool_ms, key_elems / cb + cap) * 4);
-                ch.pidx = try a.take(cap * c.candidate_blocks * 8);
+                try rg.take(a, 2, &ch.pidx, cap * c.candidate_blocks * 8);
             }
             ch.every = try a.take(cap * 8);
             {
@@ -374,7 +437,8 @@ pub const Chunk = struct {
                 try e.s.synchronize(); // (the host copy is freed next)
             }
             if (tri_index.prunes(ch.max_comp, c.index_topk)) {
-                ch.pbufs = .{ .tpos = try a.take(pruned_rows * c.index_topk * 8), .cand = try a.take(pruned_rows * c.index_topk * tri_index.tile * 8), .every = ch.every };
+                ch.pbufs = .{ .tpos = try a.take(pruned_rows * c.index_topk * 8), .cand = 0, .every = ch.every };
+                try rg.take(a, 0, &ch.pbufs.cand, pruned_rows * c.index_topk * tri_index.tile * 8);
             }
             if (split_from != 0 and ch.max_comp >= split_from and e.comm.world > 1) {
                 ch.split_top = try a.take(cap * c.index_topk * 8);
@@ -385,19 +449,18 @@ pub const Chunk = struct {
             const ew = lay.engram_wkv orelse continue;
             const en = if (e.two) |t| t.engramWidth() else ew.n; // the summed projection's width (2D: both pairs')
             ch.eb = try a.take(cap * ew.k * 2);
-            ch.ek = try a.take(cap * ew.n * 4);
-            ch.ekg = try a.take(e.world * cap * en * 4);
-            ch.kv = try a.take(cap * en * 2);
+            try rg.take(a, 1, &ch.ek, cap * ew.n * 4);
+            try rg.take(a, 0, &ch.ekg, e.world * cap * en * 4);
+            try rg.take(a, 2, &ch.kv, cap * en * 2);
             break;
         }
         const sz = exl3_experts.Scratch.sizes(cap, sl, ex.dims, ex.width + if (ex.rest) |r| r.width else 0, ex.count); // parity: the pack
-        var xs: exl3_experts.Scratch = undefined;
-        xs.rows = cap;
-        xs.slots = sl;
+        ch.xs.rows = cap;
+        ch.xs.slots = sl;
+        const shared = [_]?u8{ 2, 3, 2, 0, null, null, null, null, null, null, null }; // xg, xu, xd, z: the regions'
         inline for (.{ "xg", "xu", "xd", "z", "no_y", "ids", "count", "counts", "members", "work_gu", "work_d" }, 0..) |f, j| {
-            @field(xs, f) = try a.take(sz[j]);
+            if (shared[j]) |g| try rg.take(a, g, &@field(ch.xs, f), sz[j]) else @field(ch.xs, f) = try a.take(sz[j]);
         }
-        ch.xs = xs;
         ch.xsd = try decodeScratch(e, a, ex, sl);
         if (e.two) |t| try t.clearRest(e); // parity: the rest launches' grouping starts empty
         ch.gl = try a.take(16 * (d / 256) * c.experts * 4);
@@ -422,7 +485,10 @@ pub const Chunk = struct {
                 max_kn = @max(max_kn, @as(usize, l.k) * l.n);
             }
         }
-        ch.ws = .{ .xh = try a.take(cap * max_xk * 2), .w = try a.take(max_kn * 2), .h = try a.take(128 * 128 * 2) };
+        ch.ws = .{ .xh = 0, .w = 0, .h = 0 };
+        try rg.take(a, 4, &ch.ws.xh, cap * max_xk * 2);
+        try rg.take(a, 0, &ch.ws.w, max_kn * 2);
+        ch.ws.h = try a.take(128 * 128 * 2);
         ch.blas_ws = try a.take(cublas.Blas.workspace_bytes);
         // grouped linears: every layer's counters (int32 [8 N / 128], zeros, left zero by each launch), the largest
         // group's rotated rows and partials at 128 rows
@@ -454,10 +520,12 @@ pub const Chunk = struct {
             max_gz = @max(max_gz, exl3_linear.zFloats(kv[0..ds.blocks.len], 128));
             try addLinear(e, &ch, a, ds.main_proj, &max_gk, &max_gz);
         }
-        ch.taps = try a.take(@max(c.dspark_taps.slice().len, 1) * cap * d * 2);
+        try rg.take(a, 1, &ch.taps, @max(c.dspark_taps.slice().len, 1) * cap * d * 2);
         ch.gxh = try a.take(128 * max_gk * 2);
         ch.gz = try a.take(@max(max_gz, 1) * 4);
+        try rg.place(a);
         // the scratch as experts.py makes it: zeros, the member lists -1
+        const xs = ch.xs;
         for ([_]u64{ xs.xg, xs.xu, xs.xd, xs.z, xs.no_y, xs.ids, xs.count, xs.counts }, [_]usize{ sz[0], sz[1], sz[2], sz[3], sz[4], sz[5], sz[6], sz[7] }) |p, n| try fill(e, p, 0, n);
         try fill32(e, xs.members, 0xffffffff, sz[8] / 4);
         try fill(e, ch.neg, 0xff, cap * 8);
@@ -740,6 +808,18 @@ pub fn splitEnv() !void {
     const x = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return error.BadIdxSplit;
     split_from = if (x == 1) idx_split.default_min else x;
     if (split_from != 0) std.log.info("the keyed indexer layers' rows of {d} columns or more split over the nodes (TF_DS_IDX_SPLIT)", .{split_from});
+}
+
+/// TF_DS_PROMPT_ALIAS=1 (model.zig and the layer gate read it; unset or 0: as served): the prompt pass's large
+/// scratch in five shared regions (Chunk.init), ~1.6 GiB less a rank at 2,048 rows and a 1M context, room for the
+/// pool. Every launch reads the bytes it reads as served, so no reply moves. A rank's own memory: the ranks need not
+/// agree. TP2 only (the four-node split: not ported).
+pub var alias = false;
+
+pub fn aliasEnv() void {
+    const v = std.c.getenv("TF_DS_PROMPT_ALIAS") orelse return;
+    alias = std.mem.eql(u8, std.mem.span(v), "1");
+    if (alias) std.log.info("the prompt pass's scratch in shared regions (TF_DS_PROMPT_ALIAS)", .{});
 }
 
 /// attention_k: the partial pa [n, D] fp32 of this rank's heads; the chunk's keys go into the layer's window ring
