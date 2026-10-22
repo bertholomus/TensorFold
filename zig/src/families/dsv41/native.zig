@@ -57,7 +57,7 @@ pub const formats: []const []const u8 = &.{"exl3-mul1"};
 pub const default_context: i64 = 262144;
 pub const max_segments: u32 = 1;
 /// The served build's prompt chunk (TF_DS_PREFILL_CHUNK).
-pub const prompt_rows: u32 = 2048;
+pub const prompt_rows: u32 = 4096;
 /// The served lane's reasoning effort numbers (text.zig): the server passes each name and the template hears its number.
 pub const efforts = @import("text.zig").efforts;
 

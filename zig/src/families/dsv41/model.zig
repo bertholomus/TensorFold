@@ -30,7 +30,7 @@ const ring2d = @import("ring2d.zig");
 const rdma = @import("rdma.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
-pub const chunk_rows = 2048;
+pub const chunk_rows = 4096;
 /// The pool's streams (--parallel 4).
 pub const max_streams = draft.max_streams;
 /// The pool's streams when unset (--parallel 4).
