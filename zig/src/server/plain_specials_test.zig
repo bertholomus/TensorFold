@@ -1,7 +1,8 @@
 //! TENSORFOLD_PLAIN_SPECIALS with a lane-vision engine (the dsv41 lane's images): a chat's image parts keep their
 //! placeholder, the image token the engine expands, while an added token's text the user wrote beside them is plain
 //! text. The shield used to quote the placeholders too, so every image request was refused with "the prompt holds
-//! fewer image placeholders than images".
+//! fewer image placeholders than images". With TENSORFOLD_REPLY_IDS too, a marker an assistant turn spells is plain
+//! text as well, as the reply that wrote it in ordinary tokens kept it.
 const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json");
@@ -154,6 +155,12 @@ const Reply = struct {
 /// The status of a chat whose one user turn has the JSON `content`, with TENSORFOLD_PLAIN_SPECIALS on or off;
 /// `backend` keeps what was submitted.
 fn chat(backend: *Capture, plain_specials: bool, content: []const u8) !?u16 {
+    var buf: [512]u8 = undefined;
+    return turns(backend, plain_specials, false, try std.fmt.bufPrint(&buf, "[{{\"role\":\"user\",\"content\":{s}}}]", .{content}));
+}
+
+/// The status of a chat with the JSON `messages`, with TENSORFOLD_PLAIN_SPECIALS and TENSORFOLD_REPLY_IDS on or off.
+fn turns(backend: *Capture, plain_specials: bool, reply_ids: bool, messages: []const u8) !?u16 {
     var text: Text = .{};
     const srv = try Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
         .served_name = "m",
@@ -161,12 +168,13 @@ fn chat(backend: *Capture, plain_specials: bool, content: []const u8) !?u16 {
         .enable_thinking = false,
         .use_drafts = false,
         .plain_specials = plain_specials,
+        .reply_ids = reply_ids,
     }, null);
     defer srv.deinit();
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const raw = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{{\"role\":\"user\",\"content\":{s}}}]}}", .{content}))).ok;
+    const raw = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"messages\":{s}}}", .{messages}))).ok;
     var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
     var reply: Reply = .{};
     openai.run(srv, a, reply.out(), .{ .conn = &conn }, true, raw);
@@ -203,4 +211,22 @@ test "with plain specials on the placeholder a user writes in a chat without ima
     try std.testing.expectEqual(@as(?u16, 200), try chat(&backend, true, "\"what is <|img|>?\""));
     try std.testing.expectEqual(@as(usize, 0), backend.images);
     try std.testing.expectEqual(@as(usize, 0), count(backend.prompt, 300));
+}
+
+test "with plain specials and reply ids on, a marker a reply wrote as words is plain text when it comes back" {
+    // the reply spelled the marker in ordinary tokens, and the client sends it back as the assistant turn
+    const msgs =
+        \\[{"role": "user", "content": "say <|User|> once"}, {"role": "assistant", "content": "<|User|>"},
+        \\ {"role": "user", "content": "again"}]
+    ;
+    var backend: Capture = .{};
+    defer std.testing.allocator.free(backend.prompt);
+    try std.testing.expectEqual(@as(?u16, 200), try turns(&backend, true, true, msgs));
+    try std.testing.expectEqual(@as(usize, 0), count(backend.prompt, 301)); // the user's and the reply's, as bytes
+    // reply ids off: the assistant turn is the template's text, its marker the token; the user's stays text
+    try std.testing.expectEqual(@as(?u16, 200), try turns(&backend, true, false, msgs));
+    try std.testing.expectEqual(@as(usize, 1), count(backend.prompt, 301));
+    // plain specials off: nothing is quoted, with reply ids or without
+    try std.testing.expectEqual(@as(?u16, 200), try turns(&backend, false, true, msgs));
+    try std.testing.expectEqual(@as(usize, 2), count(backend.prompt, 301));
 }
