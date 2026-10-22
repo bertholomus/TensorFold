@@ -32,6 +32,8 @@
 //!   TF_FILL_ROUNDS, TF_FILL_FIRST               rounds between (TF_FILL_ROUNDS of them, 4 unless set); its first
 //!                                               piece TF_FILL_FIRST chunks (unset: N), so a prompt that short runs
 //!                                               whole. One pass at a time. Unset or 0: each pass whole
+//!   TF_FILL_MANY=1                              with TF_FILL_CHUNKS: a request is admitted while a pass fills and
+//!                                               its pass runs between the other's pieces (fewest tokens left first)
 //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
@@ -173,6 +175,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (getenv("TF_DS_SERVED_K")) |t| st.lanes.served_k = if (std.mem.eql(u8, t, "1") or std.mem.eql(u8, t, "all")) .all else if (std.mem.eql(u8, t, "solo")) .solo else .off;
     if (getenv("TF_FILL_CHUNKS")) |t| st.lanes.fill_chunks = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
     if (getenv("TF_FILL_FIRST")) |t| st.lanes.fill_first = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
+    st.lanes.fill_many = if (getenv("TF_FILL_MANY")) |v| !std.mem.eql(u8, v, "0") else false;
     const fill_rounds: u32 = if (getenv("TF_FILL_ROUNDS")) |t| std.fmt.parseInt(u32, t, 10) catch return error.BadFill else 4;
     st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
