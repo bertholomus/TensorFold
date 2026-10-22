@@ -222,6 +222,16 @@ pub const LaneHost = struct {
         return job.host.foregroundWaiting() or job.host.core.activeCount() > 0;
     }
 
+    /// Whether work besides this job's prompt pass waits (a queued request, another pass, a decoding stream, a cancel):
+    /// a stepped pass then ends its step after its chunks, else it runs on (asked on the engine thread, between chunks).
+    fn othersWait(ctx: *anyopaque) bool {
+        const job: *Job = @ptrCast(@alignCast(ctx));
+        const h = job.host;
+        h.lock();
+        defer h.unlock();
+        return h.queued.items.len > 0 or h.filling.items.len > 1 or h.core.activeCount() > 0 or h.cancels.items.len > 0 or h.closing;
+    }
+
     /// A foreground request is queued (they queue ahead of every background one); the caller holds the lock.
     pub fn foregroundWaiting(h: *const LaneHost) bool {
         return h.queued.items.len > 0 and !h.queued.items[0].request.background;
@@ -355,6 +365,7 @@ pub const LaneHost = struct {
             .stop_check = if (r.stop) |s| .{ .ptr = s.ctx, .check = s.check } else null,
             .cancel_check = .{ .ptr = job, .check = cancelled },
             .yield_check = if (r.background and r.max_tokens == 0) .{ .ptr = job, .check = yieldsTo } else null,
+            .share_check = .{ .ptr = job, .check = othersWait },
             .think_budget = r.think_budget,
             .think_close = r.think_close,
             .think_end = if (r.think_end) |t| t else -1,

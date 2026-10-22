@@ -420,7 +420,8 @@ pub const Lanes = struct {
     imgs: [max_streams]Images = @splat(.{}),
     // TF_FILL_CHUNKS: a prompt pass runs this many chunks a step of the lane core's (prefill_step, one pass at a time),
     // the other streams' rounds between its steps; its first step TF_FILL_FIRST chunks (0: as many), so a prompt that
-    // short runs whole. 0: each pass whole, as served
+    // short runs whole. A step runs on past them while nothing else waits (the stream's share_check). 0: each pass
+    // whole, as served
     fill_chunks: usize = 0,
     fill_first: usize = 0,
     // structured output: the prompt's last row of the last stream with a grammar prefilled (its first token may be
@@ -645,7 +646,8 @@ pub const Lanes = struct {
             m.fill_seq = &.{};
         }
         var ran: usize = 0;
-        while (f.start < f.len and ran < chunks) : (ran += 1) {
+        // past its chunks the pass runs on while nothing else waits (s.shares), so a pass alone runs as a whole one
+        while (f.start < f.len and (ran < chunks or !s.shares())) : (ran += 1) {
             const start = f.start;
             const len = f.len;
             if (start > 0 and s.isCancelled()) return error.Cancelled;
