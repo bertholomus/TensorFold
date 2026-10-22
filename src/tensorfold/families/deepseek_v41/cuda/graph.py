@@ -221,17 +221,17 @@ class GraphRunner:
         return sorted(out, reverse=True)
 
     def warm(self, sc: SeqCache, limit: int) -> dict:
-        """Capture every graph a request can replay before serving: one row without taps (serial decode) and 2 ..
-        max_rows rows with taps (verify windows) at every context bucket, the largest bucket first so it sizes the
-        shared pool. Same order on every rank (each capture issues real gathers)."""
+        """Capture every graph a request can replay before serving: one row without taps (serial decode) and, with
+        drafts, 1 .. max_rows rows with taps (verify windows; one row when a grammar cut every draft) at every context
+        bucket, the largest bucket first so it sizes the shared pool. Same order on every rank (each capture gathers)."""
 
         self.bind(sc)
         t0 = time.perf_counter()
         r0 = torch.cuda.memory_reserved()
         n_new = 0
+        verify = [(n, True) for n in range(self.max_rows, 0, -1)] if self.max_rows > 1 else []
         for b in self.buckets(limit, sc.cap):
-            for n in range(self.max_rows, 0, -1):
-                taps = n > 1
+            for n, taps in verify + [(1, False)]:
                 if (n, b, taps) in self.graphs:
                     continue
                 self._capture(sc, n, b, taps, [0] * n, b - n, None)
