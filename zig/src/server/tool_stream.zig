@@ -52,6 +52,7 @@ pub const Streamer = struct {
     searched: usize = 0, // the answer is only ever extended, so prose already searched holds no opener
     tools: []const Value,
     dsml_start: ?usize = null,
+    dsml_close: []const u8 = reply_text.calls[2][1], // the closer of the DSML block at `dsml_start`: V4's or V4.1's
     dsml_searched: usize = 0,
     dsml_seen: bool = false,
     buffered_start: usize = 0,
@@ -113,14 +114,14 @@ pub const Streamer = struct {
                         }
                     }
                     const dsml_open = reply_text.calls[2][0];
-                    const dsml_close = reply_text.calls[2][1];
+                    const dsml41_open = reply_text.calls[3][0];
                     if (s.dsml_start) |start| {
-                        const from = @max(s.pos, s.dsml_searched -| (dsml_close.len - 1));
-                        const end = reply_text.findTag(text, from, dsml_close) orelse {
+                        const from = @max(s.pos, s.dsml_searched -| (s.dsml_close.len - 1));
+                        const end = reply_text.findTag(text, from, s.dsml_close) orelse {
                             s.dsml_searched = text.len;
                             return;
                         };
-                        s.pos = end + dsml_close.len;
+                        s.pos = end + s.dsml_close.len;
                         s.searched = s.pos;
                         s.dsml_start = null;
                         const parsed = try tool_parse.parseMarked(s.a, text[start..s.pos], s.tools, null, s.marks);
@@ -133,7 +134,23 @@ pub const Streamer = struct {
                         if (std.mem.startsWith(u8, text[start..], dsml_open) and (s.marks == null or s.marks.?.real(text, start, dsml_open))) {
                             s.dsml_seen = true;
                             s.dsml_start = start;
+                            s.dsml_close = reply_text.calls[2][1];
                             s.pos = start + dsml_open.len;
+                            s.dsml_searched = s.pos;
+                            break;
+                        }
+                        if (std.mem.startsWith(u8, text[start..], dsml41_open) and (s.marks == null or s.marks.?.real(text, start, dsml41_open))) {
+                            // DeepSeek-V4.1's block is read whole, as the parser reads it: nothing in it streams as a call of
+                            // its own. Before any call has streamed, the reply's calls go at its end (when none streamed);
+                            // after one, the block's calls stream once it closes, in the reply's order
+                            if (!s.streamed) {
+                                s.state = .abort;
+                                return;
+                            }
+                            s.dsml_seen = true;
+                            s.dsml_start = start;
+                            s.dsml_close = reply_text.calls[3][1];
+                            s.pos = start + dsml41_open.len;
                             s.dsml_searched = s.pos;
                             break;
                         }

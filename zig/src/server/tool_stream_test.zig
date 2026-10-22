@@ -74,16 +74,19 @@ fn sentArguments(a: Allocator, deltas: []const Value) Allocator.Error![]const u8
     return out.items;
 }
 
+/// A DSML call to lookup whose one argument a test fills, (before, after): DeepSeek-V4's spelling and V4.1's.
+const dsml_blocks = [_][2][]const u8{
+    .{ "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"><｜DSML｜parameter name=\"q\" string=\"true\">", "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>" },
+    .{ "<｜DSML｜ calls><｜DSML｜ invoke name=\"lookup\"><｜DSML｜ parameter name=\"q\" string=\"true\">", "</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>" },
+};
+
 test "DSML containment survives every byte boundary and preserves adjacent call order" {
-    const prefix = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\">" ++
-        "<｜DSML｜parameter name=\"q\" string=\"true\">";
-    const suffix = "</｜DSML｜parameter></｜DSML｜invoke></｜DSML｜tool_calls>";
     const legacy = "<tool_call><function=lookup></function></tool_call>";
-    for ([_][]const u8{ legacy, "<tool_call><function=lookup></function>" }) |literal| {
+    for (dsml_blocks) |block| for ([_][]const u8{ legacy, "<tool_call><function=lookup></function>" }) |literal| {
         var outer_arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer outer_arena.deinit();
         const outer_a = outer_arena.allocator();
-        const text = try std.mem.concat(outer_a, u8, &.{ legacy, prefix, literal, suffix, legacy });
+        const text = try std.mem.concat(outer_a, u8, &.{ legacy, block[0], literal, block[1], legacy });
         const expected = try std.mem.concat(outer_a, u8, &.{ "{}{\"q\":", try json.quote(outer_a, literal, .{}), "}{}" });
         for (0..text.len + 1) |boundary| {
             var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -105,23 +108,21 @@ test "DSML containment survives every byte boundary and preserves adjacent call 
             try std.testing.expectEqual(@as(i64, 3), calls);
             try std.testing.expectEqualStrings(expected, try sentArguments(a, out.items));
         }
-    }
+    };
 }
 
 test "unfinished DSML retains containment through byte feeds and final closeCall" {
-    const prefix = "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\">" ++
-        "<｜DSML｜parameter name=\"q\" string=\"true\">";
     const literals = [_][]const u8{
         "<tool_call><function=lookup></function></tool_call>",
         "<tool_call><function=lookup></function>",
         "<tool_call>{\"name\":\"lookup\",\"arguments\":{}",
     };
-    for (literals) |literal| {
+    for (dsml_blocks) |block| for (literals) |literal| {
         var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
         defer arena.deinit();
         const a = arena.allocator();
         const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
-        const text = try std.mem.concat(a, u8, &.{ prefix, literal });
+        const text = try std.mem.concat(a, u8, &.{ block[0], literal });
         var s = try Streamer.init(a, tools);
         var out: std.ArrayList(Value) = .empty;
         for (0..text.len + 1) |n| {
@@ -133,7 +134,32 @@ test "unfinished DSML retains containment through byte feeds and final closeCall
         try s.feed(try std.mem.concat(a, u8, &.{ text, tail }), &out);
         try std.testing.expectEqual(@as(usize, 0), out.items.len);
         try std.testing.expect(!s.streamed);
+    };
+}
+
+test "a DeepSeek-V4.1 block before any streamed call leaves the reply's calls to its end, in order" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const tools = (try json.parse(a, "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\"}}]")).ok.array;
+    const legacy = "<tool_call><function=lookup></function></tool_call>";
+    // a Qwen call quoted in the block's argument, then one of the reply's own after the block
+    const text = try std.mem.concat(a, u8, &.{ "Checking. ", dsml_blocks[1][0], legacy, dsml_blocks[1][1], legacy });
+    for (0..text.len + 1) |n| {
+        var s = try Streamer.init(a, tools);
+        var out: std.ArrayList(Value) = .empty;
+        try s.feed(text[0..n], &out);
+        try s.feed(text, &out);
+        try std.testing.expectEqual(@as(usize, 0), out.items.len);
+        try std.testing.expect(!s.streamed);
     }
+    // what the stream's end sends when no call streamed (openai.zig): the parse's calls, the block's first
+    const r = try tool_parse.parse(a, text, tools, null);
+    try std.testing.expectEqualStrings("Checking.", r.content);
+    try std.testing.expectEqual(@as(usize, 2), r.calls.?.len);
+    const quoted = (try json.parse(a, r.calls.?[0].get("function").?.strField("arguments").?)).ok;
+    try std.testing.expectEqualStrings(legacy, quoted.strField("q").?);
+    try std.testing.expectEqualStrings("{}", r.calls.?[1].get("function").?.strField("arguments").?);
 }
 
 test "malformed closed DSML masks its nested XML and resumes the next legitimate call" {
