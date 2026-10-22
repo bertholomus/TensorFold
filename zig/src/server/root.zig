@@ -56,6 +56,7 @@ test {
     _ = @import("effort_values_test.zig");
     _ = @import("compact_test.zig");
     _ = @import("completion_prompt_test.zig");
+    _ = @import("cache_salt_test.zig");
     _ = @import("server_init_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");

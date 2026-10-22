@@ -582,6 +582,7 @@ pub fn note(comptime fmt: []const u8, args: anytype) void {
 
 test {
     _ = @import("prompt_cache_test.zig");
+    _ = @import("cache_salt.zig");
     _ = @import("prompt_cache_learn_test.zig");
     _ = @import("prompt_cache_rewind_test.zig");
     _ = @import("prompt_cache_branch_test.zig");

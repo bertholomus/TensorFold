@@ -5,6 +5,8 @@ const Allocator = std.mem.Allocator;
 
 /// The server's name for one request, unique while the process lives.
 pub const tfvideo = @import("tfvideo.zig");
+/// ``cache_salt``: a salted request's cache key.
+pub const cache_salt = @import("cache_salt.zig");
 
 pub const Id = u64;
 
