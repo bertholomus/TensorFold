@@ -206,7 +206,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
     if (args.thinking and std.mem.indexOf(u8, s.text.templateSource(), "enable_thinking") != null)
         log.line("thinking on (the chat template's default): replies reason in reasoning_content before the answer in content, and max_tokens counts both. --no-thinking turns it off; a request can send chat_template_kwargs {{\"enable_thinking\": false}}", .{});
     if (s.recall) |r| recall_routes.line(r);
-    if (srv.shield) |sh| log.line("plain specials on (TENSORFOLD_PLAIN_SPECIALS): the text of {d} added tokens is ordinary text where users, tools or search results wrote it and in tool calls; the template's own markers keep their ids", .{sh.added});
+    if (srv.shield) |sh| log.line("plain specials on (TENSORFOLD_PLAIN_SPECIALS): the text of {d} added tokens is ordinary text where users, tools or search results wrote it and in tool calls{s}; the template's own markers keep their ids", .{ sh.added, if (sh.replies) ", and in assistant turns (reply ids on)" else "" });
     if (reply_ids) log.line("reply ids on (TENSORFOLD_REPLY_IDS): a reply's think block opens and closes, and its tool calls open, only at their {d} marker tokens; the same text spelled in ordinary tokens stays words", .{srv.reply_pieces.len});
     if (srv.cortheon) |c| log.line("cortheon on: chat requests get Cortheon's reasoning program, web research before building, and cortheon_search/cortheon_fetch run here ({s}); a request can send \"cortheon\": false", .{c.engine});
     live.columns_env = env(s, "COLUMNS");

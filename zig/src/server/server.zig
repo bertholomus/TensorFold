@@ -63,7 +63,8 @@ pub const Config = struct {
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
     request_log: ?[]const u8 = null,
     /// TENSORFOLD_PLAIN_SPECIALS=1: an added token's text that users, tools or search results wrote, or a tool call
-    /// carries, is ordinary text in the prompt (specials.zig); off, every prompt is the template's text tokenized whole.
+    /// carries, is ordinary text in the prompt (specials.zig), and with reply_ids an assistant turn's too; off, every
+    /// prompt is the template's text tokenized whole.
     plain_specials: bool = false,
     /// TENSORFOLD_REPLY_IDS=1: a reply's think block opens and closes, and its call blocks open, only where their
     /// marker tokens decoded (reply_text.Marks), so a reply that spells a marker in ordinary tokens keeps it as words;
@@ -166,6 +167,7 @@ pub const Server = struct {
         if (config.plain_specials) {
             const sh = try a.create(specials.Shield);
             sh.* = try specials.Shield.init(a, text, srv.info.vision, if (srv.info.lane_vision) |v| v.placeholder else null);
+            sh.replies = config.reply_ids; // a reply's words, sent back as an assistant turn, stay words
             srv.shield = sh;
         }
         if (config.reply_ids) srv.reply_pieces = try replyPieces(a, text, srv.markers);

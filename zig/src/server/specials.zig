@@ -2,7 +2,9 @@
 //! content, and tool-call arguments) is ordinary text in the prompt, so only the chat template's own markers are
 //! control tokens; the image markers stay text in every message, as images.zig keeps them (#511). DeepInfer's served
 //! prompts keep that rule (doc/inference_deployment_qa.md, 774ce244); the model maker's encoder, like ours with the
-//! switch off, tokenizes the template's whole text, a written marker as its token.
+//! switch off, tokenizes the template's whole text, a written marker as its token. With TENSORFOLD_REPLY_IDS=1 too,
+//! a reply that spells a marker in ordinary tokens keeps it as words, so an assistant turn's content and reasoning
+//! are quoted as well: the reply a client sends back reads as the words it was.
 const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json");
@@ -31,6 +33,8 @@ pub const Shield = struct {
     lengths: []const usize,
     /// The bytes a marker starts with.
     starts: [256]bool,
+    /// Config.reply_ids: an assistant turn's content and reasoning_content are quoted too, as a sender's text is.
+    replies: bool = false,
 
     /// The text's added tokens and, with image input, its image markers; `lane_placeholder`: a lane-vision engine's
     /// image placeholder (one of the added tokens). All of it lives in `a`.
@@ -62,8 +66,9 @@ pub const Shield = struct {
     }
 
     /// `messages` with each marker a sender wrote as its sentinel: every marker in user, tool and search-result
-    /// content and in tool calls, the image markers elsewhere; null when no message spells one, so the prompt is
-    /// rendered and tokenized as with the switch off. A literal sentinel is quoted too, so it reads back as itself.
+    /// content and in tool calls (with `replies`, in assistant content and reasoning_content too), the image markers
+    /// elsewhere; null when no message spells one, so the prompt is rendered and tokenized as with the switch off. A
+    /// literal sentinel is quoted too, so it reads back as itself.
     /// `lane_images`: the request's image parts are in its text as the lane's placeholder, which stays as it is.
     pub fn apply(sh: *const Shield, a: Allocator, messages: Value, lane_images: bool) !?Value {
         const keep: ?u32 = if (lane_images) sh.lane else null;
@@ -82,11 +87,13 @@ pub const Shield = struct {
         const sender = for (senders) |r| {
             if (std.mem.eql(u8, role, r)) break true;
         } else false;
+        const reply = sh.replies and std.mem.eql(u8, role, "assistant");
         const out = try json.newObject(a);
         var it = m.object.iterator();
         while (it.next()) |kv| {
             const key = kv.key_ptr.*;
-            const all = (sender and std.mem.eql(u8, key, "content")) or std.mem.eql(u8, key, "tool_calls");
+            const all = (sender and std.mem.eql(u8, key, "content")) or std.mem.eql(u8, key, "tool_calls") or
+                (reply and (std.mem.eql(u8, key, "content") or std.mem.eql(u8, key, "reasoning_content")));
             try out.put(a, key, try sh.walk(a, kv.value_ptr.*, all, keep, quoted));
         }
         return .{ .object = out };
@@ -280,6 +287,39 @@ test "a marker a sender wrote is plain text; the template's own markers and the 
         \\ {"role": "assistant", "content": "</think>done"}, {"role": "latest_reminder", "content": "<|Assistant|>"}]
     );
     try std.testing.expect((try sh.apply(a, clean, false)) == null);
+}
+
+test "with reply ids an assistant turn's content and reasoning are quoted too; its role marker stays the template's" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var sh = try Shield.init(a, Fake.text(), null, null);
+    // a reply that wrote the tag as words, sent back as the assistant turn
+    const msgs = try parse(a,
+        \\[{"role": "user", "content": "say </think> world"},
+        \\ {"role": "assistant", "content": "</think> world", "reasoning_content": "they want </think>"},
+        \\ {"role": "user", "content": "again"}]
+    );
+    var problem: []const u8 = "";
+    const rendered = try Fake.text().render(a, msgs, .{}, &problem);
+    // without reply ids the assistant's text is the template's: its </think> is the token
+    try std.testing.expectEqual(@as(usize, 1), count(try shielded(a, &sh, msgs), 1003));
+    sh.replies = true;
+    const ids = try shielded(a, &sh, msgs);
+    try std.testing.expectEqualStrings(rendered, try Fake.decode(a, ids));
+    try std.testing.expectEqual(@as(usize, 0), count(ids, 1003)); // the user's and the assistant's, words
+    try std.testing.expectEqual(@as(usize, 1), count(ids, 1001)); // the template's <|Assistant|>
+    try std.testing.expectEqual(@as(usize, 2), count(ids, 1000)); // the template's <|User|>, twice
+    const quoted = (try sh.apply(a, msgs, false)).?;
+    try std.testing.expect(std.mem.indexOf(u8, quoted.array[1].get("reasoning_content").?.string, images.sentinel) != null);
+    // the operator's text stays the template's; an assistant turn alone is quoted only with reply ids
+    const alone = try parse(a,
+        \\[{"role": "system", "content": "a <|User|> rule"}, {"role": "assistant", "content": "</think>done"}]
+    );
+    const kept = (try sh.apply(a, alone, false)).?;
+    try std.testing.expectEqualStrings("a <|User|> rule", kept.array[0].get("content").?.string);
+    sh.replies = false;
+    try std.testing.expect((try sh.apply(a, alone, false)) == null);
 }
 
 test "a literal sentinel reads back as itself once a marker is quoted, and alone changes nothing" {
