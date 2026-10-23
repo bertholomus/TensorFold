@@ -145,13 +145,13 @@ fn rebuild(srv: *Server, cx: *Cx, input: chat.Input, gone: anytype, at: CompactA
     const middle_to = split_at orelse tail;
     var tokens: usize = 0;
     const middle = try collect(a, msgs, prefix, middle_to, marker, skip);
-    var model = try update(srv, cx, gone, at, input.cache_salt, note_task, withoutExtra(prev), middle);
+    var model = try update(srv, cx, gone, at, note_task, withoutExtra(prev), middle);
     tokens += model.tokens;
     var split_text: []const u8 = "";
     if (split_at) |s| {
         const part = try collect(a, msgs, s, tail, marker, skip);
         if (part.len > 0) {
-            const piece = try update(srv, cx, gone, at, input.cache_salt, split_task, "", part);
+            const piece = try update(srv, cx, gone, at, split_task, "", part);
             split_text = piece.text;
             tokens += piece.tokens;
         }
@@ -188,7 +188,7 @@ fn rebuild(srv: *Server, cx: *Cx, input: chat.Input, gone: anytype, at: CompactA
             }
             const nxt = nextCut(msgs, tail, marker) orelse return e;
             const dropped = try collect(a, msgs, tail, nxt, marker, 0);
-            const piece = try update(srv, cx, gone, at, input.cache_salt, note_task, withoutExtra(model.text), dropped);
+            const piece = try update(srv, cx, gone, at, note_task, withoutExtra(model.text), dropped);
             model = piece;
             tokens += piece.tokens;
             tail = nxt;
@@ -218,7 +218,7 @@ pub fn keptStart(srv: *Server, a: Allocator, msgs: []const Value, keep: usize, m
     return starts.items[0];
 }
 
-fn update(srv: *Server, cx: *Cx, gone: anytype, at: CompactAt, salt: ?[]const u8, task: []const u8, prev: []const u8, msgs: []const Value) chat.Failure!Piece {
+fn update(srv: *Server, cx: *Cx, gone: anytype, at: CompactAt, task: []const u8, prev: []const u8, msgs: []const Value) chat.Failure!Piece {
     if (msgs.len == 0) return .{ .text = prev, .tokens = 0 };
     const room = chunkRoom(srv.info.context_window, at);
     var note = prev;
@@ -233,7 +233,7 @@ fn update(srv: *Server, cx: *Cx, gone: anytype, at: CompactAt, salt: ?[]const u8
             n += more;
             j += 1;
         }
-        const piece = try oneNote(srv, cx, gone, salt, task, note, msgs[i..j]);
+        const piece = try oneNote(srv, cx, gone, task, note, msgs[i..j]);
         note = piece.text;
         tokens += piece.tokens;
         i = j;
@@ -241,8 +241,7 @@ fn update(srv: *Server, cx: *Cx, gone: anytype, at: CompactAt, salt: ?[]const u8
     return .{ .text = note, .tokens = tokens };
 }
 
-/// A note's request keeps its conversation's ``cache_salt`` (null: none), so its states stay in that namespace.
-fn oneNote(srv: *Server, cx: *Cx, gone: anytype, salt: ?[]const u8, task: []const u8, prev: []const u8, msgs: []const Value) chat.Failure!Piece {
+fn oneNote(srv: *Server, cx: *Cx, gone: anytype, task: []const u8, prev: []const u8, msgs: []const Value) chat.Failure!Piece {
     const a = cx.a;
     var list: std.ArrayList(Value) = .empty;
     try list.append(a, try msg(a, "system", task));
@@ -252,11 +251,11 @@ fn oneNote(srv: *Server, cx: *Cx, gone: anytype, salt: ?[]const u8, task: []cons
     const fields = try json.newObject(a);
     try fields.put(a, "enable_thinking", .{ .bool = false });
     try fields.put(a, "temperature", .{ .float = 0 });
-    var prepared = chat.prepare(srv, cx, .{ .messages = .{ .array = list.items }, .fields = .{ .object = fields }, .max_tokens = 1024, .temperature = 0, .cache_salt = salt }, gone) catch |e| blk: {
+    var prepared = chat.prepare(srv, cx, .{ .messages = .{ .array = list.items }, .fields = .{ .object = fields }, .max_tokens = 1024, .temperature = 0 }, gone) catch |e| blk: {
         if (!(e == error.Refused and cx.kind == .context_length)) return e;
         cx.kind = .request;
         cx.message = "";
-        const fitted = chat.prepare(srv, cx, .{ .messages = .{ .array = list.items }, .fields = .{ .object = fields }, .max_tokens = 1, .temperature = 0, .cache_salt = salt }, gone) catch |e2| {
+        const fitted = chat.prepare(srv, cx, .{ .messages = .{ .array = list.items }, .fields = .{ .object = fields }, .max_tokens = 1, .temperature = 0 }, gone) catch |e2| {
             if (e2 == error.Refused and cx.kind == .context_length) {
                 cx.kind = .request;
                 cx.message = "";

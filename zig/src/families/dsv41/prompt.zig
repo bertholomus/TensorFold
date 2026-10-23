@@ -43,6 +43,11 @@ const key_elems: usize = 1 << 24;
 const pruned_rows: usize = 512;
 
 /// model.py's RING_EXTRA: window ring slots beyond the window (a verify window never clobbers a key it reads).
+/// The rows of one fp32 cuBLAS call in a prompt pass (the gate logits, the indexer weights): the 2048-row passes the
+/// served build makes. A longer pass splits these two calls at it, so its rows keep the served bits.
+pub const gemm_rows = 2048;
+/// The longest prompt pass the host-side row tables (vis, the compressor groups) hold.
+pub const max_pass_rows = 8192;
 pub const ring_extra = 16;
 /// model.py's RAW: per-position compressor inputs kept (a ratio-2 group's earlier row for the next chunk).
 pub const raw_rows = 64;
@@ -884,7 +889,7 @@ pub fn attention(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
         const src = sh.kv_layer orelse return error.NoKvSource;
         const n_comp_end = (start + n) / r;
         // vis = (pos + 1) // ratio: the compressed entries row i may see (host-made: the same integers)
-        var vis_host: [4096]i64 = undefined;
+        var vis_host: [max_pass_rows]i64 = undefined;
         if (n > vis_host.len) return error.ChunkTooLong;
         for (0..n) |i| vis_host[i] = @intCast((start + i + 1) / r);
         try upload(e, ch.vis, &vis_host, n * 8);
@@ -995,8 +1000,8 @@ fn kvSourceUpdate(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, 
     }
     sh.kv_layer = li;
     // groups first // r .. and their positions group * r (the rotations _rot reads)
-    var g_host: [4096]i64 = undefined;
-    var p_host: [4096]i64 = undefined;
+    var g_host: [max_pass_rows]i64 = undefined;
+    var p_host: [max_pass_rows]i64 = undefined;
     if (full > g_host.len) return error.ChunkTooLong;
     for (0..full) |j| {
         g_host[j] = @intCast(start / r + j);
@@ -1050,7 +1055,7 @@ fn indexer(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, li: usi
         try tri_norm.rowmm2(e.t, ch.x, c.hidden, lay.idx_proj_h, ch.wl, n, c.hidden, ih);
     } else {
         try e.ops.toF32(e.s, ch.x, ch.xf, n * c.hidden);
-        try e.blas.xwT(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih);
+        try e.blas.xwTRows(ch.xf, lay.idx_proj, ch.wl, n, c.hidden, ih, gemm_rows);
     }
     try e.exact.bf16Scale(e.s, ch.wl, ch.iw, n * ih, exact.indexScale(id, ih));
     const kk = @min(c.index_topk, n_comp_end);
@@ -1119,7 +1124,7 @@ fn splitKeyed(e: *const Engine, ch: *Chunk, k: tri_index.IndexK, n_comp_end: usi
     const world: usize = e.comm.world;
     const sp = idx_split.span(n_comp_end, world, e.comm.rank);
     // the node's vis (host-made, as vis: the same integers on every node)
-    var vis_host: [4096]i64 = undefined;
+    var vis_host: [max_pass_rows]i64 = undefined;
     if (n > vis_host.len) return error.ChunkTooLong;
     for (0..n) |i| vis_host[i] = idx_split.nodeVis((ch.start + i + 1) / ratio, sp);
     try upload(e, ch.split_vis, &vis_host, n * 8);
@@ -1171,7 +1176,7 @@ pub fn moe(e: *const Engine, ch: *Chunk, li: usize) !void {
     } else {
         try e.ops.toF32(e.s, ch.x, ch.xf, n * d);
         try e.ops.f16ToF32(e.s, lay.gate_w, ch.gate_f, c.experts * d);
-        try e.blas.xwT(ch.xf, ch.gate_f, ch.logits, n, d, c.experts);
+        try e.blas.xwTRows(ch.xf, ch.gate_f, ch.logits, n, d, c.experts, gemm_rows);
         try tri_norm.route(e.t, ch.logits, 0, lay.gate_b, c.top_k, c.routed_scaling, shared_id, ch.pick, ch.wts, n, c.experts, sl);
     }
     try routeSpans(e, ch, lay, shared_id, sl, kc);
@@ -1335,9 +1340,10 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     const m = n * k;
     const prof = eh.io != null;
     var tq = if (prof) pstamp(e, eh) else 0;
-    // the rows read ahead (fillChunk's thread) when they are this chunk's, else read here
+    // the rows read ahead (fillChunk's thread) when they start at this chunk and cover it (its first n rows), else
+    // read here
     var rows: []u16 = eh.rows;
-    if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n == n) {
+    if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n >= n) {
         rows = eh.ahead_rows[l];
         eh.ahead_ready[l] = false;
     } else {

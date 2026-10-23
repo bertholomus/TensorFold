@@ -6,7 +6,6 @@ const errors = @import("errors.zig");
 const prompt_mod = @import("prompt.zig");
 const images = @import("images.zig");
 const chat = @import("chat.zig");
-const cache_salt = @import("cache_salt.zig");
 const log = @import("log.zig");
 const Server = @import("server.zig").Server;
 const Value = json.Value;
@@ -54,7 +53,8 @@ fn start(srv: *Server, input: chat.Input, message: Value, thinking: bool, effort
         p.request.images = x.images;
         p.request.cache_key = x.cache_key;
     }
-    if (input.cache_salt) |salt| p.request.cache_key = try cache_salt.key(a, p.request.cacheKey(), salt); // the turn's namespace
+    // a salted conversation's pass keeps its states under its salt
+    if (input.cache_salt != null) p.request.cache_key = try api.cache_salt.key(a, input.cache_salt, p.request.cacheKey());
     const id = srv.next_id.fetchAdd(1, .monotonic);
     try srv.engine.submit(id, &p.request, .{ .ctx = p, .event = Pass.event });
     handed = true;

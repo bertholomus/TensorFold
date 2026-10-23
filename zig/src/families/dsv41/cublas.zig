@@ -81,6 +81,16 @@ pub const Blas = struct {
         try b.check(b.api.cublasSgemm_v2(b.handle, .t, .n, @intCast(n), @intCast(rows), @intCast(k), &one, w, @intCast(k), x, @intCast(k), &zero, out, @intCast(n)));
     }
 
+    /// xwT in row blocks of `step` rows (the last block takes the rest): cuBLAS picks its algorithm (tiles, split-K) from
+    /// the shape, so a pass longer than `step` gives each row the bits of the `step`-row call a `step`-row pass makes.
+    pub fn xwTRows(b: *const Blas, x: u64, w: u64, out: u64, rows: usize, k: usize, n: usize, step: usize) Error!void {
+        var at: usize = 0;
+        while (at < rows) : (at += step) {
+            const r = @min(step, rows - at);
+            try b.xwT(x + at * k * 4, w, out + at * n * 4, r, k, n);
+        }
+    }
+
     /// torch.matmul of x [rows, k] fp32 (row-major) and v [1, k] fp32 transposed (the DSpark confidence head): out [rows]
     /// fp32. A [k, 1] column is contiguous by torch's rules (a size-1 dimension's stride is not checked), so torch
     /// issues C^T = v^T x^T untransposed: transa N, transb N, m = 1, n = rows, lda = 1, ldb = k, ldc = 1 (cuBLAS runs it

@@ -471,3 +471,32 @@ test "a state that lost its rows: an earlier one resumes, and the lost one leave
     try std.testing.expectEqual(@as(usize, 1), f.live);
     try std.testing.expectEqual(@as(u32, 2), s.find(&t2, &.{}, &.{}).?.at);
 }
+
+test "cache_salt: a state kept under one salt resumes only for that salt, and none only for none" {
+    const salted = @import("cache_salt.zig").key;
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
+    defer s.deinit();
+    const t1 = [_]u32{ 1, 2, 3, 4, 5, 9 };
+    const t2 = [_]u32{ 1, 2, 3, 4, 5, 6 };
+    // kept under salt "a" and with no salt
+    const a1 = try salted(a, "a", &t1);
+    _ = f.pass(&s, a1, try s.begin(a, a1, 4, &.{}, &.{}, null, &.{}));
+    _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
+    // the same salt: a hit; another salt: a miss; no salt: the unsalted state
+    try std.testing.expectEqual(@as(u32, 4), s.find(try salted(a, "a", &t2), &.{}, &.{}).?.at);
+    try std.testing.expect(s.find(try salted(a, "b", &t2), &.{}, &.{}) == null);
+    const plain = s.find(&t2, &.{}, &.{}).?;
+    try std.testing.expectEqualSlices(u32, t1[0..5], plain.tokens);
+    // a salted prompt never resumes the unsalted state, an unsalted prompt never the salted one
+    var only: Store = Store.init(gpa, f.snapshots(), .{ .lookahead = 1, .min_prompt = 0 }, 1 << 20);
+    defer only.deinit();
+    _ = f.pass(&only, &t1, try only.begin(a, &t1, 4, &.{}, &.{}, null, &.{}));
+    try std.testing.expect(only.find(try salted(a, "a", &t2), &.{}, &.{}) == null);
+    const plan = try only.begin(a, try salted(a, "a", &t2), 4, &.{}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 0), plan.from);
+}

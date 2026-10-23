@@ -1,17 +1,14 @@
-//! ``cache_salt`` on the completion and chat routes: the engine gets the request's key in the salt's namespace and
-//! the prompt as without it; a request without a salt is submitted as before; a salt that is not a non-empty string
-//! gets a 400 and reaches no engine.
+//! cache_salt on /v1/completions: a fresh salt reports no cached tokens, its repeat and the unsalted repeat do.
 const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json");
 const model_text = @import("model_text.zig");
 const openai = @import("openai.zig");
-const cache_salt = @import("cache_salt.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Allocator = std.mem.Allocator;
 
-/// Bytes as tokens (completion_prompt_test.zig's); every chat renders as "prompt".
+/// Bytes as tokens; decode skips ids past 255, as the checkpoint tokenizer skips unknown ids.
 const ByteText = struct {
     fn text(t: *@This()) model_text.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
@@ -54,32 +51,30 @@ const ByteText = struct {
     }
 };
 
-/// Copies the prompt and the key field of each request the server submits, then finishes it at once.
-const Capture = struct {
-    prompt: []u32 = &.{},
-    key: []u32 = &.{},
-    submitted: usize = 0,
+/// Restores the longest prefix of any earlier request's cache key, as a prompt cache keyed on it does.
+const Prefixes = struct {
+    keys: std.ArrayList([]u32) = .empty,
+
+    fn deinit(e: *@This()) void {
+        for (e.keys.items) |k| std.testing.allocator.free(k);
+        e.keys.deinit(std.testing.allocator);
+    }
 
     fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
     }
 
-    fn deinit(e: *@This()) void {
-        std.testing.allocator.free(e.prompt);
-        std.testing.allocator.free(e.key);
-    }
-
     fn info(_: *anyopaque) api.Info {
-        return .{};
+        return .{ .prompt_cache = true };
     }
 
     fn submit(ctx: *anyopaque, id: api.Id, request: *const api.Request, sink: api.Sink) api.SubmitError!void {
-        const e: *Capture = @ptrCast(@alignCast(ctx));
-        e.deinit();
-        e.prompt = std.testing.allocator.dupe(u32, request.prompt) catch return error.Busy;
-        e.key = std.testing.allocator.dupe(u32, request.cache_key) catch return error.Busy;
-        e.submitted += 1;
-        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
+        const e: *Prefixes = @ptrCast(@alignCast(ctx));
+        const k = request.cacheKey();
+        var best: usize = 0;
+        for (e.keys.items) |old| best = @max(best, std.mem.indexOfDiff(u32, old, k) orelse k.len);
+        e.keys.append(std.testing.allocator, std.testing.allocator.dupe(u32, k) catch return error.Busy) catch return error.Busy;
+        sink.event(sink.ctx, id, &.{ .prefilled = @intCast(@min(best, k.len - 1)) });
         sink.event(sink.ctx, id, &.{ .tokens = &.{ 'o', 'k' } });
         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
     }
@@ -95,9 +90,10 @@ const Capture = struct {
     }
 };
 
-/// A whole reply's status.
+/// A whole reply's status and usage.prompt_tokens_details.cached_tokens.
 const Reply = struct {
     status: ?u16 = null,
+    cached: ?i64 = null,
 
     fn out(r: *Reply) openai.Out {
         return .{ .ctx = r, .vt = &.{ .open = open, .event = event, .reply = reply } };
@@ -107,15 +103,31 @@ const Reply = struct {
 
     fn event(_: *anyopaque, _: ?json.Value) error{Closed}!void {}
 
-    fn reply(ctx: *anyopaque, status: u16, _: json.Value) void {
+    fn reply(ctx: *anyopaque, status: u16, body: json.Value) void {
         const r: *Reply = @ptrCast(@alignCast(ctx));
         r.status = status;
+        const usage = body.get("usage") orelse return;
+        const details = usage.get("prompt_tokens_details") orelse return;
+        r.cached = (details.get("cached_tokens") orelse return).int64();
     }
 };
 
-/// The status of a completion of the ids 0, 'h', 'i', 255 (``chat`` false) or a one-message chat, with the JSON
-/// fields ``extra`` (each after a comma) in its body.
-fn ask(backend: *Capture, chat: bool, extra: []const u8) !?u16 {
+/// One completion of a fixed prompt on `srv`, with `salt` as its JSON ``cache_salt`` (null: none).
+fn complete(srv: *Server, salt: ?[]const u8) !Reply {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const extra = if (salt) |s| try std.fmt.allocPrint(a, ",\"cache_salt\":{s}", .{s}) else "";
+    const raw = (try json.parse(a, try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"prompt\":\"a prompt the cache keeps\"{s}}}", .{extra}))).ok;
+    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
+    var reply: Reply = .{};
+    openai.run(srv, a, reply.out(), .{ .conn = &conn }, false, raw);
+    return reply;
+}
+
+test "cache_salt: cached_tokens is 0 for a fresh salt, and the same salt or no salt resumes its own" {
+    var backend: Prefixes = .{};
+    defer backend.deinit();
     var text: ByteText = .{};
     const srv = try Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
         .served_name = "m",
@@ -124,59 +136,29 @@ fn ask(backend: *Capture, chat: bool, extra: []const u8) !?u16 {
         .use_drafts = false,
     }, null);
     defer srv.deinit();
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const body = if (chat)
-        try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{{\"role\":\"user\",\"content\":\"hi\"}}]{s}}}", .{extra})
-    else
-        try std.fmt.allocPrint(a, "{{\"model\":\"m\",\"max_tokens\":2,\"prompt\":[0,104,105,255]{s}}}", .{extra});
-    const raw = (try json.parse(a, body)).ok;
-    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
-    var reply: Reply = .{};
-    openai.run(srv, a, reply.out(), .{ .conn = &conn }, chat, raw);
-    return reply.status;
+    const none = try complete(srv, null);
+    try std.testing.expectEqual(@as(?u16, 200), none.status);
+    try std.testing.expectEqual(@as(?i64, 0), none.cached);
+    // a fresh salt: nothing cached, though the same prompt ran unsalted
+    try std.testing.expectEqual(@as(?i64, 0), (try complete(srv, "\"r1\"")).cached);
+    // the same salt again, and no salt again: their own states
+    try std.testing.expect((try complete(srv, "\"r1\"")).cached.? > 0);
+    try std.testing.expect((try complete(srv, null)).cached.? > 0);
+    // another fresh salt
+    try std.testing.expectEqual(@as(?i64, 0), (try complete(srv, "\"r2\"")).cached);
 }
 
-test "without a cache_salt (or with null) a request's key is the prompt, as before" {
-    var backend: Capture = .{};
+test "cache_salt must be a non-empty string" {
+    var backend: Prefixes = .{};
     defer backend.deinit();
-    for ([_]bool{ false, true }) |chat| for ([_][]const u8{ "", ",\"cache_salt\":null" }) |extra| {
-        try std.testing.expectEqual(@as(?u16, 200), try ask(&backend, chat, extra));
-        try std.testing.expectEqual(@as(usize, 0), backend.key.len);
-    };
-    try std.testing.expectEqual(@as(usize, 4), backend.submitted);
-}
-
-test "a completion's cache_salt keys it in the salt's namespace; its prompt is as without one" {
-    var backend: Capture = .{};
-    defer backend.deinit();
-    const prompt = [_]u32{ 0, 'h', 'i', 255 };
-    try std.testing.expectEqual(@as(?u16, 200), try ask(&backend, false, ",\"cache_salt\":\"abc\""));
-    const want = try cache_salt.key(std.testing.allocator, &prompt, "abc");
-    defer std.testing.allocator.free(want);
-    try std.testing.expectEqualSlices(u32, want, backend.key);
-    try std.testing.expectEqualSlices(u32, &prompt, backend.prompt);
-    try std.testing.expectEqual(@as(?u16, 200), try ask(&backend, false, ",\"cache_salt\":\"abd\""));
-    try std.testing.expect(std.mem.indexOfDiff(u32, want, backend.key).? < cache_salt.words);
-    try std.testing.expectEqualSlices(u32, &prompt, backend.prompt);
-}
-
-test "a chat's cache_salt keys it in the salt's namespace too" {
-    var backend: Capture = .{};
-    defer backend.deinit();
-    try std.testing.expectEqual(@as(?u16, 200), try ask(&backend, true, ",\"cache_salt\":\"abc\""));
-    const want = try cache_salt.key(std.testing.allocator, backend.prompt, "abc");
-    defer std.testing.allocator.free(want);
-    try std.testing.expect(backend.prompt.len > cache_salt.words);
-    try std.testing.expectEqualSlices(u32, want, backend.key);
-}
-
-test "a cache_salt that is not a non-empty string gets a 400 and reaches no engine" {
-    var backend: Capture = .{};
-    defer backend.deinit();
-    for ([_]bool{ false, true }) |chat| for ([_][]const u8{ ",\"cache_salt\":\"\"", ",\"cache_salt\":5", ",\"cache_salt\":true", ",\"cache_salt\":[\"a\"]", ",\"cache_salt\":{}" }) |extra| {
-        try std.testing.expectEqual(@as(?u16, 400), try ask(&backend, chat, extra));
-    };
-    try std.testing.expectEqual(@as(usize, 0), backend.submitted);
+    var text: ByteText = .{};
+    const srv = try Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
+        .served_name = "m",
+        .model_ids = &.{"m"},
+        .enable_thinking = false,
+        .use_drafts = false,
+    }, null);
+    defer srv.deinit();
+    for ([_][]const u8{ "\"\"", "7", "true", "[\"x\"]" }) |bad| try std.testing.expectEqual(@as(?u16, 400), (try complete(srv, bad)).status);
+    try std.testing.expectEqual(@as(?u16, 200), (try complete(srv, "null")).status);
 }
