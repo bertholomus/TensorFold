@@ -114,6 +114,9 @@ const Eng = struct {
     opened: bool = false,
     early: usize = 0,
     late: usize = 0,
+    /// Requests whose cache key is salted in every word (``cache_salt``), and the others.
+    salted: usize = 0,
+    unsalted: usize = 0,
 
     fn engine(e: *Eng) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
@@ -130,6 +133,10 @@ const Eng = struct {
         for (request.prompt, buf) |tok, *byte| byte.* = @intCast(tok);
         e.prompts.append(gpa, buf) catch {};
         if (e.opened) e.late += 1 else e.early += 1;
+        const k = request.cacheKey();
+        var salted = k.len > 0;
+        for (k) |w| salted = salted and w >= 0x8000_0000;
+        if (salted) e.salted += 1 else e.unsalted += 1;
         sink.event(sink.ctx, id, &.{ .prefilled = 0 });
         sink.event(sink.ctx, id, &.{ .tokens = &.{ 'O', 'K' } });
         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = .stop } });
@@ -179,9 +186,13 @@ fn pads(a: Allocator, head: []const u8, n: usize) ![]u8 {
 }
 
 fn go(srv: *server_mod.Server, a: Allocator, msgs: []const Value, max: i64, cx: *errors.Cx) !chat.Reply {
+    return goSalted(srv, a, msgs, max, cx, null);
+}
+
+fn goSalted(srv: *server_mod.Server, a: Allocator, msgs: []const Value, max: i64, cx: *errors.Cx, salt: ?[]const u8) !chat.Reply {
     const owned = try a.alloc(Value, msgs.len);
     @memcpy(owned, msgs);
-    return chat.run(srv, cx, .{ .messages = .{ .array = owned }, .fields = .{ .object = try json.newObject(a) }, .max_tokens = max, .temperature = 0 }, null, Stay{});
+    return chat.run(srv, cx, .{ .messages = .{ .array = owned }, .fields = .{ .object = try json.newObject(a) }, .max_tokens = max, .temperature = 0, .cache_salt = salt }, null, Stay{});
 }
 
 fn noteOf(reply: chat.Reply) ?[]const u8 {
@@ -290,6 +301,37 @@ test "the compacted prompt fits and the same request compacts the same way" {
     try std.testing.expect(first.runtime.get("compaction") != null);
     const second = try go(srv, a, &msgs, 32, &cx);
     try std.testing.expectEqualStrings(note, noteOf(second).?);
+}
+
+test "a salted conversation's notes keep its cache_salt; without one every key is the prompt" {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: errors.Cx = .{ .a = a };
+    var text: Text = .{};
+    // as the two tests above: a middle that note_task summarizes (keep 8), a split turn that split_task does (keep 20)
+    for ([_]u32{ 8, 20 }) |keep| {
+        for ([_]?[]const u8{ null, "s" }) |salt| {
+            var eng: Eng = .{ .window = 2000 };
+            defer freePrompts(&eng);
+            const srv = try start(&eng, &text, .{ .fraction = 0.5 }, keep, null);
+            defer srv.deinit();
+            const assistant = try json.newObject(a);
+            try assistant.put(a, "role", .{ .string = "assistant" });
+            try assistant.put(a, "content", .{ .string = "KEPT-ASSISTANT" });
+            const msgs: [2]Value = if (keep == 8)
+                .{ try userMsg(a, try pads(a, "BIG-", 1200)), try userMsg(a, "TAIL") }
+            else
+                .{ try userMsg(a, try pads(a, "REQUEST-ALPHA-", 1200)), .{ .object = assistant } };
+            _ = try goSalted(srv, a, &msgs, 32, &cx, salt);
+            try std.testing.expect(seenFrom(&eng, 0, if (keep == 8) "Rewrite the memory note" else "Summarize the cut part"));
+            if (salt == null) {
+                try std.testing.expect(eng.salted == 0 and eng.unsalted >= 2);
+            } else {
+                try std.testing.expect(eng.unsalted == 0 and eng.salted >= 2);
+            }
+        }
+    }
 }
 
 test "a request that cannot fit after compaction is still context_length_exceeded" {
