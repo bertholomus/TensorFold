@@ -247,6 +247,9 @@ pub const Chunk = struct {
     wts: u64, // fp32 [cap, slots]
     pm: u64, // fp32 [cap, D]: the MoE partial
     gm: u64, // fp32 [world, cap, D]: its gather (the pending post)
+    ga_rs: usize, // ga's and gm's rank stride in elements as their last gather left them (prompt.gather)
+    gm_rs: usize,
+    y_neg: bool, // TF_DS_2D_YX: ga's and gm's rank-1 slot at cap * D holds -0.0 (written once)
     xs: exl3_experts.Scratch,
     // Model._moe_scratch's decode scratch: windows under 64 rows (a prompt's small chunk, every decode round), one for
     // every layer of the same slots and experts, its epoch carried from call to call
@@ -293,6 +296,9 @@ pub const Chunk = struct {
         ch.n = 0;
         ch.start = 0;
         ch.pending = false;
+        ch.ga_rs = 0;
+        ch.gm_rs = 0;
+        ch.y_neg = false;
         ch.ids = try a.take(cap * 8);
         ch.pos0 = try a.take(cap * 8);
         ch.pos = ch.pos0;
@@ -706,7 +712,7 @@ pub fn attnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
     if (ch.pending) {
-        const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, .{ .gathered = ch.gm, .world = e.world, .h_out = ch.h_alt }, ch.n, c.hidden);
+        const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_attn[0], lay.hc_attn[1], lay.hc_attn[2], ch.pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_a, ch.post, ch.comb, ch.part, .{ .gathered = ch.gm, .world = e.world, .h_out = ch.h_alt, .rs = ch.gm_rs }, ch.n, c.hidden);
         swapStreams(ch, src);
         ch.pending = false;
     } else {
@@ -1064,10 +1070,17 @@ pub fn scale(hd: usize) f32 {
     return @floatCast(std.math.pow(f64, @floatFromInt(hd), -0.5));
 }
 
-/// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order.
-pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
-    if (e.two) |t| return t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
+/// Comm.gather: [world, n, D] fp32 of every rank's partial, in rank order; returns the rank stride in elements, for
+/// the posting kernels' RS. 2D with TF_DS_2D_YX (prompt2d.y_sums): dst[0] the partials' rank-ordered sum rounded to
+/// bf16 (widened), dst[1] at cap * D -0.0, so every kernel that sums dst[0] + dst[1] and rounds to bf16 gets the same y.
+pub fn gather(e: *const Engine, ch: *Chunk, src: u64, dst: u64) !usize {
+    if (e.two) |t| {
+        if (try t.ySums(e, src, dst, ch.n, ch.cap, &ch.y_neg, &.{ ch.ga, ch.gm })) return ch.cap * e.c.hidden;
+        try t.quarters(e, src, dst, ch.n, t.ow, 4); // 2D: the same [2, n, D] from the four quarters
+        return ch.n * e.c.hidden;
+    }
     try e.comm.allGather(src, dst, ch.n * e.c.hidden, .f32, e.s);
+    return ch.n * e.c.hidden;
 }
 
 /// Layer `li`'s FFN mixes: hc_pre_pf with the gathered attention partials posted into the streams first; x the MoE's
@@ -1075,7 +1088,7 @@ pub fn gather(e: *const Engine, ch: *const Chunk, src: u64, dst: u64) !void {
 pub fn ffnMixes(e: *const Engine, ch: *Chunk, li: usize) !void {
     const lay = e.w.layers[li];
     const c = e.c;
-    const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], ch.pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_f, ch.post, ch.comb, ch.part, .{ .gathered = ch.ga, .world = e.world, .h_out = ch.h_alt }, ch.n, c.hidden);
+    const src = try tri_hc.hcPrePf(e.t, ch.h, lay.hc_ffn[0], lay.hc_ffn[1], lay.hc_ffn[2], ch.pre_a, lay.ffn_norm, c.eps, c.hc_eps, c.hc_iters, ch.x, ch.pre_f, ch.post, ch.comb, ch.part, .{ .gathered = ch.ga, .world = e.world, .h_out = ch.h_alt, .rs = ch.ga_rs }, ch.n, c.hidden);
     swapStreams(ch, src);
 }
 
@@ -1249,7 +1262,7 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     const c = e.c;
     const n = ch.n;
     if (ch.pending) {
-        try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
+        try tri_basic.hcPostRs(e.t, ch.gm, ch.gm_rs, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
         ch.pending = false;
     }
     const li32: u16 = @intCast(li);
@@ -1379,7 +1392,7 @@ pub fn replayCut(e: *const Engine, ch: *Chunk, cs: *const Caches, sh: *Shared, l
 pub fn tap(e: *const Engine, ch: *Chunk, j: usize) !void {
     const c = e.c;
     if (ch.pending) {
-        try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, ch.n, c.hidden);
+        try tri_basic.hcPostRs(e.t, ch.gm, ch.gm_rs, ch.h, ch.post, ch.comb, ch.h, e.world, ch.n, c.hidden);
         ch.pending = false;
     }
     try e.exact.hcMean4(e.s, ch.h, ch.taps + j * ch.cap * c.hidden * 2, c.hidden, ch.n, c.hidden);
@@ -1397,7 +1410,7 @@ pub fn head(e: *const Engine, ch: *Chunk) !void {
     const c = e.c;
     const n = ch.n;
     if (ch.pending) {
-        try tri_basic.hcPost(e.t, ch.gm, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
+        try tri_basic.hcPostRs(e.t, ch.gm, ch.gm_rs, ch.h, ch.post, ch.comb, ch.h, e.world, n, c.hidden);
         ch.pending = false;
     }
     const last_h = ch.h + (n - 1) * c.hc * c.hidden * 2;

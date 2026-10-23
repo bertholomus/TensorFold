@@ -26,6 +26,7 @@ pub const Ops = struct {
     to_f32: cuda.Function,
     f16_to_f32: cuda.Function,
     add2_bf16: cuda.Function,
+    ywiden: cuda.Function,
     topk_i64: cuda.Function,
     topk_indices: cuda.Function,
     scatter: cuda.Function,
@@ -61,6 +62,7 @@ pub const Ops = struct {
             .to_f32 = try pw.function("tf_bf16_to_f32_kernel"),
             .f16_to_f32 = try fm.function("tf_ds_f16_to_f32_kernel"),
             .add2_bf16 = try fm.function("tf_ds_add2_bf16_kernel"),
+            .ywiden = try fm.function("tf_ds_ywiden_kernel"),
             .topk_i64 = try fm.function("tf_ds_topk_i64_kernel"),
             .topk_indices = try fm.function("tf_ds_topk_indices_kernel"),
             .scatter = try fm.function("tf_ds_scatter_rows_kernel"),
@@ -123,6 +125,18 @@ pub const Ops = struct {
         a.add(out);
         a.add(@as(u64, count));
         try go(o.add2_bf16, s, blocks(count, 256), 256, &a);
+    }
+
+    /// prompt2d ySums: pieces bf16 [4, half, w] -> dst fp32 [n, 2 w], widened exactly (tf_ds_ywiden_kernel).
+    pub fn yWiden(o: *const Ops, s: cuda.Stream, pieces: u64, dst: u64, n: usize, half: usize, w: usize) !void {
+        if (n == 0) return;
+        var a: cuda.Args = .{};
+        a.add(pieces);
+        a.add(dst);
+        a.add(@as(u64, n));
+        a.add(@as(u64, half));
+        a.add(@as(u64, w));
+        try go(o.ywiden, s, blocks(n * 2 * w, 256), 256, &a);
     }
 
     /// keys.topk(k, sorted=False).values of unique int64 keys [rows, n] (row stride ks) into top [rows, k], the set in no

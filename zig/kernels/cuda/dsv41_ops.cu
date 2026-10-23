@@ -19,6 +19,18 @@ extern "C" __global__ void tf_ds_add2_bf16_kernel(const float* g0, const float* 
          i += uint64_t(gridDim.x) * blockDim.x) output[i] = __float2bfloat16_rn(__fadd_rn(g0[i], g1[i]));
 }
 
+// prompt2d ySums (TF_DS_2D_YX): the four nodes' bf16 sums, pieces [4, half, w] (node g = r + 2 p holds rows
+// r * half.. of pair p's columns), widened into dst fp32 [n, 2 w] (exact): a TP2 rank's [n, D] sum in place.
+extern "C" __global__ void tf_ds_ywiden_kernel(const __nv_bfloat16* pieces, float* dst, uint64_t n, uint64_t half,
+                                               uint64_t w) {
+    const uint64_t total = n * 2 * w;
+    for (uint64_t i = uint64_t(blockIdx.x) * blockDim.x + threadIdx.x; i < total;
+         i += uint64_t(gridDim.x) * blockDim.x) {
+        const uint64_t r = i / (2 * w), col = i - r * 2 * w, p = col / w, c = col - p * w, q = r / half;
+        dst[i] = __bfloat162float(pieces[((q + 2 * p) * half + (r - q * half)) * w + c]);
+    }
+}
+
 // A profile's GPU clock (ns, %globaltimer) when the stream reaches it, appended with its tag: buf[0] the count (reset
 // first when `reset`), then (clock, tag) pairs, at most `cap` (round phase timing; in a graph like any kernel).
 extern "C" __global__ void tf_ds_clock_kernel(uint64_t* buf, uint32_t tag, uint32_t reset, uint32_t cap) {

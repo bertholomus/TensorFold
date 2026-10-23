@@ -27,7 +27,12 @@ pub fn hcPre(t: Tri, h: u64, fn_w: u64, scale: u64, base: u64, pre_in: u64, norm
 
 /// hc_post: gathered [world, R, D] fp32 partials, h [R, 4, D] bf16 -> out [R, 4, D] (may alias h).
 pub fn hcPost(t: Tri, gathered: u64, h: u64, post: u64, comb: u64, out: u64, world: usize, rows: usize, d: usize) !void {
-    try t.run("_hc_post", .{ u(rows), u(d / 1024), 1 }, &.{ p("G", "*fp32", gathered), aot.int("RS", @intCast(rows * d)), p("X", "*bf16", h), p("XOUT", "*bf16", out), p("POST", "*fp32", post), p("COMB", "*fp32", comb) }, &.{ ci("D", d), ci("WORLD", world), ci("BLOCK", 1024), t.pdlConst() });
+    return hcPostRs(t, gathered, rows * d, h, post, comb, out, world, rows, d);
+}
+
+/// hcPost with the gather's rank stride `rs` in elements (prompt.gather's return).
+pub fn hcPostRs(t: Tri, gathered: u64, rs: usize, h: u64, post: u64, comb: u64, out: u64, world: usize, rows: usize, d: usize) !void {
+    try t.run("_hc_post", .{ u(rows), u(d / 1024), 1 }, &.{ p("G", "*fp32", gathered), aot.int("RS", @intCast(rs)), p("X", "*bf16", h), p("XOUT", "*bf16", out), p("POST", "*fp32", post), p("COMB", "*fp32", comb) }, &.{ ci("D", d), ci("WORLD", world), ci("BLOCK", 1024), t.pdlConst() });
 }
 
 /// rmsnorm: x [R, D] (row stride xs) bf16 -> out [R, D] (row stride os) bf16.
