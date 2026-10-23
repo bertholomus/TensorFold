@@ -221,7 +221,7 @@ pub fn parseIp(text: []const u8) ![4]u8 {
 
 test "addresses parse as four bytes" {
     try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, try parseIp("192.0.2.7"));
-    try std.testing.expectError(error.BadAddress, parseIp("10.200.30"));
+    try std.testing.expectError(error.BadAddress, parseIp("192.0.2"));
 }
 
 test "frames cross a loopback link in order" {

@@ -238,5 +238,5 @@ fn exchange(io: std.Io, rank: u32, world: u32, master: u32, port: u16, mine: []c
 
 test "an IPv4 address in dotted form" {
     try std.testing.expectEqual(@as(u32, 0xc0000201), try ip4("192.0.2.1"));
-    try std.testing.expectError(error.BadAddress, ip4("10.200.10"));
+    try std.testing.expectError(error.BadAddress, ip4("198.51.100"));
 }
