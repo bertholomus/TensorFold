@@ -40,17 +40,29 @@ def jit_table() -> dict:
     (aot_pack.py's --jit input), by module-qualified name."""
 
     import importlib
-    import pkgutil
+    import os
 
     import tensorfold
     from triton.runtime.jit import JITFunction
 
-    for m in pkgutil.walk_packages(tensorfold.__path__, "tensorfold."):
-        if m.name.startswith(("tensorfold.families.deepseek_v41", "tensorfold.cuda")):
-            try:
-                importlib.import_module(m.name)
-            except Exception:
-                pass
+    # pkgutil.walk_packages misses a subpackage without __init__.py (iter_modules reports only dirs with one) and
+    # the family's cuda/ is one: its markov.py (the drafter's _bias, _score, ...) never reached the table and
+    # aot_pack.py died on the first recorded launch there. Import the two prefixes' modules from disk instead.
+    def _import_tree(base: str) -> None:
+        for p in list(importlib.import_module(base).__path__):
+            for dirpath, dirnames, filenames in os.walk(p):
+                dirnames[:] = sorted(d for d in dirnames if d != "__pycache__" and not d.startswith("."))
+                for fn in sorted(filenames):
+                    if fn.endswith(".py") and not fn.startswith("_"):
+                        name = base + "." + os.path.relpath(os.path.join(dirpath, fn), p)[:-3].replace(os.sep, ".")
+                        try:
+                            importlib.import_module(name)
+                        except Exception as e:
+                            raise SystemExit(f"{name}: the jit table cannot import it ({e!r}) — aot_pack.py would "
+                                             "miss its kernels; fix the import and rerun zrec_fixtures.py")
+
+    for base in ("tensorfold.families.deepseek_v41", "tensorfold.cuda"):
+        _import_tree(base)
     out = {}
     for mod in list(sys.modules.values()):
         if not getattr(mod, "__name__", "").startswith("tensorfold."):

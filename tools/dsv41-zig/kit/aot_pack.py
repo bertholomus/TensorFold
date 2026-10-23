@@ -50,7 +50,10 @@ def main() -> int:
 def entry(k: dict, jit: dict, cache: Path, out: Path) -> dict:
     """One specialization's launch facts; its cubin copied beside them by hash."""
 
-    fn = jit[k["function"]]
+    fn = jit.get(k["function"])
+    if fn is None:
+        raise SystemExit(f"{k['function']} is not in the jit table: rebuild it with zrec_fixtures.py on the engine "
+                         "install the recording came from (a module that failed to import there is missing)")
     nospec = set(fn["do_not_specialize"])
     attrs = {n for n, v in k["attrs"].items() if v}
     runtime = [n for n, t in k["signature"].items() if t != "constexpr"]
