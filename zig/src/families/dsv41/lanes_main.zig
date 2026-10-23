@@ -177,6 +177,9 @@ pub fn main(init: std.process.Init) !u8 {
             std.debug.print("dsv41: rank {d} stopped following rank 0: {s}\n", .{ o.rank, @errorName(err) });
             try w.print("{{\"rank\": {d}, \"follow\": \"{s}\"}}\n", .{ o.rank, @errorName(err) });
             try w.flush();
+            // a failed context frees nothing in order (NCCL's teardown can wait on a peer): end the process now, so
+            // its links close and rank 0's watch stops rank 0
+            if (err == error.GpuContextFailed or m.contextFailed()) std.process.exit(1);
             return 1;
         };
         try w.print("{{\"rank\": {d}, \"followed\": true}}\n", .{o.rank});
