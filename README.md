@@ -3,16 +3,25 @@
 > (MIT), our EXL3 quant of [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
 > (MIT), sized for two nodes. The four-node branch's releases up to v0.1.1 served [Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw)
 > (MIT), an EXL3 quant of [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
-> The branch is the four-node branch `deepseek-v41-zig-tp4` at its v0.3.1 with nine
-> changes on top: vLLM's `cache_salt`; three fixes the two-node branch `deepseek-v41-zig` had taken (#17, #38, and
-> upstream TensorFold #973's template append, two commits); DeepSeek-V4.1 tool calls read from their own tags (a port
-> of #25); an assistant turn's marker text kept as text with `TENSORFOLD_REPLY_IDS`; and a parser fix for a
-> `<tool_call>` that only starts with a DSML opener. The `dsv41` family adds DeepSeek-V4.1-Flash to TensorFold
+> The branch is the four-node branch `deepseek-v41-zig-tp4` at its v0.3.1 with the two-node recipe's
+> changes on top. The recipe's v0.7.0 has nine: vLLM's `cache_salt`; three fixes the two-node branch
+> `deepseek-v41-zig` had taken (#17, #38, and upstream TensorFold #973's template append, two commits); DeepSeek-V4.1
+> tool calls read from their own tags (a port of #25); an assistant turn's marker text kept as text with
+> `TENSORFOLD_REPLY_IDS`; and a parser fix for a
+> `<tool_call>` that only starts with a DSML opener. The recipe's v0.7.1 adds seven: one DSML call reader for both
+> lines (a call to a tool the request did not offer is a call) and streamed prose that hides a V4.1 block as the
+> parser reads it, both with #25's tests; `TF_DS_PROMPT_ALIAS=1`, the prompt pass's large scratch in five shared
+> regions (off unless set); a rank that stops stops the others with a line that names it, a follower whose GPU
+> context failed among them; the kit rebuild's jit table that sees the family's namespace subpackage (#14); and
+> documentation addresses in two tests. It then merges the four-node branch's v0.3.2 (prompt passes of 4,096 rows
+> for long prompts, with `TF_DS_PROMPT_ALIAS=1` about 2.7 GiB a node less scratch; v0.3.2's `cache_salt` in place of
+> this branch's; #38 once) and keeps a conversation's `cache_salt` on its compaction notes. The `dsv41` family adds
+> DeepSeek-V4.1-Flash to TensorFold
 > 1.0.12's native engine: two or four nodes, image input, up to 1,048,576 tokens a request in a shared window
 > (2,097,152 positions in the two-node recipe) with kept-prompt reuse (image turns too), structured output, forced
 > tool calls in DeepSeek's DSML, and exact DSpark speculative decoding. Launch, measured numbers, gates and the kernel
 > kit are in the recipe, [bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10)
-> (v0.7.0); the four-node recipe is [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10).
+> (v0.7.1); the four-node recipe is [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10).
 > An optional [neighbor transport](docs/recipes/deepseek-v41-neighbor.md) supports adjacent-edge RDMA on a physical ring.
 > `tools/dsv41-zig/inputs/` makes each node's weight file and token map from the checkpoint; `tools/dsv41-zig/kit/`
 > makes and checks the kit's generated files. Contributions: Lucas Peters ([@lucas-peters](https://github.com/lucas-peters), #4),

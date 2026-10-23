@@ -12,11 +12,13 @@ Copyright 2026 BertholomusAI (Albert Lee, https://github.com/bertholomus)
 
 This branch adds a DeepSeek-V4.1-Flash family to TensorFold's native engine (1.0.12 since the four-node branch's
 v0.2.0; 1.0.2 before), under the same Apache License, Version 2.0 (LICENSE), and runs it on two or four GB10 nodes. It
-is the four-node branch deepseek-v41-zig-tp4 at its v0.3.1 with nine changes for the two-node recipe. Its new files are
+is the four-node branch deepseek-v41-zig-tp4 at its v0.3.1 with the two-node recipe's changes: nine in its v0.7.0, and
+in its v0.7.1 seven more, a merge of the four-node branch's v0.3.2 and one fix. Its new files are
 under zig/src/families/dsv41/, zig/kernels/cuda/dsv41/ (with zig/kernels/cuda/dsv41_ops.cu and dsv41_torch.cu) and
 tools/dsv41-zig/, plus zig/src/core/lanes/novelty.zig, zig/src/server/effort_values_test.zig,
-zig/src/server/cache_salt.zig, zig/src/server/cache_salt_test.zig, zig/src/server/plain_specials_test.zig,
-zig/src/server/reply_parity.zig, zig/src/server/specials.zig, zig/src/server/sse_keepalive_test.zig,
+zig/src/core/cache_salt.zig, zig/src/server/cache_salt_test.zig, zig/src/server/dsml.zig,
+zig/src/server/dsml_test.zig, zig/src/server/plain_specials_test.zig, zig/src/server/reply_parity.zig,
+zig/src/server/specials.zig, zig/src/server/sse_keepalive_test.zig,
 docs/recipes/deepseek-v41-neighbor.md with its receipts in
 docs/receipts/dsv41-neighbor-hardware/ and docs/receipts/dsv41-neighbor-host/, ATTRIBUTION.md and two license texts in
 LICENSES/ (PyTorch, CUTLASS) that THIRD_PARTY_NOTICES.md refers to. tools/dsv41-zig/kit/aot_pack.py is TensorFold
@@ -25,7 +27,8 @@ packed with it. Nine of the branch's changes are contributions to this fork unde
 authors' names: Lucas Peters (pull request #4), LeetJoe (pull request #17), lepetitprince716-prog (pull request #18),
 Manrique (pull request #26), Scott Woolsey Biggart (pull request #30), mrsergiopascal (pull request #31) and
 Blackwellboy (pull requests #33, #34 and #38); three more port Manrique's pull requests #25 (the native side of
-willjriley's pull request #20), #28 and #29 to the four-node family, and two are upstream TensorFold's own, by Nathan
+willjriley's pull request #20), #28 and #29 to the four-node family, two more carry #25's tests into one DSML call
+reader and the streamed prose (both name Manrique as co-author), and two are upstream TensorFold's own, by Nathan
 McBride (upstream pull request #973), cherry-picked. ATTRIBUTION.md lists every outside source the family uses and what
 it took from each. The branch changes these upstream files:
   README.md
@@ -61,6 +64,7 @@ it took from each. The branch changes these upstream files:
   zig/src/server/anthropic.zig
   zig/src/server/chat.zig
   zig/src/server/compact.zig
+  zig/src/server/compact_test.zig
   zig/src/server/hf_text.zig
   zig/src/server/images.zig
   zig/src/server/messages.zig

@@ -4,7 +4,8 @@ This branch adds a DeepSeek-V4.1-Flash family (`zig/src/families/dsv41/`, its ke
 tools in `tools/dsv41-zig/`) to TensorFold 1.0.12's native Zig engine (1.0.2 up to the branch's v0.1.1), and runs it on two or four NVIDIA GB10 nodes. It ports our own DeepSeek-V4.1 family of TensorFold's Python line (the TP2 recipe
 [bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10))
 and extends it to an exact two-dimensional split over four nodes. This branch is the four-node branch
-`deepseek-v41-zig-tp4` at its v0.3.1 with nine changes on top, which the two-node recipe's v0.7.0 serves. It was
+`deepseek-v41-zig-tp4` at its v0.3.1 with the two-node recipe's changes on top (nine in its v0.7.0; in its v0.7.1 seven
+more, a merge of the four-node branch's v0.3.2 and one fix), which the two-node recipe's v0.7.1 serves. It was
 written independently and is clean-room with
 respect to other people's DeepSeek-V4.1 work: the jayleaton recipe, upstream TensorFold's DeepSeek-V4.1 pull requests
 (#299, #300 and later) and the DeepSeek-named files of upstream's tree were never opened, and the MiaAI-Lab vLLM kit
@@ -44,7 +45,7 @@ ourselves are not listed.
 | Lucas Peters ([@lucas-peters](https://github.com/lucas-peters)), [pull request #4](https://github.com/bertholomus/TensorFold/pull/4) to this fork | Apache-2.0, contributed to this fork | The prompt indexer passes each row block's `vis` 16-byte aligned (a copy when its view is not), so prompts whose last chunk ends in a short keyed block at an odd row answer | Merged; the commit keeps its author | `zig/src/families/dsv41/` (the prompt indexer) |
 | LeetJoe ([@LeetJoe](https://github.com/LeetJoe)), [pull request #17](https://github.com/bertholomus/TensorFold/pull/17) to this fork's two-node branch | Apache-2.0, contributed to this fork | A message's own text that carries the image placeholder is escaped to its plain form, so the prompt's image count still matches and the request is not refused | Cherry-picked; the commit keeps its author and its own trailer | `zig/src/server/messages.zig` |
 | lepetitprince716-prog ([@lepetitprince716-prog](https://github.com/lepetitprince716-prog)), [pull request #18](https://github.com/bertholomus/TensorFold/pull/18) to this fork | Apache-2.0, contributed to this fork | The loader reads each layer's expert run from the rank cache whole, with O_DIRECT, instead of nine strided sweeps (a faster load) | Merged; the commit keeps its author | `zig/src/families/dsv41/` (the loader) |
-| Manrique ([@hashd1ve](https://github.com/hashd1ve)), [pull request #25](https://github.com/bertholomus/TensorFold/pull/25) to this fork's two-node branch (the native side of [#20](https://github.com/bertholomus/TensorFold/pull/20) by [@willjriley](https://github.com/willjriley)) | Apache-2.0, contributed to this fork | DeepSeek-V4.1 calls are read from their own tags, never moved by `<tool_call>` text in the prose or in an argument, and the call streamer reads a V4.1 block whole | Ported to the four-node line's DSML parser; the commit credits them, and their test of a `<tool_call>` around and inside a block is theirs | `zig/src/server/tool_parse.zig`, `zig/src/server/tool_stream.zig` |
+| Manrique ([@hashd1ve](https://github.com/hashd1ve)), [pull request #25](https://github.com/bertholomus/TensorFold/pull/25) to this fork's two-node branch (the native side of [#20](https://github.com/bertholomus/TensorFold/pull/20) by [@willjriley](https://github.com/willjriley)) | Apache-2.0, contributed to this fork | DeepSeek-V4.1 calls are read from their own tags, never moved by `<tool_call>` text in the prose or in an argument, and the call streamer reads a V4.1 block whole | Ported to the four-node line's DSML parser; the commit credits them, and their test of a `<tool_call>` around and inside a block is theirs. v0.7.1's DSML call reader (`dsml.zig`, one parser for both lines) and its streamed-prose fix carry their tests and name them as co-author | `zig/src/server/tool_parse.zig`, `zig/src/server/tool_stream.zig`, `zig/src/server/dsml.zig`, `zig/src/server/dsml_test.zig`, `zig/src/server/reply_text.zig` |
 | Manrique ([@hashd1ve](https://github.com/hashd1ve)), [pull request #26](https://github.com/bertholomus/TensorFold/pull/26) to this fork's two-node branch | Apache-2.0, contributed to this fork | A prefix two conversations share no longer stales the first one's kept prompt states | Cherry-picked; the commit keeps its author | `zig/src/families/dsv41/lanes.zig` |
 | Manrique ([@hashd1ve](https://github.com/hashd1ve)), pull requests [#28](https://github.com/bertholomus/TensorFold/pull/28) and [#29](https://github.com/bertholomus/TensorFold/pull/29) to this fork's two-node branch | Apache-2.0, contributed to this fork | Prompts with images keep and resume their prompt states, matched by the images' digests (#28); a prompt pass in pieces between the other streams' rounds, off unless `TF_FILL_CHUNKS` is set (#29) | Ported to the four-node family; the commits credit them | `zig/src/server/prompt.zig`, `zig/src/core/lane_host.zig`, `zig/src/families/dsv41/lanes.zig` |
 | Scott Woolsey Biggart ([@swbiggart](https://github.com/swbiggart)), [pull request #30](https://github.com/bertholomus/TensorFold/pull/30) to this fork | Apache-2.0, contributed to this fork | The optional neighbor transport: adjacent-edge RDMA exchanges on a physical four-node ring (`TF_DS_NEIGHBOR_RDMA`, off unless set), its recipe and receipts | Merged; the commits keep their author | `zig/src/families/dsv41/neighbor.zig`, `docs/recipes/deepseek-v41-neighbor.md` |
@@ -65,6 +66,12 @@ ourselves are not listed.
 - [@den13501](https://github.com/den13501) ([two-node recipe issue #12](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10/issues/12))
   found that long prefills look dead to clients with an idle timer; `TENSORFOLD_SSE_KEEPALIVE` (an SSE comment while
   a streamed reply has nothing to send) follows their report.
+- [@den13501](https://github.com/den13501) ([two-node recipe issue #15](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10/issues/15))
+  found the kit rebuild's `cuda.markov._bias` mapping error; the rebuild's jit table that imports the family's
+  namespace subpackage from disk (#14) follows their report.
+- [@plyldavid-maker](https://github.com/plyldavid-maker) ([two-node recipe issue #25](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10/issues/25))
+  found, with careful testing, the two ranks waiting on each other for good when their settings differed or one
+  of them stopped; the start-up settings check (v0.7.0) and the stopped-rank watch (v0.7.1) follow their report.
 - [@ahinore](https://github.com/ahinore) ([four-node recipe issue #3](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10/issues/3))
   found, with the measurements that showed it, that with `TENSORFOLD_PLAIN_SPECIALS` and `TENSORFOLD_REPLY_IDS` on, a
   reply's marker text sent back as the assistant turn became real markers; with both switches on the shield now quotes
@@ -77,8 +84,13 @@ name Claude (Anthropic's AI assistant), which helped write them. The three commi
 as their author; the two that adapt the pick to the four-node line also name Claude, which made the adaptation. The
 commit that ports #25 names Manrique in a `Co-authored-by` trailer and Claude, which made the port. LeetJoe's #17
 commit keeps its own `Co-authored-by` trailer, and the first of the two #973 commits names Claude for moving its test
-in the pick. The export removed no trailer; it dropped the "cherry picked from" lines that named our private working
-commits, and kept those that name public ones.
+in the pick. The two v0.7.1 commits that carry #25's tests name Manrique in a `Co-authored-by` trailer and Claude.
+The export removed no trailer; it dropped the "cherry picked from" lines that named our private working commits, and
+kept those that name public ones. In v0.7.1's messages it also put back one line of a message that a pick had lost,
+wrote this branch's public commit `f9c0cee8` for the four-node line's private one of the same change, and took out the
+name of a private note.
+The merge brings the four-node branch's v0.3.2 commits as they were published there; its #38 commit keeps
+Blackwellboy as its author.
 
 ## Names
 
