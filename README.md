@@ -1,20 +1,27 @@
-> **BertholomusAI's fork of TensorFold, branch `deepseek-v41-zig-tp4`: DeepSeek-V4.1-Flash on four NVIDIA GB10 (DGX
-> Spark) nodes.** Weights: [bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-4.0bpw](https://huggingface.co/bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-4.0bpw)
+> **BertholomusAI's fork of TensorFold, branch `deepseek-v41-zig-tp2`: DeepSeek-V4.1-Flash-1017 on two NVIDIA GB10
+> (DGX Spark) nodes.** Weights: [bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw](https://huggingface.co/bertholomus/DeepSeek-V4.1-Flash-1017-EXL3-2.5bpw)
 > (MIT), our EXL3 quant of [deepseek-ai/DeepSeek-V4.1-Flash-1017](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017)
-> (MIT). Releases up to v0.1.1 served [Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw)
+> (MIT), sized for two nodes. The four-node branch's releases up to v0.1.1 served [Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw](https://huggingface.co/Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw)
 > (MIT), an EXL3 quant of [deepseek-ai/DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash).
-> The branch adds a `dsv41` family to TensorFold 1.0.12's native engine: a four-node split (on the 2.9 bpw weights its
-> replies equal the two-node family's token for token in our gates), image input, up to 1,048,576 tokens a request in
-> a shared 25,165,824-position window with kept-prompt reuse (image turns too), structured output, forced tool calls
-> in DeepSeek's DSML, and exact DSpark speculative decoding. Launch, measured
-> numbers, gates and the kernel kit are in the recipe, [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10).
+> The branch is the four-node branch `deepseek-v41-zig-tp4` at its v0.3.1 with nine
+> changes on top: vLLM's `cache_salt`; three fixes the two-node branch `deepseek-v41-zig` had taken (#17, #38, and
+> upstream TensorFold #973's template append, two commits); DeepSeek-V4.1 tool calls read from their own tags (a port
+> of #25); an assistant turn's marker text kept as text with `TENSORFOLD_REPLY_IDS`; and a parser fix for a
+> `<tool_call>` that only starts with a DSML opener. The `dsv41` family adds DeepSeek-V4.1-Flash to TensorFold
+> 1.0.12's native engine: two or four nodes, image input, up to 1,048,576 tokens a request in a shared window
+> (2,097,152 positions in the two-node recipe) with kept-prompt reuse (image turns too), structured output, forced
+> tool calls in DeepSeek's DSML, and exact DSpark speculative decoding. Launch, measured numbers, gates and the kernel
+> kit are in the recipe, [bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10)
+> (v0.7.0); the four-node recipe is [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10).
 > An optional [neighbor transport](docs/recipes/deepseek-v41-neighbor.md) supports adjacent-edge RDMA on a physical ring.
 > `tools/dsv41-zig/inputs/` makes each node's weight file and token map from the checkpoint; `tools/dsv41-zig/kit/`
 > makes and checks the kit's generated files. Contributions: Lucas Peters ([@lucas-peters](https://github.com/lucas-peters), #4),
-> [@lepetitprince716-prog](https://github.com/lepetitprince716-prog) (#18), Manrique ([@hashd1ve](https://github.com/hashd1ve), #26, #28
-> and #29), Scott Woolsey Biggart ([@swbiggart](https://github.com/swbiggart), #30),
-> [@mrsergiopascal](https://github.com/mrsergiopascal) (#31) and [@Blackwellboy](https://github.com/Blackwellboy) (#33 and
-> #34). Thank you. See NOTICE and ATTRIBUTION.md.
+> LeetJoe ([@LeetJoe](https://github.com/LeetJoe), #17), [@lepetitprince716-prog](https://github.com/lepetitprince716-prog) (#18),
+> [@willjriley](https://github.com/willjriley) (#20, the base of #25), Manrique ([@hashd1ve](https://github.com/hashd1ve),
+> #25, #26, #28 and #29), Scott Woolsey Biggart ([@swbiggart](https://github.com/swbiggart), #30),
+> [@mrsergiopascal](https://github.com/mrsergiopascal) (#31), [@Blackwellboy](https://github.com/Blackwellboy) (#33, #34
+> and #38) and Nathan McBride ([@nmcbride](https://github.com/nmcbride), upstream TensorFold #973). Thank you. See NOTICE
+> and ATTRIBUTION.md.
 > This fork is not affiliated with or endorsed by DeepSeek, NVIDIA, the TensorFold authors or Mia-AiLab.
 
 # TensorFold

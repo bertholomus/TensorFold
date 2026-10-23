@@ -7,23 +7,27 @@ Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
 MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
 
-DeepSeek-V4.1-Flash on NVIDIA GB10 nodes: branch deepseek-v41-zig-tp4 of this fork
+DeepSeek-V4.1-Flash on NVIDIA GB10 nodes: branch deepseek-v41-zig-tp2 of this fork
 Copyright 2026 BertholomusAI (Albert Lee, https://github.com/bertholomus)
 
-This branch adds a DeepSeek-V4.1-Flash family to TensorFold's native engine (1.0.12 since this branch's v0.2.0; 1.0.2
-before), under the same Apache License, Version 2.0 (LICENSE), and runs it on two or four GB10 nodes. Its new files are
+This branch adds a DeepSeek-V4.1-Flash family to TensorFold's native engine (1.0.12 since the four-node branch's
+v0.2.0; 1.0.2 before), under the same Apache License, Version 2.0 (LICENSE), and runs it on two or four GB10 nodes. It
+is the four-node branch deepseek-v41-zig-tp4 at its v0.3.1 with nine changes for the two-node recipe. Its new files are
 under zig/src/families/dsv41/, zig/kernels/cuda/dsv41/ (with zig/kernels/cuda/dsv41_ops.cu and dsv41_torch.cu) and
 tools/dsv41-zig/, plus zig/src/core/lanes/novelty.zig, zig/src/server/effort_values_test.zig,
-zig/src/server/plain_specials_test.zig, zig/src/server/reply_parity.zig, zig/src/server/specials.zig,
-zig/src/server/sse_keepalive_test.zig, docs/recipes/deepseek-v41-neighbor.md with its receipts in
+zig/src/server/cache_salt.zig, zig/src/server/cache_salt_test.zig, zig/src/server/plain_specials_test.zig,
+zig/src/server/reply_parity.zig, zig/src/server/specials.zig, zig/src/server/sse_keepalive_test.zig,
+docs/recipes/deepseek-v41-neighbor.md with its receipts in
 docs/receipts/dsv41-neighbor-hardware/ and docs/receipts/dsv41-neighbor-host/, ATTRIBUTION.md and two license texts in
 LICENSES/ (PyTorch, CUTLASS) that THIRD_PARTY_NOTICES.md refers to. tools/dsv41-zig/kit/aot_pack.py is TensorFold
 1.0.2's zig/tests/cuda/nemotron/aot_pack.py, kept with a two-line header after 1.0.12 replaced it, because the kits are
-packed with it. Seven of the branch's changes are contributions to this fork under the same license, kept under their
-authors' names: Lucas Peters (pull request #4), lepetitprince716-prog (pull request #18), Manrique (pull request #26),
-Scott Woolsey Biggart (pull request #30), mrsergiopascal (pull request #31) and Blackwellboy (pull requests #33 and
-#34); two more port Manrique's pull requests #28 and #29 to the four-node family. ATTRIBUTION.md lists every outside
-source the family uses and what it took from each. The branch changes these upstream files:
+packed with it. Nine of the branch's changes are contributions to this fork under the same license, kept under their
+authors' names: Lucas Peters (pull request #4), LeetJoe (pull request #17), lepetitprince716-prog (pull request #18),
+Manrique (pull request #26), Scott Woolsey Biggart (pull request #30), mrsergiopascal (pull request #31) and
+Blackwellboy (pull requests #33, #34 and #38); three more port Manrique's pull requests #25 (the native side of
+willjriley's pull request #20), #28 and #29 to the four-node family, and two are upstream TensorFold's own, by Nathan
+McBride (upstream pull request #973), cherry-picked. ATTRIBUTION.md lists every outside source the family uses and what
+it took from each. The branch changes these upstream files:
   README.md
   THIRD_PARTY_NOTICES.md
   docs/api.md
@@ -46,6 +50,8 @@ source the family uses and what it took from each. The branch changes these upst
   zig/src/core/prompt_cache.zig
   zig/src/core/prompt_cache_fake.zig
   zig/src/core/prompt_cache_test.zig
+  zig/src/core/template/eval.zig
+  zig/src/core/template/tests.zig
   zig/src/cuda/aot.zig
   zig/src/cuda/driver.zig
   zig/src/cuda/kernels.zig
@@ -54,6 +60,7 @@ source the family uses and what it took from each. The branch changes these upst
   zig/src/native/cuda_bound.zig
   zig/src/server/anthropic.zig
   zig/src/server/chat.zig
+  zig/src/server/compact.zig
   zig/src/server/hf_text.zig
   zig/src/server/images.zig
   zig/src/server/messages.zig
@@ -71,3 +78,5 @@ source the family uses and what it took from each. The branch changes these upst
   zig/src/server/tool_parse.zig
   zig/src/server/tool_parse_test.zig
   zig/src/server/tool_stream.zig
+  zig/src/server/tool_stream_test.zig
+  zig/src/server/warm.zig
