@@ -5,7 +5,8 @@ tools in `tools/dsv41-zig/`) to TensorFold 1.0.12's native Zig engine (1.0.2 up 
 [bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10))
 and extends it to an exact two-dimensional split over four nodes. This branch is the four-node branch
 `deepseek-v41-zig-tp4` at its v0.3.1 with the two-node recipe's changes on top (nine in its v0.7.0; in its v0.7.1 seven
-more, a merge of the four-node branch's v0.3.2 and one fix), which the two-node recipe's v0.7.1 serves. It was
+more, a merge of the four-node branch's v0.3.2 and one fix; in its v0.7.2 two in the tokenizer), which the two-node
+recipe's v0.7.2 serves. It was
 written independently and is clean-room with
 respect to other people's DeepSeek-V4.1 work: the jayleaton recipe, upstream TensorFold's DeepSeek-V4.1 pull requests
 (#299, #300 and later) and the DeepSeek-named files of upstream's tree were never opened, and the MiaAI-Lab vLLM kit

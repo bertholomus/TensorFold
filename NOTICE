@@ -13,7 +13,8 @@ Copyright 2026 BertholomusAI (Albert Lee, https://github.com/bertholomus)
 This branch adds a DeepSeek-V4.1-Flash family to TensorFold's native engine (1.0.12 since the four-node branch's
 v0.2.0; 1.0.2 before), under the same Apache License, Version 2.0 (LICENSE), and runs it on two or four GB10 nodes. It
 is the four-node branch deepseek-v41-zig-tp4 at its v0.3.1 with the two-node recipe's changes: nine in its v0.7.0, and
-in its v0.7.1 seven more, a merge of the four-node branch's v0.3.2 and one fix. Its new files are
+in its v0.7.1 seven more, a merge of the four-node branch's v0.3.2 and one fix, and in its v0.7.2 two in the
+tokenizer. Its new files are
 under zig/src/families/dsv41/, zig/kernels/cuda/dsv41/ (with zig/kernels/cuda/dsv41_ops.cu and dsv41_torch.cu) and
 tools/dsv41-zig/, plus zig/src/core/lanes/novelty.zig, zig/src/server/effort_values_test.zig,
 zig/src/core/cache_salt.zig, zig/src/server/cache_salt_test.zig, zig/src/server/dsml.zig,
@@ -55,6 +56,9 @@ it took from each. The branch changes these upstream files:
   zig/src/core/prompt_cache_test.zig
   zig/src/core/template/eval.zig
   zig/src/core/template/tests.zig
+  zig/src/core/tokenizer/model.zig
+  zig/src/core/tokenizer/steps.zig
+  zig/src/core/tokenizer/tokenizer.zig
   zig/src/cuda/aot.zig
   zig/src/cuda/driver.zig
   zig/src/cuda/kernels.zig
