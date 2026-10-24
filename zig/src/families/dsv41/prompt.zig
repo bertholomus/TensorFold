@@ -739,6 +739,9 @@ pub fn mm(e: *const Engine, ch: *const Chunk, l: weights.Linear, x: u64, ldx: us
 /// by the gather path (off: ring mode, as the served lane reads, the slot's previous request's keys below the floor).
 pub var replay_floor = false;
 
+/// TF_DS_WAVES (model.zig sets it): a pass's two waves each apply their part of the Engram rows read ahead for the pass.
+pub var waves = false;
+
 /// TF_DS_IDX_SPLIT (idx_split.zig; model.zig and the layer gate set it on every rank, the ranks' settings check it): the
 /// keyed indexer layers' rows of at least this many columns split by columns over the run's nodes, the same columns
 /// out; 0: as served.
@@ -1276,9 +1279,14 @@ pub fn engramApply(e: *const Engine, ch: *Chunk, eh: *EngramHost, li: usize, seq
     // the rows read ahead (fillChunk's thread) when they start at this chunk and cover it (its first n rows), else
     // read here
     var rows: []u16 = eh.rows;
-    if (l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n >= n) {
+    // (TF_DS_WAVES: a wave's are its part of the pass's rows; the last wave's use ends them)
+    const ahead_end = eh.ahead_start +| eh.ahead_n;
+    if (!waves and l < 2 and eh.ahead_ready[l] and eh.ahead_start == ch.start and eh.ahead_n >= n) {
         rows = eh.ahead_rows[l];
         eh.ahead_ready[l] = false;
+    } else if (waves and l < 2 and eh.ahead_ready[l] and ch.start >= eh.ahead_start and ch.start + n <= ahead_end) {
+        rows = eh.ahead_rows[l][(ch.start - eh.ahead_start) * k * t.row_w ..];
+        if (ch.start + n == ahead_end) eh.ahead_ready[l] = false;
     } else {
         eh.hasher.hashes(seq, ch.start, n, eh.hashes[0 .. n * eh.hasher.layers * cols]);
         for (0..n) |r| {

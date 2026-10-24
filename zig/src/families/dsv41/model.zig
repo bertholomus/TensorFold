@@ -32,6 +32,15 @@ const neighbor = @import("neighbor.zig");
 
 /// The served prompt chunk (TF_DS_PREFILL_CHUNK): a prompt runs in chunks that start at its multiples.
 pub const chunk_rows = 4096;
+/// TF_DS_WAVES=1: a prompt pass of more than wave_rows rows runs as two waves, two chunks of at most wave_rows rows
+/// (fillPair), layer by layer, each wave's partial gathers on a stream and an NCCL communicator of their own while the
+/// stream runs the other wave. Every kernel takes the rows and inputs of two wave_rows chunks one after the other.
+pub const wave_rows = 2048;
+
+pub fn wavesOn() bool {
+    const v = std.c.getenv("TF_DS_WAVES") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
 /// Rows between resume points: the served build's 2048-row grid. Kept states land on it; a pass is cut short to end at
 /// the next one it keeps, so a longer pass resumes where a 2048-row pass would.
 pub const resume_rows = 2048;
@@ -116,6 +125,15 @@ pub const Model = struct {
     arena: prompt.Arena,
     eng: prompt.Engine,
     ch: prompt.Chunk,
+    // TF_DS_WAVES: the first wave's chunk (ch is the second's), the gathers' stream, communicator, 2D buffers (the
+    // upper half of the parts) and engine, and each wave's events (pa, ga, pm, gm ready)
+    waves: bool,
+    ch2: prompt.Chunk,
+    cs: ?cuda.Stream,
+    comm2: ?comm_mod.Comm,
+    two_c: prompt2d.Two,
+    ec: prompt.Engine,
+    wev: [2][4]cuda.Event,
     caches: prompt.Caches,
     blas: cublas.Blas,
     rings: []u64, // each layer's window rings, max_streams slots
@@ -216,6 +234,10 @@ pub const Model = struct {
         m.graphs = null;
         m.pgraphs = null;
         m.two = null;
+        m.waves = wavesOn();
+        prompt.waves = m.waves;
+        m.cs = null;
+        m.comm2 = null;
         m.rdma_rings = null;
         m.neighbor_gather = null;
         const d = ctx.d;
@@ -259,6 +281,9 @@ pub const Model = struct {
             .pool = o.pool,
         });
         errdefer m.comm.deinit();
+        // TF_DS_WAVES: the gathers' communicator (every rank opens it here, in the same order)
+        if (m.waves) m.comm2 = try m.fan.comm(o.rank, o.world);
+        errdefer if (m.comm2) |*x| x.deinit();
         // TP2: the decode gathers' RDMA ring (both ranks connect before either returns)
         if (sp.pair == null and o.rdma_devices != null) {
             const list = o.rdma_devices.?;
@@ -336,11 +361,34 @@ pub const Model = struct {
         m.eng = .{ .d = d, .s = m.stream, .t = .{ .set = &m.set, .stream = m.stream }, .blas = undefined, .comm = &m.comm, .pf = &m.pf, .lin = &m.lg, .ex = &m.exk, .ops = &m.ops, .exact = &m.ex, .c = c, .w = &m.w, .world = sp.world, .plain = rope, .compressed = rope_c, .ring = m.ring, .two = if (m.two) |*t| t else null };
         m.eng.round_rows = o.round_rows;
         if (m.par) |*x| m.eng.par = x;
-        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, chunk_rows, m.ctx_cap); // a stream's keys at most
+        m.ch = try prompt.Chunk.init(&m.eng, &m.arena, if (m.waves) wave_rows else chunk_rows, m.ctx_cap); // a stream's keys at most
+        if (m.waves) m.ch2 = try prompt.Chunk.init(&m.eng, &m.arena, wave_rows, m.ctx_cap);
         m.caches = try prompt.Caches.init(&m.eng, &m.arena, o.pool, m.streams);
         m.blas = try cublas.Blas.open(m.stream, m.ch.blas_ws);
         errdefer m.blas.close();
         m.eng.blas = &m.blas;
+        if (m.waves) {
+            if (2 * wave_rows != chunk_rows) return error.WavesNeedTwoWaveRowsAPass;
+            const t = if (m.two) |*x| x else return error.WavesNeedThe2DSplit;
+            if (t.ow[0] != t.ow[1]) return error.WavesNeedEqualWidths; // the gathers on cs never take t.pad
+            m.cs = try cuda.Stream.init(d, true);
+            // the compute stream's exchanges stay in the parts' lower half (a wave's rows at most), cs's in the upper
+            m.two_c = t.*;
+            m.two_c.part_bytes = t.part_bytes / 2;
+            m.two_c.parts = t.parts + 2 * t.part_bytes;
+            m.two_c.rings = null;
+            // the bf16-sum gathers (TF_DS_2D_YX) exchange through a pad of cs's own
+            m.two_c.pad = try m.arena.take(m.two_c.part_bytes);
+            m.ec = m.eng;
+            m.ec.s = m.cs.?;
+            m.ec.t.stream = m.cs.?;
+            m.ec.comm = &m.comm2.?;
+            m.ec.two = &m.two_c;
+            m.ec.ring = null;
+            for (&m.wev) |*w| for (w) |*ev| {
+                ev.* = try cuda.Event.init(d, false);
+            };
+        }
         m.rings = try a.alloc(u64, c.layers);
         m.ring_view = try a.alloc(u64, c.layers);
         for (m.rings) |*r| {
@@ -440,6 +488,11 @@ pub const Model = struct {
             r.destroy(m.gpa);
         }
         if (m.rdma_mod) |*x| x.unload();
+        if (m.waves) {
+            for (&m.wev) |*w| for (w) |*ev| ev.deinit();
+            if (m.cs) |*x| x.deinit();
+        }
+        if (m.comm2) |*x| x.deinit();
         m.comm.deinit();
         m.fan.close();
         m.w.deinit();
@@ -603,6 +656,10 @@ pub const Model = struct {
         try m.spans.appendSlice(m.gpa, spans);
         m.ch.spans = m.spans.items;
         m.ch.img_rows = if (m.img_buf) |b| b.ptr else 0;
+        if (m.waves) {
+            m.ch2.spans = m.ch.spans;
+            m.ch2.img_rows = m.ch.img_rows;
+        }
     }
 
     pub fn fillBegin(m: *Model, slot: usize, base: usize) !void {
@@ -613,6 +670,7 @@ pub const Model = struct {
         }
         m.spans.clearRetainingCapacity();
         m.ch.spans = &.{};
+        if (m.waves) m.ch2.spans = &.{};
         m.view = try m.caches.view(&m.eng, slot, base);
         for (m.rings, m.ring_view) |r, *v| v.* = r + slot * m.eng.ringBytes();
         m.fill_slot = slot;
@@ -624,6 +682,7 @@ pub const Model = struct {
     /// drafting, its DSpark taps absorbed into the slot's drafter rings. True when it reached the head.
     pub fn fillChunk(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
         if (n == 0 or n > chunk_rows or seq.len != start + n) return error.BadChunk;
+        if (m.waves and n > wave_rows) return m.fillPair(seq, start, n, replay);
         const e = &m.eng;
         const c = e.c;
         const ch = &m.ch;
@@ -731,6 +790,139 @@ pub const Model = struct {
             try t.finish();
         }
         return true;
+    }
+
+    /// fillChunk's pass of n > wave_rows rows with TF_DS_WAVES: wave A (rows [start, start + wave_rows), in ch2) and
+    /// wave B (the rest, in ch) layer by layer, A's work then B's on the stream, each wave's partial gathers (the
+    /// quarters of pa and pm) on cs over comm2 while the stream runs the other wave. A wave's kernels take the rows and
+    /// inputs a fillChunk of its rows would: the stream runs A's layer before B's (B's attention reads A's keys of
+    /// that layer) and B's before A's next, and a wave's consumers wait for its gathers. The head and the logits are
+    /// B's (ch's), as the second of two chunks would leave them.
+    fn fillPair(m: *Model, seq: []const i32, start: usize, n: usize, replay: usize) !bool {
+        if (n > 2 * wave_rows) return error.BadChunk;
+        const e = &m.eng;
+        const c = e.c;
+        const ws = [2]*prompt.Chunk{ &m.ch2, &m.ch };
+        const st = [2]usize{ start, start + wave_rows };
+        const nw = [2]usize{ wave_rows, n - wave_rows };
+        const image_id: i64 = if (c.image_token) |t| t else 0;
+        for (0..n) |j| m.ids64[j] = if (seq[start + j] < 0) image_id else seq[start + j];
+        var hp: [2][]i64 = undefined;
+        var shared: [2]prompt.Shared = .{ .{}, .{} };
+        var live = [2]bool{ true, true };
+        var posted = [2]bool{ false, false }; // a wave's gm gather on cs the stream has not waited for yet
+        // whatever happens, the stream waits for every gather on cs before the pass's buffers are used again
+        defer for (0..2) |w| if (posted[w]) m.stream.wait(m.wev[w][3]) catch {};
+        for (0..2) |w| {
+            hp[w] = m.host_pos[w * wave_rows ..];
+            try prompt.begin(e, ws[w], m.ids64[w * wave_rows ..][0..nw[w]], st[w], hp[w]);
+            if (ws[w].spans.len > 0) try prompt.embedSpans(e, ws[w]);
+        }
+        const taps = m.dr != null;
+        var floor: usize = 0;
+        var kv_done: ?usize = null;
+        // the Engram rows read ahead for the whole pass (fillChunk's), each wave applying its part of them
+        var ahead: ?std.Thread = m.ahead;
+        m.ahead = null;
+        defer if (ahead) |th| th.join();
+        if (m.eh) |*eh| {
+            if (ahead != null and (eh.ahead_start != start or eh.ahead_n != n)) {
+                ahead.?.join();
+                ahead = null;
+            }
+            const whole = eh.ahead_start == start and eh.ahead_n == n and eh.ahead_err == null and eh.ahead_ready[0] and (c.engram_layers.slice().len < 2 or eh.ahead_ready[1]);
+            if (ahead == null and !whole) {
+                eh.ahead_start = start;
+                eh.ahead_n = n;
+                eh.ahead_ready = .{ false, false };
+                eh.ahead_err = null;
+                ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, @as(usize, 0) }) catch null;
+            }
+        }
+        for (0..c.layers) |li| {
+            if (li == c.layers / 2) {
+                for (0..2) |w| {
+                    try m.waitGm(&posted, w);
+                    live[w] = try prompt.replayCut(e, ws[w], &m.view, &shared[w], li, replay, hp[w]);
+                }
+                if (!live[1]) return false; // encoder-only (wave A's rows too): fillChunk's, no synchronize
+                floor = replay;
+                kv_done = li;
+            }
+            if (e.w.layers[li].engram_wkv != null) {
+                const eh = if (m.eh) |*x| x else return error.NoEngramTables;
+                if (ahead) |th| {
+                    th.join();
+                    ahead = null;
+                }
+                if (eh.ahead_err) |err| return err;
+                const j = std.mem.indexOfScalar(u16, c.engram_layers.slice(), @intCast(li)).?;
+                const ne = @min(2, c.engram_layers.slice().len);
+                // the next layer's read-ahead takes the hashes of this one's (the whole pass's): only after rows read
+                // ahead, never after the waves hashed their own rows here
+                const read_ahead = j < 2 and eh.ahead_ready[j] and eh.ahead_start == start and eh.ahead_n == n;
+                for (0..2) |w| if (live[w]) {
+                    try m.waitGm(&posted, w);
+                    try prompt.engramApply(e, ws[w], eh, li, seq[0 .. st[w] + nw[w]]);
+                };
+                if (j + 1 < ne) {
+                    if (!eh.ahead_ready[j + 1] and read_ahead)
+                        ahead = std.Thread.spawn(.{}, prompt.engramReadAhead, .{ eh, c, seq, start, n, j + 1 }) catch null;
+                } else if (m.fill_seq.len > start + n and m.fill_seq.ptr == seq.ptr) {
+                    const nn = @min(chunk_rows, m.fill_seq.len - start - n);
+                    eh.ahead_start = start + n;
+                    eh.ahead_n = nn;
+                    eh.ahead_ready = .{ false, false };
+                    eh.ahead_err = null;
+                    m.ahead = std.Thread.spawn(.{}, prompt.engramReadAheadAll, .{ eh, c, m.fill_seq[0 .. start + n + nn], start + n, nn }) catch null;
+                }
+            }
+            for (0..2) |w| if (live[w]) {
+                const ch = ws[w];
+                try m.waitGm(&posted, w);
+                if (taps) if (std.mem.indexOfScalar(u16, c.dspark_taps.slice(), @intCast(li))) |j| try prompt.tap(e, ch, j);
+                try prompt.attnMixes(e, ch, li);
+                try prompt.attention(e, ch, &m.view, &shared[w], li, m.ring_view[li], floor, kv_done != null and kv_done.? == li);
+                try m.gatherOnCs(w, 0, ch.pa, ch.ga);
+            };
+            for (0..2) |w| if (live[w]) {
+                const ch = ws[w];
+                try m.stream.wait(m.wev[w][1]);
+                try prompt.ffnMixes(e, ch, li);
+                try prompt.moe(e, ch, li);
+                try m.gatherOnCs(w, 2, ch.pm, ch.gm);
+                posted[w] = true;
+                prompt.endLayer(ch);
+            };
+        }
+        for (0..2) |w| try m.waitGm(&posted, w);
+        try prompt.head(e, &m.ch);
+        if (m.dr) |*dr| {
+            const dw = c.hidden;
+            for (0..2) |w| if (live[w]) {
+                const ch = ws[w];
+                for (0..c.dspark_taps.slice().len) |j| try e.ops.copyRows(e.s, prompt.tapRows(e, ch, j), dw * 2, dr.at + j * dw * 2, dr.taps_w * 2, dw * 2, ch.n);
+                try dr.absorb(e, ch, &m.dpool.?, m.fill_slot, dr.at, ch.n, ch.start);
+            };
+        }
+        return true;
+    }
+
+    /// Wave w's partial `src` gathered into `dst` on cs (events k, k + 1: ready on the stream, gathered on cs).
+    fn gatherOnCs(m: *Model, w: usize, k: usize, src: u64, dst: u64) !void {
+        const ch = if (w == 0) &m.ch2 else &m.ch;
+        try m.wev[w][k].record(m.stream);
+        try m.cs.?.wait(m.wev[w][k]);
+        const rs = try prompt.gather(&m.ec, ch, src, dst);
+        if (k == 0) ch.ga_rs = rs else ch.gm_rs = rs;
+        try m.wev[w][k + 1].record(m.cs.?);
+    }
+
+    /// The stream waits for wave w's MoE gather (on cs) before anything reads its gm.
+    fn waitGm(m: *Model, posted: *[2]bool, w: usize) !void {
+        if (!posted[w]) return;
+        try m.stream.wait(m.wev[w][3]);
+        posted[w] = false;
     }
 
     /// The prompt's logits (its last row's, the ranks' columns in rank order) after a fill's last chunk.
