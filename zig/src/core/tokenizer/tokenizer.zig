@@ -134,19 +134,9 @@ pub const Tokenizer = struct {
         }
         var ids: std.ArrayList(u32) = .empty;
         for (try t.splitAdded(&ctx, &t.raw, valid)) |seg| {
-            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeSegment(&ctx, valid[seg.start..seg.end], seg.start == 0, &ids);
+            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, valid[seg.start..seg.end], seg.start == 0, &ids);
         }
         return a.dupe(u32, ids.items);
-    }
-
-    /// encodeText through the memo for a long segment: its kept ids, else encoded and kept.
-    fn encodeSegment(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
-        const m = t.memo orelse return t.encodeText(ctx, text, first, ids);
-        if (text.len < @import("memo.zig").min_bytes) return t.encodeText(ctx, text, first, ids);
-        if (try m.append(text, first, ctx.a, ids)) return;
-        const from = ids.items.len;
-        try t.encodeText(ctx, text, first, ids);
-        m.put(text, first, ids.items[from..]);
     }
 
     /// `encode` with no added token matched: text that spells one (a quoted marker) is ordinary text.
@@ -182,10 +172,20 @@ pub const Tokenizer = struct {
                 continue;
             }
             if (seg.end == seg.start) continue;
+            const part = normalized[seg.start..seg.end];
+            const lead = seg.start < zero;
+            // a long segment goes through the memo here, between every added token: a chat's markers can be ones
+            // matched after normalization (DeepSeek-V4's are), and only here does a message's text stand alone, the
+            // same in the prompt's render, the history's and the next turn's. Its ids come from its text and `lead`
+            // alone, the memo's key.
+            const kept = if (added and part.len >= @import("memo.zig").min_bytes) t.memo else null;
+            if (kept) |k| if (try k.append(part, lead, ctx.a, ids)) continue;
+            const from = ids.items.len;
             var pieces: std.ArrayList(steps.Piece) = .empty;
-            try pieces.append(ctx.a, .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero });
+            try pieces.append(ctx.a, .{ .text = part, .first = lead });
             if (t.pre_tokenizer) |*p| try p.apply(ctx, &pieces);
             for (pieces.items) |piece| try t.model.tokenize(ctx, &t.vocab, piece.text, ids);
+            if (kept) |k| k.put(part, lead, ids.items[from..]);
         }
     }
 
@@ -417,6 +417,43 @@ test "with the memo, long segments encode as without it, and the second encode t
         try std.testing.expectEqualSlices(u32, plain, kept);
     }
     try std.testing.expectEqual(@as(u64, 2), t.memo.?.hits); // both segments, the second time
+}
+
+test "the memo keeps a message's text between markers matched after normalization, as a chat's are" {
+    // DeepSeek-V4's chat markers are added tokens with "normalized": true: the prompt's render and the history's
+    // differ past the message, and the message's text is the same segment in both only after the split on them
+    const json =
+        \\{"added_tokens":[{"id":7,"content":"<|end|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+        \\ {"id":8,"content":"<|user|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false},
+        \\ {"id":9,"content":"<|bot|>","single_word":false,"lstrip":false,"rstrip":false,"normalized":true,"special":false}],
+        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":" ?\\S+|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
+        \\ "decoder":{"type":"ByteLevel"},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":"","end_of_word_suffix":"","fuse_unk":false,"byte_fallback":false,"ignore_merges":false,
+        \\  "vocab":{"a":0,"b":1,"Ġ":2,"ab":3,"Ġa":4,"Ġab":5,"c":6},"merges":[["Ġ","a"],"a b","Ġa b"]}}
+    ;
+    const a = std.testing.allocator;
+    var t = try parse(a, json);
+    defer t.deinit();
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(a);
+    for (0..300) |_| try body.appendSlice(a, "ab abc ");
+    const history = try std.mem.concat(a, u8, &.{ "<|end|><|user|>", body.items });
+    defer a.free(history);
+    const prompt = try std.mem.concat(a, u8, &.{ history, "<|bot|>" });
+    defer a.free(prompt);
+    const fresh_prompt = try t.encode(a, prompt);
+    defer a.free(fresh_prompt);
+    const fresh_history = try t.encode(a, history);
+    defer a.free(fresh_history);
+    try std.testing.expectEqual(@as(u32, 9), fresh_prompt[fresh_prompt.len - 1]);
+    t.memo = try Memo.create(a, 1 << 20);
+    const kept_prompt = try t.encode(a, prompt);
+    defer a.free(kept_prompt);
+    const kept_history = try t.encode(a, history);
+    defer a.free(kept_history);
+    try std.testing.expectEqualSlices(u32, fresh_prompt, kept_prompt);
+    try std.testing.expectEqualSlices(u32, fresh_history, kept_history);
+    try std.testing.expectEqual(@as(u64, 1), t.memo.?.hits); // the message's text, in the history's encode
 }
 
 test "a kept segment's ids equal a fresh encode's wherever the segment sits" {
