@@ -395,6 +395,14 @@ pub const Engine = struct {
             committed.shrinkRetainingCapacity(c);
             try committed.append(a, try s.startClose(e.gpa));
         }
+        if (s.call_gate) |gate| if (try gate.cut(gate.ptr, a, committed.items)) |hit| {
+            cut = hit.at;
+            path = path[0 .. hit.at + 1];
+            committed.shrinkRetainingCapacity(hit.at);
+            s.force.clearRetainingCapacity();
+            try s.force.appendSlice(e.gpa, hit.fix[1..]);
+            try committed.append(a, hit.fix[0]);
+        };
         s.rounds += 1;
         var committed_rows: []LogRow = &.{};
         if (rows_lp.len > 0) {
@@ -512,6 +520,7 @@ pub const Engine = struct {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
         if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        if (s.call_gate) |gate| current = try gate.feed(e.arena.allocator(), e.gpa, &s.force, e.backend, current);
         var token: u32 = undefined;
         if (mode == .drain) {
             token = try e.readFeed(current); // the last queued step: no new one
@@ -537,6 +546,7 @@ pub const Engine = struct {
         var current: Feed = .{ .handle = s.inflight.? };
         s.inflight = null;
         if (try e.forcedNext(s)) |t| current = .{ .value = t };
+        if (s.call_gate) |gate| current = try gate.feed(e.arena.allocator(), e.gpa, &s.force, e.backend, current);
         const token = try e.readFeed(current);
         s.rounds += 1;
         const landed = try s.commit(e.gpa, &.{token}, &.{});

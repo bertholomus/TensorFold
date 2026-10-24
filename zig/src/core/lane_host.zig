@@ -373,6 +373,7 @@ pub const LaneHost = struct {
             .prompt_logprobs = r.prompt_logprobs,
             .loop_guard = r.loop_guard,
             .loop_windows = r.loop_windows,
+            .call_gate = if (r.call) |c| c.filter else null,
             .chunks = r.chunks,
             .history_len = r.history_len,
             .shared_prefixes = r.shared_prefixes,
