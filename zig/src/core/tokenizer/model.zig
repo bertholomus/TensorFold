@@ -64,6 +64,12 @@ pub const Model = struct {
     fn bpe(m: *const Model, ctx: *steps.Context, vocab: *const Vocab, word: []const u8, out: *std.ArrayList(u32)) Error!void {
         const a = ctx.a;
         if (m.ignore_merges) if (m.id(vocab, word)) |whole| return out.append(a, whole);
+        // the word's scratch lives in ctx.word when the caller gives one and is emptied for the next word, so an encode
+        // of a long text holds one word's symbols and queue instead of every word's; the ids still go to `a`
+        const w = if (ctx.word) |scratch| scratch.allocator() else a;
+        defer if (ctx.word) |scratch| {
+            _ = scratch.reset(.retain_capacity);
+        };
         var symbols: std.ArrayList(Symbol) = .empty;
         var pending_unk: ?u32 = null;
         var piece: std.ArrayList(u8) = .empty;
@@ -73,16 +79,16 @@ pub const Model = struct {
             var s = word[i .. i + len];
             if ((i > 0 and m.prefix != null) or (i + len == word.len and m.suffix != null)) {
                 piece.clearRetainingCapacity();
-                if (i > 0) try piece.appendSlice(a, m.prefix orelse "");
-                try piece.appendSlice(a, s);
-                if (i + len == word.len) try piece.appendSlice(a, m.suffix orelse "");
+                if (i > 0) try piece.appendSlice(w, m.prefix orelse "");
+                try piece.appendSlice(w, s);
+                if (i + len == word.len) try piece.appendSlice(w, m.suffix orelse "");
                 s = piece.items;
             }
             i += len;
             if (m.id(vocab, s)) |found| {
-                if (pending_unk) |u| try symbols.append(a, .{ .id = u, .prev = 0, .next = 0 });
+                if (pending_unk) |u| try symbols.append(w, .{ .id = u, .prev = 0, .next = 0 });
                 pending_unk = null;
-                try symbols.append(a, .{ .id = found, .prev = 0, .next = 0 });
+                try symbols.append(w, .{ .id = found, .prev = 0, .next = 0 });
                 continue;
             }
             if (m.byte_fallback) {
@@ -91,17 +97,17 @@ pub const Model = struct {
                     if (m.byte_ids[b] == null) break false;
                 } else true;
                 if (all) {
-                    for (s) |b| try symbols.append(a, .{ .id = m.byte_ids[b].?, .prev = 0, .next = 0 });
+                    for (s) |b| try symbols.append(w, .{ .id = m.byte_ids[b].?, .prev = 0, .next = 0 });
                     continue;
                 }
             }
             if (m.unk_token != null) {
                 if (pending_unk != null and m.fuse_unk) continue;
-                if (pending_unk) |u| try symbols.append(a, .{ .id = u, .prev = 0, .next = 0 });
+                if (pending_unk) |u| try symbols.append(w, .{ .id = u, .prev = 0, .next = 0 });
                 pending_unk = try m.unk(vocab);
             }
         }
-        if (pending_unk) |u| try symbols.append(a, .{ .id = u, .prev = 0, .next = 0 });
+        if (pending_unk) |u| try symbols.append(w, .{ .id = u, .prev = 0, .next = 0 });
         const syms = symbols.items;
         for (syms, 0..) |*s, k| {
             s.prev = @as(i32, @intCast(k)) - 1;
@@ -109,7 +115,7 @@ pub const Model = struct {
         }
         var queue = std.PriorityQueue(Candidate, void, order).empty;
         for (0..syms.len -| 1) |k| if (m.pair(syms[k].id, syms[k + 1].id)) |hit|
-            try queue.push(a, .{ .rank = hit.rank, .pos = @intCast(k), .id = hit.id });
+            try queue.push(w, .{ .rank = hit.rank, .pos = @intCast(k), .id = hit.id });
         while (queue.pop()) |top| {
             const s = &syms[top.pos];
             if (!s.alive or s.next < 0) continue;
@@ -121,9 +127,9 @@ pub const Model = struct {
             syms[right].alive = false;
             if (s.next >= 0) syms[@intCast(s.next)].prev = @intCast(top.pos);
             if (s.prev >= 0) if (m.pair(syms[@intCast(s.prev)].id, s.id)) |hit|
-                try queue.push(a, .{ .rank = hit.rank, .pos = @intCast(s.prev), .id = hit.id });
+                try queue.push(w, .{ .rank = hit.rank, .pos = @intCast(s.prev), .id = hit.id });
             if (s.next >= 0) if (m.pair(s.id, syms[@intCast(s.next)].id)) |hit|
-                try queue.push(a, .{ .rank = hit.rank, .pos = top.pos, .id = hit.id });
+                try queue.push(w, .{ .rank = hit.rank, .pos = top.pos, .id = hit.id });
         }
         for (syms) |s| if (s.alive) try out.append(a, s.id);
     }

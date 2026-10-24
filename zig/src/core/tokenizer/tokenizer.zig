@@ -119,9 +119,13 @@ pub const Tokenizer = struct {
 
     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
-        var arena = std.heap.ArenaAllocator.init(a);
+        // the scratch comes from the tokenizer's allocator, not `a`, so it goes back when the ids exist even when `a` is
+        // an arena that lives on (a server request's); only the returned ids are `a`'s
+        var arena = std.heap.ArenaAllocator.init(t.allocator);
         defer arena.deinit();
-        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+        var word = std.heap.ArenaAllocator.init(t.allocator);
+        defer word.deinit();
+        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() }, .word = &word };
         var valid = text;
         if (!std.unicode.utf8ValidateSlice(text)) {
             var fixed: std.ArrayList(u8) = .empty;
@@ -147,9 +151,11 @@ pub const Tokenizer = struct {
 
     /// `encode` with no added token matched: text that spells one (a quoted marker) is ordinary text.
     pub fn encodePlain(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
-        var arena = std.heap.ArenaAllocator.init(a);
+        var arena = std.heap.ArenaAllocator.init(t.allocator); // as encode's
         defer arena.deinit();
-        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+        var word = std.heap.ArenaAllocator.init(t.allocator);
+        defer word.deinit();
+        var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() }, .word = &word };
         var valid = text;
         if (!std.unicode.utf8ValidateSlice(text)) {
             var fixed: std.ArrayList(u8) = .empty;

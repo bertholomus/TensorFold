@@ -14,6 +14,8 @@ pub const Context = struct {
     raw_bytes: bool = false,
     spans: std.ArrayList(Span) = .empty,
     hits: std.ArrayList([2]usize) = .empty,
+    /// One word's scratch for the model (BPE's symbols and merge queue), emptied after each word; null: it stays in `a`.
+    word: ?*std.heap.ArenaAllocator = null,
 };
 
 pub const Span = struct { start: usize, end: usize, matched: bool };
