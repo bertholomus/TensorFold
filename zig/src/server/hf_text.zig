@@ -4,6 +4,7 @@ const tokenizer = @import("tokenizer");
 const template = @import("template");
 const json = @import("json.zig");
 const model_text = @import("model_text.zig");
+const literal_tokens = @import("literal_tokens.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
@@ -19,6 +20,7 @@ pub const HfText = struct {
     eos: []const u32 = &.{},
     prefix: []const u32 = &.{}, // the post-processor's tokens before a text (add_special_tokens)
     suffix: []const u32 = &.{},
+    literals: literal_tokens.Table = .{}, // added tokens a client's quoted text keeps as text
 
     /// Loads ``dir``'s tokenizer.json, chat template, special tokens and end-of-sequence ids; a failure's reason in `problem` (from `pa`).
     pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, pa: Allocator, problem: *[]const u8) !*HfText {
@@ -37,6 +39,9 @@ pub const HfText = struct {
         t.specials = try specialsOf(a, config);
         t.eos = try t.eosIds(a, model_config, config);
         try t.readPostProcessor(io, a, dir);
+        const contents = try a.alloc([]const u8, t.tok.added.len);
+        for (contents, t.tok.added) |*c, at| c.* = at.content;
+        t.literals = try literal_tokens.Table.init(a, contents);
         if (t.source.len > 0) {
             var diag: template.Diag = .{};
             t.compiled = template.compile(gpa, t.source, &diag) catch |e| {
@@ -201,7 +206,12 @@ pub const HfText = struct {
             .render = renderFn,
             .template_source = sourceFn,
             .special = specialFn,
+            .literals = literalsFn,
         } };
+    }
+
+    fn literalsFn(ctx: *anyopaque) *const literal_tokens.Table {
+        return &self(ctx).literals;
     }
 
     fn specialFn(ctx: *anyopaque, id: u32) bool {
