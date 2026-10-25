@@ -368,7 +368,8 @@ pub const LaneHost = struct {
         if (h.loneFits(job)) return h.runLone(job, began);
         h.core.addStream(&job.stream) catch |e| {
             if (e == error.Cancelled) return h.cancel(job);
-            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+            // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
+            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
             return h.drop(job, h.words(e));
         };
         if (h.core.filling == &job.stream) {
@@ -468,9 +469,9 @@ pub const LaneHost = struct {
         return true;
     }
 
-    /// A request whose prompt pass the backend's pool cannot hold while other streams run (error.ContextFull, before
-    /// anything of it was placed) goes back to the queue's front and waits until one of them ends, as the Python
-    /// lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
+    /// A request whose prompt pass the backend's pool cannot hold while other streams run or a pass fills (ContextFull,
+    /// before anything of it was placed) goes back to the queue's front and waits until one of them ends, as the
+    /// Python lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
     /// false: nothing more is admitted now.
     fn requeue(h: *LaneHost, job: *Job) bool {
         h.remove(job);

@@ -447,7 +447,7 @@ pub const Lanes = struct {
         };
         if (self.fill) |f| if (f.s != s) {
             // a prompt cuts in between this pass's pieces: it waits (one at most, no images), its next piece resumes it
-            if (self.paused != null or f.s.images.len > 0) return error.FillBusy;
+            if (self.paused != null or f.s.images.len > 0 or s.images.len > 0) return error.FillBusy;
             self.paused = f;
             self.fill = null;
         };
@@ -1218,4 +1218,18 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try ln.snaps.append(std.testing.allocator, &later);
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+}
+
+test "a prompt with images does not cut in between another pass's pieces" {
+    var m: Model = undefined;
+    m.io = std.testing.io;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    var long: lanes.Stream = undefined;
+    long.images = &.{};
+    var short: lanes.Stream = undefined;
+    const image = [_]lanes.stream.Image{.{ .at = 0, .tokens = 1, .bytes = "" }};
+    short.images = &image;
+    ln.fill = .{ .s = &long, .slot = 0, .len = 16, .replay = 0, .last_end = 0, .start = 8 };
+    try std.testing.expectError(error.FillBusy, ln.prefillPart(&short, 1));
+    try std.testing.expect(ln.paused == null and ln.fill.?.s == &long); // the pass in pieces stays as it was
 }
