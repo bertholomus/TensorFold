@@ -37,7 +37,7 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -327,6 +327,7 @@ pub const Lanes = struct {
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
+    paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -444,9 +445,15 @@ pub const Lanes = struct {
         defer if (self.prof) |*p| {
             p.prefill += m.now() - t0;
         };
-        if (self.fill) |f| {
-            if (f.s != s) return error.FillBusy;
-        } else try self.fillOpen(s);
+        if (self.fill) |f| if (f.s != s) {
+            // a prompt cuts in between this pass's pieces: it waits (one at most, no images), its next piece resumes it
+            if (self.paused != null or f.s.images.len > 0 or s.images.len > 0) return error.FillBusy;
+            self.paused = f;
+            self.fill = null;
+        };
+        if (self.fill == null) {
+            if (self.paused != null and self.paused.?.s == s) try self.fillResume() else try self.fillOpen(s);
+        }
         errdefer self.fill = null;
         const f = &self.fill.?;
         const seq = self.seqs[f.slot].items;
@@ -486,6 +493,20 @@ pub const Lanes = struct {
         const token = try draw(logits, done.len, s.sampling);
         self.streams.getPtr(s).?.first = self.take(token);
         return true;
+    }
+
+    /// A paused pass resumes: both ranks' model views back on its slot and extent, whose rows, rings and ids it kept.
+    fn fillResume(self: *Lanes) !void {
+        const f = self.paused.?;
+        const l = self.streams.get(f.s) orelse return error.UnknownStream;
+        if (try self.begin(.fill_resume)) {
+            try self.wire.int(self.gpa, u32, @intCast(f.slot));
+            try self.wire.int(self.gpa, u64, l.base);
+            try self.flush();
+        }
+        try self.m.fillBegin(f.slot, l.base);
+        self.fill = f;
+        self.paused = null;
     }
 
     /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
@@ -907,6 +928,9 @@ pub const Lanes = struct {
             self.m.fill_seq = &.{};
             self.fill = null;
         };
+        if (self.paused) |f| if (f.s == s) {
+            self.paused = null;
+        };
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
     }
@@ -964,6 +988,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             7 => .snap_drop,
             8 => .fill_images,
             9 => .done,
+            10 => .fill_resume,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
@@ -980,6 +1005,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 if (slot >= max_streams) return error.BadSlot;
                 img_rows.clearRetainingCapacity();
                 try r.ids(gpa, &seqs[slot]);
+                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                m.fill_seq = seqs[slot].items;
+            },
+            .fill_resume => {
+                slot = try r.int(u32);
+                const base = try r.int(u64);
+                if (slot >= max_streams) return error.BadSlot;
                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
                 m.fill_seq = seqs[slot].items;
             },
@@ -1186,4 +1218,18 @@ test "a prefix two conversations share: the second one resuming it in place woul
     try ln.snaps.append(std.testing.allocator, &later);
     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+}
+
+test "a prompt with images does not cut in between another pass's pieces" {
+    var m: Model = undefined;
+    m.io = std.testing.io;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    var long: lanes.Stream = undefined;
+    long.images = &.{};
+    var short: lanes.Stream = undefined;
+    const image = [_]lanes.stream.Image{.{ .at = 0, .tokens = 1, .bytes = "" }};
+    short.images = &image;
+    ln.fill = .{ .s = &long, .slot = 0, .len = 16, .replay = 0, .last_end = 0, .start = 8 };
+    try std.testing.expectError(error.FillBusy, ln.prefillPart(&short, 1));
+    try std.testing.expect(ln.paused == null and ln.fill.?.s == &long); // the pass in pieces stays as it was
 }

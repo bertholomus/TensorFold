@@ -293,12 +293,21 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
     }
 
-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+    /// Prefills the next queued request (while a pass fills, the first that core.cutsIn); false if none or no lane.
     fn admitOne(h: *LaneHost) bool {
         h.lock();
-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or h.filling != null) {
+        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
             return false;
+        }
+        var at: usize = 0;
+        if (h.filling != null) {
+            at = for (h.queued.items, 0..) |j, i| {
+                if (h.core.cutsIn(j.request.prompt.len, j.request.images.len > 0)) break i;
+            } else {
+                h.unlock();
+                return false;
+            };
         }
         if (h.full_wait) |n| {
             const active = h.core.activeCount();
@@ -315,7 +324,7 @@ pub const LaneHost = struct {
             }
             h.finish_until = null;
         }
-        const job = h.queued.orderedRemove(0);
+        const job = h.queued.orderedRemove(at);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
@@ -359,7 +368,8 @@ pub const LaneHost = struct {
         if (h.loneFits(job)) return h.runLone(job, began);
         h.core.addStream(&job.stream) catch |e| {
             if (e == error.Cancelled) return h.cancel(job);
-            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+            // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
+            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
             return h.drop(job, h.words(e));
         };
         if (h.core.filling == &job.stream) {
@@ -459,9 +469,9 @@ pub const LaneHost = struct {
         return true;
     }
 
-    /// A request whose prompt pass the backend's pool cannot hold while other streams run (error.ContextFull, before
-    /// anything of it was placed) goes back to the queue's front and waits until one of them ends, as the Python
-    /// lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
+    /// A request whose prompt pass the backend's pool cannot hold while other streams run or a pass fills (ContextFull,
+    /// before anything of it was placed) goes back to the queue's front and waits until one of them ends, as the
+    /// Python lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
     /// false: nothing more is admitted now.
     fn requeue(h: *LaneHost, job: *Job) bool {
         h.remove(job);

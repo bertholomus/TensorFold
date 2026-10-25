@@ -384,3 +384,126 @@ test "a prompt within the first piece runs whole: the decoding stream waits for 
         try history.append(gpa, t);
     }
 }
+
+/// A long pass in pieces (cut_in set, nothing decoding), a request sent in its first chunk: chunk order, both replies.
+const CutIn = struct {
+    mutex: std.Io.Mutex = .init,
+    seen: std.ArrayList([2]usize) = .empty,
+    a: std.ArrayList(u32) = .empty,
+    b: std.ArrayList(u32) = .empty,
+    first: bool = false, // the long pass's first chunk is running
+    sent: bool = false, // the second request is queued
+    a_done: bool = false,
+    b_done: bool = false,
+
+    fn hook(ctx: *anyopaque, s: *lanes.stream.Stream, chunk: usize) void {
+        const w: *CutIn = @ptrCast(@alignCast(ctx));
+        w.mutex.lockUncancelable(std.testing.io);
+        w.seen.append(std.testing.allocator, .{ s.prompt_len, chunk }) catch {};
+        const wait = s.prompt_len == long.len and chunk == 0;
+        if (wait) w.first = true;
+        w.mutex.unlock(std.testing.io);
+        // the long pass's first chunk holds the engine until the second request is in the queue
+        if (wait) w.until(.sent) catch {};
+    }
+
+    fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
+        const w: *CutIn = @ptrCast(@alignCast(ctx));
+        w.mutex.lockUncancelable(std.testing.io);
+        defer w.mutex.unlock(std.testing.io);
+        switch (e.*) {
+            .tokens => |t| (if (id == 1) &w.a else &w.b).appendSlice(std.testing.allocator, t) catch {},
+            .finished => if (id == 1) {
+                w.a_done = true;
+            } else {
+                w.b_done = true;
+            },
+            else => {},
+        }
+    }
+
+    fn until(w: *CutIn, comptime what: enum { first, sent, done }) !void {
+        for (0..20000) |_| {
+            w.mutex.lockUncancelable(std.testing.io);
+            const ok = switch (what) {
+                .first => w.first,
+                .sent => w.sent,
+                .done => w.a_done and w.b_done,
+            };
+            w.mutex.unlock(std.testing.io);
+            if (ok) return;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+        return error.Timeout;
+    }
+
+    const long = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8 };
+
+    /// The long request, then `second`: the chunk order (caller frees), each reply checked as the fake's.
+    fn run(second: []const u32, opts: struct { cut_in: u32 = 4, refuse_full: usize = 0 }) ![][2]usize {
+        const gpa = std.testing.allocator;
+        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+        defer cfg.deinit(gpa);
+        var w: CutIn = .{};
+        defer w.a.deinit(gpa);
+        defer w.b.deinit(gpa);
+        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w, .refuse_full = opts.refuse_full };
+        defer target.deinit();
+        var clock: lanes.fake.FixedClock = .{};
+        var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+        defer core.deinit();
+        core.fill_chunks = 1;
+        core.fill_rounds = 2;
+        core.cut_in = opts.cut_in;
+        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+        try host.start();
+        defer host.stop();
+        const e = host.engine();
+        try e.submit(1, &.{ .prompt = &long, .max_tokens = 6 }, .{ .ctx = &w, .event = event });
+        try w.until(.first);
+        try e.submit(2, &.{ .prompt = second, .max_tokens = 6 }, .{ .ctx = &w, .event = event });
+        w.mutex.lockUncancelable(std.testing.io);
+        w.sent = true;
+        w.mutex.unlock(std.testing.io);
+        try w.until(.done);
+        try std.testing.expectEqual(@as(usize, 0), target.refuse_full);
+        for ([_][]const u32{ &long, second }, [_][]const u32{ w.a.items, w.b.items }) |prompt, reply| {
+            var history: std.ArrayList(u32) = .empty;
+            defer history.deinit(gpa);
+            try history.appendSlice(gpa, prompt);
+            try std.testing.expectEqual(@as(usize, 6), reply.len);
+            for (reply) |t| {
+                try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
+                try history.append(gpa, t);
+            }
+        }
+        return w.seen.toOwnedSlice(gpa);
+    }
+};
+
+test "a short prompt cuts in: its whole pass runs between a long pass's pieces, and both replies are unchanged" {
+    const order = try CutIn.run(&.{ 3, 1, 4 }, .{});
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 12), order.len);
+    // the long pass's first chunk, the short pass whole, then the long pass's other five chunks
+    try std.testing.expectEqual([2]usize{ CutIn.long.len, 0 }, order[0]);
+    for (order[1..7], 0..) |o, i| try std.testing.expectEqual([2]usize{ 3, i }, o);
+    for (order[7..12], 1..) |o, i| try std.testing.expectEqual([2]usize{ CutIn.long.len, i }, o);
+}
+
+test "a prompt longer than cut_in waits for the pass in pieces, as before" {
+    const order = try CutIn.run(&.{ 3, 1, 4, 1, 5 }, .{});
+    defer std.testing.allocator.free(order);
+    try std.testing.expectEqual(@as(usize, 12), order.len);
+    for (order[0..6], 0..) |o, i| try std.testing.expectEqual([2]usize{ CutIn.long.len, i }, o);
+    for (order[6..12], 0..) |o, i| try std.testing.expectEqual([2]usize{ 5, i }, o);
+}
+
+test "a short prompt refused for room as it cuts in waits in the queue and then runs, as it does without cut_in" {
+    // the fake refuses the short pass once (error.ContextFull) while the long pass holds its lane; its reply is whole
+    for ([_]u32{ 4, 0 }) |cut_in| {
+        const order = try CutIn.run(&.{ 3, 1, 4 }, .{ .cut_in = cut_in, .refuse_full = 1 });
+        defer std.testing.allocator.free(order);
+        try std.testing.expectEqual(@as(usize, 12), order.len);
+    }
+}

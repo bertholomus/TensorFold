@@ -196,6 +196,8 @@ const Host = struct {
         h.core.fill_chunks = envInt("TF_FILL_CHUNKS") orelse 0;
         h.core.fill_rounds = envInt("TF_FILL_ROUNDS") orelse h.core.fill_rounds;
         h.core.fill_first = envInt("TF_FILL_FIRST") orelse 0; // the first piece's chunks: a prompt that short runs whole
+        // TF_FILL_CUT_IN=T (with TF_FILL_CHUNKS): a prompt of at most T tokens runs between another pass's pieces
+        h.core.cut_in = envInt("TF_FILL_CUT_IN") orelse 0;
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
