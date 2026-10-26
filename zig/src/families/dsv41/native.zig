@@ -98,15 +98,17 @@ fn nonEmpty(v: ?[]const u8) ?[]const u8 {
 /// The device bytes this rank's weights take, for the host's memory check: its file in TF_DS_RANK_CACHE (the
 /// checkpoint holds both ranks'); 0 when there is none to read (open then says what to set).
 pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
+    return weightBytesWith(io, dir, true);
+}
+
+/// weightBytes for a start with or without drafts: --no-drafts loads none of the drafter's entries, so none count.
+pub fn weightBytesWith(io: std.Io, dir: []const u8, drafts: bool) u64 {
     _ = dir;
     var d = std.Io.Dir.cwd().openDir(io, getenv("TF_DS_RANK_CACHE") orelse return 0, .{ .iterate = true }) catch return 0;
     defer d.close(io);
-    var buf: [512]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
     const world = std.fmt.parseInt(u32, getenv("TF_TP_WORLD") orelse "2", 10) catch return 0;
-    const name = rank_cache.find(fba.allocator(), io, d, 0, world) catch return 0;
-    const st = d.statFile(io, name, .{}) catch return 0;
-    return st.size;
+    const skip: ?[]const u8 = if (drafts) null else @import("plan.zig").drafter_prefix;
+    return rank_cache.loadBytes(std.heap.page_allocator, io, d, 0, world, skip) catch 0;
 }
 
 /// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds `o.context`

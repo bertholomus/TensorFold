@@ -84,6 +84,13 @@ pub fn counts(unified: bool, card: MemInfo, text: ?[]const u8) error{HostMemoryU
     return card;
 }
 
+/// The weights a start's check charges: the family's own share (by the start's drafts when it tells), else `whole`'s.
+pub fn familyWeights(comptime F: type, io: std.Io, dir: []const u8, drafts: bool, whole: *const fn (std.Io, []const u8) u64) u64 {
+    if (@hasDecl(F, "weightBytesWith")) return F.weightBytesWith(io, dir, drafts);
+    if (@hasDecl(F, "weightBytes")) return F.weightBytes(io, dir);
+    return whole(io, dir);
+}
+
 test "the memory plan: reserve, cap, and admission that fails closed" {
     const g: u64 = 1 << 30;
     try std.testing.expectEqual(4 * g, try reserveBytes(null, 24 * g)); // at least 4 GiB
@@ -135,4 +142,35 @@ test "memory limit refuses an oversized finite value and the rounded u64 boundar
     try std.testing.expectError(error.Invalid, limitBytes("17179869184"));
     try std.testing.expectError(error.Invalid, limitBytes("17179869183.9999995")); // parses to 2^34: 2^64 bytes
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64) - 2047), try limitBytes("17179869183.9999980926513671875"));
+}
+
+test "the weights check charges a family's own share, less its drafter on a start without drafts" {
+    const io = std.testing.io;
+    const g: u64 = 1 << 30;
+    const Drafted = struct {
+        pub fn weightBytes(_: std.Io, _: []const u8) u64 {
+            return 98 * g + 8 * g / 10;
+        }
+        pub fn weightBytesWith(_: std.Io, _: []const u8, drafts: bool) u64 {
+            return if (drafts) 98 * g + 8 * g / 10 else 95 * g + 3 * g / 10;
+        }
+    };
+    const Split = struct {
+        pub fn weightBytes(_: std.Io, _: []const u8) u64 {
+            return 50 * g;
+        }
+    };
+    const files = struct {
+        fn whole(_: std.Io, _: []const u8) u64 {
+            return 200 * g;
+        }
+    }.whole;
+    try std.testing.expectEqual(98 * g + 8 * g / 10, familyWeights(Drafted, io, "model", true, &files));
+    try std.testing.expectEqual(95 * g + 3 * g / 10, familyWeights(Drafted, io, "model", false, &files));
+    try std.testing.expectEqual(50 * g, familyWeights(Split, io, "model", false, &files));
+    try std.testing.expectEqual(200 * g, familyWeights(struct {}, io, "model", false, &files));
+    // a room that refuses the drafted share can still take the share without drafts
+    const p: Pool = .{ .free = 108 * g + 6 * g / 10, .total = 121 * g, .reserve = 12 * g + 2 * g / 10, .limit = null, .unified = true };
+    try std.testing.expect(familyWeights(Drafted, io, "model", true, &files) > p.room(0));
+    try std.testing.expect(familyWeights(Drafted, io, "model", false, &files) <= p.room(0));
 }

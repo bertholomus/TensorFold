@@ -196,6 +196,9 @@ fn block(b: *Builder, c: Config, s: Split, p: []const u8, i: usize, experts: usi
     }
 }
 
+/// The start of every key `wants` adds for the DSpark drafter (its stages and heads), and of no other.
+pub const drafter_prefix = "mtp.";
+
 /// Every tensor rank `s` loads, in load order (`dspark`: the DSpark stages and heads too). Keys live in `a`.
 pub fn wants(a: std.mem.Allocator, c: Config, s: Split, dspark: bool) ![]Want {
     var b: Builder = .{ .a = a };
@@ -305,4 +308,23 @@ test "the 2D split: node 2 (rank 0 of pair 1) keeps pair 1's blocks, DSpark stay
     var down0 = false;
     for (p0) |x| down0 = down0 or std.mem.eql(u8, x.key, "layers.5.ffn.shared_experts.w2|(0, 2560)|(1152, 2304)|tr");
     try std.testing.expect(down0);
+}
+
+test "the drafter's keys: exactly the ones wants adds with dspark, on every split" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var why: @import("config.zig").Why = .{};
+    const c = try @import("config.zig").parse(a, @import("config.zig").test_config, &why);
+    const splits = [_]Split{ .{ .rank = 0, .world = 2 }, .{ .rank = 1, .world = 2 }, .{ .rank = 0, .world = 2, .pair = 1 } };
+    for (splits) |s| {
+        const target = try wants(a, c, s, false);
+        const all = try wants(a, c, s, true);
+        try std.testing.expect(all.len > target.len);
+        for (target, all[0..target.len]) |t, x| {
+            try std.testing.expectEqualStrings(t.key, x.key);
+            try std.testing.expect(!std.mem.startsWith(u8, t.key, drafter_prefix));
+        }
+        for (all[target.len..]) |x| try std.testing.expect(std.mem.startsWith(u8, x.key, drafter_prefix));
+    }
 }
