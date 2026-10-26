@@ -97,6 +97,7 @@ pub const LaneHost = struct {
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
         enforced.loop_guard = true;
+        enforced.structures = lanes.structure.served(core.backend, core.cfg); // the backend redraws rows under a grammar
         return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
     }
 
@@ -225,7 +226,7 @@ pub const LaneHost = struct {
             .@"error" => .failed,
             else => .stop,
         };
-        h.finish(job, reason, "");
+        h.finish(job, reason, if (reason == .failed) job.stream.message else "");
         return true;
     }
 
@@ -332,6 +333,11 @@ pub const LaneHost = struct {
         };
         h.unlock();
         const r = job.request;
+        var grammar: ?lanes.structure.Spec = null;
+        if (r.structure) |st| {
+            const vocab = if (st.kind == .json) st.vocab else null;
+            grammar = .{ .vocab = vocab orelse return h.drop(job, "this engine enforces only json_object structures"), .after = st.after };
+        }
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
         if (h.cache) |store| if (store.lookup(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
@@ -358,6 +364,7 @@ pub const LaneHost = struct {
             .chunks = r.chunks,
             .reuse = reuse,
             .images = r.images,
+            .structure = grammar,
         }) catch {
             job.proposer.deinit();
             return h.drop(job, "out of memory");

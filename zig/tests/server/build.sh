@@ -10,8 +10,8 @@ version="$(sed -n 's/^[[:space:]]*\.version = "\([0-9]*\.[0-9]*\.[0-9]*\)",$/\1/
 [ -n "$version" ] || { echo 'missing manifest version' >&2; exit 1; }
 options="$out/build_options.zig"
 printf 'pub const version = "%s";\n' "$version" > "$options"
-core=(--dep lanes "-Mengine_api=$root/zig/src/core/engine_api.zig" "-Mlanes=$root/zig/src/core/lanes/lanes.zig"
-      "-Mtokenizer=$root/zig/src/core/tokenizer/tokenizer.zig" "-Mtemplate=$root/zig/src/core/template/template.zig")
+core=(--dep lanes "-Mengine_api=$root/zig/src/core/engine_api.zig" --dep grammar "-Mlanes=$root/zig/src/core/lanes/lanes.zig"
+      "-Mgrammar=$root/zig/src/core/grammar/grammar.zig" "-Mtokenizer=$root/zig/src/core/tokenizer/tokenizer.zig" "-Mtemplate=$root/zig/src/core/template/template.zig")
 "$zig" build-exe -lc -O "${OPT:-ReleaseSafe}" --dep server --dep engine_api "-Mroot=$root/zig/tests/server/fake_serve.zig" \
   --dep engine_api --dep tokenizer --dep template "-Mserver=$root/zig/src/server/root.zig" "${core[@]}" \
   --name fake_serve -femit-bin="$out/fake_serve"

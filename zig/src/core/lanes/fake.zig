@@ -5,9 +5,12 @@ const be = @import("backend.zig");
 const Stream = @import("stream.zig").Stream;
 const Sampling = @import("sampling.zig").Sampling;
 const keyBits = @import("sampling.zig").keyBits;
+const mix = @import("sampling.zig").mix;
 const accept = @import("accept.zig");
+const grammar = @import("grammar");
 
 pub const vocab = 97;
+const fake_vocab = vocab;
 
 /// The fake target's draw after `history` at `position` (keyed noise when sampled).
 pub fn next(history: []const u32, s: ?Sampling, position: u64) u32 {
@@ -18,11 +21,80 @@ pub fn next(history: []const u32, s: ?Sampling, position: u64) u32 {
     return @intCast(token);
 }
 
+/// Structured output's test tokens: JSON pieces, a fence, a split CJK character, think markup; the rest are no text.
+pub const json_tokens = struct {
+    pub const eos: u32 = 96;
+    pub const think_end: u32 = 91; // an added token
+
+    pub fn piece(id: u32) ?[]const u8 {
+        const pieces = [_][]const u8{
+            "{",    "}",     "\"", "a",  ":",    ",", " ",    "1",  "true", "```", "[",  "]", "\"a\"", "{\"", "\":", "null",     "b",
+            "2",    "\n",    "}}", ": ", ", \"", "x", "json", ".5", "-",    "0",   "\\", "n", "\"}",   "]}",  "e",   "\xe4\xb8", "\xad",
+            "\":{", "false",
+        };
+        if (id < pieces.len) return pieces[id];
+        return switch (id) {
+            90 => "\n",
+            think_end => "</think>",
+            92 => "\n\n",
+            else => null,
+        };
+    }
+
+    /// The token source grammar.Vocab.build reads.
+    pub const Source = struct {
+        added: []const struct { id: u32 } = &.{.{ .id = think_end }},
+
+        pub fn tokenBytes(_: *const Source, a: Allocator, id: u32) !?[]u8 {
+            return try a.dupe(u8, piece(id) orelse return null);
+        }
+    };
+
+    pub fn vocab(a: Allocator) !grammar.Vocab {
+        const source: Source = .{};
+        return grammar.Vocab.build(a, fake_vocab, &source, &.{eos});
+    }
+
+    /// Keyed noise over the last few tokens, closers favoured as a reply grows; the end and </think> never come first.
+    pub fn score(history: []const u32, token: u32) f64 {
+        var h: u64 = history.len;
+        for (history[history.len -| 4..]) |t| h = h *% 1000003 +% t;
+        var v = @as(f64, @floatFromInt(mix(h *% 131 +% token) % 1000)) / 1000.0;
+        if (token == eos or token == think_end) v -= 2;
+        if (token == 1 or token == 19 or token == 29 or token == 30) v += @as(f64, @floatFromInt(history.len)) / 64.0;
+        return v;
+    }
+};
+
+/// A target that ranks every token (structured output's tests): the best score wins, plus keyed noise when sampled.
+pub const Scored = struct {
+    score: *const fn (history: []const u32, token: u32) f64,
+
+    /// The first best token after `history` at `position` (among `allow`'s); null when it allows none.
+    pub fn best(sc: Scored, history: []const u32, s: ?Sampling, position: u64, allow: ?be.Allow) ?u32 {
+        var top: ?u32 = null;
+        var top_value = -std.math.inf(f64);
+        for (0..vocab) |i| {
+            const t: u32 = @intCast(i);
+            var v = sc.score(history, t);
+            if (s) |st| if (st.temperature > 0) {
+                v += @as(f64, @floatFromInt(keyBits(st.seed, position, t) % 1024)) / 256.0;
+            };
+            if (top != null and !(v > top_value)) continue;
+            if (allow) |a| if (!a.allows(t)) continue;
+            top = t;
+            top_value = v;
+        }
+        return top;
+    }
+};
+
 const Lane = struct {
     history: std.ArrayList(u32) = .empty, // the stream's cache: prompt and fed tokens
     held: std.ArrayList(u32) = .empty, // drafts for the next round
     base: usize = 0, // the history length before the last verify
     rows: std.ArrayList(u32) = .empty, // the last verify's row tokens
+    parents: std.ArrayList(i32) = .empty, // and their parent rows
     pieces: usize = 0, // the prompt pass's chunks run so far (prefill_part)
 };
 
@@ -41,21 +113,27 @@ pub const Fake = struct {
     prefill_hook_ctx: ?*anyopaque = null,
     refuse_sampled: bool = false, // prefill refuses a sampled stream with error.SamplingRefused
     refuse_full: usize = 0, // prefill refuses this many times with error.ContextFull while another lane is live
+    scored: ?Scored = null, // draws rank every token, and the backend redraws rows (structured output)
+    windows: std.ArrayList(*Stream) = .empty, // the last verify's streams in window order
+    redraws: usize = 0,
 
     pub fn deinit(x: *Fake) void {
         var it = x.lanes.valueIterator();
         while (it.next()) |l| freeLane(x.gpa, l);
         x.lanes.deinit(x.gpa);
         x.drawn.deinit(x.gpa);
+        x.windows.deinit(x.gpa);
     }
 
     fn freeLane(gpa: Allocator, l: *Lane) void {
         l.history.deinit(gpa);
         l.held.deinit(gpa);
         l.rows.deinit(gpa);
+        l.parents.deinit(gpa);
     }
 
     pub fn backend(x: *Fake) be.Backend {
+        if (x.scored != null) return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_part = prefillPart, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .redraw = redraw, .release = release } };
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_part = prefillPart, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
     }
 
@@ -74,6 +152,7 @@ pub const Fake = struct {
     }
 
     fn targetNext(x: *Fake, history: []const u32, sampling: ?Sampling, position: u64) u32 {
+        if (x.scored) |sc| return sc.best(history, sampling, position, null).?;
         if (x.cycle_after) |start| if (history.len >= x.probe_prompt) {
             const reply = history[x.probe_prompt..];
             if (std.mem.indexOfScalar(u32, reply, 91)) |close| {
@@ -182,7 +261,9 @@ pub const Fake = struct {
     fn verify(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const x = self(ptr);
         x.rounds += 1;
+        x.windows.clearRetainingCapacity();
         for (windows, out) |w, o| {
+            try x.windows.append(x.gpa, w.stream);
             const l = x.lane(w.stream);
             l.base = l.history.items.len;
             l.rows.clearRetainingCapacity();
@@ -192,6 +273,8 @@ pub const Fake = struct {
             @memcpy(o.drafts, l.rows.items[1..]);
             const parents = try accept.rowParents(x.gpa, l.rows.items.len, w.parents);
             defer x.gpa.free(parents);
+            l.parents.clearRetainingCapacity();
+            try l.parents.appendSlice(x.gpa, parents);
             for (0..l.rows.items.len) |r| {
                 // each row reads the cache and its own path from the pending row
                 l.history.shrinkRetainingCapacity(l.base);
@@ -240,6 +323,29 @@ pub const Fake = struct {
                 try guess.append(x.gpa, t);
             }
         }
+    }
+
+    /// The prompt's row or a row of the last verify, ranked again among the allowed tokens.
+    fn redraw(ptr: *anyopaque, r: be.Redraw, allow: be.Allow) anyerror!?u32 {
+        const x = self(ptr);
+        const l = x.lane(r.stream);
+        x.redraws += 1;
+        var history: std.ArrayList(u32) = .empty;
+        defer history.deinit(x.gpa);
+        if (r.row) |at| {
+            if (at.window >= x.windows.items.len or x.windows.items[at.window] != r.stream) return error.WrongWindow;
+            try history.appendSlice(x.gpa, l.history.items[0..l.base]);
+            var path: std.ArrayList(u32) = .empty;
+            defer path.deinit(x.gpa);
+            var row: i32 = @intCast(at.row);
+            while (row >= 0) : (row = l.parents.items[@intCast(row)]) try path.insert(x.gpa, 0, l.rows.items[@intCast(row)]);
+            try history.appendSlice(x.gpa, path.items);
+        } else {
+            if (l.history.items.len != r.stream.prompt_len) return error.NotAfterPrompt;
+            try history.appendSlice(x.gpa, l.history.items);
+        }
+        if (r.position != history.items.len) return error.PositionMismatch;
+        return x.scored.?.best(history.items, r.stream.sampling, r.position, allow);
     }
 
     fn release(ptr: *anyopaque, s: *Stream) void {

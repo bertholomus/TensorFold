@@ -204,6 +204,19 @@ server without xgrammar (with the install command), and a grammar sent with `too
 function. A reply whose grammar fails while decoding ends with HTTP 500 (an error event when streaming); the other
 requests go on.
 
+On the native server, the Zig engine enforces `{"type": "json_object"}` for DeepSeek-V4.1, also as
+`structured_outputs` `json_object`. It refuses `json_schema`, `guided_json`, `regex`, `choice` and `grammar` with
+HTTP 400. `ignore_eos` with a grammar gets HTTP 400, because the end token must close the reply. An engine whose
+family cannot draw a row again, or whose rounds run a step ahead, refuses every grammar.
+
+The Zig engine needs no xgrammar. A byte matcher in `zig/src/core/grammar` follows the `json_object` grammar of
+xgrammar 0.2.8, with at most 32 blanks in a run. Strings must be strict UTF-8. Objects and arrays nest at most 128
+deep. Added tokens such as `</think>` never come inside the object.
+
+The Zig engine walks the accepted path of each verified window under the grammar. A greedy row keeps its token when
+the grammar allows it. Every other row draws again among the allowed tokens, with its own key. This commits the same
+tokens as a cut before the verify, so a constrained reply equals its `"draft": false` reply and its solo run.
+
 ## Reasoning
 
 On both backends, `reasoning_effort: none` disables thinking; other effort values enable it and reach the chat

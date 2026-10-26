@@ -179,6 +179,17 @@ pub const Tokenizer = struct {
         return out.items;
     }
 
+    /// The bytes token `id` adds to a ByteLevel decoder's output before any UTF-8 repair; null for an unknown id.
+    pub fn tokenBytes(t: *const Tokenizer, a: Allocator, id: u32) Error!?[]u8 {
+        const d = t.decoder orelse return error.UnsupportedDecoder;
+        if (d != .byte_level) return error.UnsupportedDecoder;
+        const token = t.id_to_token.get(id) orelse return null;
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(a);
+        try steps.appendByteLevel(&out, a, token);
+        return try out.toOwnedSlice(a);
+    }
+
     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
         var arena = std.heap.ArenaAllocator.init(a);

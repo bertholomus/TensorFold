@@ -288,6 +288,12 @@ const Host = struct {
                     return x.inner.vtable.alternatives.?(x.inner.ptr, s, out);
                 }
             }.f else null,
+            .redraw = if (v.redraw != null) struct {
+                fn f(p: *anyopaque, r: lanes.backend.Redraw, allow: lanes.backend.Allow) anyerror!?u32 {
+                    const x = bind(p);
+                    return x.inner.vtable.redraw.?(x.inner.ptr, r, allow);
+                }
+            }.f else null,
             .release = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream) void {
                     const x = bind(p);
