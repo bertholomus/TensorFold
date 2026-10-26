@@ -194,6 +194,8 @@ pub const Status = struct {
     prefill_tokens_per_second: f64 = 0,
     /// Requests that gave a lane up to a later one; null when the engine does not count them.
     preemptions: ?u64 = null,
+    /// CUDA graph captures that failed, their work run eagerly instead; null when the engine does not count them.
+    graph_fallbacks: ?u64 = null,
     warming: bool = false,
     /// Live streams written to the caller's buffer: tokens each holds.
     streams: usize = 0,

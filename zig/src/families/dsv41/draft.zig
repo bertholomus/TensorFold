@@ -24,6 +24,7 @@ const exl3_linear = @import("exl3_linear.zig");
 const exl3_experts = @import("exl3_experts.zig");
 const markov_tokens = @import("markov_tokens.zig");
 const draft2d = @import("draft2d.zig");
+const graph_fallback = @import("graph_fallback.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -113,44 +114,51 @@ const MarkovGather = struct {
 /// The drafter pass's CUDA graphs (BatchDraftGraph), one a (streams, steps): every pointer it reads is a fixed
 /// buffer and every per-pass value (ids, positions, slots, the pick lists) is uploaded ahead of the replay.
 pub const PassGraphs = struct {
-    gpa: std.mem.Allocator,
-    map: std.AutoHashMapUnmanaged(Key, cuda.graph.Exec) = .empty,
+    lazy: Lazy,
 
     pub const Key = struct { streams: u32, steps: u32 };
+    const Entry = struct { exec: cuda.graph.Exec };
+    const Lazy = graph_fallback.Lazy(graph_fallback.Cuda, Key, Entry);
 
     pub fn init(gpa: std.mem.Allocator) PassGraphs {
-        return .{ .gpa = gpa };
+        return .{ .lazy = .init(gpa) };
     }
 
     pub fn deinit(g: *PassGraphs) void {
-        var it = g.map.valueIterator();
-        while (it.next()) |x| x.deinit();
-        g.map.deinit(g.gpa);
+        g.lazy.deinit();
         g.* = undefined;
     }
 
     pub fn count(g: *const PassGraphs) usize {
-        return g.map.count();
+        return g.lazy.count();
     }
 
     fn run(g: *PassGraphs, dr: *Drafter, e: *const Engine, ch: *const Chunk, pool: *const Pool, N: usize, steps: usize) !void {
         const key: Key = .{ .streams = @intCast(N), .steps = @intCast(steps) };
-        if (g.map.getPtr(key)) |x| return x.launchOn(e.s);
-        try cuda.graph.beginCapture(e.s, .thread_local);
-        dr.body(e, ch, pool, N, steps, null) catch |err| {
-            if (cuda.graph.endCapture(e.s)) |got| {
-                var x = got;
-                x.deinit();
-            } else |_| {}
-            return err;
-        };
-        var graph = try cuda.graph.endCapture(e.s);
-        defer graph.deinit();
-        var exec = try graph.instantiate();
-        errdefer exec.deinit();
-        try g.map.put(g.gpa, key, exec);
-        try exec.launchOn(e.s);
+        if (g.lazy.get(key)) |x| return x.exec.launchOn(e.s);
+        var site: Site = .{ .dr = dr, .e = e, .ch = ch, .pool = pool, .N = N, .steps = steps };
+        try g.lazy.capture(e.s, key, &site);
     }
+
+    /// A pass as PassGraphs.Lazy's site (a capture that fails runs it eagerly: graph_fallback.zig).
+    const Site = struct {
+        dr: *Drafter,
+        e: *const Engine,
+        ch: *const Chunk,
+        pool: *const Pool,
+        N: usize,
+        steps: usize,
+
+        pub fn body(s: *Site) !void {
+            return s.dr.body(s.e, s.ch, s.pool, s.N, s.steps, null);
+        }
+
+        pub fn undo(_: *Site) void {} // the pass's host state is its inputs, uploaded before it
+
+        pub fn value(_: *Site, exec: cuda.graph.Exec) Entry {
+            return .{ .exec = exec };
+        }
+    };
 };
 
 pub const Drafter = struct {
