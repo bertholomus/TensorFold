@@ -475,6 +475,7 @@ fn metalEngineModules(b: *std.Build, target: std.Build.ResolvedTarget, optimize:
     metal.linkFramework("Foundation", .{});
     metal.linkSystemLibrary("objc", .{});
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    lanes.addImport("grammar", b.createModule(.{ .root_source_file = b.path("zig/src/core/grammar/grammar.zig"), .target = target, .optimize = optimize }));
     const fabric = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/fabric.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/sources.zig") });
     const engine = b.createModule(.{

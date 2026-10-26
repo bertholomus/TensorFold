@@ -60,17 +60,20 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, grammar: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
+    // structured output's grammars (no imports), which the lane core keeps each stream's reply inside
+    const grammar = b.createModule(.{ .root_source_file = b.path("zig/src/core/grammar/grammar.zig"), .target = target, .optimize = optimize });
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    lanes.addImport("grammar", grammar);
     const nemotron = b.createModule(.{ .root_source_file = b.path("zig/src/families/nemotron/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     nemotron.addImport("cuda", cuda);
     nemotron.addImport("core", core);
     nemotron.addImport("lanes", lanes);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer };
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .grammar = grammar };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
@@ -210,11 +213,10 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
-    // structured output's grammars (no imports), and their token table over the real tokenizer
-    const grammar = b.createModule(.{ .root_source_file = b.path("zig/src/core/grammar/grammar.zig"), .target = host, .optimize = .debug });
-    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = grammar })).step);
+    // structured output's grammars, and their token table over the real tokenizer
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = mods.grammar })).step);
     const vocab_test = b.createModule(.{ .root_source_file = b.path("zig/src/core/grammar/vocab_tokenizer_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
-    vocab_test.addImport("grammar", grammar);
+    vocab_test.addImport("grammar", mods.grammar);
     vocab_test.addImport("tokenizer", mods.tokenizer);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = vocab_test })).step);
 }

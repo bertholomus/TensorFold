@@ -507,3 +507,67 @@ test "a short prompt refused for room as it cuts in waits in the queue and then 
         try std.testing.expectEqual(@as(usize, 12), order.len);
     }
 }
+
+test "a reply whose grammar refuses its forced close fails alone, with the grammar's words" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 6, .mtp = true, .speculate = true, .speculate_early = false, .drafts = 4, .hidden_rows = true, .draft_streams = true }, 6, 5);
+    defer cfg.deinit(gpa);
+    const words = lanes.fake.json_tokens;
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .scored = .{ .score = words.score } };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var vocab = try words.vocab(gpa);
+    defer vocab.deinit(gpa);
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3 });
+    try std.testing.expect(host.engine().info().structures); // the core's backend redraws rows
+    try host.start();
+    defer host.stop();
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        done: ?Reason = null,
+        message: []const u8 = "",
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            if (e.* == .finished) {
+                b.done = e.finished.reason;
+                b.message = e.finished.message;
+            }
+        }
+        fn wait(b: *@This()) Reason {
+            while (true) {
+                b.mutex.lockUncancelable(std.testing.io);
+                const d = b.done;
+                b.mutex.unlock(std.testing.io);
+                if (d) |r| return r;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    const json: api.Structure = .{ .kind = .json, .vocab = &vocab };
+    // the close's blank line after </think>: the grammar admits no blank before the object
+    var thinking = json;
+    thinking.after = words.think_end;
+    const close = [_]u32{ 90, words.think_end, 92 };
+    const bad: Request = .{ .prompt = &prompt, .max_tokens = 40, .eos = &.{words.eos}, .think_budget = 6, .think_close = &close, .think_end = words.think_end, .structure = thinking };
+    const good: Request = .{ .prompt = &prompt, .max_tokens = 40, .eos = &.{words.eos}, .structure = json };
+    var schema = json;
+    schema.kind = .json_schema;
+    const other: Request = .{ .prompt = &prompt, .max_tokens = 40, .eos = &.{words.eos}, .structure = schema };
+    var failed: Box = .{};
+    var served: Box = .{};
+    var refused: Box = .{};
+    const e = host.engine();
+    try e.submit(1, &bad, .{ .ctx = &failed, .event = Box.event });
+    try e.submit(2, &good, .{ .ctx = &served, .event = Box.event });
+    try e.submit(3, &other, .{ .ctx = &refused, .event = Box.event });
+    try std.testing.expectEqual(Reason.failed, failed.wait());
+    try std.testing.expectEqualStrings(lanes.structure.refused, failed.message);
+    try std.testing.expectEqual(Reason.failed, refused.wait());
+    try std.testing.expectEqualStrings("this engine enforces only json_object structures", refused.message);
+    try std.testing.expect(served.wait() != Reason.failed);
+}

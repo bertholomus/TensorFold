@@ -1,6 +1,7 @@
 //! The tokenizer and chat template a server renders prompts and replies with (the tok and jinja branches plug in here).
 const std = @import("std");
 const json = @import("json.zig");
+const grammar = @import("engine_api").grammar;
 const Allocator = std.mem.Allocator;
 
 pub const RenderOptions = struct {
@@ -38,6 +39,8 @@ pub const Text = struct {
         template_source: *const fn (ctx: *anyopaque) []const u8,
         /// Whether an id is a special token (an added token flagged special); null: none are known.
         special: ?*const fn (ctx: *anyopaque, id: u32) bool = null,
+        /// Each token's bytes, for structured output's grammars (`eos`: the end tokens); null: none are known.
+        vocab: ?*const fn (ctx: *anyopaque, a: Allocator, eos: []const u32) anyerror!grammar.Vocab = null,
     };
 
     pub fn encode(t: Text, a: Allocator, text: []const u8, add_special: bool) Error![]u32 {
@@ -83,4 +86,9 @@ pub const Text = struct {
         return f(t.ctx, id);
     }
 
+    /// The token table structured output tests tokens with; error.NoTokenBytes when the tokenizer gives none.
+    pub fn vocabTable(t: Text, a: Allocator, eos: []const u32) !grammar.Vocab {
+        const f = t.vtable.vocab orelse return error.NoTokenBytes;
+        return f(t.ctx, a, eos);
+    }
 };
