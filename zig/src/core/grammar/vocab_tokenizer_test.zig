@@ -132,7 +132,7 @@ test "a vocab table from the tokenizer: added tokens by id, eos, padded columns,
     const ids = try t.encode(a, reply);
     defer a.free(ids);
     try std.testing.expect(std.mem.indexOfScalar(u32, ids, half) != null and ids[0] == brace_quote);
-    var m: grammar.Matcher = .{};
+    var m: grammar.json.Matcher = .{};
     var text: std.ArrayList(u8) = .empty;
     defer text.deinit(a);
     for (ids) |id| {
@@ -147,6 +147,6 @@ test "a vocab table from the tokenizer: added tokens by id, eos, padded columns,
     const marked = try t.encode(a, "{\"</think>");
     defer a.free(marked);
     try std.testing.expectEqualSlices(u32, &.{ brace_quote, think }, marked);
-    var k: grammar.Matcher = .{};
+    var k: grammar.json.Matcher = .{};
     try std.testing.expect(k.advance("{\"") and k.accepts(think_close) and !v.allows(k, think));
 }

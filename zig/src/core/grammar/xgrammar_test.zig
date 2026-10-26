@@ -5,7 +5,7 @@ const json = @import("json.zig");
 const corpus = @embedFile("testdata/xgrammar_json_object.txt");
 
 /// A corpus line's bytes (none when the line has no space): `_` is a space, %XX a byte, any other character itself.
-fn decode(buf: []u8, text: []const u8) ![]u8 {
+pub fn decode(buf: []u8, text: []const u8) ![]u8 {
     var n: usize = 0;
     var i: usize = 0;
     while (i < text.len) : (n += 1) {

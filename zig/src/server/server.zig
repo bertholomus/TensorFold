@@ -182,10 +182,10 @@ pub const Server = struct {
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
-            if (s.kind != .json) return cx.fail(.request, "{s}: this engine enforces only json_object yet, not {s}", .{ s.field, @tagName(s.kind) });
+            const program = try grammar.program(cx, s);
             const vocab = if (srv.vocab) |*v| v else return cx.refuse("structured output needs a tokenizer with a ByteLevel decoder, and this one has none");
             if (request.eos.len == 0) return cx.fail(.request, "{s} needs the model's end token: send it without ignore_eos", .{s.field});
-            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .vocab = vocab };
+            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .vocab = vocab, .program = program };
         }
     }
 

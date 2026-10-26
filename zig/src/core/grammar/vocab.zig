@@ -63,8 +63,8 @@ pub const Vocab = struct {
         return v.bytes[v.offsets[id]..v.offsets[id + 1]];
     }
 
-    /// Whether token `id` may come next after the reply that brought the grammar to `m`.
-    pub fn allows(v: *const Vocab, m: json.Matcher, id: u32) bool {
+    /// Whether token `id` may come next after the reply that brought matcher `m` (or the one it points to) here.
+    pub fn allows(v: *const Vocab, m: anytype, id: u32) bool {
         return switch (v.kind(id)) {
             .text => m.accepts(v.piece(id)),
             .eos => m.complete(),

@@ -10,21 +10,22 @@ const Engine = @import("engine.zig").Engine;
 /// Why a stream ends when its grammar refuses a token it must commit (a forced token, or a row that allows none).
 pub const refused = "the reply's grammar refused its next token";
 
-/// A request's grammar: the server's token table, and the think end it starts after when thinking is on.
+/// A request's grammar: the token table, its program (null: json_object), and the think end it starts after.
 pub const Spec = struct {
     vocab: *const grammar.Vocab,
+    program: ?*const grammar.Program = null,
     after: ?u32 = null,
 };
 
 /// A reply's grammar at its committed tokens, a small value that callers copy to try tokens without taking them.
 pub const State = struct {
     vocab: *const grammar.Vocab,
-    matcher: grammar.Matcher = .{},
+    matcher: grammar.Matcher,
     /// The token the grammar waits for before it starts; null once it has started.
     after: ?u32 = null,
 
     pub fn init(spec: Spec) State {
-        return .{ .vocab = spec.vocab, .after = spec.after };
+        return .{ .vocab = spec.vocab, .matcher = .init(spec.program), .after = spec.after };
     }
 
     pub fn active(st: *const State) bool {
@@ -33,7 +34,7 @@ pub const State = struct {
 
     /// Whether `token` may come next; before the grammar starts, every token may.
     pub fn allows(st: *const State, token: u32) bool {
-        return st.after != null or st.vocab.allows(st.matcher, token);
+        return st.after != null or st.vocab.allows(&st.matcher, token);
     }
 
     /// Takes a committed token, or returns false and stays as it was when the grammar refuses it.
@@ -42,7 +43,7 @@ pub const State = struct {
             if (token == end) st.after = null;
             return true;
         }
-        if (!st.vocab.allows(st.matcher, token)) return false;
+        if (!st.vocab.allows(&st.matcher, token)) return false;
         if (st.vocab.kind(token) == .text) _ = st.matcher.advance(st.vocab.piece(token));
         return true;
     }
@@ -53,7 +54,7 @@ pub const State = struct {
 
     fn ok(ctx: *const anyopaque, token: u32) bool {
         const st: *const State = @ptrCast(@alignCast(ctx));
-        return st.vocab.allows(st.matcher, token);
+        return st.vocab.allows(&st.matcher, token);
     }
 };
 

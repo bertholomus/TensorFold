@@ -1,10 +1,11 @@
-//! json_object reaches an engine that enforces structures with the token table; what it cannot enforce gets a 400.
+//! json_object, json_schema and choice reach the engine with the token table and a program; the rest get a 400.
 const std = @import("std");
 const api = @import("engine_api");
 const server = @import("root.zig");
 const json = server.json;
 const model_text = @import("model_text.zig");
 const openai = @import("openai.zig");
+const anthropic_translate = @import("anthropic_translate.zig");
 const Conn = @import("http_conn.zig").Conn;
 const Allocator = std.mem.Allocator;
 
@@ -120,12 +121,16 @@ const Capture = struct {
 const Seen = struct {
     status: u16 = 0,
     message: []const u8 = "",
+    opened: bool = false,
 
     fn out(c: *Seen) openai.Out {
         return .{ .ctx = c, .vt = &.{ .open = open, .event = event, .reply = reply } };
     }
 
-    fn open(_: *anyopaque) error{Closed}!void {}
+    fn open(ctx: *anyopaque) error{Closed}!void {
+        const c: *Seen = @ptrCast(@alignCast(ctx));
+        c.opened = true;
+    }
 
     fn event(_: *anyopaque, _: ?json.Value) error{Closed}!void {}
 
@@ -139,6 +144,10 @@ const Seen = struct {
 };
 
 fn send(text: *ByteText, engine: *Capture, a: Allocator, body: []const u8) !Seen {
+    return sendValue(text, engine, a, (try json.parse(a, body)).ok);
+}
+
+fn sendValue(text: *ByteText, engine: *Capture, a: Allocator, raw: json.Value) !Seen {
     var srv = try server.Server.init(std.testing.allocator, std.testing.io, engine.engine(), text.text(), .{
         .served_name = "m",
         .model_ids = &.{"m"},
@@ -146,7 +155,6 @@ fn send(text: *ByteText, engine: *Capture, a: Allocator, body: []const u8) !Seen
         .use_drafts = false,
     }, null);
     defer srv.deinit();
-    const raw = (try json.parse(a, body)).ok;
     var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
     var seen: Seen = .{};
     openai.run(srv, a, seen.out(), .{ .conn = &conn }, true, raw);
@@ -168,13 +176,71 @@ test "json_object reaches an engine that enforces structures, with the token tab
     try std.testing.expectEqualSlices(api.grammar.vocab.Kind, &.{ .text, .special, .eos }, &engine.kinds);
 }
 
+const gate = "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"action\",\"confidence\",\"pair\"]," ++
+    "\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"buy\",\"sell\",\"hold\"]},\"confidence\":{\"type\":\"number\"},\"pair\":{\"type\":\"string\"}}}";
+
+/// The compiled gate schema: an object of three required properties, the first an enum.
+fn expectGate(st: api.Structure) !void {
+    try std.testing.expect(st.kind == .json_schema and st.vocab != null);
+    const p = st.program.?;
+    const o = p.objects[p.nodes[p.root].object];
+    try std.testing.expectEqual(@as(usize, 3), o.props.len);
+    try std.testing.expectEqualStrings("\"confidence\"", o.props[1].key);
+    try std.testing.expect(p.nodes[o.props[0].node] == .literal);
+}
+
+test "json_schema and guided_choice reach the engine with their compiled program, from either field" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bodies = [_][]const u8{
+        ask ++ "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"trade\",\"strict\":true,\"schema\":" ++ gate ++ "}}}",
+        ask ++ "\"stream\":true,\"guided_json\":" ++ gate ++ "}",
+        ask ++ "\"structured_outputs\":{\"json\":" ++ gate ++ "}}",
+    };
+    for (bodies) |body| {
+        var text: ByteText = .{};
+        var engine: Capture = .{};
+        const seen = try send(&text, &engine, a, body);
+        try std.testing.expect(seen.status == 200 or seen.opened);
+        try expectGate(engine.structure.?);
+    }
+    var text: ByteText = .{};
+    var engine: Capture = .{};
+    const seen = try send(&text, &engine, a, ask ++ "\"guided_choice\":[\"yes\",\"no\"]}");
+    try std.testing.expectEqual(@as(u16, 200), seen.status);
+    const st = engine.structure.?;
+    try std.testing.expect(st.kind == .choice and st.program != null);
+    const p = st.program.?;
+    const root = p.nodes[p.root].literal;
+    try std.testing.expect(p.child(root, 'y') != null and p.child(root, 'n') != null and p.child(root, 'x') == null);
+}
+
+test "an Anthropic output_config.format reaches the engine as a compiled json_schema" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const body = (try json.parse(a, "{\"model\":\"m\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," ++
+        "\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":" ++ gate ++ "}}}")).ok;
+    var cx: server.errors.Cx = .{ .a = a };
+    const chat = try anthropic_translate.translate(&cx, body, false);
+    var text: ByteText = .{};
+    var engine: Capture = .{};
+    const seen = try sendValue(&text, &engine, a, chat);
+    try std.testing.expectEqual(@as(u16, 200), seen.status);
+    try expectGate(engine.structure.?);
+}
+
 test "a grammar this engine cannot enforce is refused before the engine sees it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const cases = [_]struct { body: []const u8, said: []const u8, structures: bool = true, table: bool = true }{
-        .{ .body = ask ++ "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":{\"type\":\"object\"}}}}", .said = "response_format: this engine enforces only json_object yet, not json_schema" },
-        .{ .body = ask ++ "\"guided_choice\":[\"a\",\"b\"]}", .said = "guided_choice: this engine enforces only json_object yet, not choice" },
+        .{ .body = ask ++ "\"guided_regex\":\"a+\"}", .said = "guided_regex: this engine enforces json_object, json_schema and choice, not regex" },
+        .{ .body = ask ++ "\"structured_outputs\":{\"grammar\":\"root ::= \\\"a\\\"\"}}", .said = "structured_outputs: this engine enforces json_object, json_schema and choice, not grammar" },
+        .{ .body = ask ++ "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"schema\":{\"type\":\"object\",\"properties\":{\"p\":{\"type\":\"string\",\"pattern\":\"^a\"}}}}}}", .said = "response_format: the schema cannot be enforced: #/properties/p: pattern: it is not enforced by this engine" },
+        .{ .body = ask ++ "\"stream\":true,\"guided_json\":{\"anyOf\":[{\"type\":\"string\"},{\"enum\":[\"a\"]}]}}", .said = "guided_json: the schema cannot be enforced: #: two anyOf, oneOf or type branches can start with '\"': this engine needs branches that start with different bytes" },
+        .{ .body = ask ++ "\"guided_choice\":[\"a\",\"\\ud800\"]}", .said = "guided_choice: a choice is not valid Unicode" },
         .{ .body = ask ++ "\"response_format\":{\"type\":\"json_object\"},\"ignore_eos\":true}", .said = "response_format needs the model's end token: send it without ignore_eos" },
         .{ .body = ask ++ "\"response_format\":{\"type\":\"json_object\"}}", .said = "structured output needs a tokenizer with a ByteLevel decoder, and this one has none", .table = false },
         .{ .body = ask ++ "\"response_format\":{\"type\":\"json_object\"}}", .said = "structured output (response_format and the guided_* fields) is not supported by this engine yet", .structures = false },
@@ -185,7 +251,7 @@ test "a grammar this engine cannot enforce is refused before the engine sees it"
         const seen = try send(&text, &engine, a, c.body);
         try std.testing.expectEqual(@as(u16, 400), seen.status);
         try std.testing.expectEqualStrings(c.said, seen.message);
-        try std.testing.expect(!engine.submitted);
+        try std.testing.expect(!engine.submitted and !seen.opened);
     }
 }
 

@@ -21,6 +21,7 @@ const Case = struct {
     sampling: ?Sampling = null,
     drafts: bool = true,
     structured: bool = true,
+    program: ?*const grammar.Program = null,
     after: ?u32 = null,
     think_budget: u32 = 0,
     think_close: []const u32 = &.{ 90, think_end },
@@ -59,7 +60,7 @@ fn run(vocab: *const grammar.Vocab, cases: []const Case) !Run {
     defer gpa.free(proposers);
     for (cases, streams, proposers) |c, *s, *p| {
         p.* = try SuffixLookup.init(gpa, .{ .min_match = 4 });
-        const spec: ?structure.Spec = if (c.structured) .{ .vocab = vocab, .after = c.after } else null;
+        const spec: ?structure.Spec = if (c.structured) .{ .vocab = vocab, .program = c.program, .after = c.after } else null;
         s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = &.{eos}, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = c.think_close, .think_end = think_end, .structure = spec });
     }
     defer for (streams, proposers) |*s, *p| {
@@ -81,7 +82,7 @@ fn table() !grammar.Vocab {
 fn walks(vocab: *const grammar.Vocab, tokens: []const u32, m: *grammar.Matcher) bool {
     for (tokens) |t| {
         if (t == eos) return m.complete();
-        if (!vocab.allows(m.*, t)) return false;
+        if (!vocab.allows(m, t)) return false;
         _ = m.advance(vocab.piece(t));
     }
     return true;
@@ -107,7 +108,7 @@ test "a json_object reply is the same drafted, plain and shared, greedy and samp
             try std.testing.expectEqualSlices(u32, plain.outs[0].emitted, drafted.outs[0].emitted);
             try std.testing.expectEqualSlices(u32, plain.outs[0].emitted, shared.outs[1].emitted);
             try std.testing.expect(drafted.redraws > 0 and drafted.outs[0].accepted > 0);
-            var m: grammar.Matcher = .{};
+            var m: grammar.Matcher = .init(null);
             try std.testing.expect(walks(&vocab, drafted.outs[0].emitted, &m));
             const reply = drafted.outs[0].emitted;
             if (reply[reply.len - 1] == eos) {
@@ -129,6 +130,54 @@ test "a json_object reply is the same drafted, plain and shared, greedy and samp
     try std.testing.expect(completed >= 2);
 }
 
+/// A schema and a choice list the fake's tokens can spell: "{\"", "a", "\":", digits, ", \"", "b", true, false...
+const object_schema =
+    \\{"type": "object", "properties": {"a": {"type": "integer"}, "b": {"type": "boolean"}, "x": {"type": "array",
+    \\ "items": {"enum": [null, 2]}, "maxItems": 2}}, "required": ["a"], "additionalProperties": false}
+;
+const choices = [_][]const u8{ "null", "ax", "json", "a" };
+
+test "a json_schema reply and a choice reply are the same drafted, plain and shared, greedy and sampled" {
+    var vocab = try table();
+    defer vocab.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    var why: []const u8 = "";
+    const programs = [_]grammar.Program{
+        try grammar.schema.compile(arena.allocator(), object_schema, &why),
+        try grammar.schema.choice(arena.allocator(), &choices),
+    };
+    var completed = [_]usize{ 0, 0 };
+    for (&programs, 0..) |*program, k| for ([_]?Sampling{ null, sampled }) |s| for ([_][]const u32{ &p1, &p2, &p3 }) |p| {
+        const case: Case = .{ .prompt = p, .sampling = s, .program = program };
+        var plain_case = case;
+        plain_case.drafts = false;
+        const drafted = try run(&vocab, &.{case});
+        defer drafted.deinit();
+        const plain = try run(&vocab, &.{plain_case});
+        defer plain.deinit();
+        const shared = try run(&vocab, &.{ .{ .prompt = &p2 }, case, .{ .prompt = &p3, .sampling = sampled, .structured = false } });
+        defer shared.deinit();
+        const reply = drafted.outs[0].emitted;
+        try std.testing.expectEqualSlices(u32, plain.outs[0].emitted, reply);
+        try std.testing.expectEqualSlices(u32, plain.outs[0].emitted, shared.outs[1].emitted);
+        var m: grammar.Matcher = .init(program);
+        try std.testing.expect(walks(&vocab, reply, &m));
+        if (reply[reply.len - 1] != eos) continue;
+        completed[k] += 1;
+        try std.testing.expectEqual(sm.Reason.stop, drafted.outs[0].reason);
+        if (k == 1) {
+            var bytes: std.ArrayList(u8) = .empty;
+            defer bytes.deinit(gpa);
+            for (reply[0 .. reply.len - 1]) |t| try bytes.appendSlice(gpa, vocab.piece(t));
+            try std.testing.expect(for (choices) |c| {
+                if (std.mem.eql(u8, c, bytes.items)) break true;
+            } else false);
+        }
+    };
+    for (completed) |c| try std.testing.expect(c >= 2);
+}
+
 test "the first token is drawn again when the grammar refuses the prompt row's pick" {
     var vocab = try table();
     defer vocab.deinit(gpa);
@@ -139,7 +188,7 @@ test "the first token is drawn again when the grammar refuses the prompt row's p
         const free = sc.best(p, null, p.len, null).?;
         const first = r.outs[0].emitted[0];
         try std.testing.expect(vocab.piece(first).len > 0 and vocab.piece(first)[0] == '{');
-        if (free != first) try std.testing.expect(!vocab.allows(.{}, free));
+        if (free != first) try std.testing.expect(!vocab.allows(grammar.json.Matcher{}, free));
     }
 }
 
@@ -162,7 +211,7 @@ test "under the thinking budget's close the grammar starts after </think>, its n
         try std.testing.expectEqualSlices(u32, plain.outs[0].emitted, reply);
         try std.testing.expectEqualSlices(u32, plain.outs[0].emitted, shared.outs[1].emitted);
         try std.testing.expectEqualSlices(u32, &.{ 90, think_end }, reply[8..10]);
-        var m: grammar.Matcher = .{};
+        var m: grammar.Matcher = .init(null);
         try std.testing.expect(walks(&vocab, reply[10..], &m));
         try std.testing.expect(vocab.piece(reply[10])[0] == '{');
         // the forced window's last row drew this token: the target's own pick there is one the grammar refuses

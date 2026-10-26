@@ -335,8 +335,8 @@ pub const LaneHost = struct {
         const r = job.request;
         var grammar: ?lanes.structure.Spec = null;
         if (r.structure) |st| {
-            const vocab = if (st.kind == .json) st.vocab else null;
-            grammar = .{ .vocab = vocab orelse return h.drop(job, "this engine enforces only json_object structures"), .after = st.after };
+            const vocab = if (st.kind == .json or st.program != null) st.vocab else null; // json_schema, choice: compiled
+            grammar = .{ .vocab = vocab orelse return h.drop(job, "this engine enforces json_object, json_schema and choice structures"), .program = if (st.kind == .json) null else st.program, .after = st.after };
         }
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass

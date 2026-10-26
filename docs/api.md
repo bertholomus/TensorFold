@@ -204,14 +204,27 @@ server without xgrammar (with the install command), and a grammar sent with `too
 function. A reply whose grammar fails while decoding ends with HTTP 500 (an error event when streaming); the other
 requests go on.
 
-On the native server, the Zig engine enforces `{"type": "json_object"}` for DeepSeek-V4.1, also as
-`structured_outputs` `json_object`. It refuses `json_schema`, `guided_json`, `regex`, `choice` and `grammar` with
-HTTP 400. `ignore_eos` with a grammar gets HTTP 400, because the end token must close the reply. An engine whose
-family cannot draw a row again, or whose rounds run a step ahead, refuses every grammar.
+On the native server, the Zig engine enforces `{"type": "json_object"}`, `json_schema` (also as `guided_json` and
+`structured_outputs` `json`), `guided_choice` (also as `structured_outputs` `choice`) and the Anthropic
+`output_config.format` for DeepSeek-V4.1. It refuses `regex` and `grammar` with HTTP 400. `ignore_eos` with a
+grammar gets HTTP 400, because the end token must close the reply. An engine whose family cannot draw a row again,
+or whose rounds run a step ahead, refuses every grammar.
 
-The Zig engine needs no xgrammar. A byte matcher in `zig/src/core/grammar` follows the `json_object` grammar of
-xgrammar 0.2.8, with at most 32 blanks in a run. Strings must be strict UTF-8. Objects and arrays nest at most 128
-deep. Added tokens such as `</think>` never come inside the object.
+The Zig engine needs no xgrammar. `zig/src/core/grammar` holds a byte matcher for the `json_object` grammar and a
+compiler for schemas and choice lists. Both follow xgrammar 0.2.8 as Python 0.6 used it (strict mode, at most 32
+blanks in a run). A schema object takes its properties in their order. A property that is not required may be left
+out. Other keys come last, and only with `additionalProperties`. A `guided_choice` reply is one of the strings, byte
+for byte. Strings must be strict UTF-8. Objects and arrays nest at most 128 deep. Added tokens such as `</think>`
+never come inside the value.
+
+A schema may use `type` (a name or a list), `properties`, `required`, `additionalProperties`, `items`,
+`prefixItems`, `minItems`, `maxItems`, `minLength`, `maxLength`, `format` (`date-time`, `date`, `time`, `uuid`,
+`ipv4`, `email`), `enum`, `const`, `anyOf`, `oneOf`, `allOf` with one schema, and local `$ref` (`#` and `#/...`,
+recursion included). Annotations (`title`, `description`, `default`, `examples` and others) change nothing. HTTP 400
+names the first keyword this engine cannot enforce and where it is, before any token. Examples: `pattern`, numeric
+bounds, `uniqueItems`, `if`/`then`/`else`, `not`, `patternProperties`, `allOf` with more schemas, a remote `$ref`,
+and an `anyOf` whose branches can start with the same byte (two object branches, or a string and an enum of
+strings). The schema text may be at most 1 MiB.
 
 The Zig engine walks the accepted path of each verified window under the grammar. A greedy row keeps its token when
 the grammar allows it. Every other row draws again among the allowed tokens, with its own key. This commits the same
