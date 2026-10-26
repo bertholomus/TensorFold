@@ -380,20 +380,7 @@ pub const Decoder = union(enum) {
             },
             .byte_level => {
                 var bytes: std.ArrayList(u8) = .empty;
-                for (tokens) |token| {
-                    const start = bytes.items.len;
-                    var i: usize = 0;
-                    const mapped = while (i < token.len) {
-                        const c = unicode.decodeAt(token, i);
-                        if (c.cp >= char_bytes.len or char_bytes[c.cp] < 0) break false;
-                        try bytes.append(a, @intCast(char_bytes[c.cp]));
-                        i += c.len;
-                    } else true;
-                    if (!mapped) {
-                        bytes.shrinkRetainingCapacity(start);
-                        try bytes.appendSlice(a, token);
-                    }
-                }
+                for (tokens) |token| try appendByteLevel(&bytes, a, token);
                 var text: std.ArrayList(u8) = .empty;
                 try unicode.appendLossy(&text, a, bytes.items);
                 return a.dupe([]const u8, &.{text.items});
@@ -466,6 +453,21 @@ pub const Decoder = union(enum) {
         }
     }
 };
+
+/// A ByteLevel token's bytes: each character's byte, or the token's own text when a character has none (added tokens).
+pub fn appendByteLevel(bytes: *std.ArrayList(u8), a: Allocator, token: []const u8) Allocator.Error!void {
+    const start = bytes.items.len;
+    var i: usize = 0;
+    while (i < token.len) {
+        const c = unicode.decodeAt(token, i);
+        if (c.cp >= char_bytes.len or char_bytes[c.cp] < 0) {
+            bytes.shrinkRetainingCapacity(start);
+            return bytes.appendSlice(a, token);
+        }
+        try bytes.append(a, @intCast(char_bytes[c.cp]));
+        i += c.len;
+    }
+}
 
 fn cleanup(a: Allocator, token: []const u8) Error![]const u8 {
     const pairs = [_][2][]const u8{ .{ " .", "." }, .{ " ?", "?" }, .{ " !", "!" }, .{ " ,", "," }, .{ " ' ", "'" }, .{ " n't", "n't" }, .{ " 'm", "'m" }, .{ " do not", " don't" }, .{ " 's", "'s" }, .{ " 've", "'ve" }, .{ " 're", "'re" } };
