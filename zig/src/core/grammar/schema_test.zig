@@ -101,7 +101,7 @@ test "a schema text past 1 MiB is refused" {
     _ = try compile(a, text[0..schema.max_text]);
 }
 
-test "the gate schema: three required properties in order, an enum, no other key" {
+test "a trade signal schema: three required properties in order, an enum, no other key" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const p = try compile(arena.allocator(),
@@ -158,4 +158,26 @@ test "guided_choice is a trie of the raw strings" {
     const t = p.child(root, 'a').?;
     try std.testing.expect(p.tries[t].end and p.child(t, 'b') != null and p.child(t, '"') != null);
     try std.testing.expect(p.child(root, 'b') == null);
+}
+
+test "a repeated type or branch adds no branch, as xgrammar takes it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{
+        "{\"type\": [\"integer\", \"integer\"]}",
+        "{\"type\": [\"string\", \"integer\", \"string\"], \"minLength\": 2}",
+        "{\"type\": [\"object\", \"object\"], \"properties\": {\"a\": {\"type\": \"integer\"}}}",
+        "{\"anyOf\": [{}, {}]}",
+        "{\"anyOf\": [{\"type\": \"string\", \"format\": \"date\"}, {\"type\": \"string\", \"format\": \"date\"}]}",
+        "{\"anyOf\": [{\"$ref\": \"#/$defs/p\"}, {\"$ref\": \"#/$defs/p\"}], \"$defs\": {\"p\": {\"type\": \"object\"}}}",
+    }) |t| _ = try compile(a, t);
+    const p = try compile(a, "{\"type\": [\"integer\", \"null\", \"integer\"]}");
+    const u = p.unions[p.nodes[p.root].any_of].dispatch;
+    try std.testing.expect(p.nodes[u['1']] == .integer and p.nodes[u['n']] == .literal and u['"'] == schema.none);
+    // two objects stay two branches that start alike
+    try std.testing.expectEqualStrings(
+        "#: two anyOf, oneOf or type branches can start with '{': this engine needs branches that start with different bytes",
+        try refusal(a, "{\"anyOf\": [{\"type\": \"object\", \"properties\": {\"a\": {}}}, {\"type\": \"object\", \"properties\": {\"a\": {}}}]}"),
+    );
 }

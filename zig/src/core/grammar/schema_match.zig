@@ -15,6 +15,7 @@ pub const max_blanks = json.max_blanks;
 pub const Frame = struct { node: Id, at: u16 };
 const tail: u16 = std.math.maxInt(u16);
 const no: u16 = std.math.maxInt(u16);
+const gone: u32 = std.math.maxInt(u32);
 
 const Lex = enum(u8) {
     root, // before the root value
@@ -52,11 +53,9 @@ const Lexer = struct {
     need: u2 = 0,
     lo: u8 = 0x80,
     hi: u8 = 0xBF,
-    // a key: the first property it can be, whether it can be another key, the first name it starts, the bytes taken
-    cand: u16 = no,
+    // a key: its node in the object's key trie (gone: it starts no key), and whether it can be another key
+    trie: u32 = gone,
     free: bool = false,
-    excl: u16 = no,
-    pos: u16 = 0,
     num: Num = .minus,
     integer: bool = false,
     /// text: characters taken; literal: the trie node.
@@ -245,12 +244,9 @@ const Lexer = struct {
         const o = obj(p, lx.cur);
         const c = lx.cur.at;
         const free = o.additional != none and (c == tail or o.required_from[c] == o.props.len);
-        const cand: u16 = if (c != tail and c < o.props.len) c else no;
-        if (cand == no and !free) return false;
-        lx.cand = cand;
+        if ((c == tail or c >= o.props.len) and !free) return false;
+        lx.trie = o.trie;
         lx.free = free;
-        lx.excl = if (free and o.props.len > 0) 0 else no;
-        lx.pos = 1;
         lx.esc = .none;
         lx.need = 0;
         lx.lex = .obj_key;
@@ -260,37 +256,25 @@ const Lexer = struct {
     /// A key's next byte: a property up to the next required one, or (if allowed) another key that is no name.
     fn key(lx: *Lexer, p: *const Program, b: u8) bool {
         const o = obj(p, lx.cur);
-        const pos = lx.pos;
-        var cand = lx.cand;
-        var declared = false;
-        if (cand != no) {
-            const lit = o.props[cand].key;
-            if (!(pos < lit.len and lit[pos] == b)) {
-                const hi = @min(o.required_from[lx.cur.at], o.props.len - 1);
-                cand = for (cand + 1..hi + 1) |j| {
-                    const k = o.props[j].key;
-                    if (k.len > pos and k[pos] == b and std.mem.eql(u8, k[0..pos], lit[0..pos])) break @intCast(j);
-                } else no;
-            }
-            declared = cand != no and o.props[cand].key.len == pos + 1;
-        }
+        const t: u32 = if (lx.trie == gone) gone else p.child(lx.trie, b) orelse gone;
+        const cand = if (t == gone) no else ahead(o, t, lx.cur.at);
+        // the key so far, closing quote included, is a property's key
+        const whole = t != gone and p.tries[t].end;
         var free = lx.free;
         var other = false;
         if (free) {
             switch (lx.body(b)) {
                 .bad => free = false,
-                .close => if (lx.excl != no and named(o, lx.excl, pos - 1)) {
+                // xgrammar keeps every name, passed or ahead, from other keys; names are bare (schema_keys.bare)
+                .close => if (whole) {
                     free = false;
                 } else {
                     other = true;
                 },
-                // names are bare (schema_keys.bare): an escape or a multibyte character leaves them all
-                .more => if (lx.excl != no) {
-                    lx.excl = starts(o, lx.excl, pos - 1, b);
-                },
+                .more => {},
             }
         }
-        if (declared) {
+        if (cand != no and whole) {
             lx.cur.at = cand + 1;
             lx.node = o.props[cand].node;
             lx.lex = .obj_colon;
@@ -303,9 +287,8 @@ const Lexer = struct {
             return true;
         }
         if (cand == no and !free) return false;
-        lx.cand = cand;
+        lx.trie = t;
         lx.free = free;
-        lx.pos +|= 1;
         return true;
     }
 
@@ -425,29 +408,29 @@ const Lexer = struct {
     }
 };
 
-fn obj(p: *const Program, f: Frame) schema.Object {
-    return p.objects[p.nodes[f.node].object];
+fn obj(p: *const Program, f: Frame) *const schema.Object {
+    return &p.objects[p.nodes[f.node].object];
 }
 
 fn arr(p: *const Program, f: Frame) schema.Array {
     return p.arrays[p.nodes[f.node].array];
 }
 
-/// Some property from `first` on is named exactly the first `n` bytes of property `first`'s name.
-fn named(o: schema.Object, first: u16, n: u16) bool {
-    const name = o.props[first].name;
-    for (o.props[first..]) |q| if (q.name.len == n and std.mem.eql(u8, q.name, name[0..n])) return true;
-    return false;
-}
-
-/// The first property from `first` on whose name has byte `b` after the `i` bytes it shares with property `first`.
-fn starts(o: schema.Object, first: u16, i: u16, b: u8) u16 {
-    const name = o.props[first].name;
-    if (name.len > i and name[i] == b) return first;
-    for (o.props[first + 1 ..], first + 1..) |q, j| {
-        if (q.name.len > i and q.name[i] == b and std.mem.eql(u8, q.name[0..i], name[0..i])) return @intCast(j);
+/// The first property from `c` up to the next required one whose key passes through key-trie node `t`, or `no`.
+fn ahead(o: *const schema.Object, t: u32, c: u16) u16 {
+    // after the last property every list ends before c, so only `tail` needs a test
+    if (c == tail) return no;
+    const span = o.below[t - o.trie];
+    const list = o.members[span.first..][0..span.len];
+    // the members are in property order: find the first at or after c
+    var lo: usize = 0;
+    var hi: usize = list.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list[mid] < c) lo = mid + 1 else hi = mid;
     }
-    return no;
+    // past a required property the key cannot be a later one
+    return if (lo < list.len and list[lo] <= o.required_from[c]) list[lo] else no;
 }
 
 fn escaped(b: u8) bool {

@@ -229,6 +229,9 @@ strings). The schema text may be at most 1 MiB.
 The Zig engine walks the accepted path of each verified window under the grammar. A greedy row keeps its token when
 the grammar allows it. Every other row draws again among the allowed tokens, with its own key. This commits the same
 tokens as a cut before the verify, so a constrained reply equals its `"draft": false` reply and its solo run.
+Sometimes the engine must commit a token that the grammar refuses. Examples are a forced `</think>` from the
+thinking budget, and a row where the grammar allows no token. That reply ends with HTTP 500 and the grammar's
+message, or with an error event when streaming. The other requests go on.
 
 ## Reasoning
 

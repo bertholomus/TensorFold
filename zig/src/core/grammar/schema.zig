@@ -44,7 +44,14 @@ pub const Object = struct {
     required_from: []const u16,
     /// The values of other keys; none: no other key.
     additional: Id,
+    /// The trie of the keys after their opening quote, so a key's next byte costs no scan of the properties.
+    trie: u32,
+    /// below[t - trie]: the properties whose keys pass through trie node t, a slice of `members` in order.
+    below: []const Span,
+    members: []const u16,
 };
+
+pub const Span = struct { first: u32, len: u32 };
 
 /// A property: its key as a JSON string, its raw name, and its value's node.
 pub const Prop = struct { key: []const u8, name: []const u8, node: Id };
@@ -79,10 +86,21 @@ pub const Program = struct {
     const boolean: Id = 6;
     const @"null": Id = 7;
 
-    /// Trie node `t`'s child by byte `b`.
+    /// Trie node `t`'s child by byte `b`. A node's edges are in byte order.
     pub fn child(p: *const Program, t: u32, b: u8) ?u32 {
         const n = p.tries[t];
-        for (p.edges[n.first..][0..n.len]) |e| if (e.byte == b) return e.to;
+        var lo = n.first;
+        var hi = n.first + n.len;
+        if (n.len <= 8) {
+            for (p.edges[lo..hi]) |e| if (e.byte == b) return e.to;
+            return null;
+        }
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const e = p.edges[mid];
+            if (e.byte == b) return e.to;
+            if (e.byte < b) lo = mid + 1 else hi = mid;
+        }
         return null;
     }
 };
@@ -150,8 +168,7 @@ const Compiler = struct {
     fn init(c: *Compiler) Error!void {
         try c.path.appendSlice(c.a, "#");
         _ = try c.add(.any);
-        try c.objects.append(c.a, .{ .props = &.{}, .required_from = &.{0}, .additional = Program.any });
-        _ = try c.add(.{ .object = 0 });
+        _ = try c.add(.{ .object = try c.objectOf(&.{}, &.{0}, Program.any) });
         try c.arrays.append(c.a, .{ .prefix = &.{}, .items = Program.any, .min = 0, .max = none });
         _ = try c.add(.{ .array = 0 });
         _ = try c.add(.string);
@@ -206,12 +223,19 @@ const Compiler = struct {
             .string => |name| return c.typed(s, name),
             .array => |types| {
                 if (types.items.len == 0) return c.untyped(s);
-                const ids = try c.a.alloc(Id, types.items.len);
-                for (types.items, ids) |name, *id| {
+                var ids: std.ArrayList(Id) = .empty;
+                // a repeated type name adds no branch; there are 7 names, so `seen` stays short
+                var seen: std.ArrayList([]const u8) = .empty;
+                for (types.items) |name| {
                     if (name != .string) return c.fail("type must be a string or a list of strings", .{});
-                    id.* = try c.typed(s, name.string);
+                    const again = for (seen.items) |prev| {
+                        if (std.mem.eql(u8, prev, name.string)) break true;
+                    } else false;
+                    if (again) continue;
+                    try ids.append(c.a, try c.typed(s, name.string));
+                    try seen.append(c.a, name.string);
                 }
-                return c.union_(ids);
+                return c.union_(ids.items);
             },
             else => return c.fail("type must be a string or a list of strings", .{}),
         };
@@ -313,8 +337,23 @@ const Compiler = struct {
             i -= 1;
             from[i] = if (required[i]) @intCast(i) else from[i + 1];
         }
-        try c.objects.append(c.a, .{ .props = props.items, .required_from = from, .additional = additional });
-        return c.add(.{ .object = @intCast(c.objects.items.len - 1) });
+        return c.add(.{ .object = try c.objectOf(props.items, from, additional) });
+    }
+
+    fn objectOf(c: *Compiler, props: []const Prop, from: []const u16, additional: Id) Error!u32 {
+        const texts = try c.a.alloc([]const u8, props.len);
+        for (props, texts) |p, *t| t.* = p.key[1..];
+        var below: Below = .{};
+        const root = try c.trieOf(texts, &below);
+        try c.objects.append(c.a, .{
+            .props = props,
+            .required_from = from,
+            .additional = additional,
+            .trie = root,
+            .below = below.spans.items,
+            .members = below.members.items,
+        });
+        return @intCast(c.objects.items.len - 1);
     }
 
     fn array(c: *Compiler, s: std.json.ObjectMap) Error!Id {
@@ -371,29 +410,35 @@ const Compiler = struct {
 
     /// A trie of `texts`, built without recursion (a value may be long).
     fn trie(c: *Compiler, texts: []const []const u8) Error!u32 {
-        const sorted = try c.a.dupe([]const u8, texts);
-        std.mem.sort([]const u8, sorted, {}, struct {
-            fn less(_: void, x: []const u8, y: []const u8) bool {
-                return std.mem.order(u8, x, y) == .lt;
+        return c.trieOf(texts, null);
+    }
+
+    /// Each node's texts by index, in order, for a trie of keys.
+    const Below = struct { spans: std.ArrayList(Span) = .empty, members: std.ArrayList(u16) = .empty };
+
+    fn trieOf(c: *Compiler, texts: []const []const u8, below: ?*Below) Error!u32 {
+        const order = try c.a.alloc(u32, texts.len);
+        for (order, 0..) |*o, i| o.* = @intCast(i);
+        std.mem.sort(u32, order, texts, struct {
+            fn less(t: []const []const u8, x: u32, y: u32) bool {
+                return std.mem.order(u8, t[x], t[y]) == .lt;
             }
         }.less);
-        const Span = struct { node: u32, lo: usize, hi: usize, depth: usize };
-        var todo: std.ArrayList(Span) = .empty;
-        const root: u32 = @intCast(c.tries.items.len);
-        try c.tries.append(c.a, .{ .first = 0, .len = 0, .end = false });
-        try todo.append(c.a, .{ .node = root, .lo = 0, .hi = sorted.len, .depth = 0 });
+        const Todo = struct { node: u32, lo: usize, hi: usize, depth: usize };
+        var todo: std.ArrayList(Todo) = .empty;
+        const root = try c.trieNode(order[0..], below);
+        try todo.append(c.a, .{ .node = root, .lo = 0, .hi = order.len, .depth = 0 });
         while (todo.pop()) |span| {
             var i = span.lo;
             // sorted, so the text that ends here (and its repeats) comes first
-            while (i < span.hi and sorted[i].len == span.depth) : (i += 1) c.tries.items[span.node].end = true;
+            while (i < span.hi and texts[order[i]].len == span.depth) : (i += 1) c.tries.items[span.node].end = true;
             const first: u32 = @intCast(c.edges.items.len);
             var j = i;
             while (j < span.hi) {
-                const b = sorted[j][span.depth];
+                const b = texts[order[j]][span.depth];
                 var e = j;
-                while (e < span.hi and sorted[e][span.depth] == b) e += 1;
-                const to: u32 = @intCast(c.tries.items.len);
-                try c.tries.append(c.a, .{ .first = 0, .len = 0, .end = false });
+                while (e < span.hi and texts[order[e]][span.depth] == b) e += 1;
+                const to = try c.trieNode(order[j..e], below);
                 try c.edges.append(c.a, .{ .byte = b, .to = to });
                 try todo.append(c.a, .{ .node = to, .lo = j, .hi = e, .depth = span.depth + 1 });
                 j = e;
@@ -402,6 +447,19 @@ const Compiler = struct {
             c.tries.items[span.node].len = @intCast(c.edges.items.len - first);
         }
         return root;
+    }
+
+    /// A new trie node for the texts `order` names; with `below`, it records them in index order.
+    fn trieNode(c: *Compiler, order: []const u32, below: ?*Below) Error!u32 {
+        const id: u32 = @intCast(c.tries.items.len);
+        try c.tries.append(c.a, .{ .first = 0, .len = 0, .end = false });
+        if (below) |w| {
+            const first: u32 = @intCast(w.members.items.len);
+            for (order) |i| try w.members.append(c.a, @intCast(i));
+            std.mem.sort(u16, w.members.items[first..], {}, std.sort.asc(u16));
+            try w.spans.append(c.a, .{ .first = first, .len = @intCast(order.len) });
+        }
+        return id;
     }
 
     fn anyOf(c: *Compiler, o: Value, comptime word: []const u8) Error!Id {
@@ -474,8 +532,12 @@ const Compiler = struct {
 
     /// A union's branch for each first byte (nested unions opened, integer in number, literals merged), or a refusal.
     fn dispatch(c: *Compiler, u: u32) Error!Union {
+        var all: std.ArrayList(Id) = .empty;
+        try c.flatten(u, &all, 0);
+        // branches with the same node take the same replies, so one of them stands for all
         var flat: std.ArrayList(Id) = .empty;
-        try c.flatten(u, &flat, 0);
+        var seen: std.AutoHashMapUnmanaged(Node, void) = .empty;
+        for (all.items) |b| if (!(try seen.getOrPut(c.a, c.nodes.items[b])).found_existing) try flat.append(c.a, b);
         var number = false;
         var texts: std.ArrayList([]const u8) = .empty;
         for (flat.items) |b| switch (c.nodes.items[b]) {

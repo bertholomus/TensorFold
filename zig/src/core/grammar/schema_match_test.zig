@@ -40,16 +40,16 @@ fn compile(a: Allocator, text: []const u8) !schema.Program {
     };
 }
 
-const gate =
+const signal =
     \\{"type": "object", "additionalProperties": false, "required": ["action", "confidence", "pair"],
     \\ "properties": {"action": {"type": "string", "enum": ["buy", "sell", "hold"]}, "confidence": {"type": "number"},
     \\ "pair": {"type": "string"}}}
 ;
 
-test "the gate schema: its keys in order, an enum value, no other key, blanks only between tokens" {
+test "a trade signal schema: its keys in order, an enum value, no other key, blanks only between tokens" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const p = try compile(arena.allocator(), gate);
+    const p = try compile(arena.allocator(), signal);
     try expectRun(&p, .complete, "{\"action\":\"buy\",\"confidence\":0.72,\"pair\":\"BTC/USD\"}");
     try expectRun(&p, .complete, "{ \"action\" : \"hold\" ,\n\t\"confidence\": -1e-3, \"pair\": \"\\u00e9\" }");
     try expectRun(&p, at(0), " {\"action\":\"buy\"");
@@ -81,6 +81,95 @@ test "optional properties may be left out in order; other keys come last and are
     try expectRun(&none, .complete, "{}");
     try expectRun(&none, .complete, "{ \"k\" : 0 }");
     try expectRun(&none, at(2), "{\"j\":0}");
+}
+
+test "keys that start each other in any order, a required one between, other keys after it (xgrammar 0.2.8 verdicts)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try compile(arena.allocator(),
+        \\{"type": "object", "properties": {"ab": {"type": "integer"}, "a": {"type": "integer"}, "abc": {"type": "integer"},
+        \\ "b": {"type": "integer"}}, "required": ["abc"], "additionalProperties": true}
+    );
+    try expectRun(&p, .complete, "{\"abc\":1}");
+    try expectRun(&p, .complete, "{\"a\":1,\"abc\":1}");
+    try expectRun(&p, .complete, "{\"ab\":1,\"a\":1,\"abc\":1}");
+    try expectRun(&p, at(10), "{\"a\":1,\"ab\":1,\"abc\":1}"); // ab comes before a
+    try expectRun(&p, at(2), "{\"b\":1}"); // b lies past the required abc
+    try expectRun(&p, .complete, "{\"abc\":1,\"zz\":1,\"\":1}");
+    try expectRun(&p, at(12), "{\"abc\":1,\"ab\":1}"); // a passed name is no other key
+    try expectRun(&p, at(11), "{\"abc\":1,\"a\":1}");
+    try expectRun(&p, at(19), "{\"ab\":1,\"abc\":1,\"ab\":1}");
+    try expectRun(&p, .complete, "{\"abc\":1,\"b\":1,\"abx\":1,\"abcd\":1}");
+    try expectRun(&p, .prefix, "{\"ab");
+}
+
+test "an object of 30,000 properties takes each key in order; its key trie lists the properties under each prefix" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "{\"type\": \"object\", \"properties\": {");
+    for (0..30_000) |i| try text.print(a, "{s}\"p{d}\": {{\"type\": \"integer\"}}", .{ if (i == 0) "" else ", ", i });
+    try text.appendSlice(a, "}}");
+    const p = try compile(a, text.items);
+    try expectRun(&p, .complete, "{\"p29999\":1}");
+    try expectRun(&p, .complete, "{\"p0\":1,\"p1\":1,\"p10\":1,\"p100\":1,\"p1000\":1,\"p10000\":1}");
+    try expectRun(&p, at(11), "{\"p5\":1,\"p4\":1}");
+    try expectRun(&p, .complete, "{\"p5\":1,\"p50\":1,\"p500\":1,\"p5000\":1}");
+    try expectRun(&p, at(12), "{\"p50\":1,\"p5\":1}"); // p5 still starts p500 and on, so its closing quote is refused
+    try expectRun(&p, at(7), "{\"p30000\":1}");
+    // a key byte reads one trie node and searches its list: it never scans all 30,000 properties
+    const o = p.objects[p.nodes[p.root].object];
+    var node = o.trie;
+    for ("p2") |b| node = p.child(node, b).?;
+    const span = o.below[node - o.trie];
+    const below = o.members[span.first..][0..span.len];
+    try std.testing.expectEqual(@as(usize, 1 + 10 + 100 + 1000 + 10_000), below.len);
+    try std.testing.expectEqual(@as(u16, 2), below[0]);
+    for (below[1..], below[0 .. below.len - 1]) |x, prev| {
+        try std.testing.expect(x > prev);
+        try std.testing.expect(std.mem.startsWith(u8, o.props[x].name, "p2"));
+    }
+}
+
+test "every key trie node lists exactly the properties whose keys start with its bytes, in order" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var prng = std.Random.DefaultPrng.init(20261026);
+    const r = prng.random();
+    for (0..200) |_| {
+        var names: std.ArrayList([]const u8) = .empty;
+        for (0..r.uintLessThan(usize, 12)) |_| {
+            const name = try a.alloc(u8, r.uintLessThan(usize, 5));
+            for (name) |*c| c.* = "ab\"\\\x01\xc3\xa9"[r.uintLessThan(usize, 7)];
+            if (!std.unicode.utf8ValidateSlice(name)) continue;
+            for (names.items) |n| {
+                if (std.mem.eql(u8, n, name)) break;
+            } else try names.append(a, name);
+        }
+        var text: std.ArrayList(u8) = .empty;
+        try text.appendSlice(a, "{\"type\": \"object\", \"properties\": {");
+        for (names.items, 0..) |n, i| {
+            if (i > 0) try text.appendSlice(a, ", ");
+            try keys.writeString(a, &text, n);
+            try text.appendSlice(a, ": {}");
+        }
+        try text.appendSlice(a, "}}");
+        const p = try compile(a, text.items);
+        const o = p.objects[p.nodes[p.root].object];
+        try std.testing.expectEqual(names.items.len, o.props.len);
+        // walk the trie by every prefix of every key, and compare its list with a scan
+        for (o.props) |prop| for (0..prop.key.len) |n| {
+            var node = o.trie;
+            for (prop.key[1 .. n + 1]) |b| node = p.child(node, b).?;
+            const span = o.below[node - o.trie];
+            var want: std.ArrayList(u16) = .empty;
+            for (o.props, 0..) |q, j| if (std.mem.startsWith(u8, q.key, prop.key[0 .. n + 1])) try want.append(a, @intCast(j));
+            try std.testing.expectEqualSlices(u16, want.items, o.members[span.first..][0..span.len]);
+            try std.testing.expectEqual(n + 1 == prop.key.len, p.tries[node].end);
+        };
+    }
 }
 
 test "arrays: prefix items, then items within minItems and maxItems; two blank runs in an empty prefix array" {
@@ -168,7 +257,7 @@ test "containers nest at most 128 deep; a token that opens more than the trial h
 }
 
 const walked = [_][]const u8{
-    gate,
+    signal,
     \\{"type": "object", "properties": {"steps": {"type": "array", "items": {"$ref": "#/$defs/step"}},
     \\ "final_answer": {"type": "string"}}, "$defs": {"step": {"type": "object", "properties": {"explanation":
     \\ {"type": "string"}, "output": {"type": "string"}}, "required": ["explanation", "output"],
@@ -201,6 +290,9 @@ const walked = [_][]const u8{
     \\ {"enum": [true, false]}, {"type": "null"}, {"type": "object"}]}, "minItems": 1}
     ,
     \\{"type": ["object", "null"], "properties": {"x": {}, "y": {"type": "array"}}, "required": ["x"]}
+    ,
+    \\{"type": "object", "properties": {"ab": {"type": "integer"}, "a": {"type": "integer"}, "abc": {"type": "integer"},
+    \\ "b": {"type": "integer"}}, "required": ["abc"], "additionalProperties": true}
     ,
 };
 

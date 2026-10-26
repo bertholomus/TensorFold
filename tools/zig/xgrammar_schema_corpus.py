@@ -17,7 +17,7 @@ ITEM = {"type": "object", "properties": {"name": {"type": "string"}, "value": {"
         "required": ["name", "value"], "additionalProperties": False}
 # Each schema is passed as Python 0.6 passed it: json.dumps(schema, ensure_ascii=False).
 SCHEMAS = [
-    # the lab's gate G3 (infra/v4-flash/window-2026-10b/win-gates.sh)
+    # a trade signal: an enum, three required properties, no other key
     {"type": "object", "additionalProperties": False, "required": ["action", "confidence", "pair"],
      "properties": {"action": {"type": "string", "enum": ["buy", "sell", "hold"]}, "confidence": {"type": "number"},
                     "pair": {"type": "string"}}},
@@ -94,6 +94,18 @@ SCHEMAS = [
     {"allOf": [{"type": "object", "properties": {"q": {"type": "string", "minLength": 1}}, "required": ["q"]}]},
     {"type": "object", "properties": {"n": {"type": "object", "properties": {"n": {"type": "object", "properties": {
         "n": {"type": "array", "items": {"type": "object", "properties": {"leaf": {"type": "integer"}}}}}}}}}},
+    # names that start each other in no order, a required one between, with and without other keys
+    {"type": "object", "properties": {"ab": {"type": "integer"}, "a": {"type": "integer"}, "abc": {"type": "integer"},
+                                      "b": {"type": "integer"}, "a_b": {"type": "integer"}, "ba": {"type": "integer"}},
+     "required": ["abc"], "additionalProperties": True},
+    {"type": "object", "properties": {"abcd": {"type": "string"}, "ab": {"type": "integer"}, "a": {"type": "boolean"},
+                                      "abc": {"type": "null"}}, "required": ["a"], "additionalProperties": False},
+    # branches that repeat a type or a schema
+    {"type": ["integer", "integer", "string"]},
+    {"anyOf": [{"type": "string"}, {"type": "string"}, {"type": "null"}]},
+    {"anyOf": [{}, {}]},
+    {"anyOf": [{"$ref": "#/$defs/p"}, {"$ref": "#/$defs/p"}],
+     "$defs": {"p": {"type": "object", "properties": {"k": {"type": "integer"}}}}},
 ]
 CHOICES = [["yes", "no"], ["a", "ab", "abc"], ["x\ny", "😀", "\u0001", "\u007f", "a\"b\\c"], ["positive", "negative", "neutral"]]
 

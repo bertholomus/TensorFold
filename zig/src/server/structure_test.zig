@@ -176,10 +176,10 @@ test "json_object reaches an engine that enforces structures, with the token tab
     try std.testing.expectEqualSlices(api.grammar.vocab.Kind, &.{ .text, .special, .eos }, &engine.kinds);
 }
 
-const gate = "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"action\",\"confidence\",\"pair\"]," ++
+const signal = "{\"type\":\"object\",\"additionalProperties\":false,\"required\":[\"action\",\"confidence\",\"pair\"]," ++
     "\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"buy\",\"sell\",\"hold\"]},\"confidence\":{\"type\":\"number\"},\"pair\":{\"type\":\"string\"}}}";
 
-/// The compiled gate schema: an object of three required properties, the first an enum.
+/// The compiled trade signal schema: an object of three required properties, the first an enum.
 fn expectGate(st: api.Structure) !void {
     try std.testing.expect(st.kind == .json_schema and st.vocab != null);
     const p = st.program.?;
@@ -194,9 +194,9 @@ test "json_schema and guided_choice reach the engine with their compiled program
     defer arena.deinit();
     const a = arena.allocator();
     const bodies = [_][]const u8{
-        ask ++ "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"trade\",\"strict\":true,\"schema\":" ++ gate ++ "}}}",
-        ask ++ "\"stream\":true,\"guided_json\":" ++ gate ++ "}",
-        ask ++ "\"structured_outputs\":{\"json\":" ++ gate ++ "}}",
+        ask ++ "\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"trade\",\"strict\":true,\"schema\":" ++ signal ++ "}}}",
+        ask ++ "\"stream\":true,\"guided_json\":" ++ signal ++ "}",
+        ask ++ "\"structured_outputs\":{\"json\":" ++ signal ++ "}}",
     };
     for (bodies) |body| {
         var text: ByteText = .{};
@@ -221,7 +221,7 @@ test "an Anthropic output_config.format reaches the engine as a compiled json_sc
     defer arena.deinit();
     const a = arena.allocator();
     const body = (try json.parse(a, "{\"model\":\"m\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"x\"}]," ++
-        "\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":" ++ gate ++ "}}}")).ok;
+        "\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":" ++ signal ++ "}}}")).ok;
     var cx: server.errors.Cx = .{ .a = a };
     const chat = try anthropic_translate.translate(&cx, body, false);
     var text: ByteText = .{};
