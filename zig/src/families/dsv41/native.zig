@@ -21,6 +21,7 @@
 //!   TF_DS_FIX_K=K                               a measurement: every drafted stream verifies K drafts a round
 //!   TF_DS_SOLO_OVERHEAD=1                       a lone drafted stream's head windows cost the fixed draft allowance
 //!   TF_DS_NO_COPIES=1                           a drafted stream proposes no suffix-lookup copy windows
+//!   TF_DS_VISION=0                              a vision checkpoint text only: no tower on rank 0, images refused
 //! The kernel set (TENSORFOLD_CUDA_KERNELS) is the recorded Triton set (aot_pack.py). The pool holds --context
 //! positions for every stream together (each takes an extent: its prompt, its max_tokens and a round's rows).
 //! TF_TP_WORLD=4: the four nodes of the exact 2D split (prompt2d.zig), ranks 1-3 `tf-dsv41-lanes` following on the
@@ -95,6 +96,14 @@ fn nonEmpty(v: ?[]const u8) ?[]const u8 {
     return if (s.len == 0) null else s;
 }
 
+/// TF_DS_VISION: unset, empty or 1 loads a vision checkpoint's tower, 0 serves it text only; anything else is refused.
+pub fn visionOn(v: ?[]const u8) error{BadVision}!bool {
+    const s = nonEmpty(v) orelse return true;
+    if (std.mem.eql(u8, s, "1")) return true;
+    if (std.mem.eql(u8, s, "0")) return false;
+    return error.BadVision;
+}
+
 /// The device bytes this rank's weights take, for the host's memory check: its file in TF_DS_RANK_CACHE (the
 /// checkpoint holds both ranks'); 0 when there is none to read (open then says what to set).
 pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
@@ -117,6 +126,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const master = link.parseIp(getenv("TF_TP_MASTER") orelse return error.NoMaster) catch return error.BadMaster;
     const port = std.fmt.parseInt(u16, getenv("TF_TP_PORT") orelse "29620", 10) catch return error.BadPort;
     const arena_gib = if (getenv("TF_DS_ARENA_GIB")) |t| std.fmt.parseInt(usize, t, 10) catch return error.BadArena else 0;
+    const tower = try visionOn(getenv("TF_DS_VISION")); // (read before the weights load: a bad value fails in seconds)
     const st = try gpa.create(State);
     errdefer gpa.destroy(st);
     st.gpa = gpa;
@@ -151,7 +161,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
     // a vision checkpoint's tower on this rank, from the kit's vision/ (torch's attention cubin, the routing bias)
     st.vision = null;
-    if (st.m.cfg.vision) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
+    if (st.m.cfg.vision and tower) st.vision = try vision_mod.Vision.open(gpa, io, st.m, dir, getenv("TF_DS_KIT").?);
+    if (st.m.cfg.vision and !tower) std.debug.print("{{\"vision\": \"off (TF_DS_VISION=0): no tower, image inputs are refused\"}}\n", .{});
     errdefer if (st.vision) |v| v.close();
     st.lanes.vision = st.vision;
     // the pool is the model's (preallocated): a stream takes no device memory of its own
@@ -182,6 +193,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.ContextFull => "the streams' prompts and budgets fill the context's pool: lower max_tokens, or retry when a stream ends",
         error.PromptTooLong => "the prompt and its max_tokens do not fit the context window",
         error.NoVisionKit => "this checkpoint reads images: its kit (TF_DS_KIT) needs vision/torch_fmha_sm120.cubin and vision/gate_bias_vl.safetensors",
+        error.BadVision => "TF_DS_VISION: 0 serves a vision checkpoint text only (no tower; image inputs refused), 1 or unset loads its tower",
         else => null,
     };
 }
@@ -190,4 +202,14 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
+}
+
+test "TF_DS_VISION: 0 leaves the tower out, 1 or unset or empty loads it, any other value is refused and named" {
+    try std.testing.expect(try visionOn(null));
+    try std.testing.expect(try visionOn(""));
+    try std.testing.expect(try visionOn("1"));
+    try std.testing.expect(!try visionOn("0"));
+    for ([_][]const u8{ "off", "false", "no", " 0", "0 ", "00", "2", "yes" }) |v| try std.testing.expectError(error.BadVision, visionOn(v));
+    const text = explain(null, error.BadVision).?;
+    try std.testing.expect(std.mem.indexOf(u8, text, "TF_DS_VISION") != null and std.mem.indexOf(u8, text, "0 serves") != null);
 }
