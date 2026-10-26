@@ -135,6 +135,15 @@ others decode") is adapted to this fork's pacing gate: `families/glm_moe_dsa/cud
 returns a stream whose remaining prompt is under `TF_GLM_FILL_MIN_ROWS` (2048, his default) before the
 `DECODE_SHARE` pacing. This fork fills whole chunks already (no layer steps), so only the wait is his.
 
+## Ling-3.1-flash
+
+The `bailing_v3` family implements the model math of inclusionAI's Ling-3.1-flash
+(`modeling_bailing_moe_v3.py` of [inclusionAI/Ling-3.1-flash](https://huggingface.co/inclusionAI/Ling-3.1-flash),
+revision 7b864daa), Apache License 2.0, Copyright 2025 Antgroup and The HuggingFace Inc. team. Its tests restate
+parts of that file in torch as references: the grouped top-k router, the KDA recurrence and the rotary form.
+`tests/fixtures/ling31/` holds the checkpoint's `chat_template.jinja` and `config.json`, part of its
+`tokenizer_config.json` (the model card states MIT), and chat turns rendered with that template.
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from

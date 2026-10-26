@@ -2,7 +2,8 @@
 //
 // Per row, following the Hugging Face definition: the depthwise conv over [conv state; q|k|v rows] (4 taps,
 // fp32) with SiLU and one bf16 rounding; fp32 L2 norms of q and k (eps inside the sum, q times DK^-0.5); the
-// per-channel decay g_i = exp(lower * sigmoid(exp(A_log) * (a_i + dt_bias_i))) in fp32; beta = bf16(sigmoid(b));
+// per-channel decay g_i = exp(lower * sigmoid(exp(A_log) * (a_i + dt_bias_i))) in fp32; beta = bf16(sigmoid(b))
+// (GLM-5.3-Flash) or sigmoid(b) kept in fp32 (Ling-3.1-flash: ``beta_bf16`` 0);
 // the delta rule in fp32 (decay along the key channel, read with k, correct toward v, read out with q);
 // read-out rounded to bf16; then the gated RMSNorm bf16(w * (y * rsqrt(mean(y^2) + eps)) * sigmoid(gate)).
 // Warp w owns value rows 4w .. 4w + 3, lane l the key columns 4l .. 4l + 3. The state update is one routine
@@ -53,7 +54,7 @@ __global__ void __launch_bounds__(1024) chain_kernel(
         const __nv_bfloat16* __restrict__ norm_w, float eps, float lower, int rows,
         __nv_bfloat16* __restrict__ out, float* __restrict__ state_out,
         float* __restrict__ k_save, __nv_bfloat16* __restrict__ v_save, float* __restrict__ g_save,
-        float* __restrict__ b_save) {
+        float* __restrict__ b_save, int beta_bf16) {
     const int C = 3 * H * DK;                         // conv channels: q | k | v
     const int h = blockIdx.x;
     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -87,7 +88,8 @@ __global__ void __launch_bounds__(1024) chain_kernel(
             const float a = __bfloat162float(A[(size_t)r * a_stride + h * DK + i]) + dt_bias[h * DK + i];
             gs[i] = expf(lower * sigmoidf_(decay_rate * a));
         } else if (t == 1023) {
-            beta_s = bf(sigmoidf_(__bfloat162float(P[(size_t)r * p_stride + b_off + h])));
+            const float sb = sigmoidf_(__bfloat162float(P[(size_t)r * p_stride + b_off + h]));
+            beta_s = beta_bf16 ? bf(sb) : sb;
         }
         __syncthreads();
         if (warp < 2) {
@@ -223,7 +225,7 @@ __global__ void __launch_bounds__(512) prep_kernel(
         const __nv_bfloat16* __restrict__ A, int a_stride, const __nv_bfloat16* __restrict__ cs,
         const __nv_bfloat16* __restrict__ cw, const float* __restrict__ a_log, const float* __restrict__ dt_bias,
         float lower, float* __restrict__ q_out, float* __restrict__ k_save, __nv_bfloat16* __restrict__ v_save,
-        float* __restrict__ g_save, float* __restrict__ b_save) {
+        float* __restrict__ g_save, float* __restrict__ b_save, int beta_bf16) {
     const int C = 3 * H * DK;
     const int r = blockIdx.x, h = blockIdx.y;
     const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
@@ -248,7 +250,10 @@ __global__ void __launch_bounds__(512) prep_kernel(
         const float decay_rate = expf(a_log[h]);
         const float a = __bfloat162float(A[(size_t)r * a_stride + h * DK + i]) + dt_bias[h * DK + i];
         g_save[base + i] = expf(lower * sigmoidf_(decay_rate * a));
-        if (i == 0) b_save[r * H + h] = bf(sigmoidf_(__bfloat162float(P[(size_t)r * p_stride + b_off + h])));
+        if (i == 0) {
+            const float sb = sigmoidf_(__bfloat162float(P[(size_t)r * p_stride + b_off + h]));
+            b_save[r * H + h] = beta_bf16 ? bf(sb) : sb;
+        }
     }
     __syncthreads();
     if (warp < 2) {
@@ -362,7 +367,7 @@ void kda_chain_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, const 
                     const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
                     const at::Tensor& norm_w, double eps, double lower, int64_t rows, at::Tensor& out,
                     at::Tensor& state_out, at::Tensor& k_save, at::Tensor& v_save, at::Tensor& g_save,
-                    at::Tensor& b_save) {
+                    at::Tensor& b_save, bool beta_bf16) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)a_log.numel();
     chain_kernel<<<H, 1024, 0, stream>>>(
@@ -370,7 +375,7 @@ void kda_chain_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, const 
         ptr<__nv_bfloat16>(G), (int)g_stride, ptr<__nv_bfloat16>(cs), ptr<__nv_bfloat16>(cw), ptr<float>(state_in),
         ptr<float>(a_log), ptr<float>(dt_bias), ptr<__nv_bfloat16>(norm_w), (float)eps, (float)lower, (int)rows,
         ptr<__nv_bfloat16>(out), ptr<float>(state_out), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save),
-        ptr<float>(g_save), ptr<float>(b_save));
+        ptr<float>(g_save), ptr<float>(b_save), beta_bf16 ? 1 : 0);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -399,14 +404,15 @@ void kda_chain_wide_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, c
                          const at::Tensor& state_in, const at::Tensor& a_log, const at::Tensor& dt_bias,
                          const at::Tensor& norm_w, double eps, double lower, int64_t rows, at::Tensor& out,
                          at::Tensor& state_out, at::Tensor& k_save, at::Tensor& v_save, at::Tensor& g_save,
-                         at::Tensor& b_save, at::Tensor& q_tmp, at::Tensor& y_tmp) {
+                         at::Tensor& b_save, at::Tensor& q_tmp, at::Tensor& y_tmp, bool beta_bf16) {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)a_log.numel();
     const dim3 grid((unsigned)rows, (unsigned)H);
     prep_kernel<<<grid, 512, 0, stream>>>(
         H, ptr<__nv_bfloat16>(P), (int)p_stride, (int)b_off, ptr<__nv_bfloat16>(A), (int)a_stride,
         ptr<__nv_bfloat16>(cs), ptr<__nv_bfloat16>(cw), ptr<float>(a_log), ptr<float>(dt_bias), (float)lower,
-        ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save));
+        ptr<float>(q_tmp), ptr<float>(k_save), ptr<__nv_bfloat16>(v_save), ptr<float>(g_save), ptr<float>(b_save),
+        beta_bf16 ? 1 : 0);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     constexpr int WARPS = 4, TR = 16;
     step_kernel<WARPS, TR><<<dim3((unsigned)H, DV / 4 / WARPS), WARPS * 32, 0, stream>>>(

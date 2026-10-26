@@ -251,7 +251,9 @@ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
-// Program (member row, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (0: GLM's bf16 roundings, 1: fp32), then Xd = fp16((act * suh_d) @ H).
+// Program (member row, 128-block of the width): splits summed in order, rotated, * svh, SwiGLU (0: GLM's bf16 roundings,
+// gate and up clamped first; 1: fp32; 2: the bf16 roundings with the clamp after silu, Ling-3.1's
+// min(silu(g), L) * clip(u, -L, L), NaN kept), then Xd = fp16((act * suh_d) @ H).
 __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
@@ -283,6 +285,15 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
             float uu = fminf(fmaxf(bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j])), -limit),
                              limit);
             act = bf16r(bf16r(gg / (1.f + expf(-gg))) * uu);
+        } else if (act_mode == 2) {
+            // torch's clamp(silu(g), max=L) * clamp(u, -L, L) on bf16 tensors: L is a bf16 value, so the clamps round
+            // nothing and the product rounds once; at L = inf these are mode 0's bits
+            float gg = bf16r(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]));
+            float uu = bf16r(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]));
+            float ss = bf16r(gg / (1.f + expf(-gg)));
+            ss = ss > limit ? limit : ss;
+            uu = uu > limit ? limit : (uu < -limit ? -limit : uu);
+            act = bf16r(ss * uu);
         } else {
             float gg = fminf(gv[j] * HAD_SCALE * __half2float(svh_g[(size_t)e * N + n + j]), limit);
             float uu = fminf(fmaxf(uv[j] * HAD_SCALE * __half2float(svh_u[(size_t)e * N + n + j]), -limit), limit);

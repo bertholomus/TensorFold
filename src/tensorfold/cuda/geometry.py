@@ -145,7 +145,10 @@ def share_tile(n: int, world: int, rank: int, tile: int) -> int:
     return tile * share(n // tile, world, rank)
 
 
-def split_weights(rule, world: int = 2):
+def split_weights(rule, world: int = 2, unit=None):
+    """``unit``: split.unit, the items a rank's span moves in (whole 128-column EXL3 blocks): rank 0's share, the
+    largest, of an axis that splits in whole units (Ling's 1280-wide experts at TP4: 384, not 320)."""
+
     def transform(name: str, info: dict) -> tuple[int, int]:
         kind = rule(name)
         if kind == "drop":
@@ -155,7 +158,11 @@ def split_weights(rule, world: int = 2):
             return padded(info, shape, float32=False, name=name), 0
         if not info.get("split") and kind != "rep":
             axis = {"row": 0, "col": -1, "dim1": 1}[kind]
-            shape[axis] = share(shape[axis], world)      # balanced uneven: exact for every divisible dim
+            u = unit(name, list(info["shape"]), kind, world) if unit is not None else 1
+            if u > 1 and shape[axis] % u == 0:
+                shape[axis] = share(shape[axis] // u, world) * u
+            else:
+                shape[axis] = share(shape[axis], world)  # balanced uneven: exact for every divisible dim
         if name.startswith("lm_head."):
             shape[0] = share(shape[0], world)
         cast = name.endswith((".A_log", ".dt_bias", ".hc_attn_base", ".hc_attn_scale", ".hc_ffn_base",

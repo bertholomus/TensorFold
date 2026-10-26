@@ -137,11 +137,12 @@ def unpack_q(plane: KvQ, n: int, out: torch.Tensor) -> torch.Tensor:
 @triton.jit
 def _dense_chunks_pe(QA, QP, LC, LS, HQ, PC, POS, PO, PM, PL, R, H: tl.constexpr, LW: tl.constexpr,
                      PW: tl.constexpr, CH: tl.constexpr, SCALE: tl.constexpr, HBT: tl.constexpr, KTT: tl.constexpr,
-                     KV8: tl.constexpr, QB: tl.constexpr, QSC: tl.constexpr = False):
+                     KV8: tl.constexpr, QB: tl.constexpr, QSC: tl.constexpr = False, FILLED: tl.constexpr = False):
     """Program (row, head block, chunk): causal attention of HB heads of row r over keys [c CH, (c + 1) CH).
 
     The latent rows are bf16 (LC), FP8 codes with a scale a row (KV8: LC, LS) or packed QB-bit codes with fp16 group
-    scales (QB: LC, LS, HQ the +-1 H32), the rope keys bf16 (PC)."""
+    scales (QB: LC, LS, HQ the +-1 H32), the rope keys bf16 (PC). FILLED: a chunk past the row's last key stores
+    nothing (the filled _merge stops before it)."""
 
     r = tl.program_id(0)
     hb = tl.program_id(1)
@@ -156,6 +157,9 @@ def _dense_chunks_pe(QA, QP, LC, LS, HQ, PC, POS, PO, PM, PL, R, H: tl.constexpr
     o = tl.zeros((HBT, LW), tl.float32)
     start = c * CH
     limit = P + r
+    if FILLED:
+        if start > limit:
+            return
     if start <= limit:
         q = tl.load(QA + (r * H + hh[:, None]) * LW + k[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
         qp = tl.load(QP + (r * H + hh[:, None]) * PW + kq[None, :], mask=hok[:, None], other=0).to(tl.bfloat16)
@@ -303,7 +307,7 @@ def _scratch_planes(cache, qscratch: torch.Tensor | None):
 
 def attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, pos: torch.Tensor,
               s: LatentScratch, *, scale: float, nch: int, out: torch.Tensor, hb: int | None = None,
-              qscratch: torch.Tensor | None = None) -> torch.Tensor:
+              qscratch: torch.Tensor | None = None, filled: bool = False) -> torch.Tensor:
     """Dense causal attention of rows (qa [R, H, 512], qp [R, H, 64]) through pos + R - 1 in nch 512-key chunks.
 
     ``cache`` is the layer's bf16 latent rows, its FP8 plane (kv8.Kv8: codes and a scale a row) or its quantized
@@ -311,6 +315,9 @@ def attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, p
 
     A prompt chunk's scratch holds ``part_rows`` rows of partials: longer windows run in row blocks, each at its first
     row's device position (same bits a row as one call: rows never see each other's partials).
+
+    ``filled``: each row walks only the chunks up to its last key's, whatever ``nch`` (at least those): a CUDA graph
+    captured for the whole cache then reads and writes what eager does at this depth, with eager's bits.
     """
 
     R = qa.shape[0]
@@ -319,18 +326,19 @@ def attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, p
     hb = HB if hb is None else hb
     step = s.part_rows
     if R <= step:
-        return _attention(qa, qp, cache, pcache, pos, s, scale=scale, nch=nch, out=out, hb=hb, qscratch=qscratch)
+        return _attention(qa, qp, cache, pcache, pos, s, scale=scale, nch=nch, out=out, hb=hb, qscratch=qscratch,
+                          filled=filled)
     for r0 in range(0, R, step):
         r1 = min(R, r0 + step)
         at = pos if r0 == 0 else pos + r0
         _attention(qa[r0:r1], qp[r0:r1], cache, pcache, at, s, scale=scale, nch=nch, out=out[r0:r1], hb=hb,
-                   qscratch=qscratch)
+                   qscratch=qscratch, filled=filled)
     return out
 
 
 def _attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, pos: torch.Tensor,
                s: LatentScratch, *, scale: float, nch: int, out: torch.Tensor, hb: int,
-               qscratch: torch.Tensor | None = None) -> torch.Tensor:
+               qscratch: torch.Tensor | None = None, filled: bool = False) -> torch.Tensor:
     R, H, LW = qa.shape
     PW = qp.shape[2]
     if nch > s.nch or R > s.part_rows or LW != s.lw:
@@ -346,9 +354,10 @@ def _attention(qa: torch.Tensor, qp: torch.Tensor, cache, pcache: torch.Tensor, 
     # (the arithmetic does not depend on the stages)
     _dense_chunks_pe[(R, triton.cdiv(H, hb), nch)](qa, qp, rows, scales, h32, pcache, pos, s.po[:n * LW], s.pm[:n],
                                                    s.pl[:n], R, H=H, LW=LW, PW=PW, CH=CHUNK, SCALE=scale, HBT=hb,
-                                                   KTT=KT, KV8=kv8, QB=qb, QSC=qsc, num_warps=4,
+                                                   KTT=KT, KV8=kv8, QB=qb, QSC=qsc, FILLED=filled, num_warps=4,
                                                    num_stages=2 if qsc else 3)
-    _merge[(R, H)](s.po, s.pm, s.pl, out, s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False, num_warps=4)
+    _merge[(R, H)](s.po, s.pm, s.pl, out, pos if filled else s.dummy, R, H=H, LW=LW, NCH=nch, SPARSE=False,
+                   FILLED=filled, CH=CHUNK, num_warps=4)
     return out
 
 

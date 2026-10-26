@@ -811,9 +811,9 @@ def test_glm_moe_dsa_loader_w6_on_the_tiny_checkpoint(tmp_path, monkeypatch):
             # every rank holds the whole expert set (5b128db: the router picks global expert ids), each expert
             # at the rank's share of the width
             assert ex.count == CFG["n_routed_experts"]
-            # the routed-expert width splits in whole 16-row trellis tiles (the tiny scale has 2 tiles:
-            # ranks 0-1 hold one, ranks 2-5 none); the real 2048 rows split 352/352/336/336/336/336
-            # (128 tiles // 6 leaves every rank >= 21 tiles)
+            # the routed-expert width splits in whole 16-row trellis tiles (the tiny scale has 2 tiles, fewer
+            # than one 128-column block a rank: ranks 0-1 hold one, ranks 2-5 none); the real 2048 rows split in
+            # whole Hadamard blocks, 384/384/384/384/256/256 (split.unit)
             assert ex.width % 16 == 0
             assert ex.width == 16 * share(CFG["moe_intermediate_size"] // 16, 6, rank)
         # lm_head: this rank's contiguous vocab span under the balanced split

@@ -15,7 +15,8 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_glm_kda_v2", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
+    # v3: chain / chain_wide take beta_bf16 (a new binding signature, so a new build name)
+    return load(name="tensorfold_glm_kda_v3", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
 
 
@@ -73,18 +74,22 @@ def _wide_scratch(rows: int, heads: int, device) -> tuple[torch.Tensor, torch.Te
 def chain(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
           conv_w: torch.Tensor, state_in: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
           norm_w: torch.Tensor, eps: float, lower: float, rows: int, scratch: KDAScratch,
-          state_out: torch.Tensor, *, wide: bool | None = None) -> torch.Tensor:
-    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits."""
+          state_out: torch.Tensor, *, wide: bool | None = None, beta_bf16: bool = True) -> torch.Tensor:
+    """Run projection rows p [q | k | v | ... | b at b_off ...] and bf16 gate rows a and g; windows of WIDE_ROWS rows or more take the three-kernel path, same bits.
+
+    ``beta_bf16``: beta = bf16(sigmoid(b)) as GLM-5.3-Flash's reference rounds it (the default: its bits unchanged);
+    False keeps sigmoid(b) in fp32 (Ling-3.1-flash, modeling 856). Replay reads the beta the chain saved.
+    """
 
     if wide if wide is not None else rows >= WIDE_ROWS:
         q_tmp, y_tmp = _wide_scratch(rows, a_log.numel(), p.device)
         _ext().chain_wide(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in,
                           a_log, dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out,
-                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp)
+                          scratch.k, scratch.v, scratch.g, scratch.b, q_tmp, y_tmp, bool(beta_bf16))
         return scratch.out[:rows]
     _ext().chain(p, p.stride(0), int(b_off), a, a.stride(0), g, g.stride(0), conv_state, conv_w, state_in, a_log,
                  dt_bias, norm_w, float(eps), float(lower), int(rows), scratch.out, state_out, scratch.k, scratch.v,
-                 scratch.g, scratch.b)
+                 scratch.g, scratch.b, bool(beta_bf16))
     return scratch.out[:rows]
 
 

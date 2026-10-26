@@ -13,6 +13,7 @@ import torch
 
 CB_3INST, CB_MCG, CB_MUL1 = 0, 1, 2
 ACT_BF16, ACT_F32 = 0, 1          # SwiGLU with the GLM family's bf16 roundings / in fp32
+ACT_BF16_POST = 2                 # the bf16 roundings, the clamp after silu: min(silu(g), L) * clip(u, -L, L)
 # Half-bits a value: 1..8 bits (2, 4, .. 16) and every half-integer rate 1.5..7.5 (3, 5, .. 15).
 K2_SUPPORTED = tuple(range(2, 17))
 
@@ -63,7 +64,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v20", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v21", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -251,6 +252,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     prompt grouping runs (default EXACT_ROWS; 1: every window, a chunk-invariant prompt path).
     """
 
+    if act_mode not in (ACT_BF16, ACT_F32, ACT_BF16_POST):
+        raise ValueError(f"unknown act_mode {act_mode!r}")
     ext = _ext()
     D, I, E = ex.dims, ex.width, ex.count
     slots = s.slots

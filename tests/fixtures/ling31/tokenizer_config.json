@@ -1,0 +1,7 @@
+{
+  "add_bos_token": false,
+  "add_eos_token": false,
+  "bos_token": "<|startoftext|>",
+  "eos_token": "<|role_end|>",
+  "pad_token": "<|endoftext|>"
+}

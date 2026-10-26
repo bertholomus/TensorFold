@@ -277,8 +277,14 @@ def _sparse_chunks(QA, LC, TOK, CNT, PO, PM, PL, R, W: tl.constexpr, H: tl.const
 
 
 @triton.jit
-def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.constexpr, SPARSE: tl.constexpr):
-    """Program (row, head): the row's chunk partials in chunk order -> OUT[r, h] bf16. Sparse: rows with CNT 0 skip."""
+def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.constexpr, SPARSE: tl.constexpr,
+           FILLED: tl.constexpr = False, CH: tl.constexpr = 512):
+    """Program (row, head): the row's chunk partials in chunk order -> OUT[r, h] bf16. Sparse: rows with CNT 0 skip.
+
+    FILLED (dense calls): CNT is the window's device position, and a row stops after the chunk of its last key, the
+    chunks past it left unwritten (_dense_chunks_pe FILLED). Those chunks hold no key of the row (m -inf, l 0), so the
+    full walk passes over them with a 1 and a 0: the same chunks merge in the same order, and a graph sized for the
+    whole cache gives eager's bits."""
     r = tl.program_id(0)
     h = tl.program_id(1)
     if SPARSE:
@@ -288,18 +294,32 @@ def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.c
     m = float("-inf")
     l = 0.0
     o = tl.zeros((LW,), tl.float32)
-    for c in range(NCH):
-        base = (c * R + r) * H + h
-        cm = tl.load(PM + base)
-        cl = tl.load(PL + base)
-        co = tl.load(PO + base * LW + k)
-        active = cl > 0.0
-        next_m = tl.where(active, tl.maximum(m, cm), m)
-        a = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
-        b = tl.where(active, tl.exp(cm - next_m), 0.0)
-        o = o * a + co * b
-        l = l * a + cl * b
-        m = next_m
+    if FILLED:
+        for c in range(tl.minimum((tl.load(CNT) + r) // CH + 1, NCH)):
+            base = (c * R + r) * H + h
+            cm = tl.load(PM + base)
+            cl = tl.load(PL + base)
+            co = tl.load(PO + base * LW + k)
+            active = cl > 0.0
+            next_m = tl.where(active, tl.maximum(m, cm), m)
+            a = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+            b = tl.where(active, tl.exp(cm - next_m), 0.0)
+            o = o * a + co * b
+            l = l * a + cl * b
+            m = next_m
+    else:
+        for c in range(NCH):
+            base = (c * R + r) * H + h
+            cm = tl.load(PM + base)
+            cl = tl.load(PL + base)
+            co = tl.load(PO + base * LW + k)
+            active = cl > 0.0
+            next_m = tl.where(active, tl.maximum(m, cm), m)
+            a = tl.where(active, tl.where(m == float("-inf"), 0.0, tl.exp(m - next_m)), 1.0)
+            b = tl.where(active, tl.exp(cm - next_m), 0.0)
+            o = o * a + co * b
+            l = l * a + cl * b
+            m = next_m
     tl.store(OUT + (r * H + h) * LW + k, (o / l).to(tl.bfloat16))
 
 

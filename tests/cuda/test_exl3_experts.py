@@ -7,6 +7,8 @@
 - Mixed-K layers (a bit width per expert matrix, codebooks 3inst / mcg / mul1): each row gives identical bits alone
   and inside windows of 1, 2, 3, 16, 17, 64 and 128 rows, and agrees with a float64 reference.
 - A layer captured in CUDA graphs at 1, 2, 4 and 8 rows replays to exactly the eager call's output.
+- ACT_BF16_POST (Ling-3.1-flash's clamp after silu): ACT_BF16's bits at L = inf on every path; at a finite L, rows
+  independent of their window and the clamped float64 reference's values (not the clamp before silu's).
 """
 
 from __future__ import annotations
@@ -134,8 +136,10 @@ def _rot(v, H):
     return (v.reshape(*s[:-1], s[-1] // HAD, HAD) @ H).reshape(s)
 
 
-def _reference(x, sel, wts, mats, cb):
-    """float64 routed output from the decoded W_q (the kernels' decode is checked bit-exact above)."""
+def _reference(x, sel, wts, mats, cb, limit=math.inf, post=True):
+    """float64 routed output from the decoded W_q (the kernels' decode is checked bit-exact above). ``limit``: the
+    up projection clipped to [-L, L] and, with ``post``, silu(gate) capped at L (Ling-3.1-flash), else the gate capped
+    before silu (GLM's swiglu_limit)."""
 
     from tensorfold.cuda.exl3 import experts
 
@@ -155,8 +159,12 @@ def _reference(x, sel, wts, mats, cb):
                 return _rot(_rot(v * suh.double(), H) @ experts.dequant(t, cb).double(), H) * svh.double()
 
             gg = lin(xd[r], gate[e])
-            uu = lin(xd[r], up[e])
-            a = gg * torch.sigmoid(gg) * uu
+            uu = lin(xd[r], up[e]).clamp(-limit, limit)
+            if post:
+                a = (gg * torch.sigmoid(gg)).clamp(max=limit) * uu
+            else:
+                gg = gg.clamp(max=limit)
+                a = gg * torch.sigmoid(gg) * uu
             out[r] += float(wts[r, j]) * lin(a, down[e])
     return out
 
@@ -203,6 +211,53 @@ def test_mixed_k_rows_are_independent_and_match_the_reference(name, cb, kfun):
     ref = _reference(x[:6].float(), sel[:6], w[:6], mats, cb)
     err = (full[:6].double() - ref).abs().max().item() / ref.abs().max().item()
     assert err < 1e-2, err
+
+
+def test_post_silu_clamp_mode():
+    """ACT_BF16_POST: min(bf16(silu(g)), L) * clip(u, -L, L), rounded once, on the bf16 gate and up values. At L = inf
+    it is ACT_BF16 at inf bit for bit, in decode windows and in prompt chunks of each kernel (the epilogue is the one
+    place the activation happens). At L = 0.75 (about half the up values and a seventh of the silu values clamped) each
+    row's bits do not depend on its window, and the output is the clamped float64 reference's, clearly not the clamp
+    before silu's nor the unclamped one's."""
+
+    from tensorfold.cuda.exl3 import experts
+
+    E, D, I, TOPK, CB = 24, 512, 256, 6, 2                # mul1, 4 bits: Ling's codebook; mma3 takes it
+    ex, mats = _layer(E, D, I, [(8, 8, 8)] * E, CB, seed=29)
+    g = torch.Generator().manual_seed(4)
+    ROWS = 128
+    x = torch.randn((ROWS, D), generator=g).to(torch.bfloat16).cuda()
+    sel, w = _picks(E, ROWS, TOPK, g, shared=True)
+    scratch = experts.Scratch(ex, ROWS, TOPK + 1)
+
+    def run(rows, limit, mode, kernel=None):
+        out = experts.routed(x[rows], sel[rows].contiguous(), w[rows].contiguous(), ex, scratch, None, len(rows),
+                             limit=limit, act_mode=mode, kernel=kernel)
+        return out.clone()
+
+    every = list(range(ROWS))
+    for kernel in ("mma3", "mma", "rows"):
+        for rows in (every[:1], every[:5], every[:64], every):
+            assert torch.equal(run(rows, math.inf, experts.ACT_BF16_POST, kernel),
+                               run(rows, math.inf, experts.ACT_BF16, kernel)), (kernel, len(rows))
+    L = 0.75
+    full = run(every, L, experts.ACT_BF16_POST)
+    assert torch.isfinite(full).all()
+    for n in (1, 2, 3, 16, 17, 64, 128):
+        for start in (0, ROWS - n):
+            rows = list(range(start, start + n))
+            assert torch.equal(run(rows, L, experts.ACT_BF16_POST), full[rows]), (n, start)
+    got = full[:6].double()
+    ref = _reference(x[:6].float(), sel[:6], w[:6], mats, CB, limit=L)
+    scale = ref.abs().max().item()
+    err = (got - ref).abs().max().item() / scale
+    assert err < 1e-2, err
+    pre = _reference(x[:6].float(), sel[:6], w[:6], mats, CB, limit=L, post=False)
+    free = _reference(x[:6].float(), sel[:6], w[:6], mats, CB)
+    assert (got - pre).abs().max().item() / scale > 5e-2           # the cap sits after silu
+    assert (got - free).abs().max().item() / scale > 5e-2          # and it bites
+    with pytest.raises(ValueError, match="act_mode"):
+        run(every[:1], L, 3)
 
 
 def _hot(sel, E, every=4):
