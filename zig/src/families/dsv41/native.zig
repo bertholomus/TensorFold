@@ -98,15 +98,22 @@ fn nonEmpty(v: ?[]const u8) ?[]const u8 {
 /// The device bytes this rank's weights take, for the host's memory check: its file in TF_DS_RANK_CACHE (the
 /// checkpoint holds both ranks'); 0 when there is none to read (open then says what to set).
 pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
+    return weightBytesWith(io, dir, true);
+}
+
+/// weightBytes for a start with or without drafts: --no-drafts loads none of the drafter's entries, so none count.
+pub fn weightBytesWith(io: std.Io, dir: []const u8, drafts: bool) u64 {
     _ = dir;
     var d = std.Io.Dir.cwd().openDir(io, getenv("TF_DS_RANK_CACHE") orelse return 0, .{ .iterate = true }) catch return 0;
     defer d.close(io);
-    var buf: [512]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&buf);
     const world = std.fmt.parseInt(u32, getenv("TF_TP_WORLD") orelse "2", 10) catch return 0;
-    const name = rank_cache.find(fba.allocator(), io, d, 0, world) catch return 0;
-    const st = d.statFile(io, name, .{}) catch return 0;
-    return st.size;
+    return rankBytes(std.heap.page_allocator, io, d, world, drafts);
+}
+
+/// Rank 0's bytes in the rank cache `d` of `world` ranks, less the drafter's entries without drafts; 0 without a file.
+fn rankBytes(gpa: std.mem.Allocator, io: std.Io, d: std.Io.Dir, world: u32, drafts: bool) u64 {
+    const skip: ?[]const u8 = if (drafts) null else @import("plan.zig").drafter_prefix;
+    return rank_cache.loadBytes(gpa, io, d, 0, world, skip) catch 0;
 }
 
 /// Loads rank 0 and links rank 1 (which must start against TF_TP_MASTER:TF_TP_PORT); the pool holds `o.context`
@@ -190,4 +197,21 @@ test "refusals name what to set" {
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoMaster).?, "TF_TP_MASTER") != null);
     try std.testing.expect(std.mem.indexOf(u8, explain(null, error.NoFreeSlot).?, "TF_DS_STREAMS") != null);
     try std.testing.expectEqual(@as(?[]const u8, null), explain(null, error.OutOfMemory));
+}
+
+test "rank 0's charge: the whole file with drafts, the file less the drafter's entries with --no-drafts" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const name = "rank0of2-0123456789abcdef0123.bin";
+    try rank_cache.writeFake(arena.allocator(), io, tmp.dir, name, &.{
+        .{ .key = "embed.weight|None", .dtype = "bfloat16", .shape = &.{ 4, 8 }, .fill = 1 }, // 64 bytes
+        .{ .key = "mtp.0.main_norm.weight|None", .dtype = "bfloat16", .shape = &.{8}, .fill = 2 }, // 16 bytes
+    });
+    const size = (try tmp.dir.statFile(io, name, .{})).size;
+    try std.testing.expectEqual(size, rankBytes(std.testing.allocator, io, tmp.dir, 2, true));
+    try std.testing.expectEqual(size - 16, rankBytes(std.testing.allocator, io, tmp.dir, 2, false));
+    try std.testing.expectEqual(@as(u64, 0), rankBytes(std.testing.allocator, io, tmp.dir, 4, false)); // no file
 }

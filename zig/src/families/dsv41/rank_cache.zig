@@ -142,6 +142,26 @@ pub fn find(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, rank: u32, world: u32) 
     return found orelse error.NoRankCache;
 }
 
+/// The bytes of the index's entries whose keys start with `prefix`.
+pub fn prefixBytes(ix: *const Index, prefix: []const u8) u64 {
+    var n: u64 = 0;
+    for (ix.entries.keys(), ix.entries.values()) |key, e| {
+        if (std.mem.startsWith(u8, key, prefix)) n += e.bytes;
+    }
+    return n;
+}
+
+/// The size of rank `rank` of `world`'s file less its entries under `skip`; the whole size when its index is bad.
+pub fn loadBytes(gpa: std.mem.Allocator, io: Io, dir: Io.Dir, rank: u32, world: u32, skip: ?[]const u8) !u64 {
+    const name = try find(gpa, io, dir, rank, world);
+    defer gpa.free(name);
+    const size = (try dir.statFile(io, name, .{})).size;
+    const prefix = skip orelse return size;
+    var ix = open(gpa, io, dir, name) catch return size;
+    defer ix.deinit();
+    return size -| prefixBytes(&ix, prefix);
+}
+
 /// A cache file as weights.py writes one, for the tests: each tensor's bytes, then the index, offset and magic.
 pub fn writeFake(a: std.mem.Allocator, io: Io, dir: Io.Dir, name: []const u8, rows: []const struct { key: []const u8, dtype: []const u8, shape: []const usize, fill: u8 }) !void {
     var body: std.ArrayList(u8) = .empty;
@@ -205,4 +225,38 @@ test "an index whose entries overlap, leave gaps or disagree with their shapes i
     };
     for (bad) |json| try std.testing.expectError(error.BadRankCache, parseIndex(std.testing.allocator, json, 16));
     try std.testing.expectError(error.UnsupportedDType, parseIndex(std.testing.allocator, "[[\"a\", \"complex64\", [1], 0, 8]]", 16));
+}
+
+test "a rank's load bytes: the whole file, or the file less the entries under a skipped prefix" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    // 64 + 576 + 64 bytes of target entries, 192 + 16 + 32 of the drafter's
+    try writeFake(a, io, tmp.dir, "rank0of2-0123456789abcdef0123.bin", &.{
+        .{ .key = "embed.weight|None", .dtype = "bfloat16", .shape = &.{ 4, 8 }, .fill = 1 },
+        .{ .key = "layers.0.attn.wq_b|(0, 16384)|None|tr", .dtype = "int16", .shape = &.{ 2, 3, 48 }, .fill = 2 },
+        .{ .key = "layers.1.ffn.gate.bias|torch.float32", .dtype = "float32", .shape = &.{16}, .fill = 3 },
+        .{ .key = "mtp.0.attn.wq_b|(0, 16384)|None|tr", .dtype = "int16", .shape = &.{ 2, 3, 16 }, .fill = 4 },
+        .{ .key = "mtp.0.main_norm.weight|None", .dtype = "bfloat16", .shape = &.{8}, .fill = 5 },
+        .{ .key = "mtp.2.confidence_head.proj.weight|None", .dtype = "bfloat16", .shape = &.{ 2, 8 }, .fill = 6 },
+    });
+    const name = "rank0of2-0123456789abcdef0123.bin";
+    const size = (try tmp.dir.statFile(io, name, .{})).size;
+    var ix = try open(std.testing.allocator, io, tmp.dir, name);
+    defer ix.deinit();
+    try std.testing.expectEqual(@as(u64, 240), prefixBytes(&ix, "mtp."));
+    try std.testing.expectEqual(@as(u64, 640), prefixBytes(&ix, "layers."));
+    try std.testing.expectEqual(@as(u64, 0), prefixBytes(&ix, "vision."));
+    const gpa = std.testing.allocator;
+    try std.testing.expectEqual(size, try loadBytes(gpa, io, tmp.dir, 0, 2, null));
+    try std.testing.expectEqual(size - 240, try loadBytes(gpa, io, tmp.dir, 0, 2, "mtp."));
+
+    // a file whose index does not read is charged whole (the load then refuses it); a missing one is an error
+    const junk = "no index here, no magic word";
+    try tmp.dir.writeFile(io, .{ .sub_path = "rank1of2-ffffffffffffffffffff.bin", .data = junk });
+    try std.testing.expectEqual(@as(u64, junk.len), try loadBytes(gpa, io, tmp.dir, 1, 2, "mtp."));
+    try std.testing.expectError(error.NoRankCache, loadBytes(gpa, io, tmp.dir, 0, 4, "mtp."));
 }
