@@ -210,6 +210,13 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.S
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cli })).step);
+    // structured output's grammars (no imports), and their token table over the real tokenizer
+    const grammar = b.createModule(.{ .root_source_file = b.path("zig/src/core/grammar/grammar.zig"), .target = host, .optimize = .debug });
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = grammar })).step);
+    const vocab_test = b.createModule(.{ .root_source_file = b.path("zig/src/core/grammar/vocab_tokenizer_test.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    vocab_test.addImport("grammar", grammar);
+    vocab_test.addImport("tokenizer", mods.tokenizer);
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = vocab_test })).step);
 }
 
 /// nvcc -fatbin with torch's flags, the kernel's own and one -gencode per SASS target, as the Python build passes them.
