@@ -40,6 +40,7 @@ pub const LaneHost = struct {
     lone_job: ?*Job = null, // the job that driver holds now
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+    graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the backend's failed graph captures (read at any time)
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
     // other streams ran): admitted again once fewer than this many streams are active, or at full_retry (a backend
@@ -183,6 +184,7 @@ pub const LaneHost = struct {
             .decode_tokens_per_second = @as(f64, @floatFromInt(tokens)) / 2.0,
             .prefill_tokens_per_second = if (now - h.prefill_at <= window_ns) h.prefill_rate else 0,
             .preemptions = 0,
+            .graph_fallbacks = if (h.graph_fallbacks) |c| c.load(.monotonic) else null,
             .streams = n,
             .generation_tokens = h.live_generated,
         };

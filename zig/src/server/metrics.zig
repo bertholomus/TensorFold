@@ -141,6 +141,7 @@ pub const Metrics = struct {
         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+        if (status.graph_fallbacks) |n| try gauge(w, "graph_fallbacks_total", "counter", "CUDA graph captures that failed; their work ran eagerly instead (this rank's).", n);
     }
 };
 
@@ -322,4 +323,20 @@ test "request counter append failure frees its label" {
     m.httpRequest(std.testing.io, "client", 200);
     try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
     try std.testing.expectEqual(allocations, failing.allocations);
+}
+
+test "render counts failed graph captures only for an engine that counts them" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var none: std.Io.Writer.Allocating = .init(gpa);
+    defer none.deinit();
+    try m.render(std.testing.io, &none.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, none.written(), "graph_fallbacks") == null);
+    stub.status_value.graph_fallbacks = 3;
+    var some: std.Io.Writer.Allocating = .init(gpa);
+    defer some.deinit();
+    try m.render(std.testing.io, &some.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, some.written(), "# TYPE tensorfold:graph_fallbacks_total counter\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, some.written(), "tensorfold:graph_fallbacks_total 3\n") != null);
 }

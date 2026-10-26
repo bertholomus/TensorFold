@@ -325,6 +325,8 @@ drafts share it), `request_latency_seconds`, `time_to_first_token_seconds` and `
 finished request's decode time: the CUDA engine's own figure, or first token to end on the Mac server; its `_sum`
 over `generation_tokens_total` is the decode rate), `request_time_per_output_token_seconds`, `decode_rounds_total`,
 and the `request_prefill_seconds` histogram, all under the `tensorfold:` prefix. TPOT already carries vLLM's name.
+DeepSeek-V4.1 with `TF_DS_GRAPHS=1` adds `graph_fallbacks_total`: the CUDA graph captures that failed on rank 0,
+whose work ran eagerly instead. Other engines, and DeepSeek-V4.1 without graphs, leave it out.
 The readings vLLM also has are repeated under its names (`num_requests_running`, `num_requests_waiting`,
 `kv_cache_usage_perc`, `spec_decode_num_draft_tokens_total`, `spec_decode_num_accepted_tokens_total`,
 `e2e_request_latency_seconds`, `request_decode_time_seconds`, `request_prefill_time_seconds`) with identical values, so a dashboard copied from vLLM fills by swapping the

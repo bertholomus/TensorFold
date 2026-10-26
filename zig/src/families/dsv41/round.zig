@@ -27,6 +27,7 @@ const exl3_experts2d = @import("exl3_experts2d.zig");
 const engram = @import("engram.zig");
 const exact = @import("exact.zig");
 const ops_mod = @import("ops.zig");
+const graph_fallback = @import("graph_fallback.zig");
 
 const Engine = prompt.Engine;
 const Chunk = prompt.Chunk;
@@ -431,6 +432,20 @@ pub const Round = struct {
         if (!rd.side_out) return;
         try e.s.wait(rd.join.?);
         rd.side_out = false;
+    }
+
+    /// What a stretch changes on the host beside its Carry: the open forks and the profile's marks.
+    const Undo = struct { side_out: bool, pf_out: bool, marks: usize };
+
+    fn undoMark(rd: *const Round) Undo {
+        return .{ .side_out = rd.side_out, .pf_out = rd.pf_out, .marks = if (rd.timer) |t| t.n else 0 };
+    }
+
+    /// A failed capture's forks closed again: its events are in a dropped graph, and a later wait on one is refused.
+    fn undo(rd: *Round, u: Undo) void {
+        rd.side_out = u.side_out;
+        rd.pf_out = u.pf_out;
+        if (rd.timer) |t| t.n = u.marks;
     }
 
     fn g(rd: *const Round, k: Glue) u64 {
@@ -839,32 +854,33 @@ const Carry = struct {
 /// The rounds' stretches as CUDA graphs (the served graph.py: one capture a rows and context bucket, the round cut
 /// before each Engram layer, whose rows the host reads between the stretches): a stretch is captured the first time
 /// its (rows, bucket, stretch) comes up and replayed after, with what it leaves. The same launches with the same
-/// arguments as the eager round, so the same bytes.
+/// arguments as the eager round, so the same bytes; a stretch whose capture fails runs eagerly (graph_fallback.zig).
 pub const Graphs = struct {
-    gpa: std.mem.Allocator,
-    map: std.AutoHashMapUnmanaged(Key, Entry) = .empty,
+    lazy: Lazy,
 
     pub const Key = struct { rows: u32, bucket: u64, stretch: u32 };
     const Entry = struct { exec: cuda.graph.Exec, start: Carry, end: Carry };
+    const Lazy = graph_fallback.Lazy(graph_fallback.Cuda, Key, Entry);
 
     pub fn init(gpa: std.mem.Allocator) Graphs {
-        return .{ .gpa = gpa };
+        return .{ .lazy = .init(gpa) };
     }
 
     pub fn deinit(g: *Graphs) void {
-        var it = g.map.valueIterator();
-        while (it.next()) |en| en.exec.deinit();
-        g.map.deinit(g.gpa);
+        g.lazy.deinit();
         g.* = undefined;
     }
 
     /// The captured stretches.
     pub fn count(g: *const Graphs) usize {
-        return g.map.count();
+        return g.lazy.count();
     }
 
     fn run(g: *Graphs, key: Key, e: *const Engine, rd: *Round, ch: *const Chunk, cs: *const Caches, rings: []const u64, cy: *Carry, li: usize, end: usize) !void {
-        if (g.map.getPtr(key)) |en| {
+        // a replay or a capture starts joined: a failed eager stretch may have left a fork open (a plain event)
+        try rd.joinSide(e);
+        try rd.joinPrefetch(e);
+        if (g.lazy.get(key)) |en| {
             if (!std.meta.eql(en.start, cy.*)) return error.GraphStateMismatch;
             try en.exec.launchOn(e.s);
             cy.* = en.end;
@@ -873,22 +889,39 @@ pub const Graphs = struct {
             rd.has_cblk = cy.has_cblk;
             return;
         }
-        const start = cy.*;
-        try cuda.graph.beginCapture(e.s, .thread_local);
-        stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
-            if (cuda.graph.endCapture(e.s)) |got| {
-                var x = got;
-                x.deinit();
-            } else |_| {}
-            return err;
-        };
-        var graph = try cuda.graph.endCapture(e.s);
-        defer graph.deinit();
-        var exec = try graph.instantiate();
-        errdefer exec.deinit();
-        try g.map.put(g.gpa, key, .{ .exec = exec, .start = start, .end = cy.* });
-        try exec.launchOn(e.s);
+        var site: Site = .{ .e = e, .rd = rd, .ch = ch, .cs = cs, .rings = rings, .cy = cy, .li = li, .end = end, .start = cy.*, .mark = rd.undoMark() };
+        try g.lazy.capture(e.s, key, &site);
     }
+
+    /// A stretch as Graphs.Lazy's site: its launches, the host state it starts from, and its entry once captured.
+    const Site = struct {
+        e: *const Engine,
+        rd: *Round,
+        ch: *const Chunk,
+        cs: *const Caches,
+        rings: []const u64,
+        cy: *Carry,
+        li: usize,
+        end: usize,
+        start: Carry,
+        mark: Round.Undo,
+
+        pub fn body(s: *Site) !void {
+            return stretch(s.e, s.rd, s.ch, s.cs, s.rings, s.cy, s.li, s.end, null);
+        }
+
+        pub fn undo(s: *Site) void {
+            s.cy.* = s.start;
+            s.rd.kk = s.start.kk;
+            s.rd.has_cand = s.start.has_cand;
+            s.rd.has_cblk = s.start.has_cblk;
+            s.rd.undo(s.mark);
+        }
+
+        pub fn value(s: *Site, exec: cuda.graph.Exec) Entry {
+            return .{ .exec = exec, .start = s.start, .end = s.cy.* };
+        }
+    };
 };
 
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
@@ -1126,6 +1159,35 @@ test "context buckets as graph.py makes them" {
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(4096, 1 << 20));
     try std.testing.expectEqual(@as(usize, 8192), bucketFor(4097, 1 << 20));
     try std.testing.expectEqual(@as(usize, 4096), bucketFor(5000, 4096));
+}
+
+test "a failed capture's undo puts the stretch's start back: its Carry, kk, the candidate flags, forks and marks" {
+    var t: PhaseTimer = undefined;
+    t.n = 3;
+    var rd: Round = undefined;
+    rd.timer = &t;
+    rd.side_out = false;
+    rd.pf_out = false;
+    rd.kk = 64;
+    rd.has_cand = false;
+    rd.has_cblk = false;
+    var cy: Carry = .{ .h = 1, .spare = 2, .pre = 3, .pre_f = 4, .kk = 64 };
+    var e: Engine = undefined;
+    var site: Graphs.Site = .{ .e = &e, .rd = &rd, .ch = undefined, .cs = undefined, .rings = &.{}, .cy = &cy, .li = 0, .end = 1, .start = cy, .mark = rd.undoMark() };
+    // what a stretch that failed in its capture leaves: forks open on the dropped graph's events, a later layer's state
+    rd.side_out = true;
+    rd.pf_out = true;
+    rd.kk = 512;
+    rd.has_cand = true;
+    rd.has_cblk = true;
+    t.n = 9;
+    cy = .{ .h = 2, .spare = 1, .pre = 4, .pre_f = 3, .ntap = 2, .sh = .{ .kk = 512, .pool = true }, .kk = 512, .has_cand = true };
+    site.undo();
+    try std.testing.expect(std.meta.eql(cy, site.start));
+    try std.testing.expect(!rd.side_out and !rd.pf_out); // no later join waits on an event of the dropped graph
+    try std.testing.expectEqual(@as(usize, 64), rd.kk);
+    try std.testing.expect(!rd.has_cand and !rd.has_cblk);
+    try std.testing.expectEqual(@as(usize, 3), t.n);
 }
 
 /// error.NotPortedYet with its site on stderr (a request that reaches a path the port lacks names it in the log).

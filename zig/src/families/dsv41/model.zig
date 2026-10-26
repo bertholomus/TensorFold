@@ -103,6 +103,7 @@ pub const Model = struct {
     rd: round.Round,
     graphs: ?round.Graphs = null,
     pgraphs: ?draft.PassGraphs = null, // the drafter pass as CUDA graphs (with graphs)
+    graph_fallbacks: std.atomic.Value(u64) = .init(0), // both kinds' failed captures, each run eagerly (/metrics)
     dpool: ?draft.Pool = null,
     dr: ?draft.Drafter = null,
     tables: ?engram_io.Tables = null,
@@ -190,6 +191,7 @@ pub const Model = struct {
         m.ring = null;
         m.graphs = null;
         m.pgraphs = null;
+        m.graph_fallbacks = .init(0);
         m.two = null;
         m.rdma_rings = null;
         const d = ctx.d;
@@ -297,7 +299,10 @@ pub const Model = struct {
         }
         m.rd = try round.Round.init(&m.eng, &m.arena, a, o.pool);
         m.amax = try m.arena.take(round.max_rows * 4);
-        if (o.graphs) m.graphs = round.Graphs.init(gpa);
+        if (o.graphs) {
+            m.graphs = round.Graphs.init(gpa);
+            m.graphs.?.lazy.failures = &m.graph_fallbacks;
+        }
         if (o.side) try m.rd.useSide(&m.eng);
         if (o.prefetch) try m.rd.usePrefetch(&m.eng);
         if (o.drafts) {
@@ -305,6 +310,7 @@ pub const Model = struct {
             m.dr = try draft.Drafter.init(&m.eng, &m.arena, sp);
             if (o.graphs) {
                 m.pgraphs = draft.PassGraphs.init(gpa);
+                m.pgraphs.?.lazy.failures = &m.graph_fallbacks;
                 m.dr.?.graphs = &m.pgraphs.?;
             }
         }

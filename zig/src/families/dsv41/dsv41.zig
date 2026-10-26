@@ -46,6 +46,7 @@ pub const round = @import("round.zig");
 pub const round2d = @import("round2d.zig");
 pub const draft2d = @import("draft2d.zig");
 pub const markov_tokens = @import("markov_tokens.zig");
+pub const graph_fallback = @import("graph_fallback.zig");
 pub const draft = @import("draft.zig");
 pub const sampling = @import("sampling.zig");
 pub const model = @import("model.zig");
@@ -94,6 +95,7 @@ test {
     refAll(round2d);
     refAll(draft2d);
     refAll(markov_tokens);
+    refAll(graph_fallback);
     refAll(draft);
     refAll(sampling);
     refAll(model);

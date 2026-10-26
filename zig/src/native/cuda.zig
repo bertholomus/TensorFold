@@ -157,6 +157,7 @@ const Host = struct {
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+    graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the family's failed graph captures, when it counts them
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -203,6 +204,7 @@ const Host = struct {
         h.host.explain = explain;
         if (h.cache) |*store| h.host.cache = store;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
+        h.host.graph_fallbacks = h.graph_fallbacks;
         try h.host.start();
     }
 
@@ -385,6 +387,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
     });
     errdefer gpa.free(h.startup);
+    if (@hasDecl(F, "graphFallbacks")) h.graph_fallbacks = F.graphFallbacks(loaded.ctx);
     // a family that keeps prompt states (its snapshots) gets the prompt cache: states at its chunk ends
     if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
         const want: u64 = @intFromFloat((o.prompt_cache_gib orelse 0.5) * gib);
