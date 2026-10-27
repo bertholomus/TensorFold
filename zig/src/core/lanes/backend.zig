@@ -42,6 +42,25 @@ pub const DraftRequest = struct {
     ranks: bool = false, // also keep each chained level's best tokens (alternatives(), for grafts)
 };
 
+/// The tokens a redraw may pick, as a test of each token id.
+pub const Allow = struct {
+    ctx: *const anyopaque,
+    ok: *const fn (ctx: *const anyopaque, token: u32) bool,
+
+    pub fn allows(a: Allow, token: u32) bool {
+        return a.ok(a.ctx, token);
+    }
+};
+
+/// A row to draw again (structured output). A greedy stream asks only when the grammar refuses the row's argmax.
+pub const Redraw = struct {
+    stream: *Stream,
+    /// Row `row` of window `window` in the last verify, valid until the next verify or prefill; null: the prompt's row.
+    row: ?struct { window: u32, row: u32 } = null,
+    /// The row's keyed position, as its first draw had it.
+    position: u64,
+};
+
 pub const Backend = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -71,6 +90,8 @@ pub const Backend = struct {
         tree: ?*const fn (ptr: *anyopaque, s: *Stream, gpa: std.mem.Allocator) anyerror!?Held = null,
         /// The head's best tokens and probabilities at each level it drafted for the stream (waits for the drafts).
         alternatives: ?*const fn (ptr: *anyopaque, s: *Stream, out: []Alternative) anyerror!usize = null,
+        /// The row's draw over a copy with every token `allow` refuses at -inf; null when it allows none.
+        redraw: ?*const fn (ptr: *anyopaque, r: Redraw, allow: Allow) anyerror!?u32 = null,
         /// The stream left the rounds: free its caches and held drafts.
         release: *const fn (ptr: *anyopaque, s: *Stream) void,
     };

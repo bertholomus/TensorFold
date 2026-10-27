@@ -70,6 +70,8 @@ pub const Server = struct {
     eos: []const u32 = &.{},
     think_close: []const u32 = &.{},
     think_close_end: ?u32 = null,
+    /// Each token's bytes for structured output, built once when the engine enforces structures (Info.structures).
+    vocab: ?api.grammar.Vocab = null,
     metrics: metrics.Metrics,
     store: responses.Store,
     next_id: std.atomic.Value(u64) = .init(1),
@@ -92,6 +94,10 @@ pub const Server = struct {
         };
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
+        if (srv.info.structures) srv.vocab = text.vocabTable(gpa, srv.eos) catch |e| blk: {
+            log.line("structured output is off: the tokenizer gives no token bytes ({s})", .{@errorName(e)});
+            break :blk null;
+        };
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         if (srv.info.efforts.len > 0) {
             // a family whose template takes numbers: every name it gives one passes as asked, rendered as that number
@@ -117,6 +123,7 @@ pub const Server = struct {
 
     pub fn deinit(srv: *Server) void {
         if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
+        if (srv.vocab) |*v| v.deinit(srv.gpa);
         srv.arena.deinit();
         srv.store.deinit();
         srv.gpa.destroy(srv);
@@ -175,8 +182,18 @@ pub const Server = struct {
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
-            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null };
+            const program = try grammar.program(cx, s);
+            const vocab = if (srv.vocab) |*v| v else return cx.refuse("structured output needs a tokenizer with a ByteLevel decoder, and this one has none");
+            if (request.eos.len == 0) return cx.fail(.request, "{s} needs the model's end token: send it without ignore_eos", .{s.field});
+            request.structure = .{ .kind = s.kind, .text = s.text, .after = if (thinking) srv.text.tokenId(srv.markers.close) else null, .vocab = vocab, .program = program };
         }
+    }
+
+    /// The forced close of a think block; under a grammar it ends at the think end, since the grammar starts there.
+    pub fn thinkClose(srv: *const Server, structured: bool) []const u32 {
+        const end = srv.think_close_end orelse return srv.think_close;
+        const at = std.mem.indexOfScalar(u32, srv.think_close, end) orelse return srv.think_close;
+        return if (structured) srv.think_close[0 .. at + 1] else srv.think_close;
     }
 
     const Form = struct { opener: []const u8, lead: ?[]const u8, tail: ?[]const u8 };

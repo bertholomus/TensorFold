@@ -44,7 +44,14 @@ pub const Structure = struct {
     text: []const u8 = "",
     /// With thinking on, the grammar starts after this token.
     after: ?u32 = null,
+    /// The tokenizer's token bytes the engine tests each token with (the server's, built once); null: none.
+    vocab: ?*const grammar.Vocab = null,
+    /// json_schema and choice: the compiled program, which lives as long as the request; null for json.
+    program: ?*const grammar.Program = null,
 };
+
+/// Structured output's byte matchers and token table (core/grammar).
+pub const grammar = lanes.grammar;
 
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {

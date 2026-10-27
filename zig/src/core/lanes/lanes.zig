@@ -19,6 +19,8 @@ pub const events = @import("events.zig");
 pub const windows = @import("windows.zig");
 pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
+pub const structure = @import("structure.zig");
+pub const grammar = @import("grammar");
 pub const fake = @import("fake.zig");
 
 pub const Engine = engine.Engine;
@@ -32,4 +34,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("engine_test.zig");
     _ = @import("gpu_full_test.zig");
+    _ = @import("structure_test.zig");
 }

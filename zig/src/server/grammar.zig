@@ -92,6 +92,33 @@ pub fn spec(cx: *Cx, body: Value) errors.Refused!?Spec {
     return null;
 }
 
+/// A json_schema or choice spec's program in the request's arena (null: json_object), or a refusal before any token.
+pub fn program(cx: *Cx, s: Spec) errors.Refused!?*const api.grammar.Program {
+    const p = switch (s.kind) {
+        .json => return null,
+        .regex, .grammar => return cx.fail(.request, "{s}: this engine enforces json_object, json_schema and choice, not {s}", .{ s.field, @tagName(s.kind) }),
+        .json_schema, .choice => try cx.a.create(api.grammar.Program),
+    };
+    if (s.text.len > api.grammar.schema.max_text) return cx.fail(.request, "{s} is longer than {d} bytes", .{ s.field, api.grammar.schema.max_text });
+    if (s.kind == .choice) {
+        const list = (try json.parse(cx.a, s.text)).ok.array; // choices() wrote it: a list of strings
+        const options = try cx.a.alloc([]const u8, list.len);
+        for (list, options) |v, *o| {
+            // a lone surrogate (kept as its three bytes) has no UTF-8 spelling for a reply to match
+            if (!std.unicode.utf8ValidateSlice(v.string)) return cx.fail(.request, "{s}: a choice is not valid Unicode", .{s.field});
+            o.* = v.string;
+        }
+        p.* = try api.grammar.schema.choice(cx.a, options);
+        return p;
+    }
+    var why: []const u8 = "";
+    p.* = api.grammar.schema.compile(cx.a, s.text, &why) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Refused => return cx.fail(.request, "{s}: the schema cannot be enforced: {s}", .{ s.field, why }),
+    };
+    return p;
+}
+
 /// ``grammar.refusal``: a malformed grammar, or one beside a required call, refused before any header.
 pub fn refusal(cx: *Cx, body: Value) errors.Refused!void {
     const s = try spec(cx, body) orelse return;

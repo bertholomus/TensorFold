@@ -204,6 +204,44 @@ server without xgrammar (with the install command), and a grammar sent with `too
 function. A reply whose grammar fails while decoding ends with HTTP 500 (an error event when streaming); the other
 requests go on.
 
+On the native server, the Zig engine enforces `{"type": "json_object"}`, `json_schema` (also as `guided_json` and
+`structured_outputs` `json`), `guided_choice` (also as `structured_outputs` `choice`) and the Anthropic
+`output_config.format` for DeepSeek-V4.1. It refuses `regex` and `grammar` with HTTP 400. `ignore_eos` with a
+grammar gets HTTP 400, because the end token must close the reply. An engine whose family cannot draw a row again,
+or whose rounds run a step ahead, refuses every grammar.
+
+The Zig engine needs no xgrammar. `zig/src/core/grammar` holds a byte matcher for the `json_object` grammar and a
+compiler for schemas and choice lists. Both follow xgrammar 0.2.8 as Python 0.6 used it (strict mode, at most 32
+blanks in a run). A schema object takes its properties in their order. A property that is not required may be left
+out. Other keys come last, and only with `additionalProperties`. A `guided_choice` reply is one of the strings, byte
+for byte. Strings must be strict UTF-8. Objects and arrays nest at most 128 deep. Added tokens such as `</think>`
+never come inside the value.
+
+A schema may use `type` (a name or a list), `properties`, `required`, `additionalProperties`, `items`,
+`prefixItems`, `minItems`, `maxItems`, `minLength`, `maxLength`, `format` (`date-time`, `date`, `time`, `uuid`,
+`ipv4`, `email`), `minimum`, `maximum`, `exclusiveMinimum` and `exclusiveMaximum` (for `integer` and `number`),
+`enum`, `const`, `anyOf`, `oneOf`, `allOf` with one schema, and local `$ref` (`#` and `#/...`, recursion included).
+Annotations (`title`, `description`, `default`, `examples` and others) change nothing. HTTP 400 names the first keyword
+this engine cannot enforce and where it is, before any token. Examples: `pattern`, `multipleOf`, `uniqueItems`,
+`if`/`then`/`else`, `not`, `patternProperties`, `allOf` with more schemas, a remote `$ref`, and an `anyOf` whose
+branches can start with the same byte (two object branches, or a string and an enum of strings). The schema text may
+be at most 1 MiB.
+
+A number with bounds follows xgrammar 0.2.8: no exponent, no leading zero, at most 6 decimals, and a value inside the
+bounds. A bound off the 6-decimal grid moves to the nearest grid point inside the range. Zero is `0` or `0.0` to
+`0.000000`, and `-0.0` to `-0.000000` only when the range goes below 0. xgrammar caps whole parts at int64
+(2^63-1), so at that size and above it refuses some `number` replies that lie in the range. This engine refuses the
+same replies. A bound gets HTTP 400 when xgrammar ignores it (beside `$ref`, `const`, `enum`, `anyOf`, `oneOf` or
+`allOf`, or with no `integer` or `number` in `type`), when xgrammar fails on it, and when no number with 6 decimals
+lies in the range.
+
+The Zig engine walks the accepted path of each verified window under the grammar. A greedy row keeps its token when
+the grammar allows it. Every other row draws again among the allowed tokens, with its own key. This commits the same
+tokens as a cut before the verify, so a constrained reply equals its `"draft": false` reply and its solo run.
+Sometimes the engine must commit a token that the grammar refuses. Examples are a forced `</think>` from the
+thinking budget, and a row where the grammar allows no token. That reply ends with HTTP 500 and the grammar's
+message, or with an error event when streaming. The other requests go on.
+
 ## Reasoning
 
 On both backends, `reasoning_effort: none` disables thinking; other effort values enable it and reach the chat

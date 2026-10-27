@@ -12,6 +12,7 @@ const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
 const trail = @import("trail.zig");
+const structure = @import("structure.zig");
 const Stream = sm.Stream;
 const Feed = be.Feed;
 const Plan = win.Plan;
@@ -19,7 +20,7 @@ const f = ev.f;
 const str = trail.str;
 const int = trail.int;
 
-const Outcome = struct { got: []const u32, path: []const u32, cut: ?usize, follow: []const u32 };
+const Outcome = struct { got: []const u32, path: []const u32, cut: ?usize, follow: []const u32, redrawn: bool = false };
 const Result = struct { rows: u32, keep: u32, got: []const u32 };
 const Unread = struct { event: usize, handle: u64 };
 
@@ -86,6 +87,7 @@ pub const Engine = struct {
     /// `filling` and fillStep runs the rest between rounds.
     pub fn addStream(e: *Engine, s: *Stream) !void {
         _ = e.arena.reset(.retain_capacity);
+        if (s.structure != null and !structure.served(e.backend, e.cfg)) return error.StructureUnsupported;
         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
         if (e.filling != null) {
             if (!e.cutsIn(s.prompt_len, s.images.len > 0)) return error.FillBusy;
@@ -150,7 +152,7 @@ pub const Engine = struct {
         const position: u64 = s.prompt_len;
         const drawn = try e.backend.first(s, position);
         var feed: Feed = .{ .handle = drawn };
-        if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+        if (try e.forcedNext(s)) |t| feed = .{ .value = t } else if (try structure.first(e, s, drawn, position)) |t| feed = .{ .value = t };
         var asked: ?u32 = null;
         if (e.cfg.family_mtp and s.drafts) {
             // the head reads the prompt's last row and the first token, and drafts the one after it
@@ -302,11 +304,11 @@ pub const Engine = struct {
         try e.backend.verify(&windows, &out);
         const tokens = try win.tokens(e, windows[0], out[0]);
         const parents = try win.rowParents(e, windows[0]);
-        const o = try e.conclude(s, plan, out[0].sampled, tokens, parents, windows[0].positions);
+        const o = try e.conclude(s, plan, 0, out[0].sampled, tokens, parents, windows[0].positions);
         if (o.path.len < rows or plan.parents != null) try e.backend.keep(&windows, &.{o.path});
         const held_levels = s.held_levels;
         if (e.cfg.family_mtp and s.drafts) {
-            if (early and o.cut == null) {
+            if (early and o.cut == null and !o.redrawn) {
                 var w = win.who(s);
                 const d: u32 = @intCast(try e.rule.headDepth(&w, null, win.probe(e)));
                 try e.askDrafts(&.{.{ .stream = s, .follow = o.follow, .rows = o.path, .start = plan.position, .position = s.cache_len + 1, .depth = d, .early = true }});
@@ -357,9 +359,9 @@ pub const Engine = struct {
         try e.backend.verify(windows, out);
         const outcomes = try a.alloc(Outcome, plans.len);
         const paths = try a.alloc([]const u32, plans.len);
-        for (plans, windows, out, outcomes, paths) |p, w, o, *oc, *path| {
+        for (plans, windows, out, outcomes, paths, 0..) |p, w, o, *oc, *path, k| {
             const tokens = try win.tokens(e, w, o);
-            oc.* = try e.conclude(p.stream, p, o.sampled, tokens, try win.rowParents(e, w), w.positions);
+            oc.* = try e.conclude(p.stream, p, @intCast(k), o.sampled, tokens, try win.rowParents(e, w), w.positions);
             path.* = oc.path;
             const rows: u32 = @intCast(w.rows());
             p.stream.min_rows = if (p.stream.min_rows == 0) rows else @min(p.stream.min_rows, rows);
@@ -393,20 +395,23 @@ pub const Engine = struct {
     }
 
     /// Commit the target-sampled path (after the thinking budget's cut); the kept rows and their following tokens.
-    fn conclude(e: *Engine, s: *Stream, p: Plan, sampled: []const u32, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
+    fn conclude(e: *Engine, s: *Stream, p: Plan, window: u32, sampled: []const u32, tokens: []const u32, parents: []const i32, positions: []const u64) !Outcome {
         const a = e.arena.allocator();
         const rows = tokens.len;
         var path: []u32 = undefined;
         var committed: std.ArrayList(u32) = .empty;
+        var redrawn = false;
         if (p.kind == .forced) {
             path = try a.alloc(u32, rows);
             for (path, 0..) |*r, i| r.* = @intCast(i);
             try committed.appendSlice(a, p.forced);
-            try committed.append(a, s.popForce() orelse sampled[rows - 1]);
+            try committed.append(a, s.popForce() orelse try structure.tail(e, s, window, p.forced, sampled, positions));
         } else {
-            path = try accept.acceptPath(a, tokens, parents, sampled);
+            const walked = try structure.path(e, s, window, sampled, tokens, parents, positions);
+            path = walked.rows;
+            redrawn = walked.redrawn;
             for (path[1..]) |r| try committed.append(a, tokens[r]);
-            try committed.append(a, sampled[path[path.len - 1]]);
+            try committed.append(a, walked.last);
             if (rows > 1) {
                 const kept = path.len - 1;
                 e.drafted += rows - 1;
@@ -469,7 +474,7 @@ pub const Engine = struct {
             f("path", .{ .u32s = path }),                             f("got", .{ .u32s = got }),
             f("cut", if (cut) |c| int(c) else .null),
         });
-        return .{ .got = got, .path = path, .cut = cut, .follow = committed.items[0..keep] };
+        return .{ .got = got, .path = path, .cut = cut, .follow = committed.items[0..keep], .redrawn = redrawn };
     }
 
     /// Read the kept rows with their following tokens and ask the head for the next round's drafts.

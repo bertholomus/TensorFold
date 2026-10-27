@@ -88,6 +88,28 @@ pub fn topCandidates(row: []const f32, count: usize, values: []f32, ids: []i64) 
     return n;
 }
 
+/// topCandidates of a copy of the row whose tokens `allow` refuses are -inf: those come last, by id.
+pub fn topCandidatesAllowed(row: []const f32, count: usize, values: []f32, ids: []i64, allow: anytype) usize {
+    const k = @min(count, row.len);
+    var n: usize = 0;
+    for (row, 0..) |raw, i| {
+        const id: i64 = @intCast(i);
+        // ids rise, so a full list takes only a larger value: the predicate runs for those alone (-inf is never larger)
+        if (n == k and !before(raw, id, values[k - 1], ids[k - 1])) continue;
+        const v = if (allow.allows(@intCast(i))) raw else -std.math.inf(f32);
+        if (n == k and !before(v, id, values[k - 1], ids[k - 1])) continue;
+        var j: usize = if (n < k) n else k - 1;
+        while (j > 0 and before(v, id, values[j - 1], ids[j - 1])) : (j -= 1) {
+            values[j] = values[j - 1];
+            ids[j] = ids[j - 1];
+        }
+        values[j] = v;
+        ids[j] = id;
+        if (n < k) n += 1;
+    }
+    return n;
+}
+
 /// The first index of the largest value (np.argmax / torch.argmax on a row without NaN).
 pub fn argmax(row: []const f32) usize {
     var best: usize = 0;
@@ -97,16 +119,50 @@ pub fn argmax(row: []const f32) usize {
     return best;
 }
 
+/// argmax of a copy of the row whose refused tokens are -inf; null when no allowed token has a finite value.
+pub fn argmaxAllowed(row: []const f32, allow: anytype) ?usize {
+    var best: ?usize = null;
+    var top = -std.math.inf(f32);
+    for (row, 0..) |v, i| {
+        // the predicate runs only for a value that beats the best so far
+        if (v > top and allow.allows(@intCast(i))) {
+            best = i;
+            top = v;
+        }
+    }
+    return best;
+}
+
 /// sample_rows for one row of fp32 logits at absolute position `position`: the token.
 pub fn sampleRow(row: []const f32, position: u64, s: Sampling) !i64 {
     if (s.temperature <= 0) return @intCast(argmax(row));
+    var values: [max_candidates]f32 = undefined;
+    var ids: [max_candidates]i64 = undefined;
+    const width = topCandidates(row, try candidates(row, s), &values, &ids);
+    return choose(values[0..width], ids[0..width], position, s);
+}
+
+/// sampleRow on a copy of the row whose tokens `allow` refuses are -inf, bit for bit; null when it allows none.
+pub fn sampleRowAllowed(row: []const f32, position: u64, s: Sampling, allow: anytype) !?i64 {
+    if (s.temperature <= 0) return if (argmaxAllowed(row, allow)) |i| @intCast(i) else null;
+    var values: [max_candidates]f32 = undefined;
+    var ids: [max_candidates]i64 = undefined;
+    const width = topCandidatesAllowed(row, try candidates(row, s), &values, &ids, allow);
+    if (width == 0 or values[0] == -std.math.inf(f32)) return null;
+    return choose(values[0..width], ids[0..width], position, s);
+}
+
+/// How many candidates a sampled row reads: top_k + MARGIN of the row.
+fn candidates(row: []const f32, s: Sampling) !usize {
     if (s.top_k == 0) return error.NotPortedYet; // the nucleus path (top_k off: a model setting only top_p)
     const count = @min(row.len, s.top_k + margin);
     if (count > max_candidates) return error.TooManyCandidates;
-    var values: [max_candidates]f32 = undefined;
-    var ids: [max_candidates]i64 = undefined;
-    const width = topCandidates(row, count, &values, &ids);
-    // choose_rows on the candidates (already in lexsort's order)
+    return count;
+}
+
+/// choose_rows on candidates already in lexsort's order: the token.
+fn choose(values: []const f32, ids: []const i64, position: u64, s: Sampling) i64 {
+    const width = values.len;
     const k = @max(1, @min(s.top_k, width));
     const t = @max(s.temperature, 1e-6);
     var scaled: [max_candidates]f64 = undefined;
