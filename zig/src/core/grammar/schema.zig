@@ -1,6 +1,8 @@
 //! A JSON schema or guided_choice list as a program with xgrammar 0.2.8's strict semantics, as Python 0.6 used them.
 const std = @import("std");
 const formats = @import("formats.zig");
+const bounds = @import("bounds.zig");
+const bytetrie = @import("bytetrie.zig");
 const keys = @import("schema_keys.zig");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
@@ -30,6 +32,8 @@ pub const Node = union(enum) {
     format: formats.Format,
     integer,
     number,
+    /// An integer or number with bounds: its automaton's start in Program.states.
+    range: u32,
     /// One of a set of byte strings: enum, const, true and false, null, guided_choice.
     literal: u32,
     any_of: u32,
@@ -72,6 +76,8 @@ pub const Program = struct {
     unions: []const Union,
     tries: []const Trie,
     edges: []const Edge,
+    /// The automata of bounded numbers.
+    states: []const bounds.State,
     root: Id,
     /// The trie of true, false and null, for any value.
     words: u32,
@@ -142,6 +148,7 @@ const Compiler = struct {
     branches: std.ArrayList([]const Id) = .empty,
     tries: std.ArrayList(Trie) = .empty,
     edges: std.ArrayList(Edge) = .empty,
+    numbers: bounds.Table = .{},
     /// Each literal node's byte strings by its trie, for anyOf to merge.
     sets: std.AutoHashMapUnmanaged(u32, []const []const u8) = .empty,
     refs: std.StringHashMapUnmanaged(Id) = .empty,
@@ -207,6 +214,8 @@ const Compiler = struct {
             else => return c.fail("a schema must be an object or a boolean", .{}),
         };
         if (keys.refusal(s)) |k| return c.fail("{s}: {s}", .{ k, keys.advice(k) });
+        if (bounds.given(s)) |k| if (!bounds.placed(s))
+            return c.fail("{s} needs type integer or number, without $ref, const, enum, anyOf, oneOf or allOf: xgrammar ignores it elsewhere", .{k});
         if (s.get("$ref")) |r| return c.ref(r);
         if (s.get("const")) |k| return c.values(&.{k});
         if (s.get("enum")) |e| {
@@ -254,14 +263,23 @@ const Compiler = struct {
     fn typed(c: *Compiler, s: std.json.ObjectMap, name: []const u8) Error!Id {
         const eql = std.mem.eql;
         if (eql(u8, name, "string")) return c.string(s);
-        if (eql(u8, name, "integer")) return Program.integer;
-        if (eql(u8, name, "number")) return Program.number;
+        if (eql(u8, name, "integer")) return if (bounds.given(s) == null) Program.integer else c.bounded(s, true);
+        if (eql(u8, name, "number")) return if (bounds.given(s) == null) Program.number else c.bounded(s, false);
         if (eql(u8, name, "boolean")) return Program.boolean;
         if (eql(u8, name, "null")) return Program.null;
         // a schema with only "type" and annotations is xgrammar's plain object or array: any keys, any items
         if (eql(u8, name, "object")) return if (keys.plain(s)) Program.any_object else c.object(s);
         if (eql(u8, name, "array")) return if (keys.plain(s)) Program.any_array else c.array(s);
         return c.fail("type {s} is not a JSON type", .{name});
+    }
+
+    fn bounded(c: *Compiler, s: std.json.ObjectMap, integer: bool) Error!Id {
+        var why: []const u8 = "";
+        const start = bounds.compile(c.a, &c.numbers, s, integer, &why) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Refused => return c.fail("{s}", .{why}),
+        };
+        return c.add(.{ .range = start });
     }
 
     /// A non-negative count, as xgrammar reads one: an integer that fits in 64 bits.
@@ -343,7 +361,7 @@ const Compiler = struct {
     fn objectOf(c: *Compiler, props: []const Prop, from: []const u16, additional: Id) Error!u32 {
         const texts = try c.a.alloc([]const u8, props.len);
         for (props, texts) |p, *t| t.* = p.key[1..];
-        var below: Below = .{};
+        var below: bytetrie.Below = .{};
         const root = try c.trieOf(texts, &below);
         try c.objects.append(c.a, .{
             .props = props,
@@ -413,53 +431,8 @@ const Compiler = struct {
         return c.trieOf(texts, null);
     }
 
-    /// Each node's texts by index, in order, for a trie of keys.
-    const Below = struct { spans: std.ArrayList(Span) = .empty, members: std.ArrayList(u16) = .empty };
-
-    fn trieOf(c: *Compiler, texts: []const []const u8, below: ?*Below) Error!u32 {
-        const order = try c.a.alloc(u32, texts.len);
-        for (order, 0..) |*o, i| o.* = @intCast(i);
-        std.mem.sort(u32, order, texts, struct {
-            fn less(t: []const []const u8, x: u32, y: u32) bool {
-                return std.mem.order(u8, t[x], t[y]) == .lt;
-            }
-        }.less);
-        const Todo = struct { node: u32, lo: usize, hi: usize, depth: usize };
-        var todo: std.ArrayList(Todo) = .empty;
-        const root = try c.trieNode(order[0..], below);
-        try todo.append(c.a, .{ .node = root, .lo = 0, .hi = order.len, .depth = 0 });
-        while (todo.pop()) |span| {
-            var i = span.lo;
-            // sorted, so the text that ends here (and its repeats) comes first
-            while (i < span.hi and texts[order[i]].len == span.depth) : (i += 1) c.tries.items[span.node].end = true;
-            const first: u32 = @intCast(c.edges.items.len);
-            var j = i;
-            while (j < span.hi) {
-                const b = texts[order[j]][span.depth];
-                var e = j;
-                while (e < span.hi and texts[order[e]][span.depth] == b) e += 1;
-                const to = try c.trieNode(order[j..e], below);
-                try c.edges.append(c.a, .{ .byte = b, .to = to });
-                try todo.append(c.a, .{ .node = to, .lo = j, .hi = e, .depth = span.depth + 1 });
-                j = e;
-            }
-            c.tries.items[span.node].first = first;
-            c.tries.items[span.node].len = @intCast(c.edges.items.len - first);
-        }
-        return root;
-    }
-
-    /// A new trie node for the texts `order` names; with `below`, it records them in index order.
-    fn trieNode(c: *Compiler, order: []const u32, below: ?*Below) Error!u32 {
-        const id: u32 = @intCast(c.tries.items.len);
-        try c.tries.append(c.a, .{ .first = 0, .len = 0, .end = false });
-        if (below) |w| {
-            const first: u32 = @intCast(w.members.items.len);
-            for (order) |i| try w.members.append(c.a, @intCast(i));
-            std.mem.sort(u16, w.members.items[first..], {}, std.sort.asc(u16));
-            try w.spans.append(c.a, .{ .first = first, .len = @intCast(order.len) });
-        }
-        return id;
+    fn trieOf(c: *Compiler, texts: []const []const u8, below: ?*bytetrie.Below) Error!u32 {
+        return bytetrie.build(.{ .a = c.a, .tries = &c.tries, .edges = &c.edges }, texts, below);
     }
 
     fn anyOf(c: *Compiler, o: Value, comptime word: []const u8) Error!Id {
@@ -525,6 +498,7 @@ const Compiler = struct {
             .unions = unions,
             .tries = c.tries.items,
             .edges = c.edges.items,
+            .states = c.numbers.states.items,
             .root = targets[root],
             .words = c.words,
         };
@@ -547,11 +521,15 @@ const Compiler = struct {
             else => {},
         };
         var kept: std.ArrayList(Id) = .empty;
+        // integer and bounded replies are numbers too; without number, two or more become one automaton
+        var ints: std.ArrayList(Id) = .empty;
         for (flat.items) |b| switch (c.nodes.items[b]) {
-            .integer => if (!number) try kept.append(c.a, b), // integer replies are numbers too
+            .integer, .range => if (!number) try ints.append(c.a, b),
             .literal => {},
             else => try kept.append(c.a, b),
         };
+        if (ints.items.len == 1) try kept.append(c.a, ints.items[0]);
+        if (ints.items.len > 1) try kept.append(c.a, try c.united(ints.items));
         if (texts.items.len > 0) try kept.append(c.a, try c.literal(texts.items));
         var out: Union = .{ .dispatch = @splat(none) };
         for (kept.items) |b| {
@@ -563,6 +541,14 @@ const Compiler = struct {
             };
         }
         return out;
+    }
+
+    /// One automaton for integer and bounded branches: a reply any of them takes.
+    fn united(c: *Compiler, ids: []const Id) Error!Id {
+        const starts = try c.a.alloc(?u32, ids.len);
+        for (ids, starts) |b, *s| s.* = if (c.nodes.items[b] == .range) c.nodes.items[b].range else null;
+        const start = bounds.unite(c.a, &c.numbers, starts) catch |e| return if (e == error.Refused) c.fail("{s}", .{bounds.too_many}) else e;
+        return c.add(.{ .range = start });
     }
 
     fn flatten(c: *Compiler, u: u32, out: *std.ArrayList(Id), depth: usize) Error!void {
@@ -585,6 +571,9 @@ const Compiler = struct {
             .string, .text, .format => set['"'] = true,
             .integer, .number => for (number) |b| {
                 set[b] = true;
+            },
+            .range => |r| for (number) |b| {
+                set[b] = bounds.step(c.numbers.states.items, r, b) != null;
             },
             .literal => |t| {
                 const n = c.tries.items[t];

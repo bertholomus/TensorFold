@@ -46,11 +46,14 @@ test {
     _ = json;
     _ = vocab;
     _ = formats;
+    _ = @import("bounds.zig");
+    _ = @import("bytetrie.zig");
     _ = @import("schema_keys.zig");
     _ = schema;
     _ = schema_match;
     _ = @import("schema_test.zig");
     _ = @import("schema_match_test.zig");
+    _ = @import("bounds_test.zig");
     _ = @import("json_test.zig");
     _ = @import("xgrammar_test.zig");
     _ = @import("xgrammar_schema_test.zig");

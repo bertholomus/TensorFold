@@ -51,7 +51,7 @@ test "every verdict equals xgrammar 0.2.8's on the frozen schema and choice corp
         cases += 1;
         kinds[if (want[0] == 'c') 0 else if (want[0] == 'p') 1 else 2] += 1;
     }
-    try std.testing.expectEqual(@as(usize, 60), sections);
-    try std.testing.expect(cases > 4500);
+    try std.testing.expectEqual(@as(usize, 93), sections);
+    try std.testing.expect(cases > 10_000);
     for (kinds) |k| try std.testing.expect(k >= 300);
 }

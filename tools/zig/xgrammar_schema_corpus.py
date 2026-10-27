@@ -4,6 +4,7 @@ import json
 import random
 import re
 import sys
+from decimal import Decimal
 from pathlib import Path
 
 OUT = Path(__file__).resolve().parents[2] / "zig/src/core/grammar/testdata/xgrammar_schema.txt"
@@ -107,6 +108,41 @@ SCHEMAS = [
     {"anyOf": [{"$ref": "#/$defs/p"}, {"$ref": "#/$defs/p"}],
      "$defs": {"p": {"type": "object", "properties": {"k": {"type": "integer"}}}}},
 ]
+# Numeric bounds, after the choice lists and from their own seed, so the sections above stay as they were.
+BOUNDS = [
+    # a pydantic model: a label, a confidence between 0.0 and 1.0 (Field(ge=0.0, le=1.0)), an optional note
+    {"type": "object", "properties": {"label": {"type": "string", "enum": ["yes", "no"]},
+                                      "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                                      "summary": {"type": "string"}, "note": {"anyOf": [{"type": "string"}, {"type": "null"}]}},
+     "required": ["label", "confidence", "summary"]},
+    {"type": "number", "minimum": 0.0, "maximum": 1.0}, {"type": "number", "minimum": 0, "maximum": 1},
+    {"type": "number", "minimum": -2.5, "exclusiveMaximum": 10}, {"type": "number", "exclusiveMinimum": 0},
+    {"type": "number", "maximum": -0.25}, {"type": "number", "exclusiveMaximum": 0},
+    {"type": "number", "minimum": -1e-7, "maximum": 0.1234567}, {"type": "number", "minimum": 0.0078125},
+    {"type": "number", "maximum": 1e-9}, {"type": "number", "minimum": -0.0, "maximum": 0},
+    {"type": "number", "minimum": 5, "exclusiveMinimum": 5, "maximum": 6, "exclusiveMaximum": 7},
+    {"type": "number", "minimum": 123456789.123456789, "maximum": 123456790},
+    {"type": "number", "minimum": 8589934592.0078125}, {"type": "number", "minimum": 1e20},
+    {"type": "number", "minimum": 9.2e18, "maximum": 1e19}, {"type": "number", "minimum": -1e19, "maximum": -9.3e18},
+    {"type": "number", "minimum": -1e300, "maximum": 1e300},
+    {"type": "integer", "minimum": 0, "maximum": 100}, {"type": "integer", "exclusiveMinimum": -5, "exclusiveMaximum": 5},
+    {"type": "integer", "maximum": 0}, {"type": "integer", "minimum": 1.0, "maximum": 1e2},
+    {"type": "integer", "minimum": -9223372036854775808, "maximum": -9223372036854775000},
+    {"type": "integer", "minimum": 9007199254740993}, {"type": "integer", "exclusiveMaximum": -9223372036854775807},
+    {"type": ["integer", "number"], "minimum": 0, "maximum": 2},
+    {"type": ["number", "null"], "exclusiveMinimum": -1, "maximum": 1},
+    {"type": ["integer", "string"], "minimum": 3}, {"type": ["object", "number"], "minimum": 0},
+    {"anyOf": [{"type": "integer", "minimum": 10}, {"type": "number", "maximum": -1.5}, {"type": "null"}]},
+    {"anyOf": [{"type": "integer", "maximum": -10}, {"type": "integer", "minimum": 10}, {"type": "integer"}]},
+    {"type": "array", "items": {"type": "number", "minimum": 0, "exclusiveMaximum": 1}, "maxItems": 4},
+    {"type": "object", "properties": {"n": {"type": "integer", "minimum": 1}, "x": {"type": "number", "minimum": -1, "maximum": 1}},
+     "additionalProperties": {"type": "number", "exclusiveMinimum": 100}},
+]
+BOUND_KEYS = ("minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum")
+# Spellings a bounded number may meet: negative zero, leading zeros, exponents, long runs, int64's edges.
+ODD_NUMBERS = ["-0", "-0.0", "-0.000000", "-0.0000000", "0.0000000", "00", "01", "-01", "00.5", "1e0", "5E-1", "0.5e0",
+               "1e+2", "+1", ".5", "1.", "-", "1" + "0" * 25, "0." + "0" * 10 + "1", "9" * 20, "9223372036854775807",
+               "9223372036854775808", "-9223372036854775809", "1.0000001", "0.9999999", "1.000000", "0.999999"]
 CHOICES = [["yes", "no"], ["a", "ab", "abc"], ["x\ny", "😀", "\u0001", "\u007f", "a\"b\\c"], ["positive", "negative", "neutral"]]
 
 
@@ -161,6 +197,8 @@ class Gen:
             return self.arr(s, depth)
         if t == "string":
             return self.string(s)
+        if t in ("integer", "number") and any(k in s for k in BOUND_KEYS):
+            return self.bounded(s, t == "integer")
         if t == "integer":
             return self.number(True)
         if t == "number":
@@ -293,6 +331,33 @@ class Gen:
             return text.encode()
         return r.choice([b"01", b"-0", b"1.", b".5", b"+1", b"1e5", b"1.5", b"-", b"2E-3"])
 
+    def bounded(self, s, integer: bool) -> bytes:
+        """A number at, near or between the bounds, written as a model might write it, or an odd spelling."""
+        r = self.r
+        if r.random() < 0.12:
+            return r.choice(ODD_NUMBERS).encode()
+        edges = [Decimal(repr(s[k])) for k in BOUND_KEYS if k in s]
+        if len(edges) > 1 and r.random() < 0.35:
+            lo, hi = min(edges), max(edges)
+            x = lo + (hi - lo) * Decimal(r.random())        # between the bounds, most often inside
+        else:
+            x = r.choice(edges + [Decimal(0), sum(edges) / len(edges)])
+            step = r.choice([0, 0, 0, 1, 2, 10, 1000] + [Decimal(10) ** -n for n in range(1, 9)])
+            x += step * r.choice([1, -1])
+        k = r.random()
+        if integer and k < 0.85:
+            text = format(x.to_integral_value(), "f")
+        elif k < 0.6:
+            text = format(x, f".{r.randint(0, 6)}f")                   # what a model writes: up to 6 decimals
+        else:
+            text = r.choice([format(x, f".{r.randint(7, 9)}f"), format(x, "f"), format(x.normalize(), "f")])
+        if r.random() < 0.15 and not integer:
+            text += ("" if "." in text else ".") + "0" * r.randint(1, 7)
+        if self.odd(0.3):
+            text = r.choice([text.replace("-", "-0", 1) if text.startswith("-") else "0" + text, text + r.choice(["e0", "E1", "e-1", "e+2"]),
+                             text + "".join(r.choice("0123456789") for _ in range(r.randint(1, 8))), text + "."])
+        return text.encode()
+
 
 SAMPLES = {
     "date": ["2026-10-26", "1999-12-31", "2026-13-01", "2026-02-30", "26-10-26"],
@@ -369,20 +434,23 @@ def decode(payload: str) -> bytes:
 
 
 def sections():
-    """(header, compile) for each schema and choice list, as Python 0.6 compiled them."""
-    for s in SCHEMAS:
-        text = json.dumps(s, ensure_ascii=False)
-        yield "= schema " + text, s, lambda c, t=text: c.compile_json_schema(t, max_whitespace_cnt=BLANK_RUN)
-    for ch in CHOICES:
-        text = json.dumps(ch, ensure_ascii=False)
-        rule = "root ::= " + " | ".join(json.dumps(v, ensure_ascii=False) for v in ch)
-        yield "= choice " + text, ch, lambda c, g=rule: c.compile_grammar(g)
+    """(header, spec, compile, seed offset) for each schema and choice list, as Python 0.6 compiled them."""
+    for group, schemas in ((0, SCHEMAS), (1, BOUNDS)):
+        for s in schemas:
+            text = json.dumps(s, ensure_ascii=False)
+            yield "= schema " + text, s, lambda c, t=text: c.compile_json_schema(t, max_whitespace_cnt=BLANK_RUN), group
+        if group == 0:
+            for ch in CHOICES:
+                text = json.dumps(ch, ensure_ascii=False)
+                rule = "root ::= " + " | ".join(json.dumps(v, ensure_ascii=False) for v in ch)
+                yield "= choice " + text, ch, lambda c, g=rule: c.compile_grammar(g), 0
 
 
 def main() -> int:
     """Generate, label with the installed xgrammar and write the corpus (or --check it against the frozen file)."""
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--cases", type=int, default=90, help="cases for each schema or choice list")
+    p.add_argument("--bound-cases", type=int, default=150, help="cases for each schema with numeric bounds")
     p.add_argument("--seed", type=int, default=20261026)
     p.add_argument("--out", type=Path, default=OUT)
     p.add_argument("--check", action="store_true", help="relabel the frozen file and report differences")
@@ -391,7 +459,7 @@ def main() -> int:
     version = __import__("importlib.metadata").metadata.version("xgrammar")
     if args.check:
         compiled, differ = None, 0
-        builds = {h: build for h, _, build in sections()}
+        builds = {h: build for h, _, build, _ in sections()}
         for line in args.out.read_text().splitlines():
             if line.startswith("#"):
                 continue
@@ -405,18 +473,21 @@ def main() -> int:
                 print(f"xgrammar {version}: {got}, frozen: {want}: {decode(payload)!r}")
         print(f"{differ} differences")
         return 1 if differ else 0
-    r = random.Random(args.seed)
+    rngs = [random.Random(args.seed), random.Random(args.seed + 1)]
     lines = [f"# xgrammar {version} json_schema (max_whitespace_cnt={BLANK_RUN}) and guided_choice verdicts by "
              "tools/zig/xgrammar_schema_corpus.py",
-             f"# seed {args.seed}: '= schema <json>' or '= choice <json>', then verdict and bytes per case"]
+             f"# seed {args.seed} (numeric bounds: {args.seed + 1}): '= schema <json>' or '= choice <json>', then verdict "
+             "and bytes per case"]
     total = 0
-    for header, spec, build in sections():
+    for header, spec, build, group in sections():
         compiled = build(comp)
         lines.append(header)
         seen = set()
+        r = rngs[group]
         gen = Gen(r, spec)
         tries = 0
-        while len(seen) < args.cases and tries < args.cases * 50:
+        cases = args.cases if group == 0 else args.bound_cases
+        while len(seen) < cases and tries < cases * 50:
             tries += 1
             gen.clean = r.random() < 0.6
             if isinstance(spec, list):
@@ -431,7 +502,7 @@ def main() -> int:
             lines.append(f"{verdict(xgr, compiled, data)} {encode(data)}".rstrip(" "))
         total += len(seen)
     args.out.write_text("\n".join(lines) + "\n")
-    print(f"{total} cases in {len(SCHEMAS) + len(CHOICES)} sections written to {args.out}")
+    print(f"{total} cases in {len(SCHEMAS) + len(CHOICES) + len(BOUNDS)} sections written to {args.out}")
     return 0
 
 

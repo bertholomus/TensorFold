@@ -27,7 +27,7 @@ test "every keyword this engine cannot enforce is refused, with where and why" {
     const a = arena.allocator();
     const cases = [_][2][]const u8{
         .{ "{\"type\": \"string\", \"pattern\": \"^a+$\"}", "#: pattern: it is not enforced by this engine" },
-        .{ "{\"type\": \"object\", \"properties\": {\"n\": {\"type\": \"integer\", \"minimum\": 1}}}", "#/properties/n: minimum: it is not enforced by this engine" },
+        .{ "{\"type\": \"object\", \"properties\": {\"n\": {\"type\": \"integer\", \"minimum\": 1, \"multipleOf\": 2}}}", "#/properties/n: multipleOf: it is not enforced by this engine" },
         .{ "{\"type\": \"array\", \"items\": {\"type\": \"integer\"}, \"uniqueItems\": true}", "#: uniqueItems: it is not enforced by this engine" },
         .{ "{\"type\": \"object\", \"properties\": {\"a\": {}}, \"patternProperties\": {\"^x\": {}}}", "#: patternProperties: it is not enforced by this engine" },
         .{ "{\"type\": \"string\", \"nullable\": true}", "#: nullable: nullable is not JSON Schema: use \"type\": [..., \"null\"]" },
@@ -73,6 +73,81 @@ test "every keyword this engine cannot enforce is refused, with where and why" {
             return e;
         };
     }
+}
+
+test "a bound is refused where xgrammar ignores it or fails, and for a range no 6-decimal number lies in" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const needs = " needs type integer or number, without $ref, const, enum, anyOf, oneOf or allOf: xgrammar ignores it elsewhere";
+    const cases = [_][2][]const u8{
+        .{ "{\"minimum\": 1}", "#: minimum" ++ needs },
+        .{ "{\"type\": \"string\", \"exclusiveMinimum\": 1}", "#: exclusiveMinimum" ++ needs },
+        .{ "{\"type\": [], \"maximum\": 1}", "#: maximum" ++ needs },
+        .{ "{\"type\": \"object\", \"properties\": {\"n\": {\"enum\": [1, 5], \"maximum\": 3}}}", "#/properties/n: maximum" ++ needs },
+        .{ "{\"anyOf\": [{\"type\": \"integer\"}], \"minimum\": 0}", "#: minimum" ++ needs },
+        .{ "{\"$ref\": \"#/$defs/n\", \"exclusiveMaximum\": 0, \"$defs\": {\"n\": {\"type\": \"number\"}}}", "#: exclusiveMaximum" ++ needs },
+        .{ "{\"type\": \"integer\", \"minimum\": 1.5}", "#: minimum must be a whole number for type integer" },
+        .{ "{\"type\": [\"integer\", \"number\"], \"minimum\": 0.5}", "#: minimum must be a whole number for type integer" },
+        .{ "{\"type\": \"integer\", \"maximum\": 9223372036854775808}", "#: maximum must lie between -2^63 and 2^63 for type integer" },
+        .{ "{\"type\": \"integer\", \"minimum\": -9.223372036854776e18}", "#: minimum must lie between -2^63 and 2^63 for type integer" },
+        .{ "{\"type\": \"integer\", \"exclusiveMinimum\": 9223372036854775807}", "#: exclusiveMinimum leaves no int64" },
+        .{ "{\"type\": \"integer\", \"exclusiveMaximum\": -9223372036854775808}", "#: exclusiveMaximum leaves no int64" },
+        .{ "{\"type\": \"integer\", \"minimum\": 5, \"maximum\": 3}", "#: the range is empty: its lower bound is above its upper one" },
+        .{ "{\"type\": \"integer\", \"exclusiveMinimum\": 2, \"exclusiveMaximum\": 3}", "#: the range is empty: its lower bound is above its upper one" },
+        .{ "{\"type\": \"number\", \"minimum\": 5, \"exclusiveMaximum\": 5}", "#: the range is empty: its lower bound is not below its upper one" },
+        .{ "{\"type\": \"number\", \"minimum\": 1e-7, \"maximum\": 2e-7}", "#: no number with at most 6 decimals lies in the range: xgrammar 0.2.8 takes an empty value there" },
+        .{ "{\"type\": \"number\", \"exclusiveMinimum\": 0.5, \"maximum\": 0.5000001}", "#: no number with at most 6 decimals lies in the range: xgrammar 0.2.8 takes an empty value there" },
+        .{ "{\"type\": \"number\", \"maximum\": 1e400}", "#: maximum is past the largest double" },
+        .{ "{\"type\": \"number\", \"minimum\": \"0\"}", "#: minimum must be a number" },
+        .{ "{\"type\": \"number\", \"exclusiveMinimum\": true}", "#: exclusiveMinimum must be a number" },
+        .{ "{\"type\": \"number\", \"minimum\": 0, \"multipleOf\": 0.5}", "#: multipleOf: it is not enforced by this engine" },
+    };
+    for (cases) |c| {
+        const why = try refusal(a, c[0]);
+        std.testing.expectEqualStrings(c[1], why) catch |e| {
+            std.debug.print("for {s}\n", .{c[0]});
+            return e;
+        };
+    }
+    // the same bounds compile where xgrammar applies them, also beside other types, which they leave alone
+    for ([_][]const u8{
+        "{\"type\": \"integer\", \"minimum\": 1.0, \"maximum\": 1e2}",
+        "{\"type\": \"integer\", \"exclusiveMinimum\": -9223372036854775807, \"maximum\": 9223372036854775807}",
+        "{\"type\": [\"number\", \"null\"], \"exclusiveMinimum\": -1, \"maximum\": 1}",
+        "{\"type\": [\"integer\", \"string\"], \"minimum\": 3}",
+        "{\"type\": \"number\", \"minimum\": -1e300, \"maximum\": 1e300}",
+        "{\"type\": \"number\", \"maximum\": 1e-9}",
+    }) |t| _ = try compile(a, t);
+}
+
+test "equal bounds share one automaton, and a schema whose bounds need too many states is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: std.ArrayList(u8) = .empty;
+    try text.appendSlice(a, "{\"type\": \"object\", \"properties\": {");
+    for (0..1000) |i| try text.print(a, "{s}\"p{d}\": {{\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0}}", .{ if (i == 0) "" else ", ", i });
+    try text.appendSlice(a, "}}");
+    const one = try compile(a, "{\"type\": \"number\", \"minimum\": 0.0, \"maximum\": 1.0}");
+    try std.testing.expectEqual(one.states.len, (try compile(a, text.items)).states.len);
+    // -1e306 to 1e306 needs ~800 states (whole parts of up to 307 digits), so 100 different such ranges pass the cap
+    text.clearRetainingCapacity();
+    try text.appendSlice(a, "{\"type\": \"object\", \"properties\": {");
+    for (0..100) |i| try text.print(a, "{s}\"p{d}\": {{\"type\": \"number\", \"minimum\": -1.{d}e306, \"maximum\": 1.{d}e306}}", .{ if (i == 0) "" else ", ", i, i, i });
+    try text.appendSlice(a, "}}");
+    const why = try refusal(a, text.items);
+    try std.testing.expect(std.mem.startsWith(u8, why, "#/properties/p") and std.mem.endsWith(u8, why, ": the numeric bounds need more than 65536 automaton states"));
+}
+
+test "a pydantic schema with a bounded confidence (ge=0.0, le=1.0) compiles, as xgrammar 0.2.8 took it" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try compile(arena.allocator(), @embedFile("testdata/pydantic_bounds.json"));
+    const o = p.objects[p.nodes[p.root].object];
+    try std.testing.expectEqualStrings("\"confidence\"", o.props[1].key);
+    try std.testing.expect(p.nodes[o.props[1].node] == .range);
+    try std.testing.expectEqualSlices(u16, &.{ 0, 1, 2, 7, 7, 7, 7, 7 }, o.required_from);
 }
 
 test "a schema nested past 128 levels is refused" {
@@ -179,5 +254,25 @@ test "a repeated type or branch adds no branch, as xgrammar takes it" {
     try std.testing.expectEqualStrings(
         "#: two anyOf, oneOf or type branches can start with '{': this engine needs branches that start with different bytes",
         try refusal(a, "{\"anyOf\": [{\"type\": \"object\", \"properties\": {\"a\": {}}}, {\"type\": \"object\", \"properties\": {\"a\": {}}}]}"),
+    );
+}
+
+test "a union folds bounded numbers into number, unites them without it, and dispatches only the bytes they start" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const folded = try compile(a, "{\"anyOf\": [{\"type\": \"number\"}, {\"type\": \"integer\", \"minimum\": 3}]}");
+    try std.testing.expect(folded.nodes[folded.unions[folded.nodes[folded.root].any_of].dispatch['-']] == .number);
+    const united = try compile(a, "{\"type\": [\"integer\", \"number\"], \"minimum\": 0, \"maximum\": 2}");
+    const u = united.unions[united.nodes[united.root].any_of].dispatch;
+    try std.testing.expect(united.nodes[u['0']] == .range and u['1'] == u['0'] and u['2'] == u['0']);
+    try std.testing.expect(u['3'] == schema.none and u['-'] == schema.none); // no reply starts so
+    // a range that starts no '-' leaves it to an enum: a plain integer would not
+    const lits = try compile(a, "{\"anyOf\": [{\"type\": \"integer\", \"minimum\": 0}, {\"enum\": [-1, \"x\"]}]}");
+    const l = lits.unions[lits.nodes[lits.root].any_of].dispatch;
+    try std.testing.expect(lits.nodes[l['-']] == .literal and lits.nodes[l['7']] == .range);
+    try std.testing.expectEqualStrings(
+        "#: two anyOf, oneOf or type branches can start with '-': this engine needs branches that start with different bytes",
+        try refusal(a, "{\"anyOf\": [{\"type\": \"integer\"}, {\"enum\": [-1]}]}"),
     );
 }

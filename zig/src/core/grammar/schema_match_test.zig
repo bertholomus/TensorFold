@@ -233,6 +233,28 @@ test "numbers and literals at the root end with the reply; integers refuse a fra
     try expectRun(&lits, at(2), "123");
 }
 
+test "a pydantic schema: confidence takes 0.0 to 1.0 as xgrammar 0.2.8 did, inside a whole object" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const p = try compile(arena.allocator(), @embedFile("testdata/pydantic_bounds.json"));
+    const head = "{\"label\":\"yes\",\"confidence\":";
+    var buf: [128]u8 = undefined;
+    for ([_][]const u8{ "0", "0.0", "0.85", "1", "1.0", "1.000000", "0.6" }) |x|
+        try expectRun(&p, .complete, try std.fmt.bufPrint(&buf, "{s}{s},\"summary\":\"s\"}}", .{ head, x }));
+    // the first refused byte, counted in the value
+    for ([_]struct { []const u8, usize }{ .{ "1.01", 3 }, .{ "-0.1", 0 }, .{ "2", 0 }, .{ "1.0000000", 8 }, .{ "0.0000001", 8 }, .{ "-0", 0 }, .{ "1e0", 1 }, .{ ".5", 0 }, .{ "00.5", 1 } }) |c|
+        try expectRun(&p, at(head.len + c[1]), try std.fmt.bufPrint(&buf, "{s}{s},\"summary\":\"s\"}}", .{ head, c[0] }));
+    const full =
+        \\{"label": "unsure", "confidence": 0.55, "summary": "x", "tags": ["a"], "note": null,
+        \\ "extra": {"k": [1, "v"]}, "source": {"url": "u", "title": null}}
+    ;
+    try expectRun(&p, .complete, full);
+    try expectRun(&p, at(36), "{\"label\": \"unsure\", \"confidence\": 1.5, \"summary\": \"x\"}");
+    try expectRun(&p, .complete, "{\"label\":\"no\",\"confidence\":1,\"summary\":\"\"}");
+    try expectRun(&p, at(31), "{\"label\":\"yes\",\"confidence\":0.5}");
+    try expectRun(&p, at(57), "{\"label\":\"yes\",\"confidence\":0.5,\"summary\":\"s\",\"source\":{\"title\":\"t\"}}");
+}
+
 test "containers nest at most 128 deep; a token that opens more than the trial holds is tried on a copy" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -293,6 +315,11 @@ const walked = [_][]const u8{
     ,
     \\{"type": "object", "properties": {"ab": {"type": "integer"}, "a": {"type": "integer"}, "abc": {"type": "integer"},
     \\ "b": {"type": "integer"}}, "required": ["abc"], "additionalProperties": true}
+    ,
+    \\{"type": "object", "properties": {"confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0}, "n": {"type":
+    \\ "integer", "exclusiveMinimum": -5, "maximum": 1000}, "xs": {"type": "array", "items": {"anyOf": [{"type":
+    \\ "integer", "minimum": -2, "exclusiveMaximum": 3}, {"type": "number", "minimum": -2.5, "maximum": -2.25}]}}},
+    \\ "required": ["confidence"]}
     ,
 };
 
@@ -394,12 +421,33 @@ const Check = struct {
             for (v.string) |b| state = n.step(state, b);
             return n.accepting(state);
         }
-        if (eql(u8, name, "integer")) return v == .number_string and std.mem.findAny(u8, v.number_string, ".eE") == null and !eql(u8, v.number_string, "-0");
-        if (eql(u8, name, "number")) return v == .number_string;
+        if (eql(u8, name, "integer")) return v == .number_string and std.mem.findAny(u8, v.number_string, ".eE") == null and !eql(u8, v.number_string, "-0") and inRange(o, v.number_string);
+        if (eql(u8, name, "number")) return v == .number_string and inRange(o, v.number_string);
         if (eql(u8, name, "boolean")) return v == .bool;
         if (eql(u8, name, "null")) return v == .null;
         if (eql(u8, name, "object")) return v == .object and (keys.plain(o) or c.object(o, v.object));
         return v == .array and (keys.plain(o) or c.array(o, v.array.items));
+    }
+
+    /// In range, without exponent, at most 6 decimals; a double compares these walks' few-decimal bounds exactly.
+    fn inRange(o: std.json.ObjectMap, text: []const u8) bool {
+        const bound = for ([_][]const u8{ "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum" }) |k| {
+            if (o.contains(k)) break true;
+        } else false;
+        if (!bound) return true;
+        const dot = std.mem.indexOfScalar(u8, text, '.');
+        if (std.mem.findAny(u8, text, "eE") != null or (dot != null and text.len - dot.? - 1 > 6)) return false;
+        const x = std.fmt.parseFloat(f64, text) catch return false;
+        const at_ = struct {
+            fn get(m: std.json.ObjectMap, k: []const u8) ?f64 {
+                return std.fmt.parseFloat(f64, (m.get(k) orelse return null).number_string) catch null;
+            }
+        }.get;
+        if (at_(o, "minimum")) |b| if (x < b) return false;
+        if (at_(o, "maximum")) |b| if (x > b) return false;
+        if (at_(o, "exclusiveMinimum")) |b| if (x <= b) return false;
+        if (at_(o, "exclusiveMaximum")) |b| if (x >= b) return false;
+        return true;
     }
 
     fn object(c: Check, o: std.json.ObjectMap, v: std.json.ObjectMap) bool {

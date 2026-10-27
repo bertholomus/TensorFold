@@ -2,6 +2,7 @@
 const std = @import("std");
 const schema = @import("schema.zig");
 const formats = @import("formats.zig");
+const bounds = @import("bounds.zig");
 const json = @import("json.zig");
 const Program = schema.Program;
 const Id = schema.Id;
@@ -33,6 +34,7 @@ const Lex = enum(u8) {
     format, // inside a format string
     literal, // inside an enum, const, choice, true, false or null
     number,
+    range, // inside a number with bounds: `count` is its automaton's state
     done, // the root value is complete: only the end of the reply may follow
 };
 const Esc = enum(u2) { none, escape, hex };
@@ -58,7 +60,7 @@ const Lexer = struct {
     free: bool = false,
     num: Num = .minus,
     integer: bool = false,
-    /// text: characters taken; literal: the trie node.
+    /// text: characters taken; literal: the trie node; range: the automaton's state.
     count: u32 = 0,
     nfa: u64 = 0,
 
@@ -96,6 +98,10 @@ const Lexer = struct {
                 return p.tries[lx.count].end and lx.end(p, st, b);
             },
             .number => return lx.numberByte(p, st, b),
+            .range => {
+                lx.count = bounds.step(p.states, lx.count, b) orelse return p.states[lx.count].accept and lx.end(p, st, b);
+                return true;
+            },
             .done => return false,
         }
     }
@@ -168,6 +174,11 @@ const Lexer = struct {
             .format => return b == '"' and lx.open(.format, node),
             .integer => return lx.numberStart(b, true),
             .number => return lx.numberStart(b, false),
+            .range => |s| {
+                lx.count = bounds.step(p.states, s, b) orelse return false;
+                lx.lex = .range;
+                return true;
+            },
             .literal => |t| return lx.literalStart(p, t, b),
             .any_of => |u| {
                 const branch = p.unions[u].dispatch[b];
@@ -403,6 +414,7 @@ const Lexer = struct {
                 else => false,
             },
             .literal => lx.depth == 0 and p.tries[lx.count].end,
+            .range => lx.depth == 0 and p.states[lx.count].accept,
             else => false,
         };
     }

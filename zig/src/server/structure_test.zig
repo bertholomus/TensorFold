@@ -231,6 +231,29 @@ test "an Anthropic output_config.format reaches the engine as a compiled json_sc
     try expectGate(engine.structure.?);
 }
 
+test "a pydantic response_format with confidence bounds reaches the engine compiled, held to 0.0 to 1.0" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var text: ByteText = .{};
+    var engine: Capture = .{};
+    // a whole response_format (name, schema, description, strict null) with pydantic's bounds; it got HTTP 400 before
+    const seen = try send(&text, &engine, a, ask ++ "\"response_format\":" ++ @embedFile("testdata/pydantic_bounds.response_format.json") ++ "}");
+    try std.testing.expectEqual(@as(u16, 200), seen.status);
+    const st = engine.structure.?;
+    try std.testing.expect(st.kind == .json_schema and st.program != null);
+    for ([_][]const u8{ "0", "0.0", "0.85", "1", "1.0" }) |x| {
+        var m: api.grammar.Matcher = .init(st.program.?);
+        const reply = try std.fmt.allocPrint(a, "{{\"label\":\"yes\",\"confidence\":{s},\"summary\":\"s\"}}", .{x});
+        try std.testing.expect(m.advance(reply) and m.complete());
+    }
+    for ([_][]const u8{ "1.01", "-0.1", "2" }) |x| {
+        var m: api.grammar.Matcher = .init(st.program.?);
+        try std.testing.expect(m.advance("{\"label\":\"yes\",\"confidence\":"));
+        try std.testing.expect(!m.accepts(x));
+    }
+}
+
 test "a grammar this engine cannot enforce is refused before the engine sees it" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

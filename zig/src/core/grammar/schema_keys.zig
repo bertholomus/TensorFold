@@ -8,12 +8,11 @@ const annotations = [_][]const u8{ "title", "default", "description", "examples"
 
 /// Keywords that constrain a reply and that this engine does not enforce (xgrammar enforces or ignores them): refused.
 const refused = [_][]const u8{
-    "pattern",           "patternProperties", "propertyNames",         "minimum",          "maximum",
-    "exclusiveMinimum",  "exclusiveMaximum",  "multipleOf",            "minProperties",    "maxProperties",
-    "dependentRequired", "dependentSchemas",  "dependencies",          "if",               "then",
-    "else",              "not",               "unevaluatedProperties", "unevaluatedItems", "contains",
-    "minContains",       "maxContains",       "uniqueItems",           "additionalItems",  "$dynamicRef",
-    "$dynamicAnchor",    "$recursiveRef",     "$recursiveAnchor",
+    "pattern",       "patternProperties", "propertyNames",    "multipleOf",            "minProperties",
+    "maxProperties", "dependentRequired", "dependentSchemas", "dependencies",          "if",
+    "then",          "else",              "not",              "unevaluatedProperties", "unevaluatedItems",
+    "contains",      "minContains",       "maxContains",      "uniqueItems",           "additionalItems",
+    "$dynamicRef",   "$dynamicAnchor",    "$recursiveRef",    "$recursiveAnchor",
 };
 
 /// The first keyword of `schema` that this engine refuses, with why.
