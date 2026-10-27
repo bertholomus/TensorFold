@@ -70,7 +70,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer fan.close();
     var comm = try fan.comm(g, 4);
     defer comm.deinit();
-    var rings = try ring2d.Rings.open(gpa, &driver, try rdma.Kernels.load(module), devices.items, g, .{ .max_bytes = 4456448, .gid_index = gid }, &comm, stream);
+    if (std.c.getenv("TF_DS_TWO_HOP")) |v| dsv41.comm.two_hop = std.mem.eql(u8, std.mem.span(v), "1"); // a ring of four
+    var rings = try ring2d.Rings.open(gpa, io, &driver, try rdma.Kernels.load(module), devices.items, g, .{ .max_bytes = 4456448, .gid_index = gid }, &comm, stream);
     defer rings.close(gpa);
 
     var all_ok = true;
