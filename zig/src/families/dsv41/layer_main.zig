@@ -203,6 +203,7 @@ pub fn main(init: std.process.Init) !u8 {
     const a = init.arena.allocator();
     const gpa = init.gpa;
     const io = init.io;
+    if (std.c.getenv("TF_DS_TWO_HOP")) |v| dsv41.comm.two_hop = std.mem.eql(u8, std.mem.span(v), "1"); // a ring of four
     const args = try init.minimal.args.toSlice(a);
     if (args.len < 8) {
         std.debug.print("{s}", .{usage});
@@ -423,7 +424,7 @@ pub fn main(init: std.process.Init) !u8 {
         var devices: std.ArrayList([]const u8) = .empty;
         var dit = std.mem.splitScalar(u8, rdma_devices.?, ',');
         while (dit.next()) |d| try devices.append(a, d);
-        rdma_rings = try dsv41.ring2d.Rings.open(gpa, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 5 }, &comm, stream);
+        rdma_rings = try dsv41.ring2d.Rings.open(gpa, io, &driver, try dsv41.rdma.Kernels.load(rdma_mod.?), devices.items, rank, .{ .max_bytes = 4456448, .gid_index = 5 }, &comm, stream);
         two.?.rings = &rdma_rings.?;
     }
     var eng: prompt.Engine = .{ .d = &driver, .s = stream, .t = .{ .set = &set, .stream = stream }, .blas = undefined, .comm = &comm, .pf = &pf, .lin = &lg, .ex = &exk, .ops = &ops, .exact = &ex, .c = &cfg, .w = &w, .world = sp.world, .plain = rope, .compressed = rope_c, .two = if (two) |*t| t else null };

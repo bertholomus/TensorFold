@@ -194,6 +194,7 @@ pub const Model = struct {
         if (std.c.getenv("TF_DS_REPLAY_FLOOR")) |v| prompt.replay_floor = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
         try prompt.splitEnv(); // TF_DS_IDX_SPLIT: every rank alike too
         if (std.c.getenv("TF_DS_2D_YX")) |v| prompt2d.y_sums = std.mem.eql(u8, std.mem.span(v), "1"); // every rank alike
+        if (std.c.getenv("TF_DS_TWO_HOP")) |v| comm_mod.two_hop = std.mem.eql(u8, std.mem.span(v), "1"); // a ring of four: every rank alike
         m.spans = .empty;
         m.img_buf = null;
         m.host = std.heap.ArenaAllocator.init(gpa);
@@ -354,7 +355,7 @@ pub const Model = struct {
                 var devices: std.ArrayList([]const u8) = .empty;
                 var dit = std.mem.splitScalar(u8, devs, ',');
                 while (dit.next()) |x| try devices.append(a, x);
-                m.rdma_rings = try ring2d.Rings.open(gpa, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
+                m.rdma_rings = try ring2d.Rings.open(gpa, io, d, try rdma.Kernels.load(m.rdma_mod.?), devices.items, o.rank, .{ .max_bytes = ring_bytes, .gid_index = 5 }, &m.comm, m.stream);
                 m.two.?.rings = &m.rdma_rings.?;
             }
         }
