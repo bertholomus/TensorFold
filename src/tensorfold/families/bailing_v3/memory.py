@@ -14,6 +14,10 @@ without its rope key, and GLM's prompt attention scratch. This prices what the e
 - the EXL3 scratch: the routed experts' (``exl3.experts.Scratch``) and the EXL3 linears' shared one
   (``glm_moe_dsa.cuda.x3.X3Scratch``), the prompt chunk's grown on first use (decoded weights, the unpack cache).
 
+With TF_LING_SHARED_SCRATCH=1 (``SHARED``) the three Buffers hold their call-local scratch once (forward.Shared): one
+set of chunk partials for the widest Buffers' rows, and one X3Scratch core (rotated inputs, K-split partials,
+staging), not three. The same kernels on the same rows: no output bit changes.
+
 Torch-free, so tools/ling_memory_model.py reads it without torch. tests/test_bailing_13_memory.py holds the
 State and Buffers terms to their allocations byte for byte and each EXL3 rule to the code it mirrors. Outside the
 estimate (the admission reserve carries them): the CUDA context, NCCL, the graph pool and the allocator's slack.
@@ -37,6 +41,9 @@ X3_ROWS = 128               # most rows one EXL3 linear call takes (glm_moe_dsa.
 LATENT_MB = int(os.environ.get("TF_LING_LATENT_MB") or 1024)
 # decoded EXL3 weights a prompt chunk's workspace keeps (glm_moe_dsa.cuda.x3.UNPACK_CACHE_MB, the same variable)
 UNPACK_CACHE_MB = int(os.environ.get("TF_GLM_UNPACK_CACHE_MB") or 384)
+# the decode, MTP and prompt Buffers share their call-local scratch (forward.Shared): one CUDA stream runs their calls
+# one after another. Off by default; at 262K with LATENT_MB 270 it saves 0.66 GiB a rank (partials 0.50, EXL3 0.16)
+SHARED = os.environ.get("TF_LING_SHARED_SCRATCH", "0") == "1"
 
 
 def chunks_for(length: int) -> int:
@@ -264,32 +271,39 @@ def expert_scratch(D: int, I: int, count: int, rows: int, slots: int, *, prompt:
 
 # -- the geometry ---------------------------------------------------------------------------------------------------
 
-def parts(r: Rank, capacity: int, *, rows: int = 8, prefill_rows: int = 2048) -> dict[str, int]:
+def parts(r: Rank, capacity: int, *, rows: int = 8, prefill_rows: int = 2048,
+          shared: bool | None = None) -> dict[str, int]:
     """Named bytes at ``capacity`` slots: the engine's State, its decode, MTP and prompt Buffers, and their EXL3
-    scratch."""
+    scratch; ``shared`` (None: SHARED): the Buffers' call-local scratch held once (forward.Shared)."""
 
+    shared = SHARED if shared is None else bool(shared)
     decode = 2 if r.mtp else 1                                  # the decode window's Buffers and the MTP head's
+    if shared:                                                  # one set, for the widest Buffers' rows
+        chunk_partials = partials(r, max(rows, prefill_rows), capacity)
+    else:
+        chunk_partials = decode * partials(r, rows, capacity) + partials(r, prefill_rows, capacity)
     out = {"latent cache": cache_per_slot(r) * capacity,
            "KDA state": state_fixed(r, rows),
-           "chunk partials": decode * partials(r, rows, capacity) + partials(r, prefill_rows, capacity),
+           "chunk partials": chunk_partials,
            "decode buffers": decode * buffer_rows(r, rows, prefill=False),
            "prompt buffers": buffer_rows(r, prefill_rows, prefill=True)}
     if r.exl3:
         lin = x3_linears(r)
         slots = r.top_k + 1
-        out["EXL3 scratch"] = (decode * (x3_scratch(lin, prefill=False)
-                                         + expert_scratch(r.hidden, r.expert_width, r.experts, rows, slots,
-                                                          prompt=False))
+        # the decode and MTP Buffers' X3Scratch: its own core each, or the prompt chunk's (the same sizes: shared)
+        core = 0 if shared else decode * x3_scratch(lin, prefill=False)
+        out["EXL3 scratch"] = (core + decode * expert_scratch(r.hidden, r.expert_width, r.experts, rows, slots,
+                                                              prompt=False)
                                + x3_scratch(lin, prefill=True, rows=prefill_rows)
                                + expert_scratch(r.hidden, r.expert_width, r.experts, prefill_rows, slots, prompt=True))
     return out
 
 
 def geometry(text: dict[str, Any], world: int, rank: int = 0, *, mtp: bool = True, rows: int = 8,
-             prefill_rows: int = 2048, minimum_slots: int = 2560) -> Geometry:
+             prefill_rows: int = 2048, minimum_slots: int = 2560, shared: bool | None = None) -> Geometry:
     """The admission's Geometry for Ling on ``rank`` of ``world``: bytes at a slot capacity; ``rows`` (the widest
     verify window) is also the slots kept past the window."""
 
     r = Rank.of(text, world, rank, mtp=mtp)
-    return Geometry(lambda capacity: sum(parts(r, capacity, rows=rows, prefill_rows=prefill_rows).values()), rows,
-                    minimum_slots)
+    return Geometry(lambda capacity: sum(parts(r, capacity, rows=rows, prefill_rows=prefill_rows,
+                                               shared=shared).values()), rows, minimum_slots)

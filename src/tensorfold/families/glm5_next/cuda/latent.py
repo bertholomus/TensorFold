@@ -323,15 +323,33 @@ def _merge(PO, PM, PL, OUT, CNT, R, H: tl.constexpr, LW: tl.constexpr, NCH: tl.c
     tl.store(OUT + (r * H + h) * LW + k, (o / l).to(tl.bfloat16))
 
 
-class LatentScratch:
-    """Chunk partials for ``part_rows`` (one ``attention`` call) x heads x chunks; queries and latents for ``rows``."""
+def partials(n: int, lw: int, device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Chunk partials po, pm, pl (fp32) for ``n`` = chunks x part_rows x heads of width ``lw``."""
 
-    def __init__(self, rows: int, heads: int, chunks: int, device, lw: int = L, part_rows: int | None = None) -> None:
+    return (torch.empty((n * lw,), dtype=torch.float32, device=device),
+            torch.empty((n,), dtype=torch.float32, device=device),
+            torch.empty((n,), dtype=torch.float32, device=device))
+
+
+class LatentScratch:
+    """Chunk partials for ``part_rows`` (one ``attention`` call) x heads x chunks; queries and latents for ``rows``.
+
+    ``parts`` (from ``partials``): chunk partials several scratches share, at least this one's; each takes their
+    first elements. Partials live inside one ``attention`` call only, so scratches whose calls run one after another
+    on one CUDA stream can share them (bailing_v3's TF_LING_SHARED_SCRATCH)."""
+
+    def __init__(self, rows: int, heads: int, chunks: int, device, lw: int = L, part_rows: int | None = None,
+                 parts: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None) -> None:
         part_rows = rows if part_rows is None else min(rows, part_rows)
         self.rows, self.part_rows, self.heads, self.nch, self.lw = rows, part_rows, heads, chunks, lw
-        self.po = torch.empty((chunks * part_rows * heads * lw,), dtype=torch.float32, device=device)
-        self.pm = torch.empty((chunks * part_rows * heads,), dtype=torch.float32, device=device)
-        self.pl = torch.empty((chunks * part_rows * heads,), dtype=torch.float32, device=device)
+        n = chunks * part_rows * heads
+        if parts is None:
+            parts = partials(n, lw, device)
+        po, pm, pl = parts
+        if po.numel() < n * lw or pm.numel() < n or pl.numel() < n:
+            raise ValueError(f"LatentScratch: shared partials of {pm.numel()} (chunk, row, head) entries, "
+                             f"{chunks} x {part_rows} x {heads} wanted")
+        self.po, self.pm, self.pl = po[:n * lw], pm[:n], pl[:n]
         self.qa = torch.empty((rows, heads, lw), dtype=torch.bfloat16, device=device)
         self.ol = torch.empty((rows, heads, lw), dtype=torch.bfloat16, device=device)
         self.dummy = torch.zeros((1,), dtype=torch.int32, device=device)

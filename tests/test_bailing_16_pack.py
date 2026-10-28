@@ -109,6 +109,21 @@ def test_the_memory_line_reads_torch_and_the_node(tmp_path):
     assert memory_line(fake, 0, "built", meminfo=str(tmp_path / "none")).endswith("(small pool 0.50)")
 
 
+def test_the_host_line_reads_the_process_status(tmp_path):
+    from tensorfold.families.bailing_v3.cuda import engine as E
+
+    status = tmp_path / "status"
+    status.write_text("Name:\tpython3\nVmRSS:\t 3145728 kB\nRssAnon:\t 2097152 kB\nRssFile:\t  786432 kB\n"
+                      "RssShmem:\t  262144 kB\n")
+    assert E.host_line(0, "loaded", status=str(status)) == \
+        "[tensorfold] rank 0 loaded: host RSS anon 2.00 GiB, file 0.75, shmem 0.25"
+    assert E.host_line(1, "built", status=str(tmp_path / "none")) == "[tensorfold] rank 1 built: host RSS unknown"
+    assert isinstance(E.malloc_trim(), bool)                        # glibc's, or False where it is missing
+    source = Path(E.__file__).read_text()
+    assert 'os.environ.get("TF_LING_MALLOC_TRIM", "0") == "1"' in source   # off unless asked
+    assert source.count("if MALLOC_TRIM:") == 2                     # after the load and after the build
+
+
 def test_the_prompt_chunk_rows_come_from_the_environment(monkeypatch):
     from tensorfold.families.bailing_v3.cuda.engine import prompt_chunk_rows
 

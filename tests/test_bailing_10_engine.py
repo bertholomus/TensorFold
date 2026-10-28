@@ -4,13 +4,18 @@ CUDA-graph replay == eager, bit for bit, on one rank (TP2 rank bit-identity is t
 - drafted == serial: mtp_decode's reply equals serial_decode's from the same prefill, token for token, with a fixed
   depth-3 policy under greedy sampling (drafts never change the reply);
 - graph replay == eager: an Engine with captured graphs and one without produce the same logits for the same
-  committed sequence, including MTP draft steps and windows of every captured row count;
+  committed sequence, including MTP draft steps and windows of every captured row count (the graphs also captured on
+  the shared scratch);
 - packed == per-expert: the routed trellises in one allocation a projection (weights.Slab) or one an expert give the
   same bytes behind every expert pointer and the same logits and states;
 - latent row blocks and prompt chunks: a 600-token prompt committed with the latent attention's partials one row a
   block (TF_LING_LATENT_MB's floor) leaves the same states and caches as all rows a block, and the windows after it
   give the same logits; in chunks of 128 rows (TF_LING_PREFILL_ROWS) it commits every row and gives the same bits
-  run twice, but not one chunk's bits (the kernels go by a chunk's row count: glm_moe_dsa/cuda/invariant.py).
+  run twice, but not one chunk's bits (the kernels go by a chunk's row count: glm_moe_dsa/cuda/invariant.py);
+- shared scratch (TF_LING_SHARED_SCRATCH): the decode, MTP and prompt Buffers on one set of chunk partials and one
+  X3Scratch core give the same logits, hidden rows, states and caches as Buffers with their own;
+- the vocabulary-split embedding (TF_LING_EMBED_SPLIT): each rank's span rows, gathered and picked as forward.embed
+  does, are the whole table's rows, for Ling's vocabulary at TP2 and TP4.
 
 GPU only (EXL3, KDA and the latent kernels are CUDA); runs on a GB10. The random weights carry no
 meaning: only bits are compared.
@@ -92,12 +97,16 @@ def test_drafted_equals_serial_greedy(tiny):
     assert got.drafted >= 1 and got.depths and max(got.depths) >= 1   # the run drafted (or this says nothing)
 
 
-def test_graph_replay_equals_eager(tiny):
+@pytest.mark.parametrize("shared", [False, True])
+def test_graph_replay_equals_eager(tiny, monkeypatch, shared):
+    from tensorfold.families.bailing_v3 import memory
     from tensorfold.families.bailing_v3.cuda.decode import Engine, commit, prefill
     from tensorfold.families.bailing_v3.cuda.graphs import Graphs
 
     eager = Engine(_load(tiny), capacity=CAP, graphs=False)
+    monkeypatch.setattr(memory, "SHARED", shared)          # graphs captured on the shared scratch, eager on its own
     graf = Engine(_load(tiny), capacity=CAP, graphs=False)
+    monkeypatch.undo()
     graf.graphs = Graphs(graf, main_rows=(1, 2, 3, 4, 5, 6, 7, 8), mtp_rows=(1, 2, 3))
     graf.reset()                                    # the capture's warm-ups wrote the caches
     assert graf.graphs.main and graf.graphs.mtp
@@ -221,3 +230,60 @@ def test_latent_blocks_keep_the_bits_and_prompt_chunks_commit(tiny, monkeypatch)
         for e in (ref, blocks, *small):
             commit(e.w, e.st, e.buf, R, R)
     assert all(_same(a, b) for a, b in zip(_caches(blocks.st), _caches(ref.st)))
+
+
+@pytest.mark.parametrize("latent_mb", [1024, 0])
+def test_shared_scratch_gives_the_same_bits(tiny, monkeypatch, latent_mb):
+    from tensorfold.families.bailing_v3 import memory
+    from tensorfold.families.bailing_v3.cuda.decode import Engine, commit, prefill
+
+    g = torch.Generator().manual_seed(29)
+    prompt = [int(t) for t in torch.randint(0, 256, (600,), generator=g)]
+    cap = 1024
+    monkeypatch.setattr(memory, "LATENT_MB", latent_mb)        # 0: one row a block, the windows in row blocks
+    own = Engine(_load(tiny), capacity=cap, prefill_rows=1024, graphs=False)
+    monkeypatch.setattr(memory, "SHARED", True)
+    sh = Engine(_load(tiny), capacity=cap, prefill_rows=1024, graphs=False)
+    monkeypatch.undo()
+    mine = [sh.buf, sh.pbuf, sh.mbuf]
+    assert len({b.lat_s.po.data_ptr() for b in mine}) == 1 and len({b.x3.xh.data_ptr() for b in mine}) == 1
+    assert len({b.lat_s.po.data_ptr() for b in (own.buf, own.pbuf, own.mbuf)}) == 3
+    assert [b.lat_s.part_rows for b in mine] == [b.lat_s.part_rows for b in (own.buf, own.pbuf, own.mbuf)]
+    assert prefill(sh, prompt, None) == prefill(own, prompt, None)
+    assert _same(sh.last_hidden, own.last_hidden)
+    assert all(_same(a, b) for a, b in zip(_caches(sh.st), _caches(own.st)))
+    for R in (1, 2, 3, 4, 5, 6, 7, 8):
+        toks = [int(t) for t in torch.randint(0, 256, (R,), generator=g)]
+        assert _same(sh.forward(toks).clone(), own.forward(toks).clone()), f"window of {R} rows"
+        commit(own.w, own.st, own.buf, R, R)
+        commit(sh.w, sh.st, sh.buf, R, R)
+    toks = [int(t) for t in torch.randint(0, 256, (3,), generator=g)]
+    assert _same(sh.forward(toks).clone(), own.forward(toks).clone())
+    hidden = own.buf.fnormed[:3].clone()
+    assert _same(sh.buf.fnormed[:3], hidden)
+    commit(own.w, own.st, own.buf, 3, 3)
+    commit(sh.w, sh.st, sh.buf, 3, 3)
+    for n in (1, 2, 3):
+        mts = [int(t) for t in torch.randint(0, 256, (n,), generator=g)]
+        assert _same(sh.mtp(mts, hidden[:n]).clone(), own.mtp(mts, hidden[:n]).clone()), f"mtp step of {n} rows"
+    assert all(_same(a, b) for a, b in zip(_caches(sh.st), _caches(own.st)))
+
+
+@pytest.mark.parametrize("world", [2, 4])
+def test_split_embedding_rows_are_the_tables(world):
+    from tensorfold.families.bailing_v3.cuda.weights import embed_span
+    from tensorfold.families.glm_moe_dsa.cuda import glue
+
+    vocab, D = 157184, 256                                       # Ling's vocabulary, rows of any 64s
+    g = torch.Generator().manual_seed(31)
+    table = torch.randn((vocab, D), generator=g).to(torch.bfloat16).cuda()
+    spans = [embed_span(vocab, world, r, split=True) for r in range(world)]
+    for R in (1, 4, 8, 2048):
+        ids = torch.randint(0, vocab, (R,), generator=g)
+        ids[0], ids[-1] = 0, vocab - 1                           # the table's first and last rows
+        ids = ids.to(torch.int32).cuda()
+        parts = [glue.embed_span(ids, table[e0:e0 + en].contiguous(), e0,
+                                 torch.empty((R, D), dtype=torch.bfloat16, device="cuda")) for e0, en in spans]
+        got = torch.stack(parts).contiguous()                    # what the all-gather hands every rank
+        out = glue.embed_pick(ids, got, torch.empty((R, D), dtype=torch.bfloat16, device="cuda"), vocab)
+        assert _same(out, table[ids.long()]), f"{R} rows at world {world}"

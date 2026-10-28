@@ -145,6 +145,39 @@ def memory_line(torch, rank: int, what: str, meminfo: str = "/proc/meminfo") -> 
     return line
 
 
+def host_line(rank: int, what: str, status: str = "/proc/self/status") -> str:
+    """One rank's host memory after ``what``: the process's anonymous, file-backed and shared resident bytes (a
+    GB10's GPU allocations come out of the same RAM but are not among them)."""
+
+    got: dict[str, float] = {}
+    try:
+        with open(status) as f:
+            for row in f:
+                key = row.split(":")[0]
+                if key in ("RssAnon", "RssFile", "RssShmem"):
+                    got[key] = int(row.split()[1]) / float(1 << 20)
+    except OSError:
+        return f"[tensorfold] rank {rank} {what}: host RSS unknown"
+    return (f"[tensorfold] rank {rank} {what}: host RSS anon {got.get('RssAnon', 0.0):.2f} GiB, file "
+            f"{got.get('RssFile', 0.0):.2f}, shmem {got.get('RssShmem', 0.0):.2f}")
+
+
+# TF_LING_MALLOC_TRIM=1: after the load and after the build, glibc's malloc_trim hands the host heap's free pages back
+# to the node (host memory only: no output bit changes); host_line shows the resident bytes before and after
+MALLOC_TRIM = os.environ.get("TF_LING_MALLOC_TRIM", "0") == "1"
+
+
+def malloc_trim() -> bool:
+    """glibc malloc_trim(0): True when it returned memory to the system, False when it did not or cannot."""
+
+    try:
+        import ctypes
+
+        return bool(ctypes.CDLL("libc.so.6").malloc_trim(0))
+    except (OSError, AttributeError):
+        return False
+
+
 def requested_window(context: int | None, explicit: bool) -> int | None:
     """The window admission is asked for: an explicit --context, else none (the native window, capped by what fits).
 
@@ -184,7 +217,7 @@ class BailingEngine:
 
         from tensorfold.cuda.comm import open_comm
         from .decode import Engine
-        from .weights import Config, load
+        from .weights import EMBED_SPLIT, Config, embed_priced, load
         from tensorfold.families.glm5_next.cuda.split import rule, unit
         from tensorfold.cuda.capacity import admit
         from tensorfold.cuda.geometry import split_weights
@@ -210,6 +243,8 @@ class BailingEngine:
         explicit = context is not None if context_explicit is None else bool(context_explicit)
         self.mtp_on = mtp_head(serial_only, cfg.mtp_layers)
         weights_estimate = split_weights(rule, self.world, unit=unit)
+        if EMBED_SPLIT:                                 # this rank's vocabulary span of the embedding (weights.load)
+            weights_estimate = embed_priced(weights_estimate, cfg.vocab, self.world, rank)
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         prefill_rows = prompt_chunk_rows() if prefill_rows is None else int(prefill_rows)
@@ -223,14 +258,15 @@ class BailingEngine:
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         # both ranks must run the same calls: refuse to start when they were given different settings
-        mine = [capacity, int(serial_only), prefill_rows, int(self.mtp_on)]
+        mine = [capacity, int(serial_only), prefill_rows, int(self.mtp_on), int(EMBED_SPLIT), int(memory.SHARED)]
         # other conversations' kept prompts get what the window leaves, at most TF_LING_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_LING_CACHE_GIB", "3")) * 2 ** 30)
         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
         both = self._gather_ints(mine + [spare >> 20])
         if any(b[:-1] != both[0][:-1] for b in both):
-            raise RuntimeError("the ranks were started with different settings (context, drafts, TF_LING_MTP): "
+            raise RuntimeError("the ranks were started with different settings (context, drafts, TF_LING_MTP, "
+                               "TF_LING_EMBED_SPLIT, TF_LING_SHARED_SCRATCH): "
                                f"rank 0 {both[0][:-1]} vs {[b[:-1] for b in both[1:]]}")
         self.cache_bytes = min(b[-1] for b in both) << 20
         plan["kept_bytes"] = self.cache_bytes
@@ -244,6 +280,9 @@ class BailingEngine:
                   "one token", flush=True)
         w = load(model_dir, rank=rank)
         print(memory_line(torch, rank, "loaded"), flush=True)
+        print(host_line(rank, "loaded"), flush=True)
+        if MALLOC_TRIM:
+            print(host_line(rank, f"trimmed ({'released' if malloc_trim() else 'nothing to release'})"), flush=True)
         w.comm = self.comm
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
         self.comm.barrier()
@@ -251,8 +290,11 @@ class BailingEngine:
         self.e = Engine(w, capacity=capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=True,
                         graph_rows=tuple(range(1, MAX_ROWS + 1)))
         print(memory_line(torch, rank, "built (buffers, states, graphs)"), flush=True)
+        if MALLOC_TRIM:
+            print(host_line(rank, f"trimmed ({'released' if malloc_trim() else 'nothing to release'})"), flush=True)
         self.costs = self._calibrate()
         print(memory_line(torch, rank, "calibrated"), flush=True)
+        print(host_line(rank, "calibrated"), flush=True)
         if rank == 0:
             c = self.costs
             mtp = (f"; MTP draft {c['mtp']:.2f} (+{c['mtp_step']:.2f} a chained draft, +{c['mtp_row']:.2f} a row)"

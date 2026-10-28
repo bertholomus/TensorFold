@@ -19,7 +19,8 @@ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
 from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
 from tensorfold.families.glm5_next.cuda import latent, prof
 
-from .forward import Buffers, State, chunks_for, commit, compute, stage
+from .. import memory
+from .forward import Buffers, Shared, State, chunks_for, commit, compute, stage
 from .mtp import mtp_compute, mtp_forward, mtp_stage
 from .weights import Weights
 
@@ -94,12 +95,14 @@ class Engine:
         self.w = w
         w.meta["long_context"] = False            # dense at every length: no indexer, no long-context switch
         self.rows, self.prefill_rows = max_rows, prefill_rows
-        self.buf = Buffers(w, max_rows, capacity)
-        self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True)
+        # TF_LING_SHARED_SCRATCH: the three Buffers' call-local scratch once (forward.Shared; memory.parts prices it)
+        shared = Shared(w, max(max_rows, prefill_rows), capacity) if memory.SHARED else None
+        self.buf = Buffers(w, max_rows, capacity, shared=shared)
+        self.pbuf = Buffers(w, prefill_rows, capacity, prefill=True, shared=shared)
         if taps:
             self.buf.set_taps(tuple(taps))         # before any graph capture
             self.pbuf.set_taps(tuple(taps))
-        self.mbuf = Buffers(w, max_rows, capacity) if w.mtp is not None else None
+        self.mbuf = Buffers(w, max_rows, capacity, shared=shared) if w.mtp is not None else None
         self.st = State(w, capacity, max_rows)
         self.last_hidden: torch.Tensor | None = None
         self.constraint = self.window = None            # a request's grammar, and the next sample's rows under it

@@ -39,7 +39,11 @@ UNPACK_CACHE_MB = int(__import__("os").environ.get("TF_GLM_UNPACK_CACHE_MB") or 
 class X3Scratch:
     """Shared fp16 input rotations, fp32 K-split partials and staging blocks for every X3 of a model."""
 
-    def __init__(self, users: list, device, *, prefill: bool) -> None:
+    def __init__(self, users: list, device, *, prefill: bool, core: "X3Scratch | None" = None) -> None:
+        """``core``: another scratch for the same users whose rotated inputs, K-split partials and staging this one
+        uses (they live inside one call, and their sizes depend on the users only), when the two never run at once
+        (one CUDA stream); the prompt workspace stays this scratch's own."""
+
         from tensorfold.cuda.exl3.prefill import UnpackCache, Workspace
 
         xh = z = tmp = 1
@@ -49,11 +53,16 @@ class X3Scratch:
             if lin.split[0] > 1:
                 z = max(z, lin.split[0] * ROWS * lin.n)
             tmp = max(tmp, ROWS * lin.n)
-        self.xh = torch.empty((xh,), dtype=torch.float16, device=device)
-        self.z = torch.empty((z,), dtype=torch.float32, device=device)
-        # staging for outputs the linear cannot write in place (cropped widths, non-contiguous slices)
-        self.tmp = {torch.float32: torch.empty((tmp,), dtype=torch.float32, device=device),
-                    torch.bfloat16: torch.empty((tmp,), dtype=torch.bfloat16, device=device)}
+        if core is not None:
+            if core.xh.numel() < xh or core.z.numel() < z or core.tmp[torch.float32].numel() < tmp:
+                raise ValueError("X3Scratch: the shared core is smaller than these users need")
+            self.xh, self.z, self.tmp = core.xh, core.z, core.tmp
+        else:
+            self.xh = torch.empty((xh,), dtype=torch.float16, device=device)
+            self.z = torch.empty((z,), dtype=torch.float32, device=device)
+            # staging for outputs the linear cannot write in place (cropped widths, non-contiguous slices)
+            self.tmp = {torch.float32: torch.empty((tmp,), dtype=torch.float32, device=device),
+                        torch.bfloat16: torch.empty((tmp,), dtype=torch.bfloat16, device=device)}
         self.big: dict = {}                  # prompt-chunk staging (cropped groups only), grown on first use
         cache = UnpackCache(UNPACK_CACHE_MB << 20) if UNPACK_CACHE_MB > 0 else None
         self.prefill = Workspace(cache) if prefill else None

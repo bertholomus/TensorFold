@@ -29,6 +29,37 @@ CLAMP = os.environ.get("TF_LING_SWIGLU_CLAMP", "1") != "0"
 # The kernels read each expert by its own pointer (exl3.experts.prepare), so where its bytes sit changes no output bit.
 PACK = os.environ.get("TF_LING_PACK_EXPERTS", "1") != "0"
 SLOT_ALIGN = 512             # torch's caching allocator starts every block on 512 bytes: each slot starts on it too
+# TF_LING_EMBED_SPLIT=1: each rank holds only its vocabulary span of the embedding (``embed_span``), and forward.embed
+# (glm_moe_dsa's) gathers every rank's rows of the tokens: copies, the whole table's bits. Half the 1.2 GiB table a rank
+# at TP2, for one in-graph all-gather a forward and an MTP step, so off by default. Every rank must agree (the engine
+# checks it at startup); a tool that loads one rank without its peers keeps it off.
+EMBED_SPLIT = os.environ.get("TF_LING_EMBED_SPLIT", "0") == "1"
+
+
+def embed_span(vocab: int, world: int, rank: int, split: bool | None = None) -> tuple[int, int]:
+    """(first token, rows) of the embedding one rank holds: the whole table, or with the split (None: EMBED_SPLIT)
+    its span of whole 128-row blocks, the EXL3 head's (vocab_slice), which glm_moe_dsa's embed_pick reads back. Ling's
+    157,184 tokens at TP2: 78,592 rows a rank."""
+
+    if not (EMBED_SPLIT if split is None else split) or world == 1:
+        return 0, vocab
+    lo, mine, _ = vocab_slice(-(-vocab // 128), world, rank)
+    first = min(lo * 128, vocab)
+    return first, min((lo + mine) * 128, vocab) - first
+
+
+def embed_priced(transform, vocab: int, world: int, rank: int):
+    """A startup weight transform that prices this rank's embed_span rows of the embedding, not the whole table."""
+
+    rows = embed_span(vocab, world, rank)[1]
+
+    def priced(name: str, info: dict):
+        shape = info.get("shape") or []
+        if name.endswith("word_embeddings.weight") and len(shape) == 2:
+            return transform(name, {**info, "shape": [rows, shape[1]]})
+        return transform(name, info)
+
+    return priced
 
 
 class Slab:
@@ -242,7 +273,7 @@ class MTPW:
 @dataclass
 class Weights:
     cfg: Config
-    embed: torch.Tensor       # [vocab, hidden] bf16, the whole table on every rank (no vocab split yet)
+    embed: torch.Tensor       # [rows, hidden] bf16: the whole table, or this rank's embed_span (TF_LING_EMBED_SPLIT)
     layers: list[LayerW]
     norm: torch.Tensor
     head: B16 | X3            # this rank's vocabulary slice
@@ -252,6 +283,7 @@ class Weights:
     device: torch.device
     comm: Any = None
     meta: dict = field(default_factory=dict)
+    embed_lo: int = 0         # the first token of this rank's embedding rows
 
     @property
     def vocab_offset(self) -> int:
@@ -486,8 +518,10 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         lo = share_lo(cfg.vocab, world, rank)
         return make_b16(t("lm_head.weight")[lo:lo + vl].to(dev).contiguous())
 
-    # the whole table on every rank: the forward's embedding gather reads any row (no vocab split yet)
-    embed = rd.get(name("word_embeddings.weight")).to(device=dev, dtype=torch.bfloat16, copy=True)
+    # the whole table on every rank, or with TF_LING_EMBED_SPLIT this rank's vocabulary span only (forward.embed
+    # gathers the other ranks' rows)
+    e0, en = embed_span(cfg.vocab, world, rank)
+    embed = rd.get(name("word_embeddings.weight"))[e0:e0 + en].to(device=dev, dtype=torch.bfloat16, copy=True)
     try:
         built = [layer(i) for i in range(cfg.layers)]
         meta: dict = {}
@@ -501,7 +535,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
                                t(f"layers.{i}.post_attention_layernorm.weight", torch.bfloat16)))
             mtpw.layer.mla = mla(i)
             mtpw.layer.moe = moe(f"layers.{i}.mlp.")
-        w = Weights(cfg, embed, built, t("norm.weight", torch.bfloat16), head, mtpw, rank, world, dev)
+        w = Weights(cfg, embed, built, t("norm.weight", torch.bfloat16), head, mtpw, rank, world, dev, embed_lo=e0)
         w.meta.update(layers=list(range(cfg.layers)), x3=x3_users, **meta)
     finally:
         rd.close()

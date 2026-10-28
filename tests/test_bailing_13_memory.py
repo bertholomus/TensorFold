@@ -1,6 +1,9 @@
 """bailing_v3.memory, the startup estimate: every State and Buffers byte the CPU-built engine pieces allocate on the
 tiny fake equals the estimate's, the EXL3 scratch rules equal the code they mirror, and Ling's own numbers
-(11,520 cache bytes a token with the MTP layer, the partials at 262K) come out of the real config.
+(11,520 cache bytes a token with the MTP layer, the partials at 262K) come out of the real config. The 262K levers:
+the shared call-local scratch (TF_LING_SHARED_SCRATCH) priced byte for byte as decode.Engine builds it, and the
+vocabulary-split embedding (TF_LING_EMBED_SPLIT): each rank's span, the rows forward.embed picks it by, the loader's
+rows and the startup estimate's.
 
 CPU only: forward.State and forward.Buffers build on the CPU from the fake checkpoint (the experts' EXL3 scratch is
 made on CUDA only, so it is held to exl3.experts.Scratch built directly).
@@ -202,3 +205,104 @@ def test_ling_estimate_is_below_glms_and_engine_uses_it():
     assert glm_slope > 2.5 * 11520                    # GLM's: 19 latent layers, an indexer, no rope key
     source = (SRC / "tensorfold" / "families" / "bailing_v3" / "cuda" / "engine.py").read_text()
     assert "memory.geometry(" in source and "mla_geometry(" not in source
+
+
+@pytest.mark.parametrize("fake,world,rank,mtp", CASES)
+def test_shared_scratch_is_priced_byte_for_byte(fakes, fake, world, rank, mtp, monkeypatch):
+    from tensorfold.families.bailing_v3.cuda import decode as Dm
+
+    w = _load(fakes[fake], world, rank, mtp)
+    r = memory.Rank.of(_text(fakes[fake]), world, rank, mtp=mtp)
+    users = [(int(u.lin.k), int(u.lin.n)) for u in w.meta["x3"]]
+    monkeypatch.setattr(memory, "SHARED", True)
+    for latent_mb in (1024, 1, 0):
+        monkeypatch.setattr(memory, "LATENT_MB", latent_mb)
+        for capacity in (256, 1100, 5000):
+            e = Dm.Engine(w, capacity=capacity, max_rows=8, prefill_rows=64, graphs=False)
+            bufs = [e.buf, e.pbuf] + ([e.mbuf] if e.mbuf is not None else [])
+            assert len(bufs) == (2 if r.mtp else 1) + 1
+            seen: set = set()
+            got = sum(nbytes(b, skip=("x3", "moe"), seen=seen) for b in bufs)
+            p = memory.parts(r, capacity, rows=8, prefill_rows=64, shared=True)
+            assert got == p["decode buffers"] + p["prompt buffers"] + p["chunk partials"], (latent_mb, capacity)
+            assert p["chunk partials"] == memory.partials(r, 64, capacity)
+            seen = set()
+            assert sum(nbytes(b.x3, skip=("prefill",), seen=seen) for b in bufs) == \
+                memory.x3_scratch(users, prefill=False)
+            for b in bufs:
+                assert b.lat_s.part_rows == memory.latent_rows(b.rows, r.heads, memory.chunks_for(capacity),
+                                                               r.kv_lora)
+                assert b.lat_s.po.data_ptr() == bufs[0].lat_s.po.data_ptr()
+                assert b.x3.xh.data_ptr() == bufs[0].x3.xh.data_ptr() and b.x3.z is bufs[0].x3.z
+
+
+def test_ling_shared_scratch_at_262k(monkeypatch):
+    monkeypatch.setattr(memory, "LATENT_MB", 270)              # 8 rows a call at 262K: the widest verify window
+    monkeypatch.setattr(memory, "UNPACK_CACHE_MB", 0)
+    r, slots = _ling(2), 262144 + 8
+    assert memory.latent_rows(8, 32, 513, 512) == memory.latent_rows(2048, 32, 513, 512) == 8
+    own = memory.parts(r, slots, shared=False)
+    sh = memory.parts(r, slots, shared=True)
+    assert own["chunk partials"] == 3 * sh["chunk partials"] == 3 * 513 * 8 * 32 * 514 * 4
+    assert own["EXL3 scratch"] - sh["EXL3 scratch"] == 2 * memory.x3_scratch(memory.x3_linears(r), prefill=False)
+    assert all(own[k] == sh[k] for k in ("latent cache", "KDA state", "decode buffers", "prompt buffers"))
+    saved = sum(own.values()) - sum(sh.values())
+    assert 0.65 * 2 ** 30 < saved < 0.67 * 2 ** 30           # 0.50 GiB of partials and 0.16 of EXL3 scratch a rank
+    # MTP off: two Buffers (decode, prompt) share; the decode window's partials and X3 core are the ones saved
+    r1 = _ling(2, mtp=False)
+    assert memory.parts(r1, slots, shared=False)["chunk partials"] == \
+        2 * memory.parts(r1, slots, shared=True)["chunk partials"]
+
+
+def test_embed_span_is_the_heads_and_embed_picks():
+    from tensorfold.families.bailing_v3.cuda.weights import embed_span
+    from tensorfold.families.glm_moe_dsa.cuda.weights import embed_owner
+
+    assert embed_span(157184, 2, 0, split=False) == (0, 157184)
+    assert embed_span(157184, 1, 0, split=True) == (0, 157184)
+    assert [embed_span(157184, 2, r, split=True) for r in (0, 1)] == [(0, 78592), (78592, 78592)]
+    assert [embed_span(157184, 4, r, split=True)[1] for r in range(4)] == [39296] * 4
+    assert _ling(2).vocab_rows == 78592 and _ling(4).vocab_rows == 39296   # the head's slice: the same span
+    g = torch.Generator().manual_seed(7)
+    for vocab, world in ((157184, 2), (157184, 4), (256, 2), (512, 4), (1000, 3), (130, 2), (300, 4)):
+        spans = [embed_span(vocab, world, r, split=True) for r in range(world)]
+        assert spans[0][0] == 0 and sum(n for _, n in spans) == vocab
+        assert all(spans[i][0] + spans[i][1] == spans[i + 1][0] for i in range(world - 1))
+        tokens = torch.randint(0, vocab, (500,), generator=g).tolist() + [0, vocab - 1]
+        for t in tokens:                                       # glue.embed_pick's owner holds the row
+            e0, en = spans[embed_owner(t, vocab, world)]
+            assert e0 <= t < e0 + en, (vocab, world, t)
+
+
+@pytest.mark.parametrize("fake,world", [("tiny", 2), ("tp4", 4)])
+def test_split_embedding_loads_the_span_and_prices_it(fakes, fake, world, monkeypatch):
+    from tensorfold.cuda.geometry import split_weights
+    from tensorfold.families.bailing_v3.cuda import weights as W
+    from tensorfold.families.glm5_next.cuda.split import rule, unit
+
+    for rank in range(world):
+        monkeypatch.setattr(W, "EMBED_SPLIT", False)
+        whole = _load(fakes[fake], world, rank)
+        monkeypatch.setattr(W, "EMBED_SPLIT", True)
+        w = _load(fakes[fake], world, rank)
+        vocab = whole.cfg.vocab
+        e0, en = W.embed_span(vocab, world, rank)
+        assert (w.embed_lo, w.embed.shape[0]) == (e0, en) and en < vocab
+        assert torch.equal(w.embed.view(torch.int16), whole.embed[e0:e0 + en].view(torch.int16))
+        assert whole.nbytes() - w.nbytes() == (vocab - en) * w.cfg.hidden * 2
+        base = split_weights(rule, world, unit=unit)
+        priced = W.embed_priced(base, vocab, world, rank)
+        info = {"dtype": "BF16", "shape": [vocab, w.cfg.hidden]}
+        name = "model.word_embeddings.weight"
+        assert priced(name, info) == base(name, {**info, "shape": [en, w.cfg.hidden]})
+        assert base(name, info)[0] > priced(name, info)[0]
+        other = {"dtype": "BF16", "shape": [w.cfg.hidden]}
+        assert priced("model.norm.weight", other) == base("model.norm.weight", other)
+
+
+def test_engine_checks_and_prices_both_switches():
+    source = (SRC / "tensorfold" / "families" / "bailing_v3" / "cuda" / "engine.py").read_text()
+    assert "int(EMBED_SPLIT), int(memory.SHARED)]" in source       # both ranks must agree
+    assert "embed_priced(weights_estimate" in source              # the admission prices the span
+    decode = (SRC / "tensorfold" / "families" / "bailing_v3" / "cuda" / "decode.py").read_text()
+    assert "Shared(w, max(max_rows, prefill_rows), capacity) if memory.SHARED" in decode

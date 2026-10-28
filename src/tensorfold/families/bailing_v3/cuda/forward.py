@@ -66,10 +66,27 @@ def _b16_part(w: Weights, rows: int) -> int:
     return max(need, default=1) * rows
 
 
-class Buffers:
-    """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks."""
+class Shared:
+    """The call-local scratch that the decode window's, the MTP head's and a prompt chunk's Buffers hold once
+    (TF_LING_SHARED_SCRATCH, memory.SHARED): one CUDA stream runs their calls one after another, and nothing in it
+    outlives a call. The latent attention's chunk partials, sized for the widest Buffers' rows (memory.latent_rows),
+    and the EXL3 linears' rotated inputs, K-split partials and staging (their sizes depend on the linears only)."""
 
-    def __init__(self, w: Weights, rows: int, capacity: int = 2560, *, prefill: bool = False) -> None:
+    def __init__(self, w: Weights, rows: int, capacity: int) -> None:
+        c = w.cfg
+        HL = share(c.heads, w.world, w.rank)
+        chunks = latent.chunks_for(capacity)
+        self.part_rows = _latent_rows(rows, HL, chunks, c.kv_lora)
+        self.lat = latent.partials(chunks * self.part_rows * HL, c.kv_lora, w.device)
+        self.x3 = X3Scratch(w.meta.get("x3", []), w.device, prefill=False)
+
+
+class Buffers:
+    """Scratch for windows of up to ``rows`` rows, sliced [:R] for smaller ones; ``prefill`` for prompt chunks;
+    ``shared``: the call-local scratch the engine's Buffers hold once (``Shared``)."""
+
+    def __init__(self, w: Weights, rows: int, capacity: int = 2560, *, prefill: bool = False,
+                 shared: Shared | None = None) -> None:
         c = w.cfg
         dev = w.device
         bf, f32 = torch.bfloat16, torch.float32
@@ -110,7 +127,8 @@ class Buffers:
         self.gb = torch.empty((rows, HL), dtype=bf, device=dev)      # the gate, rounded to bf16
         chunks = latent.chunks_for(capacity)
         self.lat_s = latent.LatentScratch(rows, HL, chunks, dev, lw=c.kv_lora,
-                                          part_rows=_latent_rows(rows, HL, chunks, c.kv_lora))
+                                          part_rows=_latent_rows(rows, HL, chunks, c.kv_lora),
+                                          parts=shared.lat if shared is not None else None)
         # dense MLP and shared-expert widths as loaded: the split moves EXL3 widths in whole 128-column blocks, so a
         # rank's width is not share(width, world) where the blocks do not divide (Ling's 1280 at TP4: 384 or 256)
         blocks = list(w.layers) + ([w.mtp.layer] if w.mtp is not None else [])
@@ -141,7 +159,8 @@ class Buffers:
         self.gath = torch.empty((w.world * rows * D,), dtype=f32, device=dev)
         self.sk = torch.empty((_b16_part(w, rows),), dtype=f32, device=dev)
         # EXL3 groups (attention, MLPs, MTP, head) share one scratch
-        self.x3 = X3Scratch(w.meta.get("x3", []), dev, prefill=prefill)
+        self.x3 = X3Scratch(w.meta.get("x3", []), dev, prefill=prefill,
+                            core=shared.x3 if shared is not None else None)
         self.side = None                     # (glm_moe_dsa's second stream: not used here)
         # final rows: model.norm's output feeds the head and the MTP layer
         self.fnormed = torch.empty((rows, D), dtype=bf, device=dev)
