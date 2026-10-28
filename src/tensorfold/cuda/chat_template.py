@@ -10,6 +10,27 @@ from tensorfold.server.messages import _normalize_tool_call_arguments, late_syst
 from tensorfold.server.request_options import effort_levels
 
 
+def _generation_tag():
+    """Hugging Face's ``{% generation %}`` block (it marks an assistant turn for training masks): rendered as its body,
+    as apply_chat_template renders it."""
+
+    import jinja2.ext
+    import jinja2.nodes
+
+    class Generation(jinja2.ext.Extension):
+        tags = {"generation"}
+
+        def parse(self, parser):
+            lineno = next(parser.stream).lineno
+            body = parser.parse_statements(("name:endgeneration",), drop_needle=True)
+            return jinja2.nodes.CallBlock(self.call_method("_body"), [], [], body).set_lineno(lineno)
+
+        def _body(self, caller):
+            return caller()
+
+    return Generation
+
+
 class ChatTemplate:
     """The model's own Jinja chat template, rendered the way Hugging Face's apply_chat_template does."""
 
@@ -29,7 +50,7 @@ class ChatTemplate:
             raise jinja2.exceptions.TemplateError(message)
 
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True,
-                                            extensions=[jinja2.ext.loopcontrols])
+                                            extensions=[jinja2.ext.loopcontrols, _generation_tag()])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         env.globals["strftime_now"] = lambda fmt: datetime.now().strftime(fmt)

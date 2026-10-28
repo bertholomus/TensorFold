@@ -529,6 +529,29 @@ __global__ void __launch_bounds__(W * 32) grouped_rows_kernel(
 // Every row keeps grouped_kernel's bits: the K range splits into SK x WK chains, each an mma chain from zero over the
 // same k tiles in the same order; the WK chains of a split are added in order; with FOLD the splits are added in order
 // from 0 (the gate/up epilogue's order: it then reads one split), without (SK 1) the split's sum is written as is.
+// A prompt program's (place u, member group mb, column block nb, matrix). With a work list, grid.x is the column block
+// and grid.y walks the used places' 64-row member groups (place << 16 | group), grid.z the matrices: no program starts
+// empty, and a group's column blocks run side by side (its member rows read once into L2 for all of them). Without,
+// grid.x is the member group up to the busiest place's, grid.y the column block, grid.z place + matrix (most programs
+// exit at once when a few experts take most rows). The programs that run, their rows and their arithmetic are the same
+// either way: the same bits.
+__device__ __forceinline__ bool work_item(const int* __restrict__ work, const int* __restrict__ ucount, int nexp,
+                                          int& u, int& mb, int& nb, int& mat) {
+    if (work != nullptr) {
+        const int it = work[blockIdx.y];
+        u = it >> 16;
+        mb = it & 0xffff;
+        nb = blockIdx.x;
+        mat = blockIdx.z;
+        return true;
+    }
+    u = blockIdx.z % nexp;
+    mb = blockIdx.x;
+    nb = blockIdx.y;
+    mat = blockIdx.z / nexp;
+    return u < ucount[0];
+}
+
 constexpr int MMA_ROWS = 64;        // member rows a program
 constexpr int MMA_COLS = 64;        // columns a program
 constexpr int MMA_KB = 4;           // k tiles a step (it divides every chain: 24 for GLM's gate/up, 8 for its down)
@@ -671,11 +694,10 @@ __global__ void __launch_bounds__(256) grouped_mma_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    float* __restrict__ Z, int K, int N, int P, int SK, int WK, int maxm, int slots, int nexp) {
-    const int u = blockIdx.z % nexp;
-    if (u >= ucount[0]) return;
-    const int mb = blockIdx.x;
-    const int mat = blockIdx.z / nexp;
+    float* __restrict__ Z, int K, int N, int P, int SK, int WK, int maxm, int slots, int nexp,
+    const int* __restrict__ work) {
+    int u, mb, nb, mat;
+    if (!work_item(work, ucount, nexp, u, mb, nb, mat)) return;
     const half* X = mat ? X1 : X0;
     const int e = uids[u];
     const uint32_t* T = reinterpret_cast<const uint32_t*>(mat ? TP1[e] : TP0[e]);
@@ -698,7 +720,7 @@ __global__ void __launch_bounds__(256) grouped_mma_kernel(
     const int rg = warp & 3, cg = warp >> 2;
     const int r0 = rows_sh[rg * 16 + g8], r1 = rows_sh[rg * 16 + g8 + 8];
     const bool live = rows_sh[rg * 16] >= 0;                  // the warp has rows (they are a prefix)
-    const int nt0 = blockIdx.y * (MMA_COLS / 16);
+    const int nt0 = nb * (MMA_COLS / 16);
 
     float tot[4][4];
 #pragma unroll
@@ -941,11 +963,15 @@ constexpr int M3_KB = 8;             // k tiles a block (the rotation's 128 colu
 constexpr int M3_LD = M3_KB * 16 + 8;           // halfs an A row (padded)
 
 // NW n16 tiles a warp (2: 256 columns a program, as grouped_mma2; 4: 512, gate's or up's whole width on a TP4 rank, so
-// a program rotates its rows once for all of them), S trellis word stages in flight
-template <int NW> __host__ __device__ constexpr int m3_stages() { return NW == 2 ? 3 : 2; }
-__host__ __device__ constexpr size_t m3_rows_bytes() { return (size_t)2 * M2_ROWS * M3_LD * sizeof(half); }
-template <int NW>
-__host__ __device__ constexpr size_t m3_words_bytes(int k2) { return (size_t)m3_stages<NW>() * M3_KB * 8 * NW * 4 * k2 * 4; }
+// a program rotates its rows once for all of them), MT 16-row member tiles a program (4: 64 rows; 8: 128, so each
+// decoded weight tile feeds twice the rows: the A buffers double, two word stages), S trellis word stages in flight
+template <int NW, int MT = 4> __host__ __device__ constexpr int m3_stages() { return NW == 2 && MT == 4 ? 3 : 2; }
+template <int MT = 4>
+__host__ __device__ constexpr size_t m3_rows_bytes() { return (size_t)2 * 16 * MT * M3_LD * sizeof(half); }
+template <int NW, int MT = 4>
+__host__ __device__ constexpr size_t m3_words_bytes(int k2) {
+    return (size_t)m3_stages<NW, MT>() * M3_KB * 8 * NW * 4 * k2 * 4;
+}
 
 // Walsh-Hadamard transform of 128 values, 4 a lane: experts.cu's fwht128 (the same butterflies in the same order).
 __device__ __forceinline__ void m3_fwht128(float (&v)[4], int lane) {
@@ -961,14 +987,15 @@ __device__ __forceinline__ void m3_fwht128(float (&v)[4], int lane) {
     }
 }
 
-// This warp's eight rows of k block kb: x values (4 bf16 a lane a row) and suh (4 fp16 a lane) into registers.
+// This warp's eight rows of k block kb in 64-row slab s: x values (4 bf16 a lane a row) and suh (4 fp16 a lane) into
+// registers.
 __device__ __forceinline__ void m3_fetch(const __nv_bfloat16* __restrict__ x, int x_stride, const half* __restrict__ suh,
                                         const int* tok_sh, int warp, int lane, int kb, int nrows,
-                                        uint2 (&xv)[8], uint2& sv) {
+                                        uint2 (&xv)[8], uint2& sv, int s = 0) {
     const int col = kb * 128 + 4 * lane;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const int r = 8 * warp + i;
+        const int r = 64 * s + 8 * warp + i;
         const int tr = r < nrows ? tok_sh[r] : -1;
         xv[i] = tr >= 0 ? *reinterpret_cast<const uint2*>(x + (size_t)tr * x_stride + col) : make_uint2(0u, 0u);
     }
@@ -976,14 +1003,15 @@ __device__ __forceinline__ void m3_fetch(const __nv_bfloat16* __restrict__ x, in
 }
 
 // Rotate the fetched values into A rows (fp16, rot_in's arithmetic): rows past the members are left as they are.
-__device__ __forceinline__ void m3_rotate(half* as, const uint2 (&xv)[8], uint2 sv, int warp, int lane, int nrows) {
+__device__ __forceinline__ void m3_rotate(half* as, const uint2 (&xv)[8], uint2 sv, int warp, int lane, int nrows,
+                                          int s = 0) {
     const __nv_bfloat162* s2 = reinterpret_cast<const __nv_bfloat162*>(&sv);
     const half2* h2 = reinterpret_cast<const half2*>(&sv);
     const float su[4] = {__low2float(h2[0]), __high2float(h2[0]), __low2float(h2[1]), __high2float(h2[1])};
     (void)s2;
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-        const int r = 8 * warp + i;
+        const int r = 64 * s + 8 * warp + i;
         if (r >= nrows) break;
         const __nv_bfloat162* x2 = reinterpret_cast<const __nv_bfloat162*>(&xv[i]);
         float v[4] = {__low2float(x2[0]) * su[0], __high2float(x2[0]) * su[1], __low2float(x2[1]) * su[2],
@@ -998,14 +1026,15 @@ __device__ __forceinline__ void m3_rotate(half* as, const uint2 (&xv)[8], uint2 
     }
 }
 
-template <int CB, int K2, int NW>
+template <int CB, int K2, int NW, int MT>
 __device__ __forceinline__ void m3_slice(const uint32_t* __restrict__ T, int NTILES, int KT, int nt0,
                                          const __nv_bfloat16* __restrict__ x, int x_stride,
                                          const half* __restrict__ suh, const int* tok_sh, int nrows, int live,
-                                         int warp, int lane, half* As, uint32_t* Ts, float (&acc)[4][2 * NW][4]) {
+                                         int warp, int lane, half* As, uint32_t* Ts, float (&acc)[MT][2 * NW][4]) {
     constexpr int TW = Fmt<K2>::TW;
     constexpr int TILES = 8 * NW;                             // n16 tiles a program
-    constexpr int M3_S = m3_stages<NW>();
+    constexpr int M3_S = m3_stages<NW, MT>();
+    constexpr int SL = MT / 4;                                // 64-row slabs: a warp rotates eight rows of each
     constexpr int TCH = TILES * TW / 4;                       // 16-byte chunks of a k tile's words for the program
     const LaneMap<K2> map(lane);
     const int NB = KT / M3_KB;
@@ -1019,10 +1048,15 @@ __device__ __forceinline__ void m3_slice(const uint32_t* __restrict__ T, int NTI
             cp_async16(ts + kk * TILES * TW + q * 4, tsrc + ((size_t)(kb * M3_KB + kk) * NTILES) * TW + q * 4, true);
         }
     };
-    uint2 xv[8], sv;
-    m3_fetch(x, x_stride, suh, tok_sh, warp, lane, 0, nrows, xv, sv);
-    m3_rotate(As, xv, sv, warp, lane, nrows);
-    if (NB > 1) m3_fetch(x, x_stride, suh, tok_sh, warp, lane, 1, nrows, xv, sv);
+    uint2 xv[SL][8], sv;
+#pragma unroll
+    for (int s = 0; s < SL; ++s) {
+        m3_fetch(x, x_stride, suh, tok_sh, warp, lane, 0, nrows, xv[s], sv, s);
+        m3_rotate(As, xv[s], sv, warp, lane, nrows, s);
+    }
+    if (NB > 1)
+#pragma unroll
+        for (int s = 0; s < SL; ++s) m3_fetch(x, x_stride, suh, tok_sh, warp, lane, 1, nrows, xv[s], sv, s);
 #pragma unroll
     for (int st = 0; st < M3_S - 1; ++st) {
         if (st < NB) load_words(st);
@@ -1035,18 +1069,22 @@ __device__ __forceinline__ void m3_slice(const uint32_t* __restrict__ T, int NTI
         cp_async_commit();
         // block kb + 1's A rows into the other buffer, block kb + 2's values fetched (all rows at once: rotating a row
         // between each k tile's mma measured slower, 5.6 against 5.3 ms a 2,048-row layer)
-        if (kb + 1 < NB) {
-            m3_rotate(As + (size_t)((kb + 1) & 1) * M2_ROWS * M3_LD, xv, sv, warp, lane, nrows);
-            if (kb + 2 < NB) m3_fetch(x, x_stride, suh, tok_sh, warp, lane, kb + 2, nrows, xv, sv);
+        if (kb + 1 < NB) {                  // (every slab rotated with block kb + 1's suh before kb + 2's comes in)
+#pragma unroll
+            for (int s = 0; s < SL; ++s)
+                m3_rotate(As + (size_t)((kb + 1) & 1) * 16 * MT * M3_LD, xv[s], sv, warp, lane, nrows, s);
+            if (kb + 2 < NB)
+#pragma unroll
+                for (int s = 0; s < SL; ++s) m3_fetch(x, x_stride, suh, tok_sh, warp, lane, kb + 2, nrows, xv[s], sv, s);
         }
-        const half* as = As + (size_t)(kb & 1) * M2_ROWS * M3_LD;
+        const half* as = As + (size_t)(kb & 1) * 16 * MT * M3_LD;
         const uint32_t* ts = Ts + (size_t)(kb % M3_S) * M3_KB * TILES * TW + (size_t)(NW * warp) * TW;
 #pragma unroll
         for (int kk = 0; kk < M3_KB; ++kk) {
             uint32_t b[NW][4];
             m2_decode<CB, K2, NW>(ts + kk * TILES * TW, TW, map, lane, b);
 #pragma unroll
-            for (int i = 0; i < 4; ++i) {
+            for (int i = 0; i < MT; ++i) {
                 if (i < live) {
                     uint32_t a[4];
                     ldmatrix_x4(a, as + (size_t)(16 * i + lrow) * M3_LD + kk * 16 + lcol);
@@ -1063,21 +1101,20 @@ __device__ __forceinline__ void m3_slice(const uint32_t* __restrict__ T, int NTI
     cp_async_wait<0>();
 }
 
-template <int CB, int LO, int HI, int NW>
+template <int CB, int LO, int HI, int NW, int MT>
 __global__ void __launch_bounds__(256, 1) grouped_mma3_kernel(
     const __nv_bfloat16* __restrict__ x, int x_stride, const half* __restrict__ suh0, const half* __restrict__ suh1,
     const int64_t* __restrict__ TP0, const int64_t* __restrict__ TP1, const int* __restrict__ K2_0,
     const int* __restrict__ K2_1, const int* __restrict__ uids, const int* __restrict__ ucount,
-    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int maxm, int slots, int nexp) {
-    const int u = blockIdx.z % nexp;
-    if (u >= ucount[0]) return;
-    const int mb = blockIdx.x;
-    const int mat = blockIdx.z / nexp;
+    const int* __restrict__ members, float* __restrict__ Z, int K, int N, int P, int maxm, int slots, int nexp,
+    const int* __restrict__ work) {
+    int u, mb, nb, mat;
+    if (!work_item(work, ucount, nexp, u, mb, nb, mat)) return;
     extern __shared__ __align__(16) unsigned char m2_smem[];
-    __shared__ int rows_sh[M2_ROWS], tok_sh[M2_ROWS];
+    __shared__ int rows_sh[16 * MT], tok_sh[16 * MT];
     __shared__ int n_sh;
-    if (threadIdx.x < M2_ROWS) {
-        const int m = mb * M2_ROWS + threadIdx.x;
+    if (threadIdx.x < 16 * MT) {
+        const int m = mb * 16 * MT + threadIdx.x;
         const int code = m < maxm ? members[u * maxm + m] : -1;
         rows_sh[threadIdx.x] = code >= 0 ? (code >> 5) * slots + (code & 31) : -1;
         tok_sh[threadIdx.x] = code >= 0 ? (code >> 5) : -1;
@@ -1086,7 +1123,7 @@ __global__ void __launch_bounds__(256, 1) grouped_mma3_kernel(
     if (rows_sh[0] < 0) return;                               // members come first, so this block is empty
     if (threadIdx.x == 0) {
         int n = 0;
-        while (n < M2_ROWS && rows_sh[n] >= 0) ++n;
+        while (n < 16 * MT && rows_sh[n] >= 0) ++n;
         n_sh = n;
     }
     __syncthreads();
@@ -1097,13 +1134,13 @@ __global__ void __launch_bounds__(256, 1) grouped_mma3_kernel(
     const int k2 = mat ? K2_1[e] : K2_0[e];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g8 = lane >> 2, t = lane & 3;
-    const int nt0 = blockIdx.y * 8 * NW;
+    const int nt0 = nb * 8 * NW;
     half* As = reinterpret_cast<half*>(m2_smem);
-    uint32_t* Ts = reinterpret_cast<uint32_t*>(m2_smem + m3_rows_bytes());
+    uint32_t* Ts = reinterpret_cast<uint32_t*>(m2_smem + m3_rows_bytes<MT>());
 
-    float acc[4][2 * NW][4];
+    float acc[MT][2 * NW][4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i)
+    for (int i = 0; i < MT; ++i)
 #pragma unroll
         for (int q = 0; q < 2 * NW; ++q)
 #pragma unroll
@@ -1113,7 +1150,8 @@ __global__ void __launch_bounds__(256, 1) grouped_mma3_kernel(
 #define TF_EXL3X_CASE(K2_)                                                                                      \
     case K2_:                                                                                                   \
         if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            m3_slice<CB, K2_, NW>(T, N >> 4, K >> 4, nt0, x, x_stride, suh, tok_sh, nrows, live, warp, lane, As,   \
+            m3_slice<CB, K2_, NW, MT>(T, N >> 4, K >> 4, nt0, x, x_stride, suh, tok_sh, nrows, live, warp, lane, \
+                                      As,                                                                       \
                                   Ts, acc);                                                             \
         else                                                                                                    \
             __trap();                                                                                           \
@@ -1138,7 +1176,7 @@ __global__ void __launch_bounds__(256, 1) grouped_mma3_kernel(
             __trap();
     }
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < MT; ++i) {
         if (i >= live) break;
         const int pa = rows_sh[16 * i + g8], pb = rows_sh[16 * i + g8 + 8];
 #pragma unroll
@@ -1174,10 +1212,10 @@ __global__ void __launch_bounds__(256, MINB) grouped_down3_kernel(
     const half* __restrict__ Xd, const int64_t* __restrict__ TP, const int* __restrict__ K2s,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
     const half* __restrict__ svh, const float* __restrict__ wts, __nv_bfloat16* __restrict__ Y, int K, int N, int P,
-    int maxm, int slots, int nexp) {
-    const int u = blockIdx.z;
-    if (u >= ucount[0]) return;
-    const int mb = blockIdx.x;
+    int maxm, int slots, int nexp, const int* __restrict__ work) {
+    int u, mb, nb, mat;                                       // one matrix: mat is 0
+    if (!work_item(work, ucount, nexp, u, mb, nb, mat)) return;
+    (void)mat;
     extern __shared__ __align__(16) unsigned char m2_smem[];
     __shared__ int rows_sh[M2_ROWS];
     __shared__ int n_sh;
@@ -1200,7 +1238,7 @@ __global__ void __launch_bounds__(256, MINB) grouped_down3_kernel(
     const int k2 = K2s[e];
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int g8 = lane >> 2, t = lane & 3;
-    const int nt0 = blockIdx.y * M2_TILES;
+    const int nt0 = nb * M2_TILES;
     half* As = reinterpret_cast<half*>(m2_smem);
     uint32_t* Ts = reinterpret_cast<uint32_t*>(m2_smem + m2_rows_bytes<S, 4>());
 
@@ -1317,9 +1355,12 @@ struct GroupedArgs {
     int nexp_max;        // grid.x (upper bound of distinct experts)
     int mats, nt, warps, pf, lo, hi;
     int g = 1;           // grouped_rows: member tiles a program
+    int mt = 4;          // grouped_mma3: 16-row member tiles a program (4 or 8)
     int fold = 0;        // grouped_rows / grouped_mma: one program runs every split (writes their sum: Z [mats, 1, P, N])
     int order = 0;       // grouped: 1 launches its blocks expert-major (grouped_kernel)
     int stages = 0;      // grouped: > 0 streams each warp's weights through that many shared-memory stages
+    const int* work = nullptr;   // grouped_mma / mma3 / down3: the work list (work_item), nwork entries; null: the grid
+    int nwork = 0;
 };
 
 template <int CB>
@@ -1353,11 +1394,13 @@ void grouped_rows_launch(const GroupedArgs& a, cudaStream_t stream) {
 template <int CB>
 void grouped_mma_launch(const GroupedArgs& a, cudaStream_t stream) {
     const int MB = (a.maxm + MMA_ROWS - 1) / MMA_ROWS;
-    dim3 grid((unsigned)MB, (unsigned)(a.N / MMA_COLS), (unsigned)(a.nexp_max * a.mats));
+    if (a.work != nullptr && a.nwork == 0) return;
+    dim3 grid = a.work ? dim3((unsigned)(a.N / MMA_COLS), (unsigned)a.nwork, (unsigned)a.mats)
+                       : dim3((unsigned)MB, (unsigned)(a.N / MMA_COLS), (unsigned)(a.nexp_max * a.mats));
 #define TF_LAUNCH_F(LO_, HI_, F_)                                                                               \
     grouped_mma_kernel<CB, LO_, HI_, F_><<<grid, 256, 0, stream>>>(                                             \
         a.x0, a.x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, a.z, a.K, a.N, a.P, a.SK,        \
-        a.warps, a.maxm, a.slots, a.nexp_max)
+        a.warps, a.maxm, a.slots, a.nexp_max, a.work)
 #define TF_LAUNCH(LO_, HI_)                                                                                     \
     do {                                                                                                        \
         if (a.fold) TF_LAUNCH_F(LO_, HI_, true);                                                                \
@@ -1405,23 +1448,29 @@ struct Mma3Args {
 
 // grouped_mma3_kernel: gate and up (mats 2) from the layer input; Z [2, P, N]. a.g: 4 = 512 columns a program (one
 // rotation of the rows for all of a mat's columns at GLM-5.3's TP4 width), 2 = 256 (grouped_mma2's tiles)
-template <int CB, int NW, int LO, int HI>
+template <int CB, int NW, int LO, int HI, int MT = 4>
 void m3_launch_one(const GroupedArgs& a, const Mma3Args& m, cudaStream_t stream) {
-    const int MB = (a.maxm + M2_ROWS - 1) / M2_ROWS;
-    dim3 grid((unsigned)MB, (unsigned)(a.N / (128 * NW)), (unsigned)(a.nexp_max * a.mats));
-    const size_t smem = m3_rows_bytes() + m3_words_bytes<NW>(HI);
-    auto fn = grouped_mma3_kernel<CB, LO, HI, NW>;
+    const int MB = (a.maxm + 16 * MT - 1) / (16 * MT);
+    if (a.work != nullptr && a.nwork == 0) return;
+    dim3 grid = a.work ? dim3((unsigned)(a.N / (128 * NW)), (unsigned)a.nwork, (unsigned)a.mats)
+                       : dim3((unsigned)MB, (unsigned)(a.N / (128 * NW)), (unsigned)(a.nexp_max * a.mats));
+    const size_t smem = m3_rows_bytes<MT>() + m3_words_bytes<NW, MT>(HI);
+    auto fn = grouped_mma3_kernel<CB, LO, HI, NW, MT>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     fn<<<grid, 256, smem, stream>>>(m.x, m.x_stride, m.suh0, m.suh1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount,
-                                    a.members, a.z, a.K, a.N, a.P, a.maxm, a.slots, a.nexp_max);
+                                    a.members, a.z, a.K, a.N, a.P, a.maxm, a.slots, a.nexp_max, a.work);
 }
 
 template <int CB>
 void grouped_mma3_launch(const GroupedArgs& a, const Mma3Args& m, cudaStream_t stream) {
     TORCH_CHECK(a.N % M2_COLS == 0 && a.K % 128 == 0, "prompt mma3: N a multiple of ", M2_COLS, " and K of 128");
     const bool wide = a.g == 4 && a.N % 512 == 0;
+    // 128 member rows a program (a.mt 8): 256 columns, 3-bit weights (94 KB of shared memory)
+    TORCH_CHECK(a.mt == 4 || (a.mt == 8 && !wide && a.lo == 6 && a.hi == 6),
+                "prompt mma3: 128-row programs take 256 columns and 3-bit weights");
     if (a.lo == 6 && a.hi == 6) {
         if (wide) m3_launch_one<CB, 4, 6, 6>(a, m, stream);
+        else if (a.mt == 8) m3_launch_one<CB, 2, 6, 6, 8>(a, m, stream);
         else m3_launch_one<CB, 2, 6, 6>(a, m, stream);
     } else if (a.lo == 8 && a.hi == 8) {
         if (wide) m3_launch_one<CB, 4, 8, 8>(a, m, stream);
@@ -1438,14 +1487,16 @@ void grouped_down3_launch(const GroupedArgs& a, const half* svh, const float* wt
                           cudaStream_t stream) {
     TORCH_CHECK(a.N % M2_COLS == 0 && a.K % 64 == 0, "prompt down3: N a multiple of ", M2_COLS, " and K of 64");
     const int MB = (a.maxm + M2_ROWS - 1) / M2_ROWS;
-    dim3 grid((unsigned)MB, (unsigned)(a.N / M2_COLS), (unsigned)a.nexp_max);
+    if (a.work != nullptr && a.nwork == 0) return;
+    dim3 grid = a.work ? dim3((unsigned)(a.N / M2_COLS), (unsigned)a.nwork, 1u)
+                       : dim3((unsigned)MB, (unsigned)(a.N / M2_COLS), (unsigned)a.nexp_max);
 #define TF_LAUNCH_C(LO_, HI_, S_, B_, H_)                                                                        \
     do {                                                                                                        \
         const size_t smem = m3d_smem_bytes<S_, H_>(HI_);                                                        \
         auto fn = grouped_down3_kernel<CB, LO_, HI_, S_, B_, H_>;                                               \
         C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));       \
         fn<<<grid, 256, smem, stream>>>(a.x0, a.tp0, a.k2_0, a.uids, a.ucount, a.members, svh, wts, Y, a.K, a.N, \
-                                        a.P, a.maxm, a.slots, a.nexp_max);                                      \
+                                        a.P, a.maxm, a.slots, a.nexp_max, a.work);                              \
     } while (0)
 #define TF_LAUNCH(LO_, HI_) TF_LAUNCH_C(LO_, HI_, 3, 2, true)
     if (a.lo == 6 && a.hi == 6) TF_LAUNCH(6, 6);

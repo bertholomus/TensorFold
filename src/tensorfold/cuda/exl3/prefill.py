@@ -188,13 +188,15 @@ class UnpackCache:
 
 class Workspace:
     """One decoded W_q and one rotated input, grown to the largest call and reused (calls run in order on one stream).
-    ``cache``: an UnpackCache shared with other workspaces on the same stream (decoded weights reused across calls)."""
+    ``cache``: an UnpackCache shared with other workspaces on the same stream (decoded weights reused across calls).
+    ``keep``: an UnpackCache for the rotated path's decoded W_q (raw unpacks), which otherwise decodes every call."""
 
-    def __init__(self, cache: "UnpackCache | None" = None) -> None:
+    def __init__(self, cache: "UnpackCache | None" = None, keep: "UnpackCache | None" = None) -> None:
         self.w: torch.Tensor | None = None
         self.xh: torch.Tensor | None = None
         self.h: torch.Tensor | None = None
         self.cache = cache
+        self.keep = keep
 
     def _grow(self, name: str, numel: int, device) -> torch.Tensor:
         t = getattr(self, name)
@@ -268,8 +270,16 @@ def matmul(layer: Exl3Linear, x: torch.Tensor, out: torch.Tensor, ws: Workspace,
         return out
     xh = ws._grow("xh", m * k, x.device)[:m * k].view(m, k)
     ext.rot_in(x.contiguous(), layer.suh, xh)
-    wq = ws._grow("w", k * n, x.device)[:k * n].view(k, n)
-    ext.unpack(layer.words, wq, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
+    if ws.keep is not None:
+        # the decoded W_q kept for the layer's next calls (a chunk's row pieces): the same unpack, so the same bits
+        def _unpack() -> torch.Tensor:
+            t = torch.empty((k, n), dtype=torch.float16, device=x.device)
+            ext.unpack(layer.words, t, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
+            return t
+        wq = ws.keep.get(layer, x.device, "0", _unpack)
+    else:
+        wq = ws._grow("w", k * n, x.device)[:k * n].view(k, n)
+        ext.unpack(layer.words, wq, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
     bm, bk, warps, stages, group = tiles(k, n, by_shape)
     bias = layer.bias if layer.bias is not None else layer.svh
     _gemm[(triton.cdiv(m, bm) * (n // BN),)](xh, wq, ws.hadamard(x.device), layer.svh, bias, out, m, out.stride(0),

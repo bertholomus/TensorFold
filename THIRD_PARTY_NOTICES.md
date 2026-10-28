@@ -144,6 +144,14 @@ parts of that file in torch as references: the grouped top-k router, the KDA rec
 `tests/fixtures/ling31/` holds the checkpoint's `chat_template.jinja` and `config.json`, part of its
 `tokenizer_config.json` (the model card states MIT), and chat turns rendered with that template.
 
+## Beam-1.0
+
+The `beam` family implements the model math of Reflection's
+[Beam-1.0-501B-A23B](https://huggingface.co/reflection/Beam-1.0-501B-A23B) and of its DFlash2 drafter
+([Beam-1.0-501B-A23B-DFlash2](https://huggingface.co/reflection/Beam-1.0-501B-A23B-DFlash2)), following Reflection's
+Beam implementation for vLLM and the checkpoints' `config.json` files, Apache License 2.0, Copyright Reflection. Its
+tool-call parsing follows the checkpoint's `chat_template.jinja`.
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from
@@ -156,6 +164,7 @@ The MTP layer TensorFold drafts with comes from that checkpoint's last shard (MI
 `families/deepseek_v4/convert.py`.
 
 TensorFold ships no model weights. The `z-lab/Qwen3.8-27B-DFlash2` model card states Apache-2.0.
+Reflection's Beam-1.0-501B-A23B and Beam-1.0-501B-A23B-DFlash2 are Apache License 2.0.
 The optional `incoai/GLM-5.3-Flash-DFlash2` model card states CC BY-NC-ND 4.0, for non-commercial use
 without derivatives. Each checkpoint keeps its own license.
 

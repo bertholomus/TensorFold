@@ -444,10 +444,7 @@ class App:
             raw = stream.final() if finished else stream.text
             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
-            if chat and thinking:
-                reasoning, answer = split_thinking(raw, finished=finished)
-            else:
-                reasoning, answer = "", raw
+            reasoning, answer = self.split_reply(raw, chat=chat, thinking=thinking, finished=finished)
             answer_raw[0] = answer
             if tools:
                 answer = (policy.content(answer, finished=finished) if policy.single
@@ -574,7 +571,7 @@ class App:
             final["reasoning_content"] = reasoning[sent["reasoning"]:]
         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
         text = stops.visible(raw_text)
-        raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
+        raw_answer = self.split_reply(text, chat=chat, thinking=thinking, finished=True)[1]
         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
         content = policy.content(content) if tools else content
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
@@ -597,6 +594,14 @@ class App:
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
                 "stats": stats, "calls_streamed": streamed}
+
+    def split_reply(self, raw: str, *, chat: bool, thinking: bool, finished: bool) -> tuple[str, str]:
+        """(reasoning, answer) of a reply's text so far: a thinking chat's think block split off (a family whose
+        replies mark their parts another way splits them here; tool-call markup stays in the answer)."""
+
+        if chat and thinking:
+            return split_thinking(raw, finished=finished)
+        return "", raw
 
     def _turns(self) -> Turns:
         """The engine's turns (one request at a time, background ones last), made on first use."""

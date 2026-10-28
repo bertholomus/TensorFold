@@ -73,6 +73,8 @@ class NCCL:
         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
                                       ctypes.c_void_p]
+        lib.ncclReduceScatter.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_void_p, ctypes.c_void_p]
         for name in ("ncclSend", "ncclRecv"):
             getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
                                            ctypes.c_void_p, ctypes.c_void_p]
@@ -111,6 +113,17 @@ class NCCL:
             return
         self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
                                            self.comm, stream))
+
+    def reduce_scatter(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+        """recv [n] <- the sum over the ranks of block ``rank`` of their send [world * n] (contiguous tensors, same dtype;
+        recv may be this rank's own block of send: in place). NCCL adds in its ring's order: with two ranks that is
+        one add of a pair, the same bits either way."""
+
+        if send.numel() != recv.numel() * self.world or send.dtype != recv.dtype:
+            raise ValueError("reduce_scatter: send must hold world x recv of the same dtype")
+        stream = torch.cuda.current_stream().cuda_stream
+        self._check(self.lib.ncclReduceScatter(send.data_ptr(), recv.data_ptr(), recv.numel(), _DTYPES[send.dtype],
+                                               0, self.comm, stream))     # 0: ncclSum
 
     def grouped(self, sends, recvs) -> None:
         """One NCCL group of point-to-point transfers on the current stream: each (tensor, peer) of ``sends`` to that

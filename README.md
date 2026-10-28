@@ -1,9 +1,11 @@
 # TensorFold
 
 > **This is a fork of [ashhart/TensorFold](https://github.com/ashhart/TensorFold).** TensorFold is ashhart's engine.
-> Branch `ling-3.1-tp2` adds the `bailing_v3` family (inclusionAI's Ling-3.1-flash) on CUDA tensor-parallel ranks, by
-> [bertholomus](https://github.com/bertholomus), on top of branch `glm-dsa-tp4`'s `glm_moe_dsa` family (full GLM-5.3,
-> non-Flash). Deployment recipes and measurements: for Ling-3.1-flash,
+> Branch `beam-1.0-tp2` adds the `beam` family (Reflection's Beam-1.0-501B-A23B, drafted by its DFlash2 model) on CUDA
+> tensor-parallel ranks, by [bertholomus](https://github.com/bertholomus), on top of branch `ling-3.1-tp2`'s
+> `bailing_v3` family (inclusionAI's Ling-3.1-flash) and branch `glm-dsa-tp4`'s `glm_moe_dsa` family (full GLM-5.3,
+> non-Flash). Deployment recipes and measurements: for Beam-1.0,
+> [bertholomus/beam-1.0-2x-dgx-spark](https://github.com/bertholomus/beam-1.0-2x-dgx-spark); for Ling-3.1-flash,
 > [bertholomus/ling-3.1-tensorfold-tp2-2xgb10](https://github.com/bertholomus/ling-3.1-tensorfold-tp2-2xgb10); for
 > GLM-5.3, [bertholomus/glm-5.3-tensorfold-tp4-4xgb10](https://github.com/bertholomus/glm-5.3-tensorfold-tp4-4xgb10).
 

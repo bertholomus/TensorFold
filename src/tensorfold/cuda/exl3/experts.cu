@@ -516,11 +516,21 @@ void exl3x_grouped_rows_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
+// the work list of a prompt launch (work_item): int32 entries on the device, or none (an undefined or empty
+// tensor: the grid)
+static void set_work(tf_exl3x::GroupedArgs& a, const at::Tensor& work) {
+    if (!work.defined() || work.numel() == 0) return;
+    TORCH_CHECK(work.is_cuda() && work.scalar_type() == at::kInt && work.is_contiguous(),
+                "work: CUDA int32, contiguous");
+    a.work = work.data_ptr<int>();
+    a.nwork = (int)work.numel();
+}
+
 void exl3x_grouped_mma_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
                             const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids,
                             const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z, int64_t mats,
                             int64_t K, int64_t N, int64_t P, int64_t SK, int64_t slots, int64_t cb, int64_t warps,
-                            int64_t lo, int64_t hi, int64_t fold) {
+                            int64_t lo, int64_t hi, int64_t fold, const at::Tensor& work) {
     TORCH_CHECK(K % (16 * SK * warps) == 0 && N % tf_exl3x::MMA_COLS == 0, "K and N must split evenly");
     TORCH_CHECK(fold || SK == 1, "an unfolded prompt mma launch writes one split");
     TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
@@ -540,6 +550,7 @@ void exl3x_grouped_mma_cuda(const at::Tensor& X0, const at::Tensor& X1, const at
     a.mats = (int)mats; a.nt = tf_exl3x::MMA_COLS / 16; a.warps = (int)warps; a.pf = tf_exl3x::MMA_KB;
     a.lo = (int)lo; a.hi = (int)hi;
     a.fold = (int)fold;
+    set_work(a, work);
     auto stream = at::cuda::getCurrentCUDAStream();
     if (cb == 0) tf_exl3x::grouped_mma_launch<0>(a, stream);
     else if (cb == 1) tf_exl3x::grouped_mma_launch<1>(a, stream);
@@ -586,7 +597,7 @@ void exl3x_grouped_mma3_cuda(const at::Tensor& x, int64_t x_stride, const at::Te
                              const at::Tensor& TP0, const at::Tensor& TP1, const at::Tensor& B0, const at::Tensor& B1,
                              const at::Tensor& uids, const at::Tensor& ucount, const at::Tensor& members,
                              at::Tensor& Z, int64_t K, int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo,
-                             int64_t hi, int64_t nw) {
+                             int64_t hi, int64_t nw, int64_t mt, const at::Tensor& work) {
     TORCH_CHECK(x.scalar_type() == at::kBFloat16, "prompt mma3: bf16 rows");
     TORCH_CHECK(x_stride % 4 == 0, "prompt mma3: a row stride of whole 8-byte words");
     tf_exl3x::GroupedArgs a;
@@ -603,7 +614,8 @@ void exl3x_grouped_mma3_cuda(const at::Tensor& x, int64_t x_stride, const at::Te
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = 1; a.maxm = (int)members.size(1); a.slots = (int)slots;
     a.nexp_max = (int)uids.size(0);
     a.mats = 2; a.nt = tf_exl3x::M2_TILES; a.warps = 8; a.pf = 0;
-    a.lo = (int)lo; a.hi = (int)hi; a.g = (int)nw;
+    a.lo = (int)lo; a.hi = (int)hi; a.g = (int)nw; a.mt = (int)mt;
+    set_work(a, work);
     tf_exl3x::Mma3Args m;
     m.x = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
     m.x_stride = (int)x_stride;
@@ -620,7 +632,7 @@ void exl3x_grouped_mma3_cuda(const at::Tensor& x, int64_t x_stride, const at::Te
 void exl3x_grouped_down3_cuda(const at::Tensor& Xd, const at::Tensor& TP, const at::Tensor& B, const at::Tensor& uids,
                               const at::Tensor& ucount, const at::Tensor& members, const at::Tensor& svh,
                               const at::Tensor& wts, at::Tensor& Y, int64_t K, int64_t N, int64_t P, int64_t slots,
-                              int64_t cb, int64_t lo, int64_t hi) {
+                              int64_t cb, int64_t lo, int64_t hi, const at::Tensor& work) {
     TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
     tf_exl3x::GroupedArgs a;
     a.x0 = reinterpret_cast<const half*>(Xd.data_ptr());
@@ -637,6 +649,7 @@ void exl3x_grouped_down3_cuda(const at::Tensor& Xd, const at::Tensor& TP, const 
     a.nexp_max = (int)uids.size(0);
     a.mats = 1; a.nt = tf_exl3x::M2_TILES; a.warps = 8; a.pf = 0;
     a.lo = (int)lo; a.hi = (int)hi;
+    set_work(a, work);
     auto stream = at::cuda::getCurrentCUDAStream();
     auto sv = reinterpret_cast<const half*>(svh.data_ptr());
     auto y = reinterpret_cast<__nv_bfloat16*>(Y.data_ptr());

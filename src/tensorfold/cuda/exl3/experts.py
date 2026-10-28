@@ -40,6 +40,9 @@ MMA_KB = 4                        # experts_grouped.cuh's MMA_KB
 # grouped_mma3's gate/up columns a program: 4 (512, a TP4 rank's whole width: the rows rotated once a mat; 5.3 against
 # 6.1 ms a 2,048-row layer at 2) or 2 (256)
 MMA3_NW = int(os.environ.get("TF_EXL3_MMA3_NW") or 4)
+# grouped_mma3's member rows a program: 64, or 128 (TF_EXL3_MMA3_ROWS=128: each decoded weight tile feeds twice the rows,
+# for 256-column programs and 3-bit gate/up weights; the same chains, so the same bits; its own work list)
+MMA3_ROWS = int(os.environ.get("TF_EXL3_MMA3_ROWS") or 64)
 # decode windows (the one-tile path, ``grouped``): the programs launch expert-major (an expert's column blocks of one K
 # range side by side, the grid's unused experts last; TF_EXL3_GROUPED_ORDER=0: expert-minor, as before), and the picks
 # group with group2 (group's outputs, entry for entry, from a shared-memory count: 33 -> 9 us at 16 rows on GB10;
@@ -56,6 +59,24 @@ GROUPED_STAGES = int(os.environ.get("TF_EXL3_GROUPED_STAGES") or 6)
 # adds w * 0, which is what its never-written zero in y gave (the same bits); 1 MB of fp32 writes a layer a 4-row
 # window, 3.5 MB at 16 rows (TF_EXL3_DECODE_Y=1: written anyway, as before)
 DECODE_Y = os.environ.get("TF_EXL3_DECODE_Y", "0") != "0"
+# prompt chunks' mma / mma3 / down3 launches walk a work list of the used experts' 64-row member groups
+# (TF_EXL3_GROUP_LIST=0: the grid of every expert place x the busiest expert's groups x columns, whose programs past an
+# expert's members exit at once: ~95 % of them when a few experts take most rows, as in word-soup prompts). The same
+# programs run on the same rows with the same arithmetic: the same bits (tools/beam_worklist_check.py).
+GROUP_LIST = os.environ.get("TF_EXL3_GROUP_LIST", "1") != "0"
+LIST_ROWS = 64                    # the list's member groups: grouped_mma's MMA_ROWS, grouped_mma2/3's M2_ROWS
+
+
+def work_list(counts: torch.Tensor, groups: torch.Tensor, n: int) -> torch.Tensor:
+    """The prompt launches' work list, int32 [n]: place << 16 | member group for each used expert's member groups (64
+    rows; mma3's gate/up: MMA3_ROWS) in expert order (``groups``: an expert's groups; places as group_place gives them:
+    the used experts before it)."""
+
+    dev = counts.device
+    e = torch.repeat_interleave(torch.arange(counts.shape[0], device=dev), groups.long(), output_size=n)
+    first = torch.cumsum(groups, 0) - groups
+    place = torch.cumsum((counts > 0).int(), 0) - 1
+    return ((place[e] << 16) | (torch.arange(n, device=dev) - first[e])).to(torch.int32)
 
 
 @lru_cache(maxsize=1)
@@ -64,7 +85,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v21", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v24", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -264,14 +285,26 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     chunk = group and R >= (EXACT_ROWS if exact_rows is None else exact_rows)
     fast = chunk and (PROMPT if prompt is None else prompt) and all(
         n % (16 * t[0]) == 0 for n, t in ((I, PROMPT_TILES["gateup"]), (D, PROMPT_TILES["down"])))
+    work = None
     if fast:
         # a prompt chunk: experts' member counts on the device, the busiest one read back once to size the member
-        # groups, then each used expert lists its members (the grouping of any number of rows, in parallel)
+        # groups (with GROUP_LIST the work list's length in the same read), then each used expert lists its members
+        # (the grouping of any number of rows, in parallel)
         ext.group_count(pick, s.counts, R, slots, E)
-        busiest = int(s.counts.max())
+        rows3 = MMA3_ROWS if (PROMPT_KERNEL if kernel is None else kernel) == "mma3" else LIST_ROWS
+        if GROUP_LIST:
+            groups = (s.counts + (LIST_ROWS - 1)) // LIST_ROWS
+            groups3 = groups if rows3 == LIST_ROWS else (s.counts + (rows3 - 1)) // rows3
+            busiest, nwork, nwork3 = (int(v) for v in torch.stack([s.counts.max().long(), groups.sum(),
+                                                                   groups3.sum()]).tolist())
+        else:
+            busiest = int(s.counts.max())
         tile = 16 * max(PROMPT_TILES["gateup"][2], PROMPT_TILES["down"][2])
         members = s.members_buf[:ids.shape[0] * max(tile, -(-busiest // tile) * tile)].view(ids.shape[0], -1)
         ext.group_place(pick, s.counts, ids, s.count, members, R, slots, E)
+        if GROUP_LIST:
+            work = work_list(s.counts, groups, nwork)
+            work3 = work if rows3 == LIST_ROWS else work_list(s.counts, groups3, nwork3)
     elif chunk:
         # a prompt chunk: member tiles for the busiest expert's rows only (one host read). Sized for R rows, the grouped
         # grids launched an expert's 16-row tiles for every row (2.6M mostly empty blocks a layer at 2,048 rows).
@@ -297,15 +330,29 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     nt, w, sk, pf = s.cfg_gu
     mma = not mma2 and fast and kern in ("mma", "mma2", "mma3") and I % 64 == 0 and D % 64 == 0 and all(
         (k // 16) % (cfg[1] * cfg[2] * MMA_KB) == 0 for k, cfg in ((D, s.cfg_gu), (I, s.cfg_d)))
-    if mma3:
+    down3 = mma3 and wts is not None and ex.k2_d[1] <= 8
+    # z's floats for this call: prompt chunks write whole sums (gate/up's 2 P I, then down's P D, or down3's bf16 Y over
+    # gate/up's), other calls every split's partials; a prompt Scratch may be folded to its kernel's (fold_z)
+    need = (max(2 * P * I, P * D // 2) if down3 else max(2 * P * I, P * D)) if fast else \
+        max(2 * s.cfg_gu[2] * I, s.cfg_d[2] * D) * P
+    if s.z.numel() < need:
+        raise ValueError(f"the expert scratch holds {s.z.numel()} partial floats; {R} rows on this path need {need}")
+    if mma3 and work is not None:
+        ext.grouped_mma3_list(x, x.stride(0), ex.suh_g, ex.suh_u, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids,
+                              s.count, members, s.z, D, I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], MMA3_NW,
+                              rows3 // 16, work3)
+    elif mma3:
         ext.grouped_mma3(x, x.stride(0), ex.suh_g, ex.suh_u, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids,
-                         s.count, members, s.z, D, I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], MMA3_NW)
+                         s.count, members, s.z, D, I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], MMA3_NW, rows3 // 16)
     elif mma2:
         # each output one fp32 chain over K: Z [2, P, I] holds whole sums (one split)
         ext.grouped_mma2(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
                          I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1])
-    elif mma:
+    elif mma and work is not None:
         # every split's chains in one program, their sum from 0 as the epilogue would add them
+        ext.grouped_mma_list(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2,
+                             D, I, P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], 1, work)
+    elif mma:
         ext.grouped_mma(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                         P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], 1)
     elif fast:
@@ -321,14 +368,19 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
                         float(limit), act_mode)
     nt, w, sk, pf = s.cfg_d
     dsk = sk                          # the down partials' splits as down_combine reads them
-    if mma3 and wts is not None and ex.k2_d[1] <= 8:
-        # down with down_combine's per-slot arithmetic inside, times the routing weight, as bf16 Y [P, D] in the tail
-        # of the z buffer (gate/up's sums take its first 2 P I floats); the combine adds a row's routed slots
+    if down3:
+        # down with down_combine's per-slot arithmetic inside, times the routing weight, as bf16 Y [P, D] at the head
+        # of the z buffer (over gate/up's sums: the epilogue has read them, in stream order); the combine adds a row's
+        # routed slots
         if out is None:
             out = torch.empty((R, D), dtype=torch.float32, device=x.device)
-        yb = s.z.view(torch.bfloat16)[4 * P * I:4 * P * I + P * D]
-        ext.grouped_down3(s.xd, ex.down_ptr, ex.down_k2, ids, s.count, members, ex.svh_d, wts, yb, I, D, P, slots,
-                          ex.cb, ex.k2_d[0], ex.k2_d[1])
+        yb = s.z.view(torch.bfloat16)[:P * D]
+        if work is not None:
+            ext.grouped_down3_list(s.xd, ex.down_ptr, ex.down_k2, ids, s.count, members, ex.svh_d, wts, yb, I, D, P,
+                                   slots, ex.cb, ex.k2_d[0], ex.k2_d[1], work)
+        else:
+            ext.grouped_down3(s.xd, ex.down_ptr, ex.down_k2, ids, s.count, members, ex.svh_d, wts, yb, I, D, P, slots,
+                              ex.cb, ex.k2_d[0], ex.k2_d[1])
         ext.combine_y(yb, pick, s.no_y if add is None else add, out, R, D, slots, E, int(add is not None))
         return out
     if mma2:
@@ -337,8 +389,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         dsk = 1
     elif mma:
         # one split is written as is; several are folded in order from 0 (down_combine's order) into one
-        ext.grouped_mma(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
-                        I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1))
+        if work is not None:
+            ext.grouped_mma_list(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members,
+                                 s.z, 1, I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1), work)
+        else:
+            ext.grouped_mma(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z,
+                            1, I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1))
         dsk = 1
     elif fast:
         pnt, ppf, pg = PROMPT_TILES["down"]
