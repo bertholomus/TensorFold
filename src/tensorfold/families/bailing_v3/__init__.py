@@ -9,6 +9,9 @@ from typing import Any
 MODEL_TYPES = ("bailing_hybrid",)
 TITLE = "Ling-3.1-flash"
 LANES = False
+# the answer reserve (server.answer_reserve): Ling thinks by default and its prompt opens the think block, so a reply
+# keeps a quarter of max_tokens, at least 1024 tokens and at most half, for its answer (--answer-reserve 0: off)
+ANSWER_RESERVE = (0.25, 1024)
 # the EXL3 conversion is a local build (the FP8 checkpoint is its source and the reference forward's);
 # no hub repo until one is published and verified
 MODELS = ()

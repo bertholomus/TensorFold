@@ -125,6 +125,7 @@ between MLX and CUDA, different quantizations, or different tensor-parallel rank
 | `--thinking`, `--no-thinking` | Template thinking toggle | Both |
 | `--reasoning-effort` | Template effort when a request sets none; default: the template's own | Both |
 | `--thinking-budget N` | Token-count limit inside reasoning | Both |
+| `--answer-reserve R`, `--answer-reserve-min N` | Share of `max_tokens` a thinking reply keeps for its answer, at least N tokens (1024) and at most half; 0 is off (default: 0.25 for Ling-3.1, else off) | Both |
 | `--backend auto`, `mlx`, `cuda` | Select backend; auto uses MLX on macOS | Both |
 | `--parallel N` | MLX `auto` admits up to 8 within budget; CUDA `auto` is 1, explicit N enables supported shared rounds | Both |
 | `--no-drafts` | Decode serially | Both |

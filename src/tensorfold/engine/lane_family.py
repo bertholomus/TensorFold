@@ -140,7 +140,9 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
         gate = stream.call_gate
         hit = gate.cut([int(drawn.item())]) if gate is not None and gate.watching else None   # read only then
         if hit is None:
-            return None
+            lead = getattr(stream, "answer_lead", None)       # an answer that would end empty after the close
+            hit = stream.answer_fix([int(drawn.item())]) if lead is not None and lead.watching else None
+            return None if hit is None else int(hit[1][0])
         stream.force = list(hit[1][1:])
         return int(hit[1][0])
 
@@ -304,6 +306,10 @@ class FamilyRounds(FamilyPrefill, SharedRounds, DraftDepth):
             path = path[:cut + 1]
             committed = [*committed[:cut], fix[0]]
             stream.force = list(fix[1:])        # the fix's rest, forced like the thinking budget's close
+        elif getattr(stream, "answer_lead", None) is not None and (hit := stream.answer_fix(committed)) is not None:
+            cut, fix = hit                      # an answer that would end empty after the close: the lead, forced
+            path = path[:cut + 1]
+            committed = [*committed[:cut], fix[0]]
         stream.rounds += 1
         got = stream.commit(committed)
         if stream.finished and len(got) < len(path):

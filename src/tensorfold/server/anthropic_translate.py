@@ -217,6 +217,8 @@ def usage(value: dict[str, Any]) -> dict[str, Any]:
     details = value.get("completion_tokens_details") or {}
     if "reasoning_tokens" in details:
         result["output_tokens_details"] = {"thinking_tokens": details["reasoning_tokens"]}
+        if details.get("reasoning_cut"):                 # the server closed the thinking (the answer reserve)
+            result["output_tokens_details"]["thinking_cut"] = True
     return result
 
 

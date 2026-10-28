@@ -78,6 +78,14 @@ def _ints_f64(lo: int, hi: int) -> float:
     return struct.unpack("<d", struct.pack("<2i", lo, hi))[0]
 
 
+def _think(budget: int, think_end: int):
+    """The run's ThinkStop from the header's two fields (budget 0: none)."""
+
+    from tensorfold.engine.call_gate import ThinkStop
+
+    return ThinkStop(budget, think_end) if budget > 0 else None
+
+
 MTP_DEFAULT = "1"                     # TF_LING_MTP when unset: 1 (Ling has no other drafter)
 
 
@@ -398,10 +406,13 @@ class BailingEngine:
         snap.rows, snap.nbytes = None, 0
         self.cache.remove(snap)
 
-    def _remember(self, snap) -> None:
+    def _remember(self, snap, behind: bool = False) -> None:
+        """Keep ``snap`` as the newest; ``behind``: as the first to go, for a gate's continuation (its prompt holds
+        part of the reply), so the snapshot a later prompt resumes from stays (TF_LING_CACHE_GIB=0 keeps one)."""
         for c in [c for c in self.cache if c.ids == snap.ids and c is not snap]:
             self._drop(c)
-        self.cache[:] = [c for c in self.cache if c is not snap] + [snap]   # a resumed prompt kept again moves last
+        rest = [c for c in self.cache if c is not snap]
+        self.cache[:] = [snap, *rest] if behind else [*rest, snap]   # a resumed prompt kept again moves last
         dropped = False
         while len(self.cache) > 1 and (len(self.cache) > self.cache_entries or self._held_bytes() > self.cache_bytes):
             self._drop(self.cache[0])
@@ -451,15 +462,16 @@ class BailingEngine:
         return sum(snapshot_bytes(c) for c in self.cache)
 
     def _run(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool, on_tokens: Callable[[list[int]], Any],
-             code: list[int], hit, draft: bool, constraint=None) -> dict[str, Any]:
+             code: list[int], hit, draft: bool, constraint=None, think=None, continued: bool = False) -> dict[str, Any]:
         self.e.constraint, self.e.window = constraint, None       # both ranks walk and mask the same rows
         try:
-            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft)
+            return self._run_once(prompt, max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, think, continued)
         finally:
             self.e.constraint = self.e.window = None
 
     def _run_once(self, prompt: list[int], max_tokens: int, sampling, stop_eos: bool,
-                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool) -> dict[str, Any]:
+                  on_tokens: Callable[[list[int]], Any], code: list[int], hit, draft: bool, think=None,
+                  continued: bool = False) -> dict[str, Any]:
         from .decode import mtp_decode, prefill, serial_decode
 
         auto = code[0] == 4
@@ -475,15 +487,16 @@ class BailingEngine:
         self.live = list(prompt)
         use_mtp = draft and self.w.mtp is not None
         first = prefill(self.e, prompt, sampling, mtp=use_mtp, resume=hit,
-                        keep_at=max(1, len(prompt) - 1) if draft else None, keep=self._remember)
+                        keep_at=max(1, len(prompt) - 1) if draft else None,
+                        keep=(lambda snap: self._remember(snap, behind=True)) if continued else self._remember)
         prefill_s = time.perf_counter() - t0
         stats: dict[str, Any] = {"prefill_s": prefill_s, "cached": cut}
         on_tokens([first])
-        if max_tokens <= 1 or (stop_eos and first in self.eos):
+        if max_tokens <= 1 or (stop_eos and first in self.eos) or (think is not None and think.hit([first])):
             return stats
         policy = decode_policy(code) if draft else None
         if policy is None:
-            res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens)
+            res = serial_decode(self.e, first, max_tokens, sampling, stop_eos=stop_eos, on_tokens=on_tokens, think=think)
         else:
             if auto:                     # auto: adaptive MTP depth, greedy replies keep a confidence floor
                 from .decode import DepthPolicy
@@ -491,7 +504,7 @@ class BailingEngine:
                 greedy = sampling is None or sampling.temperature <= 0
                 policy = DepthPolicy(3, fixed=True, confidence=0.35) if greedy else DepthPolicy(3, low=0.6, high=0.85)
             res = mtp_decode(self.e, first, max_tokens, sampling, policy=policy, stop_eos=stop_eos,
-                             on_tokens=on_tokens)
+                             on_tokens=on_tokens, think=think)
         # the caches now hold prompt and reply; only prompts are snapshotted, since a later prompt prefills the reply again
         self.live = list(prompt) + res.tokens[:self.e.st.pos - len(prompt)]
         stats.update(decode_s=res.seconds, rounds=res.rounds, min_rows=1 + min(res.depths, default=0),
@@ -504,8 +517,10 @@ class BailingEngine:
         return stats
 
     def generate(self, prompt: list[int], max_tokens: int, sampling, on_tokens, draft: bool = True,
-                 constraint=None) -> dict[str, Any]:
-        """Mirror one rank-0 request on every other rank; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal."""
+                 constraint=None, think_stop: tuple[int, int] | None = None, continued: bool = False) -> dict[str, Any]:
+        """Mirror one rank-0 request on every other rank; draft=False uses serial decoding and fresh prefill as the reference drafted replies must equal.
+        ``think_stop`` (budget, think_end): every rank ends the run where the server's thinking budget cuts it;
+        ``continued``: the prompt holds part of the reply (a gate's continuation), so its snapshot goes behind."""
 
         if len(prompt) >= self.limit:
             raise ValueError(f"prompt of {len(prompt)} tokens: this engine serves contexts up to {self.limit}")
@@ -519,7 +534,7 @@ class BailingEngine:
                   seed & 0x7FFFFFFF, (seed >> 31) & 0x7FFFFFFF, seed >> 62,
                   *_f64_ints(sampling.temperature if sampling else 0.0), int(sampling.top_k) if sampling else 0,
                   *_f64_ints(sampling.top_p if sampling else 1.0), *_f64_ints(sampling.min_p if sampling else 0.0),
-                  int(constraint is not None)] + code
+                  int(constraint is not None), *(think_stop or (0, -1)), int(continued)] + code
         from tensorfold.engine.grammar import pack
 
         self._ring()                                   # wakes ranks 1.., which idle on the store, not in the all-gather
@@ -527,7 +542,8 @@ class BailingEngine:
         self._share(list(prompt))
         if constraint is not None:                     # the request's grammar: ranks 1.. compile the same
             self._share(pack(constraint))
-        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint)
+        stats = self._run(list(prompt), max_tokens, sampling, stop_eos, on_tokens, code, hit, draft, constraint,
+                          _think(*(think_stop or (0, -1))), continued)
         stats.update(policy=spec, drafts=draft)
         return stats
 
@@ -586,7 +602,7 @@ class BailingEngine:
                 self._score_local(prompt, labels)
                 continue
             (max_tokens, stop_eos, draft, cached, s_lo, s_hi, s_top, t_lo, t_hi, top_k, p_lo, p_hi, m_lo, m_hi,
-             shaped, *code) = header
+             shaped, think_n, think_end, continued, *code) = header
             prompt = self._share(None)
             packed = self._share(None) if shaped else []
             constraint = None
@@ -604,4 +620,4 @@ class BailingEngine:
                 if hit is None:
                     raise RuntimeError(f"rank {self.rank} has no snapshot of the {cached} tokens rank 0 resumes from")
             self._run(prompt, max_tokens, sampling, bool(stop_eos), lambda new: None, code, hit, bool(draft),
-                      constraint)
+                      constraint, _think(think_n, think_end), bool(continued))

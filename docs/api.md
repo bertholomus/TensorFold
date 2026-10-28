@@ -229,6 +229,22 @@ The cut depends on token count, so serial and drafted decoding use the same cut.
 earlier is left alone. The MLX engine forces the close inside its rounds; CUDA stops the engine at the cut and
 decodes on from the reply, as for a required tool call.
 
+The answer reserve (`--answer-reserve R`, on by default for Ling-3.1 at 0.25, off for other families) keeps part of
+`max_tokens` for the answer, so a thinking reply never ends with all of it spent on reasoning. The reserve is
+`ceil(R * max_tokens)`, at least `--answer-reserve-min` tokens (1024) and at most half of `max_tokens`, and the think
+block closes, as above, at `max_tokens` minus the reserve: `max_tokens` 128 thinks for 64, the default 4096 for 3072.
+`max_tokens` here is the reply length the request runs with, so a request near the end of the context window keeps its
+reserve from what is left. A request's smaller `thinking_budget` wins; a larger one, or `-1`, is held to the same cap.
+The Messages API's `budget_tokens` is a `thinking_budget`, and the Responses API's `max_output_tokens` a `max_tokens`,
+so every route closes at the same token. After the server's close, an answer that would end before its first word
+(an end token, alone or after blanks) starts from `Answer:` instead, once, and decodes on within the reserve; a tool
+call after the close is still the reply's call. A reply that closes its own thinking first is token for token what it
+would be without the reserve. A reply the server closed carries `completion_tokens_details.reasoning_cut: true`
+(`output_tokens_details.thinking_cut` on the Messages API, `output_tokens_details.reasoning_cut` on the Responses API),
+its `tensorfold` block `think_cut` (the reply index of the close) and, when the lead went in, `answer_lead`, and the
+server's `done` line ends with `think_cut=` and `answer_lead=`. `finish_reason` stays the reply's own: `length` only
+when the answer itself ran out. `--answer-reserve 0` turns all of this off.
+
 ## Context and errors
 
 The rendered prompt and reserved reply must fit the effective context. In 0.3.5, an explicit `max_tokens`
@@ -265,8 +281,9 @@ GPU's memory can freeze the host, so lower it only with room to spare.
 `delta.reasoning_content` while streaming. Tools use `tool_calls` and `finish_reason: "tool_calls"`.
 Every reply's usage, streamed ones included, carries its prompt, completion and total tokens,
 `prompt_tokens_details.cached_tokens` (the prompt tokens found in the prefix cache) and
-`completion_tokens_details.reasoning_tokens` (the thinking tokens, through the closing think marker); timing details
-depend on the backend.
+`completion_tokens_details.reasoning_tokens` (the thinking tokens, through the closing think marker), with
+`reasoning_cut: true` when the server closed the think block (the thinking budget or the answer reserve); timing
+details depend on the backend.
 TensorFold also reports generation statistics such as decode rate, time to first token and draft acceptance.
 
 On CUDA, `GET /health` also carries counters a poller can difference into rates: `busy`, `requests_running`,

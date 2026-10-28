@@ -113,6 +113,7 @@ class PromptFill:
             think_close=tuple(job.think_close),
             think_end=int(job.think_end),
             think_open=bool(job.think_budget),
+            answer_lead=job.answer_lead,
             call_gate=job.call_gate,
             constraint=job.constraint,
             prompt_data=job.vision,

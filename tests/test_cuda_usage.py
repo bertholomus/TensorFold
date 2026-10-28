@@ -31,8 +31,10 @@ def test_usage_counts_the_reply_and_the_first_runs_cache(tmp_path, stream, budge
     prompt = len(engine.prompts[0])
     assert usage == {"prompt_tokens": prompt, "completion_tokens": 24, "total_tokens": prompt + 24,
                      "prompt_tokens_details": {"cached_tokens": 7},
-                     # thinking through the budget's close (its third token becomes a newline, then </think>)
-                     "completion_tokens_details": {"reasoning_tokens": 4 if budget else 24}}
+                     # thinking through the budget's close (its third token becomes a newline, then </think>),
+                     # and the cut said
+                     "completion_tokens_details": {"reasoning_tokens": 4, "reasoning_cut": True} if budget
+                     else {"reasoning_tokens": 24}}
 
 
 def streamed(port, body, chat=True):

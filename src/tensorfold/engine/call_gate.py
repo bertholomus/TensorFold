@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Collection, Sequence
 
 _ANSWER, _LEAD, _NAME, _DONE = range(4)
 
@@ -112,18 +112,68 @@ class CallGate:
             self.state = state if fix is None else (state[0], _DONE, "")     # off script: stop constraining
 
 
-class ThinkBudget:
-    """The lane engine's thinking budget: the ``budget``-th token of a reply still thinking becomes ``close``."""
+_IDLE, _CLOSING, _WATCH = range(3)            # AnswerLead's phases before _DONE
 
-    def __init__(self, budget: int, close: Sequence[int], think_end: int) -> None:
+
+class AnswerLead:
+    """After the thinking budget's close, an answer that would end before its first word (an end token, alone or after
+    blanks) starts from ``lead`` instead, once; ``arm`` marks the close, which ends at ``think_end``."""
+
+    def __init__(self, lead: Sequence[int], ends: Collection[int], blank: Callable[[int], bool], think_end: int) -> None:
+        self.lead, self.ends, self.blank = [int(t) for t in lead], frozenset(int(t) for t in ends), blank
+        self.think_end, self.phase = int(think_end), _IDLE
+        self.at: int | None = None                # the reply index the lead went in at (None: never needed)
+
+    def arm(self) -> None:
+        if self.phase == _IDLE and self.lead and self.ends:
+            self.phase = _CLOSING
+
+    @property
+    def watching(self) -> bool:
+        return self.phase == _WATCH
+
+    def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
+        """(index in the next committed ``tokens`` the lead replaces, the lead), as ``CallGate.cut``; the close's own
+        ``think_end`` may come first in ``tokens`` (a lane round commits forced and drawn tokens together)."""
+
+        phase = self.phase
+        for i, token in enumerate(int(t) for t in tokens):
+            if phase == _CLOSING:
+                phase = _WATCH if token == self.think_end else phase
+                continue
+            if phase != _WATCH:
+                return None
+            if token in self.ends:
+                return i, list(self.lead)
+            if not self.blank(token):
+                return None
+        return None
+
+    def taken(self, at: int) -> None:
+        self.at, self.phase = int(at), _DONE
+
+    def observe(self, token: int) -> None:
+        token = int(token)
+        if self.phase == _CLOSING and token == self.think_end:
+            self.phase = _WATCH
+        elif self.phase == _WATCH and token not in self.ends and not self.blank(token):
+            self.phase = _DONE                    # the answer has its first word
+
+
+class ThinkBudget:
+    """The lane engine's thinking budget: the ``budget``-th token of a reply still thinking becomes ``close``; then
+    ``lead`` (an ``AnswerLead``) keeps the answer from ending empty."""
+
+    def __init__(self, budget: int, close: Sequence[int], think_end: int, lead: AnswerLead | None = None) -> None:
         self.budget, self.close, self.think_end = int(budget), [int(t) for t in close], int(think_end)
-        self.count, self.open = 0, True
+        self.count, self.open, self.lead = 0, True, lead
+        self.cut_at: int | None = None            # the reply index the close went in at (None: the reply closed it)
 
     def cut(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
         """(index in the next committed ``tokens`` the close replaces, the close), as ``CallGate.cut``."""
 
         if not self.open:
-            return None
+            return self.lead.cut(tokens) if self.lead is not None else None
         for i, token in enumerate(tokens):
             if self.count + i + 1 >= self.budget:
                 return i, list(self.close)
@@ -131,9 +181,44 @@ class ThinkBudget:
                 return None
         return None
 
+    def taken(self, at: int) -> None:
+        """generate_gated wrote this gate's fix at reply index ``at``: the close while the block is open, else the lead."""
+
+        if self.open:
+            self.cut_at = int(at)
+            if self.lead is not None:
+                self.lead.arm()
+        elif self.lead is not None:
+            self.lead.taken(at)
+
     def observe(self, token: int) -> None:
         self.count += 1
         self.open = self.open and int(token) != self.think_end
+        if self.lead is not None:
+            self.lead.observe(token)
+
+
+class ThinkStop:
+    """``ThinkBudget``'s cut seen from an engine whose ranks decode in step: the run ends with the round that holds the
+    reply's ``budget``-th token while no ``think_end`` came before it, where the server's gate closes the think block
+    and goes on in a new run. Every rank samples the same tokens, so every rank ends that run at the same round; an
+    engine that decodes on to ``max_tokens`` there decodes the rest of the run for nothing."""
+
+    def __init__(self, budget: int, think_end: int) -> None:
+        self.budget, self.think_end = int(budget), int(think_end)
+        self.seen, self.open = 0, True
+
+    def hit(self, tokens: Sequence[int]) -> bool:
+        """After a round commits ``tokens`` (the run's first token is a round of its own): True at the budget."""
+
+        for token in tokens:
+            if not self.open:
+                return False
+            self.seen += 1
+            if self.seen >= self.budget:
+                return True
+            self.open = int(token) != self.think_end
+        return False
 
 
 def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], bool]], Any], prompt: Sequence[int],
@@ -155,9 +240,11 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
             new = list(new[k:])
             if not new:
                 return False
-        hits = [(hit, getattr(gate, "replay", False)) for gate in gates if (hit := gate.cut(new)) is not None]
+        hits = [(hit, getattr(gate, "replay", False), gate) for gate in gates if (hit := gate.cut(new)) is not None]
         if hits:
-            (at, fix), replay = min(hits, key=lambda h: (h[0][0], h[1]))   # the earliest; a fix before a replay
+            (at, fix), replay, gate = min(hits, key=lambda h: (h[0][0], h[1]))   # the earliest; a fix before a replay
+            if hasattr(gate, "taken"):
+                gate.taken(len(reply) + at)
             new, state["cut"], state["replay"] = [*new[:at], *fix][:max_tokens - len(reply)], True, replay
         for token in new:
             for gate in gates:
@@ -184,4 +271,4 @@ def generate_gated(generate: Callable[[list[int], int, Callable[[list[int]], boo
     return stats
 
 
-__all__ = ["CallGate", "ThinkBudget", "call_format", "generate_gated"]
+__all__ = ["AnswerLead", "CallGate", "ThinkBudget", "ThinkStop", "call_format", "generate_gated"]

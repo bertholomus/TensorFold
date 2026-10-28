@@ -409,8 +409,9 @@ def _sync(w: Weights) -> None:
 
 @torch.no_grad()
 def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *,
-                  stop_eos: bool = False, on_tokens=None) -> DecodeResult:
-    """One token a step through the same kernels and sampler; ``pending`` is the first sampled token."""
+                  stop_eos: bool = False, on_tokens=None, think=None) -> DecodeResult:
+    """One token a step through the same kernels and sampler; ``pending`` is the first sampled token. ``think`` (a
+    call_gate.ThinkStop that has seen ``pending``) ends the loop where the server's thinking budget cuts the reply."""
 
     w, st, b = e.w, e.st, e.buf
     out = [pending]
@@ -433,6 +434,8 @@ def serial_decode(e: Engine, pending: int, count: int, sampling: Sampling | None
         out.append(tok)
         if on_tokens is not None:
             on_tokens([tok])
+        if think is not None and think.hit([tok]):
+            break
     _sync(w)
     return DecodeResult(out, time.perf_counter() - start, len(out) - 1, stages=stages)
 
@@ -456,7 +459,7 @@ class DepthPolicy:
 
 @torch.no_grad()
 def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *, policy: DepthPolicy | None = None,
-               stop_eos: bool = False, on_tokens=None) -> DecodeResult:
+               stop_eos: bool = False, on_tokens=None, think=None) -> DecodeResult:
     """Verify pending and MTP draft rows through the first mismatch, starting with every prompt position except the last in the MTP cache."""
 
     w, st, b = e.w, e.st, e.buf
@@ -496,12 +499,13 @@ def mtp_decode(e: Engine, pending: int, count: int, sampling: Sampling | None, *
         keeps.append(keep)
         e.follow(sampled[:keep])
         out.extend(sampled[:keep])
+        fed = sampled[:keep][:max(0, count - (len(out) - keep))]
         if on_tokens is not None:
-            on_tokens(sampled[:keep][:max(0, count - (len(out) - keep))])
+            on_tokens(fed)
         stages["forward"] += t1 - t0
         stages["sample"] += t2 - t1
         stages["commit"] += t3 - t2
-        if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos):
+        if len(out) >= count or (stop_eos and out[-1] in w.cfg.eos) or (think is not None and think.hit(fed)):
             break
         t4 = time.perf_counter()
         depth = min(policy.next(len(drafts), keep - 1), count - len(out))

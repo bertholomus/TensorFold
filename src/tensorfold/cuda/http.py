@@ -21,12 +21,16 @@ if TYPE_CHECKING:
 
 
 def usage_of(result: dict[str, Any]) -> dict[str, Any]:
-    """A reply's usage as the Mac server reports it, the prompt tokens found cached included."""
+    """A reply's usage as the Mac server reports it, the prompt tokens found cached included; ``reasoning_cut`` marks a
+    reply whose think block the server closed (the answer reserve)."""
 
+    details: dict[str, Any] = {"reasoning_tokens": result.get("reasoning_tokens", 0)}
+    if result.get("reasoning_cut"):
+        details["reasoning_cut"] = True
     return {"prompt_tokens": result["prompt_tokens"], "completion_tokens": result["completion_tokens"],
             "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
             "prompt_tokens_details": {"cached_tokens": result.get("cached_tokens", 0)},
-            "completion_tokens_details": {"reasoning_tokens": result.get("reasoning_tokens", 0)}}
+            "completion_tokens_details": details}
 
 
 def _error_message(exc: BaseException) -> str:

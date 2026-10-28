@@ -4,6 +4,9 @@
   ``_gather_floats`` return every rank's list in rank order, ``_slowest`` (the calibration's) takes each value's
   largest over the ranks, and the doorbell wakes every follower, a late one too. The fake all-gather keeps
   comm.py's check, so a buffer sized for two ranks fails at four as NCCL's does.
+- A request's header carries the answer reserve's stop (ThinkStop) and whether its prompt continues a reply, so every
+  rank ends the run at the same round and keeps the same snapshots; the decode loops end with the round that holds
+  the stop's token, every token up to it the unstopped run's.
 - The engine opens NCCL with NCCL_GRAPH_MIXING_SUPPORT=0, which does not cover an uncaptured collective launched
   while a graph launch on the same communicator is outstanding, whatever the stream order. Through prefill, serial
   and MTP-drafted decode (some row counts captured, some eager), every uncaptured collective comes after a
@@ -245,6 +248,35 @@ def test_the_doorbell_wakes_every_follower_a_late_one_too():
     assert not store.keys               # each follower deleted its own key
 
 
+class _Followed(Exception):
+    pass
+
+
+@pytest.mark.parametrize("world", [2, 4])
+@pytest.mark.parametrize("think_stop, continued", [((24, 90), False), ((7, 90), True), (None, True), (None, False)])
+def test_every_rank_ends_the_run_at_the_cut_and_keeps_the_same_snapshot(world, think_stop, continued):
+    def fn(e):
+        e.limit, e.serial_only, e.cache, e.request, runs = 10_000, True, [], threading.local(), []
+
+        def run(*args):
+            runs.append(args[-2:])
+            if e.rank:
+                raise _Followed                 # out of follow's loop after one request
+            return {}
+
+        e._run = run
+        if e.rank == 0:
+            e.generate([5, 6, 7], 48, None, lambda new: None, think_stop=think_stop, continued=continued)
+        else:
+            with pytest.raises(_Followed):
+                e.follow()
+        (think, behind), = runs
+        return (think.budget, think.think_end, think.seen, think.open) if think else None, behind
+
+    want = ((*think_stop, 0, True) if think_stop else None, continued)
+    assert on_ranks(world, fn) == [want] * world
+
+
 # -- graph replays and uncaptured collectives --------------------------------------------------------------------------
 V = 64              # this rank's vocabulary columns
 
@@ -352,6 +384,35 @@ def test_every_uncaptured_collective_follows_a_settled_replay(monkeypatch, mtp_s
     decode.prefill(e, [7, 8, 9], None, mtp=True)
     assert e.replays["main"] and e.replays["mtp"] and e.replays["eager"]       # both paths ran
     log.check()
+
+
+@pytest.mark.parametrize("drafted", [False, True])
+@pytest.mark.parametrize("budget", [1, 2, 5, 9, 17, 23, 24, 40])
+def test_the_decode_loops_end_with_the_round_that_holds_the_cut(monkeypatch, budget, drafted):
+    from tensorfold.engine.call_gate import ThinkStop
+
+    def run(think=None):
+        e, log = fake_engine(monkeypatch, world=2)
+        first = decode.prefill(e, list(range(1, 40)), None, mtp=True)
+        ends = [1]                                  # tokens after each round; the first token is a round of its own
+        if think is not None and think.hit([first]):
+            return [first], ends
+        feed = lambda new: ends.append(ends[-1] + len(new))  # noqa: E731
+        if drafted:
+            res = decode.mtp_decode(e, first, 24, None, policy=decode.DepthPolicy(3, fixed=True), on_tokens=feed,
+                                    think=think)
+        else:
+            res = decode.serial_decode(e, first, 24, None, on_tokens=feed, think=think)
+        log.check()
+        return res.tokens, ends
+
+    full, ends = run()
+    assert len(full) == 24
+    for end in (-1, *full[:3]):
+        closes = end in full[:budget - 1]         # the reply closes its own block before the cut: no stop
+        at = next((n for n in ends if n >= budget), None)
+        stopped, _ = run(ThinkStop(budget, end))
+        assert stopped == (full if closes or at is None else full[:at]), (end, ends)
 
 
 def test_one_rank_gets_no_extra_synchronize(monkeypatch):

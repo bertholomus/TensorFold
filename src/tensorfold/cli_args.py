@@ -70,6 +70,13 @@ def build_parser(handlers: dict[str, Callable[[argparse.Namespace], int]]) -> ar
                                  "rule. xhigh stays xhigh, so GLM-5.3 renders it as Max")
     generation.add_argument("--thinking-budget", type=int, default=0,
                             help="most thinking tokens before the server closes the think block (0: no limit)")
+    generation.add_argument("--answer-reserve", type=float, default=None, metavar="R",
+                            help="share of max_tokens a thinking reply keeps for its answer: the server closes a think "
+                                 "block still open at max_tokens minus the reserve, and a request's thinking budget is "
+                                 "held to that cap (0: off; default: the family's, 0.25 for Ling-3.1, else off)")
+    generation.add_argument("--answer-reserve-min", type=int, default=None, metavar="N",
+                            help="the answer reserve's floor in tokens, never more than half of max_tokens (default: "
+                                 "1024)")
 
     speed = serve.add_argument_group("drafting and caches")
     speed.add_argument("--no-drafts", action="store_true",

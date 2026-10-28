@@ -217,7 +217,8 @@ Two-rank Flash Next, Nemotron and GLM requests finish on both ranks after a clie
 collective sequence aligned. MLX disk snapshots and cache-budget flags do not configure these CUDA
 caches. The CUDA CLI also does not apply `--alias`; use `--name` for the served model ID. `--thinking`,
 `--reasoning-effort` and `--thinking-budget` set the defaults a request's `chat_template_kwargs.enable_thinking`,
-`reasoning_effort` and `thinking_budget` override, as on the Mac.
+`reasoning_effort` and `thinking_budget` override, as on the Mac. `--answer-reserve` (0.25 for Ling-3.1, else off)
+keeps part of each thinking reply's `max_tokens` for its answer, as [the API reference](../api.md) describes.
 
 ## Measuring
 

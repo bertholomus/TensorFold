@@ -220,6 +220,18 @@ class RequestOptions:
         with self.tokenizer_lock:
             return not self.tokenizer.decode([int(token)], skip_special_tokens=False).strip()
 
+    def _answer_lead(self, ends: Any) -> Any:
+        """The answer reserve's ``AnswerLead`` after a thinking budget's close (None: the reserve is off, the tokenizer
+        has no think end, or nothing ends this reply)."""
+
+        from tensorfold.engine.call_gate import AnswerLead
+        from tensorfold.server.answer_reserve import DEFAULT, LEAD
+
+        end = self._think_close()[1]
+        if getattr(self, "answer_reserve", DEFAULT)[0] <= 0 or end < 0 or not ends:
+            return None
+        return AnswerLead(self._encode(LEAD), ends, self._blank, end)
+
     def _think_close(self) -> tuple[tuple[int, ...], int]:
         """The forced close and its end token, or -1 when the tokenizer has no think-end token."""
 

@@ -21,7 +21,8 @@ from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
 from tensorfold.server.token_routes import flag, token_ids
 from tensorfold.server.tool_policy import ToolCallPolicy
-from tensorfold.engine.call_gate import CallGate, ThinkBudget, call_format, generate_gated
+from tensorfold.server import answer_reserve
+from tensorfold.engine.call_gate import AnswerLead, CallGate, ThinkBudget, call_format, generate_gated
 from tensorfold.engine.tool_draft import ToolCallStreamer
 from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
@@ -84,6 +85,7 @@ class App:
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
                  context_window: int | None = None, reasoning_effort: str | None = None, thinking_budget: int = 0,
+                 answer_reserve: tuple[float, int] = answer_reserve.DEFAULT,
                  aliases: tuple[str, ...] | list[str] = (), vision_max_images: int | None = None,
                  vision_image_tokens: int | None = None,
                  background_ids: tuple[str, ...] | frozenset[str] = ()):
@@ -102,6 +104,7 @@ class App:
         self.template = ChatTemplate(model_dir)
         self.default_thinking = default_thinking
         self.reasoning_effort, self.thinking_budget = reasoning_effort, int(thinking_budget)   # the Mac's defaults
+        self.answer_reserve = (float(answer_reserve[0]), int(answer_reserve[1]))   # (ratio, minimum); ratio 0: off
         self.sampling = {"temperature": 1.0, "top_k": 20, "top_p": 0.95, **(sampling or {})}
         self.max_tokens = int(max_tokens)
         self.native_context_window = _native_context(model_dir)
@@ -399,6 +402,10 @@ class App:
         limit = self._context_limit()
         if limit is not None:
             prepared.max_tokens = min(prepared.max_tokens, limit - len(prepared.prompt))
+        if chat and prepared.thinking:          # the answer reserve, from the reply length this request runs with
+            ratio, minimum = getattr(self, "answer_reserve", answer_reserve.DEFAULT)
+            prepared.think_budget = answer_reserve.think_budget(prepared.think_budget, prepared.max_tokens, ratio,
+                                                                minimum)
         return prepared
 
     def sampling_for(self, body: dict[str, Any], prompt: list[int]):
@@ -429,6 +436,8 @@ class App:
         sampling = prepared.sampling
         # end tokens end the reply and stay out of its text, unless it asks ignore_eos of an engine that reads it
         takes_stop_eos = "stop_eos" in inspect.signature(self.engine.generate).parameters
+        takes_think_stop = "think_stop" in inspect.signature(self.engine.generate).parameters
+        takes_continued = "continued" in inspect.signature(self.engine.generate).parameters
         ends = () if prepared.ignore_eos and (self.reads_ignore_eos or takes_stop_eos) else tuple(self.engine.eos)
         stops = StopStrings(prepared.stop, self.tok, ends)
         out: list[int] = []
@@ -513,7 +522,7 @@ class App:
             options["cache_salt"] = prepared.cache_salt       # every request, so an unsalted one is kept apart too
         shaped = prepared.grammar is not None or prepared.think_budget > 0
         think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
-        budget = self._think_budget(prepared, think_end)
+        budget = self._think_budget(prepared, think_end, ends)
         # background: the request's own priority, else --name-priority's default for its id; title requests always
         by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
         background = body.get("priority") == "background" or by_name or (chat and is_title_request(body.get("messages"), tools))
@@ -543,6 +552,11 @@ class App:
                 same = list(ids) == list(prepared.vision.token_ids)
                 extra["vision"] = prepared.vision if same else continued(prepared.vision, ids,
                                                                        self.vision.frontend.config)
+            if takes_think_stop and budget is not None and budget.open:   # its ranks end this run at the cut
+                # counted from this run's prompt: a replay decodes the reply it already sent again
+                extra["think_stop"] = (budget.budget - (len(ids) - len(prompt)), budget.think_end)
+            if takes_continued and len(ids) > len(prompt):   # part of the reply: the prompt's snapshot stays first
+                extra["continued"] = True
             stats = self.engine.generate(ids, count, sampling, feed, **extra)
             if not cached:
                 cached.append(int((stats or {}).get("cached") or 0))
@@ -568,6 +582,10 @@ class App:
         if stopped["client"]:                                        # as the Mac server: nothing more is written
             raise RequestCancelled("the client left during the reply")
         stats = {**(stats or {}), "token_sha": token_sha(out)}
+        cut = budget.cut_at if budget is not None else None          # where the server closed the think block
+        led = budget.lead.at if budget is not None and budget.lead is not None else None
+        if cut is not None:
+            stats.update({"think_cut": cut, **({"answer_lead": led} if led is not None else {})})
         reasoning, answer = visible(True)
         final: dict[str, Any] = {}
         if len(reasoning) > sent["reasoning"]:
@@ -584,7 +602,7 @@ class App:
         warning = unanswered(finish, chat and thinking, content, calls)
         if warning:
             print(warning, flush=True)
-        print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request)
+        print_done(len(prompt), (cached or [0])[0], thinking, out, finish, stats, request, cut=cut, led=led)
         if body.get("return_token_ids"):              # the reply's ids in the "tensorfold" block, for exactness checks
             stats = {**(stats or {}), "token_ids": [int(t) for t in out]}
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
@@ -596,7 +614,7 @@ class App:
                 **({"logprobs": logprobs} if logprobs is not None else {}),
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
-                "stats": stats, "calls_streamed": streamed}
+                "reasoning_cut": cut is not None, "stats": stats, "calls_streamed": streamed}
 
     def _turns(self) -> Turns:
         """The engine's turns (one request at a time, background ones last), made on first use."""
@@ -604,15 +622,25 @@ class App:
         with _MADE:
             return self.__dict__.setdefault("turns", Turns())
 
-    def _think_budget(self, prepared: PreparedRequest, think_end: int | None) -> ThinkBudget | None:
-        """The Mac's thinking budget: the cut becomes a newline, </think> and a blank line (</think> alone under a grammar)."""
+    def _think_budget(self, prepared: PreparedRequest, think_end: int | None,
+                      ends: tuple[int, ...] = ()) -> ThinkBudget | None:
+        """The Mac's thinking budget: the cut becomes a newline, </think> and a blank line (</think> alone under a
+        grammar); with the answer reserve on, an answer that would then end empty starts from its lead."""
 
         if prepared.think_budget <= 0 or think_end is None:
             return None
         close = [*self.tok.encode("\n", add_special_tokens=False).ids, think_end]
+        lead = None
         if prepared.grammar is None:
             close += self.tok.encode("\n\n", add_special_tokens=False).ids
-        return ThinkBudget(prepared.think_budget, close, think_end)
+            if getattr(self, "answer_reserve", answer_reserve.DEFAULT)[0] > 0 and ends:   # a grammar writes its own
+
+                def blank(token: int) -> bool:
+                    return not self.tok.decode([token], skip_special_tokens=False).strip()
+
+                lead = AnswerLead(self.tok.encode(answer_reserve.LEAD, add_special_tokens=False).ids, ends, blank,
+                                  think_end)
+        return ThinkBudget(prepared.think_budget, close, think_end, lead)
 
     def _call_gate(self, prompt: list[int], tools: list[dict[str, Any]]) -> CallGate:
         """The gate a required tool call needs, from this template's call markup and the rendered prompt."""
@@ -652,8 +680,9 @@ def token_sha(tokens: list[int]) -> str:
 
 
 def print_done(prompt: int, cached: int, thinking: bool, out: list[int], finish: str, stats: dict[str, Any],
-               request: Any) -> None:
-    """The Mac server's ``done`` line for a finished reply; tok/s runs from the first token to the last."""
+               request: Any, *, cut: int | None = None, led: int | None = None) -> None:
+    """The Mac server's ``done`` line for a finished reply; tok/s runs from the first token to the last. A reply the
+    answer reserve shaped ends with ``think_cut=`` (the reply index of the server's close) and ``answer_lead=``."""
 
     ended = time.perf_counter()
     first, started = getattr(request, "first", None), getattr(request, "started", ended)
@@ -662,7 +691,8 @@ def print_done(prompt: int, cached: int, thinking: bool, out: list[int], finish:
     print(f"[tensorfold] done req-{uuid.uuid4().hex[:12]} prompt={prompt} cached={cached} thinking={thinking} "
           f"tokens={len(out)} sha={token_sha(out)} finish={finish} tok/s={rate:.1f} "
           f"ttft={(first - started) if first is not None else -1:.2f}s prefill={stats.get('prefill_s', -1):.2f}s "
-          f"rounds={stats.get('rounds', 0)} accepted={stats.get('accepted', 0)}/{stats.get('drafted', 0)}",
+          f"rounds={stats.get('rounds', 0)} accepted={stats.get('accepted', 0)}/{stats.get('drafted', 0)}"
+          + (f" think_cut={cut}" if cut is not None else "") + (f" answer_lead={led}" if led is not None else ""),
           flush=True)
 
 

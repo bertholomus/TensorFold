@@ -226,9 +226,12 @@ def usage(chat: dict[str, Any] | None) -> dict[str, Any] | None:
     if not chat:
         return None
     cached = (chat.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    thought = (chat.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+    details = chat.get("completion_tokens_details") or {}
+    thought = {"reasoning_tokens": details.get("reasoning_tokens", 0)}
+    if details.get("reasoning_cut"):                     # the server closed the reasoning (the answer reserve)
+        thought["reasoning_cut"] = True
     return {"input_tokens": chat["prompt_tokens"], "input_tokens_details": {"cached_tokens": cached},
-            "output_tokens": chat["completion_tokens"], "output_tokens_details": {"reasoning_tokens": thought},
+            "output_tokens": chat["completion_tokens"], "output_tokens_details": thought,
             "total_tokens": chat["prompt_tokens"] + chat["completion_tokens"]}
 
 

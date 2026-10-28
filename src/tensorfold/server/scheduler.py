@@ -39,6 +39,8 @@ class ChatJob:
     think_budget: int = 0
     think_close: tuple[int, ...] = ()
     think_end: int = -1
+    # after the budget's close, an answer that would end empty starts from the answer reserve's lead (call_gate.AnswerLead)
+    answer_lead: Any = None
     # Background jobs yield to foreground arrivals, and callers restart preempted jobs from the beginning.
     background: bool = False
     preempted: bool = False

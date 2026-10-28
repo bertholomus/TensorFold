@@ -12,6 +12,7 @@ import uuid
 from tensorfold.engine.lane_engine import LaneEngine, SuffixLookupProposer
 from tensorfold.engine import grammar
 from tensorfold.server.admission import concurrency
+from tensorfold.server.answer_reserve import DEFAULT as RESERVE_OFF, think_budget as reserved_budget
 from tensorfold.server.checkpoints import (CheckpointStore, prune_conversations,
                                            save_conversations, spill_conversation)
 from tensorfold.server.cancellation import Cancellation
@@ -78,6 +79,7 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
         enable_thinking: bool = False,
         reasoning_effort: str | None = None,
         thinking_budget: int = 0,
+        answer_reserve: tuple[float, int] = RESERVE_OFF,
         default_sampling: dict[str, Any] | None = None,
         max_snapshots: int = 3,
         checkpoint_slots: int | None = None,
@@ -115,6 +117,8 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
         self.reasoning_effort = reasoning_effort
         # the default thinking budget (0: none; a request's "thinking_budget" overrides it)
         self.thinking_budget = int(thinking_budget)
+        # (ratio, minimum) of max_tokens a thinking reply keeps for its answer (server.answer_reserve; ratio 0: off)
+        self.answer_reserve = (float(answer_reserve[0]), int(answer_reserve[1]))
         self._think_tokens: tuple[tuple[int, ...], int] | None = None
         self.think_markers = think_markers(tokenizer)
         # ``exact_sampling.Sampling`` fields used when a request names none (None: greedy)
@@ -339,9 +343,13 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
                 vision=rendered.vision,
             )
             budget = int(fields.get("thinking_budget") or self.thinking_budget) if thinking else 0
+            if thinking:            # the answer reserve, from the reply length this request runs with
+                budget = reserved_budget(budget, limit, *getattr(self, "answer_reserve", RESERVE_OFF))
             if budget > 0:
                 job.think_close, job.think_end = self._think_close()
                 job.think_budget = budget if job.think_end >= 0 else 0
+                if job.think_budget and job.constraint is None:       # a grammar writes its own answer
+                    job.answer_lead = self._answer_lead(() if stops.ignore_eos else self.stop_ids)
             if drafts:
                 base: Any = SuffixLookupProposer(min_match=self.min_match)
                 if tools:
@@ -463,6 +471,8 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
             "cached_tokens": int(job.cached_tokens),
             "completion_tokens": len(collected),
             "reasoning_tokens": reasoning_count(collected, self._token_id(self.think_markers[1]) if thinking else -1),
+            # the server closed the think block (the thinking budget, the answer reserve)
+            "reasoning_cut": getattr(stream, "closed_at", None) is not None,
             "seconds": seconds,
             "runtime": {
                 "enable_thinking": thinking,
@@ -516,7 +526,9 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
                 f"hits={store.hits} misses={store.misses} evictions={store.evictions})"
                 if store is not None
                 else "checkpoints=off"
-            ),
+            )
+            + (f" think_cut={stream.closed_at}" if getattr(stream, "closed_at", None) is not None else "")
+            + (f" answer_lead={job.answer_lead.at}" if getattr(job.answer_lead, "at", None) is not None else ""),
             flush=True,
         )
         return reply

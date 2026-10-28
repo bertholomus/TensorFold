@@ -266,12 +266,15 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
             created = int(time.time())
 
             def usage_from_reply(reply: dict[str, Any]) -> dict[str, Any]:
+                details: dict[str, Any] = {"reasoning_tokens": reply.get("reasoning_tokens", 0)}
+                if reply.get("reasoning_cut"):         # the server closed the think block (the answer reserve)
+                    details["reasoning_cut"] = True
                 return {
                     "prompt_tokens": reply["prompt_tokens"],
                     "completion_tokens": reply["completion_tokens"],
                     "total_tokens": reply["prompt_tokens"] + reply["completion_tokens"],
                     "prompt_tokens_details": {"cached_tokens": reply["cached_tokens"]},
-                    "completion_tokens_details": {"reasoning_tokens": reply.get("reasoning_tokens", 0)},
+                    "completion_tokens_details": details,
                 }
 
             def response_extras(reply: dict[str, Any]) -> dict[str, Any]:

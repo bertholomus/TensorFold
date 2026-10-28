@@ -14,7 +14,7 @@ from typing import Any
 
 from tensorfold import __version__
 from tensorfold import cli_args
-from tensorfold.server import stacks, thinking_notes
+from tensorfold.server import answer_reserve, stacks, thinking_notes
 from tensorfold.server.memory_budget import MEMORY_FRACTION
 from tensorfold.serve_options import check as _check_serve_options, name_priority as _name_priority
 from tensorfold.serve_options import vision_options as _vision_options
@@ -227,6 +227,15 @@ def _note_untested(family: Any, model: str) -> None:
               f"decoding, speed and quality are unmeasured. {families.OWN_MODEL_HELP}", flush=True)
 
 
+def _answer_reserve(args: argparse.Namespace, family: Any) -> tuple[float, int]:
+    """(ratio, minimum) of the answer reserve: --answer-reserve and --answer-reserve-min, else the family's (off)."""
+
+    from tensorfold.server.answer_reserve import settings
+
+    return settings(getattr(family.package, "ANSWER_RESERVE", None), getattr(args, "answer_reserve", None),
+                    getattr(args, "answer_reserve_min", None))
+
+
 def _backend(choice: str, family: Any) -> str:
     """mlx or cuda: auto picks MLX on macOS and CUDA elsewhere; a family serves only the backends it has."""
 
@@ -300,9 +309,11 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         if value is not None:
             sampling[key] = value
     app_class = getattr(family.package, "CUDA_APP", None) or App
+    reserve = _answer_reserve(args, family)
     app = app_class(engine, model_dir, served, default_thinking=bool(args.thinking), sampling=sampling,
                     max_tokens=int(args.max_tokens), context_window=context if context is not None else args.context,
                     reasoning_effort=args.reasoning_effort, thinking_budget=int(args.thinking_budget),
+                    answer_reserve=reserve,
                     vision_max_images=getattr(args, "vision_max_images", None),
                     **({"vision_image_tokens": args.vision_image_tokens}
                        if getattr(args, "vision_image_tokens", None) is not None else {}),
@@ -321,6 +332,9 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
           f"loaded in {time.perf_counter() - started:.1f}s)", flush=True)
     app.auth = getattr(args, "auth", None)
     note = thinking_notes.startup(model_dir, bool(args.thinking))
+    if note:
+        print(note, flush=True)
+    note = answer_reserve.note(*reserve, int(args.max_tokens)) if bool(args.thinking) else None
     if note:
         print(note, flush=True)
     serve(app, args.host, int(args.port))
@@ -364,6 +378,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         raise ValueError(f"--ple-on-ssd: {family.title} has no n-gram (PLE) tables to read from SSD")
     backend = _backend(args.backend, family)
     _check_serve_options(args, family, backend, config_dir)
+    _answer_reserve(args, family)                 # a bad --answer-reserve is refused before the model loads
     families.require_readable(family, families.read_config(config_dir), backend)
     _note_untested(family, args.model)
     required_files = getattr(family.package, "REQUIRED_FILES", {}).get(args.model, ())
@@ -488,6 +503,7 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         ram = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
         gib = min(16.0, ram / 8 / 1024**3)
     budget = int(float(gib) * 1024**3)
+    reserve = _answer_reserve(args, family)
     app = ChatApp(
         model,
         tokenizer,
@@ -500,6 +516,7 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         enable_thinking=bool(args.thinking),
         reasoning_effort=args.reasoning_effort,
         thinking_budget=int(args.thinking_budget),
+        answer_reserve=reserve,
         default_sampling=sampling,
         max_snapshots=int(args.max_snapshots),
         checkpoint_slots=0 if budget <= 0 else args.checkpoint_slots,
@@ -527,6 +544,9 @@ def _serve_mlx(args: argparse.Namespace, family: Any, model_dir: Path, context: 
         hook(app, model, **options)
     app.auth = getattr(args, "auth", None)
     note = thinking_notes.startup(model_dir, bool(args.thinking))
+    if note:
+        print(note, flush=True)
+    note = answer_reserve.note(*reserve, int(args.max_tokens)) if bool(args.thinking) else None
     if note:
         print(note, flush=True)
     server = Server((args.host, int(args.port)), make_handler(app))  # type: ignore[arg-type]

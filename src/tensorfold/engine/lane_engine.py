@@ -214,6 +214,9 @@ class LaneStream:
     think_close: tuple[int, ...] = ()
     think_end: int = -1
     think_open: bool = False
+    closed_at: int | None = None    # the reply index the budget's close went in at (None: the reply closed its own)
+    # after that close, an answer that would end before its first word starts from a lead instead (call_gate.AnswerLead)
+    answer_lead: Any = None
     force: list[int] = field(default_factory=list)
     stop_check: Callable[[list[int]], bool] | None = None
     # a request that must call a tool: its answer opens a call to an offered tool (call_gate.CallGate)
@@ -263,11 +266,25 @@ class LaneStream:
         """Begin the thinking budget's close: returns its first token; the rest wait in ``force``."""
 
         self.think_open = False
+        self.closed_at = max(self.think_budget - 1, len(self.emitted))     # where ``think_cut`` puts it
+        if self.answer_lead is not None:
+            self.answer_lead.arm()
         close = self.think_close
         if self.constraint is not None and self.think_end in close:    # a grammar takes the reply from </think> on
             close = close[:close.index(self.think_end) + 1]
         self.force = list(close[1:])
         return int(close[0])
+
+    def answer_fix(self, tokens: Sequence[int]) -> tuple[int, list[int]] | None:
+        """(index in the next committed ``tokens`` the answer reserve's lead replaces, the lead), as a call gate's cut;
+        the lead's first token goes there and the rest wait in ``force``."""
+
+        lead = self.answer_lead
+        hit = lead.cut(tokens) if lead is not None else None
+        if hit is not None:
+            lead.taken(len(self.emitted) + hit[0])
+            self.force = list(hit[1][1:])
+        return hit
 
     @property
     def draft_room(self) -> int:
@@ -303,6 +320,8 @@ class LaneStream:
                 self.think_open = False
             if self.call_gate is not None:
                 self.call_gate.observe(value)
+            if self.answer_lead is not None:
+                self.answer_lead.observe(value)
             if value in self.eos_ids or (self.stop_check is not None and self.stop_check(self.emitted)):
                 self.finished = True
                 self.finish_reason = "stop"
