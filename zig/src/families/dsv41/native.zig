@@ -88,6 +88,8 @@ pub const Loaded = struct {
     lane_vision: ?lanes.stream.LaneVision = null,
     /// The other streams' rounds between two pieces of a prompt pass (TF_FILL_ROUNDS; 0 while passes run whole).
     fill_rounds: u32 = 0,
+    /// The rows of whole one-step passes started before a round (TF_FILL_DRAIN; 0 while passes run whole).
+    fill_drain: u32 = 0,
 };
 
 pub const Snaps = struct {
@@ -179,6 +181,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (getenv("TF_FILL_FIRST")) |t| st.lanes.fill_first = std.fmt.parseInt(usize, t, 10) catch return error.BadFill;
     st.lanes.fill_many = if (getenv("TF_FILL_MANY")) |v| !std.mem.eql(u8, v, "0") else false;
     const fill_rounds: u32 = if (getenv("TF_FILL_ROUNDS")) |t| std.fmt.parseInt(u32, t, 10) catch return error.BadFill else 4;
+    // TF_FILL_DRAIN=ROWS with TF_FILL_CHUNKS: one-step passes start back to back before a round, ROWS rows at most
+    const fill_drain: u32 = if (getenv("TF_FILL_DRAIN")) |t| std.fmt.parseInt(u32, t, 10) catch return error.BadFill else 0;
     st.lanes.solo_overhead = if (getenv("TF_DS_SOLO_OVERHEAD")) |v| !std.mem.eql(u8, v, "0") else false;
     st.lanes.no_copies = if (getenv("TF_DS_NO_COPIES")) |v| !std.mem.eql(u8, v, "0") else false;
     if (getenv("TF_DS_PASS_ROWS")) |t| st.lanes.pass_rows = try passRows(t);
@@ -193,7 +197,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .resumes = L.snapResumesFn, .live = L.snapLiveFn };
     // a follower that stops stops this server too, with a line that names it, instead of a wait on it for good
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0 };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0, .fill_drain = if (st.lanes.fill_chunks > 0) fill_drain else 0 };
 }
 
 fn deinitFn(ptr: *anyopaque) void {
