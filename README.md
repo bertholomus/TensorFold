@@ -9,12 +9,16 @@
 > in DeepSeek's DSML, and exact DSpark speculative decoding. Launch, measured
 > numbers, gates and the kernel kit are in the recipe, [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10).
 > An optional [neighbor transport](docs/recipes/deepseek-v41-neighbor.md) supports adjacent-edge RDMA on a physical ring.
+> New opt-in settings since v0.3.5: `TF_DS_TWO_HOP` (a four-node ring read as two pairs, exchanging only between
+> direct partners, off unless set), `TF_RDMA_GID` (the rings' source GID index, default 5), `TF_SEED_RANDOM` and
+> `TF_TOP_K_MAX` (a per-request sampling seed and a top-k cap, off unless set); `TF_DS_IDX_SPLIT=8192` is served.
 > `tools/dsv41-zig/inputs/` makes each node's weight file and token map from the checkpoint; `tools/dsv41-zig/kit/`
 > makes and checks the kit's generated files. Contributions: Lucas Peters ([@lucas-peters](https://github.com/lucas-peters), #4),
 > [@lepetitprince716-prog](https://github.com/lepetitprince716-prog) (#18), Manrique ([@hashd1ve](https://github.com/hashd1ve), #26, #28
 > and #29), Scott Woolsey Biggart ([@swbiggart](https://github.com/swbiggart), #30),
-> [@mrsergiopascal](https://github.com/mrsergiopascal) (#31) and [@Blackwellboy](https://github.com/Blackwellboy) (#33, #34
-> and #38). Thank you. See NOTICE and ATTRIBUTION.md.
+> [@mrsergiopascal](https://github.com/mrsergiopascal) (#31), [@Blackwellboy](https://github.com/Blackwellboy) (#33, #34
+> and #38), LeetJoe (#17), Nathan McBride (upstream's template fix) and tonyd2wild (`TF_RDMA_GID`;
+> `TF_SEED_RANDOM` and `TF_TOP_K_MAX`, MIT). Thank you. See NOTICE and ATTRIBUTION.md.
 > This fork is not affiliated with or endorsed by DeepSeek, NVIDIA, the TensorFold authors or Mia-AiLab.
 
 # TensorFold
