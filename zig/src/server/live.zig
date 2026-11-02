@@ -12,7 +12,8 @@ fn round1(x: f64) f64 {
     return std.fmt.parseFloat(f64, text) catch x;
 }
 
-/// /health's ``live``: open requests, how many wait, decode and prefill tokens a second.
+/// /health's ``live``: open requests, how many wait, decode and prefill tokens a second, and the optional cache
+/// account (absent when the engine cannot report one).
 pub fn snapshot(a: Allocator, engine: api.Engine) Allocator.Error!json.Value {
     var status: api.Status = .{};
     engine.status(&status, &.{});
@@ -21,6 +22,49 @@ pub fn snapshot(a: Allocator, engine: api.Engine) Allocator.Error!json.Value {
     try o.put(a, "waiting", try json.intValue(a, status.waiting));
     try o.put(a, "decode_tokens_per_second", .{ .float = round1(status.decode_tokens_per_second) });
     try o.put(a, "prefill_tokens_per_second", .{ .float = round1(status.prefill_tokens_per_second) });
+    if (status.cache) |c| try o.put(a, "cache", try cacheValue(a, c));
+    return .{ .object = o };
+}
+
+/// The additive ``live.cache`` group: the shared pool's disjoint categories, then the prompt-state store's storage and
+/// counters. Missing groups stay absent; a disabled store says so instead of reporting healthy zeroes.
+fn cacheValue(a: Allocator, c: api.CacheStatus) Allocator.Error!json.Value {
+    const o = try json.newObject(a);
+    try o.put(a, "schema_version", try json.intValue(a, c.schema_version));
+    try o.put(a, "engine_epoch", try json.intValue(a, c.engine_epoch));
+    try o.put(a, "observed_unix_ns", try json.intValue(a, c.observed_unix_ns));
+    try o.put(a, "consistent", .{ .bool = c.consistent });
+    try o.put(a, "context_limit_positions", try json.intValue(a, c.context_limit_positions));
+    try o.put(a, "stream_capacity", try json.intValue(a, c.stream_capacity));
+    if (c.pool) |p| {
+        const po = try json.newObject(a);
+        try po.put(a, "capacity_positions", try json.intValue(a, p.capacity_positions));
+        try po.put(a, "active_reserved_positions", try json.intValue(a, p.active_reserved_positions));
+        try po.put(a, "retained_prefix_positions", try json.intValue(a, p.retained_prefix_positions));
+        try po.put(a, "retained_growth_positions", try json.intValue(a, p.retained_growth_positions));
+        try po.put(a, "unclaimed_positions", try json.intValue(a, p.unclaimed_positions));
+        try po.put(a, "valid_states", try json.intValue(a, p.valid_states));
+        try po.put(a, "invalidations_total", try json.intValue(a, p.invalidations_total));
+        if (p.placement_blocks_total) |v| try po.put(a, "placement_blocks_total", try json.intValue(a, v));
+        try o.put(a, "pool", .{ .object = po });
+    }
+    if (c.prompt_state) |s| {
+        const so = try json.newObject(a);
+        try so.put(a, "enabled", .{ .bool = s.enabled });
+        try so.put(a, "budget_bytes", try json.intValue(a, s.budget_bytes));
+        try so.put(a, "held_bytes", try json.intValue(a, s.held_bytes));
+        try so.put(a, "spare_bytes", try json.intValue(a, s.spare_bytes));
+        try so.put(a, "entries", try json.intValue(a, s.entries));
+        try so.put(a, "hits_total", try json.intValue(a, s.hits_total));
+        try so.put(a, "misses_total", try json.intValue(a, s.misses_total));
+        try so.put(a, "evictions_total", try json.intValue(a, s.evictions_total));
+        try so.put(a, "refusals_total", try json.intValue(a, s.refusals_total));
+        try so.put(a, "failures_total", try json.intValue(a, s.failures_total));
+        try so.put(a, "failures_keep_total", try json.intValue(a, s.failures_keep_total));
+        try so.put(a, "failures_restore_total", try json.intValue(a, s.failures_restore_total));
+        try so.put(a, "failures_peer_forget_total", try json.intValue(a, s.failures_peer_forget_total));
+        try o.put(a, "prompt_state", .{ .object = so });
+    }
     return .{ .object = o };
 }
 
@@ -103,4 +147,26 @@ pub fn wanted(io: std.Io, no_live: bool) bool {
 test "status line" {
     var buf: [256]u8 = undefined;
     try std.testing.expectEqualStrings("[tensorfold] 3 connections (1 waiting) \u{b7} decode 142 tok/s \u{b7} prefill 1,210 tok/s", line(&buf, .{ .running = 2, .waiting = 1, .decode_tokens_per_second = 142.2, .prefill_tokens_per_second = 1210.4 }));
+}
+
+test "the cache group is additive, keeps missing groups absent and names a disabled store" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const v = try cacheValue(a, .{
+        .consistent = true,
+        .engine_epoch = 1793692800000000000,
+        .observed_unix_ns = 1793692801000000000,
+        .context_limit_positions = 1048576,
+        .stream_capacity = 16,
+        .pool = .{ .capacity_positions = 8388608, .active_reserved_positions = 0, .retained_prefix_positions = 0, .retained_growth_positions = 0, .unclaimed_positions = 8388608, .valid_states = 0, .invalidations_total = 0, .placement_blocks_total = null },
+        .prompt_state = .{ .enabled = false },
+    });
+    const text = try json.stringify(a, v, .{ .compact = true });
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"capacity_positions\":8388608") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"unclaimed_positions\":8388608") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"enabled\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "placement_blocks_total") == null); // unknown stays absent
+    try std.testing.expect(std.mem.indexOf(u8, text, "\"pool\"") != null);
 }

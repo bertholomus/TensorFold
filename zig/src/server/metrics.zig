@@ -4,8 +4,9 @@ const builtin = @import("builtin");
 const api = @import("engine_api");
 
 const prefix = "tensorfold:";
-/// Upper edges shared by the request and time-to-first-token histograms; +Inf is added when rendered.
-pub const buckets = [_]f64{ 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0 };
+/// Upper edges shared by the request and time-to-first-token histograms; +Inf is added when rendered. The 300 s edge
+/// was the last finite one; cold fills of a million-token prompt pass 2,000 s, so longer fixed edges follow it.
+pub const buckets = [_]f64{ 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0, 2400.0, 3600.0 };
 pub const tpot_buckets = [_]f64{ 0.0025, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0 };
 
 fn HistogramType(comptime edges: []const f64) type {
@@ -114,6 +115,7 @@ pub const Metrics = struct {
         try gauge(w, "generation_tokens_running", "gauge", "Generated tokens held by live streams.", status.generation_tokens);
         try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
+        if (status.cache) |c| if (c.consistent) try cacheFamilies(w, c);
         const live = streams[0..@min(status.streams, streams.len)];
         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");
         try pools(w, "kv_cache_usage_ratio", "pool", live, window);
@@ -146,6 +148,36 @@ pub const Metrics = struct {
 
 fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8) !void {
     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });
+}
+
+/// The additive cache families: the shared position pool's disjoint categories, then the prompt-state store. An
+/// absent or inconsistent group emits nothing (no fabricated zero); a disabled store keeps it absent here.
+fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStatus) !void {
+    if (c.pool) |p| {
+        try gauge(w, "kv_pool_capacity_positions", "gauge", "The shared context pool's effective capacity in positions (one logical pool, not per rank or per stream).", p.capacity_positions);
+        try gauge(w, "kv_pool_active_reserved_positions", "gauge", "Positions in live reservations, including reserved output and alignment space.", p.active_reserved_positions);
+        try gauge(w, "kv_pool_retained_prefix_positions", "gauge", "Positions of valid kept prefixes that live reservations do not overlap.", p.retained_prefix_positions);
+        try gauge(w, "kv_pool_retained_growth_positions", "gauge", "Preserved growth tails of kept extents, reclaimable without invalidating a prefix.", p.retained_growth_positions);
+        try gauge(w, "kv_pool_unclaimed_positions", "gauge", "Positions of the shared pool in no live or retained interval.", p.unclaimed_positions);
+        try gauge(w, "kv_pool_valid_states", "gauge", "Valid kept prompt states held by the allocator (not prompt-store entries).", p.valid_states);
+        try gauge(w, "kv_pool_invalidations_total", "counter", "Valid kept states whose backing a placement reused (each transition counted once).", p.invalidations_total);
+        if (p.placement_blocks_total) |v| try gauge(w, "kv_pool_placement_blocks_total", "counter", "Placement attempts refused for want of a fitting extent; attempts, not unique requests.", v);
+    }
+    if (c.prompt_state) |s| if (s.enabled) {
+        try gauge(w, "prompt_state_cache_budget_bytes", "gauge", "The configured prompt-state store budget in bytes.", s.budget_bytes);
+        try gauge(w, "prompt_state_cache_held_bytes", "gauge", "Storage charged to the store's entries.", s.held_bytes);
+        try gauge(w, "prompt_state_cache_spare_bytes", "gauge", "Reusable backend storage the store keeps inside its budget.", s.spare_bytes);
+        try gauge(w, "prompt_state_cache_entries", "gauge", "Current prompt-store entries.", s.entries);
+        try gauge(w, "prompt_state_cache_hits_total", "counter", "Successful restores of kept prompt states.", s.hits_total);
+        try gauge(w, "prompt_state_cache_misses_total", "counter", "Prompt lookups that found no usable state.", s.misses_total);
+        try gauge(w, "prompt_state_cache_evictions_total", "counter", "Store entries removed for its budget or policy.", s.evictions_total);
+        try gauge(w, "prompt_state_cache_refusals_total", "counter", "States declined for retention because they exceed the budget.", s.refusals_total);
+        try gauge(w, "prompt_state_cache_failures_total", "counter", "All counted store failures (the legacy aggregate; the stages below sum to it from now on).", s.failures_total);
+        try family(w, "prompt_state_cache_failures_by_stage_total", "counter", "Store failures by the stage that failed.");
+        try w.print("{s}prompt_state_cache_failures_by_stage_total{{stage=\"keep\"}} {d}\n", .{ prefix, s.failures_keep_total });
+        try w.print("{s}prompt_state_cache_failures_by_stage_total{{stage=\"restore\"}} {d}\n", .{ prefix, s.failures_restore_total });
+        try w.print("{s}prompt_state_cache_failures_by_stage_total{{stage=\"peer_forget\"}} {d}\n", .{ prefix, s.failures_peer_forget_total });
+    };
 }
 
 fn gauge(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8, value: u64) !void {
@@ -322,4 +354,62 @@ test "request counter append failure frees its label" {
     m.httpRequest(std.testing.io, "client", 200);
     try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
     try std.testing.expectEqual(allocations, failing.allocations);
+}
+
+test "long latency edges extend the old ones and keep cumulative buckets honest" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    m.latency.observe(2000);
+    var stub: RenderStub = .{};
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "request_latency_seconds_bucket{le=\"300\"} 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "request_latency_seconds_bucket{le=\"1800\"} 0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "request_latency_seconds_bucket{le=\"2400\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "request_latency_seconds_bucket{le=\"3600\"} 1") != null);
+}
+
+test "cache families render only a consistent account, with the store's classified stages" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    stub.status_value = .{
+        .running = 1,
+        .cache = .{
+            .consistent = true,
+            .engine_epoch = 7,
+            .observed_unix_ns = 99,
+            .context_limit_positions = 1048576,
+            .stream_capacity = 16,
+            .pool = .{ .capacity_positions = 8388608, .active_reserved_positions = 2048, .retained_prefix_positions = 4096, .retained_growth_positions = 1024, .unclaimed_positions = 8381440, .valid_states = 2, .invalidations_total = 3, .placement_blocks_total = 4 },
+            .prompt_state = .{ .enabled = true, .budget_bytes = 536870912, .held_bytes = 268435456, .spare_bytes = 1024, .entries = 2, .hits_total = 5, .misses_total = 6, .evictions_total = 1, .refusals_total = 1, .failures_total = 3, .failures_keep_total = 1, .failures_restore_total = 1, .failures_peer_forget_total = 1 },
+        },
+    };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_capacity_positions 8388608\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_unclaimed_positions 8381440\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_pool_placement_blocks_total 4\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:prompt_state_cache_budget_bytes 536870912\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_state_cache_failures_by_stage_total{stage=\"keep\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_state_cache_failures_by_stage_total{stage=\"restore\"} 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "prompt_state_cache_failures_by_stage_total{stage=\"peer_forget\"} 1") != null);
+    // inconsistent accounting is exported as nothing, never as a healthy zero
+    stub.status_value.cache.?.consistent = false;
+    var bad: std.Io.Writer.Allocating = .init(gpa);
+    defer bad.deinit();
+    try m.render(std.testing.io, &bad.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, bad.written(), "kv_pool_capacity_positions") == null);
+    // a disabled store keeps its families absent while the pool still reports
+    stub.status_value.cache.?.consistent = true;
+    stub.status_value.cache.?.prompt_state = .{ .enabled = false };
+    var off: std.Io.Writer.Allocating = .init(gpa);
+    defer off.deinit();
+    try m.render(std.testing.io, &off.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, off.written(), "tensorfold:kv_pool_capacity_positions 8388608\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, off.written(), "prompt_state_cache_entries") == null);
 }

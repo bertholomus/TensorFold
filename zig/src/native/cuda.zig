@@ -133,6 +133,42 @@ fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     return .{ .active = u.device, .cache = 0, .peak = u.peak };
 }
 
+/// The family's pool account and the prompt-state store's counts, as one coherent copy for the engine thread.
+fn readCache(ptr: ?*anyopaque, out: *api.CacheStatus) bool {
+    const h: *Host = @ptrCast(@alignCast(ptr orelse return false));
+    var ok = true;
+    if (h.pool_observe) |f| {
+        var account: api.CachePool = .{};
+        const good = f(h.family, &account);
+        out.pool = account;
+        ok = ok and good;
+    }
+    if (h.cache) |*store| {
+        out.prompt_state = .{
+            .enabled = true,
+            .budget_bytes = store.budget,
+            .held_bytes = store.held,
+            .spare_bytes = store.spare(),
+            .entries = store.entries.items.len,
+            .hits_total = store.counts.hits,
+            .misses_total = store.counts.misses,
+            .evictions_total = store.counts.evicted,
+            .refusals_total = store.counts.refused,
+            .failures_total = store.counts.failed,
+            .failures_keep_total = store.counts.failed_keep,
+            .failures_restore_total = store.counts.failed_restore,
+            .failures_peer_forget_total = store.counts.failed_peer_forget,
+        };
+    } else out.prompt_state = .{ .enabled = false };
+    return ok;
+}
+
+/// The family's publish hook: a copied account at an allocator mutation, on the engine thread.
+fn publishCache(p: ?*anyopaque) void {
+    const x: *Host = @ptrCast(@alignCast(p orelse return));
+    x.host.publishCache(true);
+}
+
 /// A lone driver returns false at completion or true when yield hands it to the lane core.
 const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
 
@@ -157,6 +193,8 @@ const Host = struct {
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
     cache: ?api.prompt_cache.Store = null, // kept prompt states, when the family keeps them
     snap_vt: api.prompt_cache.Snapshots.VTable = undefined,
+    pool_observe: ?*const fn (*anyopaque, *api.CachePool) bool = null, // the family's pool account (null: none)
+    pool_attach: ?*const fn (*anyopaque, ?*const fn (?*anyopaque) void, ?*anyopaque) void = null,
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -195,6 +233,8 @@ const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         if (h.cache) |*store| h.host.cache = store;
+        if (h.pool_observe != null) h.host.observe = .{ .ctx = h, .read = readCache };
+        if (h.pool_attach) |f| f(h.family, publishCache, h); // before the lane thread starts mutating
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -363,6 +403,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
+    if (@hasField(@TypeOf(loaded), "observe")) h.pool_observe = loaded.observe;
+    if (@hasField(@TypeOf(loaded), "attach")) h.pool_attach = loaded.attach;
     h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}", .{
         capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
     });

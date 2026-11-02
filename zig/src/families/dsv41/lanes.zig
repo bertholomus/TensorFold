@@ -23,6 +23,7 @@ const link = @import("link.zig");
 const cuda = @import("cuda");
 
 const be = lanes.backend;
+const cache = lanes.cache;
 const Model = model.Model;
 const max_streams = model.max_streams;
 const max_rows = round.max_rows;
@@ -198,6 +199,9 @@ test "a copy that fills the pool leaves no room for another request of its size"
     try std.testing.expect(try roomAfter(gpa, used[0..2], b2, 4 * c, 16 * c));
 }
 
+/// Where a mutation publishes a copied account of the pool (the native host's lane thread); null: nowhere.
+pub const Mutate = struct { ctx: ?*anyopaque = null, publish: *const fn (?*anyopaque) void };
+
 pub fn place(used: []const [2]usize, size: usize, cap: usize) ?usize {
     var base: usize = 0;
     while (base + size <= cap) {
@@ -304,6 +308,10 @@ pub const Lanes = struct {
     next: u64 = 0,
     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
     next_snap: u64 = 1,
+    // the pool's account, published at allocator mutations (never from an HTTP thread)
+    invalidations: u64 = 0, // valid -> stale transitions (each counted once)
+    placement_blocks: u64 = 0, // placement attempts refused for want of a fitting extent
+    mutate: ?Mutate = null,
 
     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
@@ -455,6 +463,7 @@ pub const Lanes = struct {
         self.staleOver(if (kept != null and !moved) base + kept.?.at else base, base + size, kept);
         try self.streams.put(gpa, s, .{ .slot = slot, .base = base, .end = base + size });
         self.used[slot] = true;
+        self.mutated(); // the reservation is visible now, not only when a long pass ends
         errdefer {
             _ = self.streams.remove(s);
             self.used[slot] = false;
@@ -776,14 +785,14 @@ pub const Lanes = struct {
             };
             const got = try placeSoft(gpa, live, kept.items, size, self.m.pool_cap);
             if (held and self.patient(source.?)) {
-                const b = got orelse return error.ContextFull;
-                return if (try roomAfter(gpa, rows.items, b, size, self.m.pool_cap)) b else error.ContextFull;
+                const b = got orelse return self.noRoom();
+                return if (try roomAfter(gpa, rows.items, b, size, self.m.pool_cap)) b else self.noRoom();
             }
             if (got) |b| return b;
             const victim = for (self.snaps.items) |sn| {
                 if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
-            } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
-            victim.stale = true;
+            } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return self.noRoom()) else return self.noRoom();
+            self.markStale(victim);
         }
     }
 
@@ -803,8 +812,54 @@ pub const Lanes = struct {
     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
     fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
         for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
-            sn.stale = true;
+            self.markStale(sn);
         };
+        self.mutated();
+    }
+
+    /// A valid state becomes stale (its rows are reused): the transition is counted once, never per retry or scrape.
+    fn markStale(self: *Lanes, sn: *Snap) void {
+        if (sn.stale) return;
+        sn.stale = true;
+        self.invalidations += 1;
+    }
+
+    /// A placement refused for want of a fitting extent: an attempt, not a request, and not a stale transition.
+    fn noRoom(self: *Lanes) error{ContextFull} {
+        self.placement_blocks += 1;
+        return error.ContextFull;
+    }
+
+    /// A copied account of the shared pool from the allocator's own spans: CPU metadata only, no device read, no
+    /// pool-capacity scan. Called on the engine thread, so the arrays it reads are the ones it owns.
+    pub fn accountPool(self: *const Lanes, out: *cache.Pool) bool {
+        const gpa = self.gpa;
+        var live: std.ArrayList(cache.Iv) = .empty;
+        defer live.deinit(gpa);
+        var kept: std.ArrayList(cache.KeptIv) = .empty;
+        defer kept.deinit(gpa);
+        var valid: u64 = 0;
+        var it = self.streams.valueIterator();
+        while (it.next()) |l| {
+            if (l.base > l.end) return false;
+            live.append(gpa, .{ .lo = l.base, .hi = l.end }) catch return false;
+        }
+        for (self.snaps.items) |sn| {
+            if (sn.stale) continue; // its rows are no one's to restore
+            valid += 1;
+            kept.append(gpa, .{ .base = sn.base, .at = sn.at, .end = sn.end }) catch return false;
+        }
+        out.* = .{ .valid_states = valid, .invalidations_total = self.invalidations, .placement_blocks_total = self.placement_blocks };
+        cache.accountIvs(gpa, self.m.pool_cap, live.items, kept.items, out) catch return false;
+        return true;
+    }
+
+    pub fn accountPoolFn(ptr: *anyopaque, out: *cache.Pool) bool {
+        return of(ptr).accountPool(out);
+    }
+
+    fn mutated(self: *Lanes) void {
+        if (self.mutate) |m| m.publish(m.ctx);
     }
 
     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
@@ -825,6 +880,7 @@ pub const Lanes = struct {
         errdefer sn.buf.free();
         try self.snaps.append(self.gpa, sn);
         self.next_snap += 1;
+        self.mutated();
         if (try self.begin(.snap_save)) {
             try self.wire.int(self.gpa, u64, sn.id);
             try self.wire.int(self.gpa, u32, @intCast(l.slot));
@@ -849,15 +905,16 @@ pub const Lanes = struct {
         }
         sn.buf.free();
         self.gpa.destroy(sn);
+        self.mutated();
     }
 
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         const kv = self.streams.fetchRemove(s) orelse return;
         self.used[kv.value.slot] = false;
+        self.mutated();
     }
 };
-
 /// Prefix survivals: out[j] = the product of sigmoid(conf[i]) for i <= j, in float64 (libm's exp, as chooseK).
 pub fn survivals(conf: []const f32, out: []f64) void {
     var surv: f64 = 1.0;

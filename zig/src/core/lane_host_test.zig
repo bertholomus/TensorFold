@@ -213,3 +213,94 @@ test "after a long prompt pass, a stream near its max_tokens ends before the nex
     // the first request (64 tokens: within finish_left) ended before the second's first token
     try std.testing.expect(seq.a_done.? < seq.b_first.?);
 }
+
+test "the cache group is a copied observation: absent without a backend, published by the engine thread, consistent to scrapes" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2, .context_window = 4096 });
+    const e = host.engine();
+    var before: api.Status = .{};
+    e.status(&before, &.{});
+    try std.testing.expect(before.cache == null); // no backend account: the group is absent, not zero
+    const Obs = struct {
+        reads: std.atomic.Value(u32) = .init(0),
+        bad: bool = false,
+        fn read(ctx: ?*anyopaque, out: *api.CacheStatus) bool {
+            const o: *@This() = @ptrCast(@alignCast(ctx.?));
+            _ = o.reads.fetchAdd(1, .monotonic);
+            out.pool = .{ .capacity_positions = 8388608, .active_reserved_positions = 10, .retained_prefix_positions = 20, .retained_growth_positions = 30, .unclaimed_positions = 8388608 - 60, .valid_states = 1, .invalidations_total = 2, .placement_blocks_total = 0 };
+            out.prompt_state = .{ .enabled = true, .budget_bytes = 1 << 29, .held_bytes = 1 << 28, .entries = 1, .failures_total = 3, .failures_keep_total = 2, .failures_restore_total = 1 };
+            return !o.bad;
+        }
+    };
+    var obs: Obs = .{};
+    host.observe = .{ .ctx = &obs, .read = Obs.read };
+    try host.start();
+    defer host.stop();
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        done: ?Reason = null,
+        tokens: usize = 0,
+        fn event(ctx: *anyopaque, _: Id, ev: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (ev.*) {
+                .tokens => |t| b.tokens += t.len,
+                .finished => |f| b.done = f.reason,
+                else => {},
+            }
+        }
+        fn finished(b: *@This()) bool {
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            return b.done != null;
+        }
+    };
+    const Scrape = struct {
+        host: *LaneHost,
+        seen: u32 = 0,
+        fn run(s: *@This()) void {
+            for (0..500) |_| {
+                var st: api.Status = .{};
+                s.host.engine().status(&st, &.{});
+                if (st.cache) |c| {
+                    std.testing.expect(c.consistent) catch return;
+                    std.testing.expectEqual(@as(u64, 8388608), c.pool.?.capacity_positions) catch return;
+                    std.testing.expectEqual(@as(u64, 8388608 - 60), c.pool.?.unclaimed_positions) catch return;
+                    s.seen += 1;
+                }
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    // a fake admission/completion runs on the engine thread while another thread scrapes status: no deadlock, no
+    // family traversal by the scraper, and every copy is internally consistent
+    const prompt = [_]u32{ 2, 7, 1, 8 };
+    var box: Box = .{};
+    try e.submit(1, &.{ .prompt = &prompt, .max_tokens = 4 }, .{ .ctx = &box, .event = Box.event });
+    var scrape = Scrape{ .host = &host };
+    const th = try std.Thread.spawn(.{}, Scrape.run, .{&scrape});
+    th.join();
+    try std.testing.expect(box.finished());
+    try std.testing.expect(scrape.seen > 0);
+    try std.testing.expect(obs.reads.load(.monotonic) > 0);
+    var st: api.Status = .{};
+    e.status(&st, &.{});
+    try std.testing.expectEqual(@as(u64, 4096), st.cache.?.context_limit_positions);
+    try std.testing.expectEqual(@as(u32, 2), st.cache.?.stream_capacity);
+    try std.testing.expect(st.cache.?.engine_epoch != 0);
+    try std.testing.expect(st.cache.?.observed_unix_ns != 0);
+    try std.testing.expectEqual(@as(u64, 3), st.cache.?.prompt_state.?.failures_total);
+    // an inconsistent account is copied as inconsistent, never clamped to a healthy one
+    obs.bad = true;
+    host.publishCache(true);
+    e.status(&st, &.{});
+    try std.testing.expect(!st.cache.?.consistent);
+}

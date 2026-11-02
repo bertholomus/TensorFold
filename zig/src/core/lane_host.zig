@@ -41,6 +41,12 @@ pub const LaneHost = struct {
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
+    /// The backend's cache account; null: no cache group. Published copies live under `obs` for scrapes.
+    observe: ?api.Observe = null,
+    obs_mutex: std.Io.Mutex = .init,
+    obs: ?api.CacheStatus = null,
+    obs_ns: i96 = 0, // monotonic time of the last published copy
+    cache_epoch: u64 = 1, // this engine start's opaque counter-domain identity
     // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
     // other streams ran): admitted again once fewer than this many streams are active, or at full_retry (a backend
     // may refuse for a while to keep its kept states, waiting for one stream, and then place it)
@@ -58,6 +64,7 @@ pub const LaneHost = struct {
     const finish_ns: i96 = 5 * std.time.ns_per_s;
     const finish_left: i64 = 256;
     const window_ns: i96 = 2 * std.time.ns_per_s;
+    const obs_interval_ns: i96 = 100 * std.time.ns_per_ms;
 
     const Job = struct {
         host: *LaneHost,
@@ -97,11 +104,33 @@ pub const LaneHost = struct {
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
         enforced.loop_guard = true;
-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
+        const epoch_ns = @max(0, std.Io.Clock.real.now(io).toNanoseconds());
+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .cache_epoch = @intCast(epoch_ns) };
     }
 
     pub fn start(h: *LaneHost) !void {
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
+    }
+
+    /// Copies the backend's cache account at a stable mutation boundary (the engine thread owns the arrays it reads).
+    /// Forced copies happen on every allocator mutation; loop copies are rate-limited, so an idle engine's unchanged
+    /// state stays freshly observed while a long prompt pass shows its reservation.
+    pub fn publishCache(h: *LaneHost, force: bool) void {
+        const ob = h.observe orelse return;
+        const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        if (!force and now - h.obs_ns < obs_interval_ns) return;
+        var out: api.CacheStatus = .{
+            .engine_epoch = h.cache_epoch,
+            .context_limit_positions = h.info_.context_window,
+            .stream_capacity = h.info_.lanes,
+        };
+        const ok = ob.read(ob.ctx, &out);
+        out.consistent = out.consistent and ok;
+        out.observed_unix_ns = @intCast(@max(0, std.Io.Clock.real.now(h.io).toNanoseconds()));
+        h.obs_mutex.lockUncancelable(h.io);
+        defer h.obs_mutex.unlock(h.io);
+        h.obs = out;
+        h.obs_ns = now;
     }
 
     /// Stops admitting, cancels what is left and joins the engine thread.
@@ -186,6 +215,10 @@ pub const LaneHost = struct {
             .streams = n,
             .generation_tokens = h.live_generated,
         };
+        // The cache copy is the lane thread's, never this thread's reading of the family's arrays.
+        h.obs_mutex.lockUncancelable(h.io);
+        if (h.obs) |c| out.cache = c;
+        h.obs_mutex.unlock(h.io);
     }
 
     fn memoryFn(ctx: *anyopaque, reset_peak: bool) ?Memory {
@@ -515,6 +548,7 @@ pub const LaneHost = struct {
             h.takeCancels();
             while (h.admitOne()) {}
             h.noteLive();
+            h.publishCache(false);
             h.lock();
             if (h.closing) {
                 const left = h.queued.items.len + h.admitted.items.len;
@@ -672,4 +706,6 @@ test "a lane host serves the core's own tokens, in order, and cancels between ro
     try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
 }
 
-test { _ = @import("lane_host_test.zig"); }
+test {
+    _ = @import("lane_host_test.zig");
+}

@@ -20,6 +20,7 @@ pub const windows = @import("windows.zig");
 pub const trail = @import("trail.zig");
 pub const engine = @import("engine.zig");
 pub const fake = @import("fake.zig");
+pub const cache = @import("cache.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;
@@ -32,4 +33,5 @@ test {
     std.testing.refAllDecls(@This());
     _ = @import("engine_test.zig");
     _ = @import("gpu_full_test.zig");
+    _ = @import("cache.zig");
 }

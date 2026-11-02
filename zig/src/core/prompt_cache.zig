@@ -59,7 +59,22 @@ pub const Entry = struct {
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
 };
 
-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
+pub const Counts = struct {
+    hits: u64 = 0,
+    misses: u64 = 0,
+    kept: u64 = 0,
+    evicted: u64 = 0,
+    refused: u64 = 0,
+    /// Every failure the store counts, by no particular stage: the legacy aggregate. Historical values cannot be
+    /// attributed to one stage after the fact; the three classified counters below sum to it from now on.
+    failed: u64 = 0,
+    /// A state could not be kept (allocation, backend save, keeping it).
+    failed_keep: u64 = 0,
+    /// A kept state could not be restored (the pass then prefills from 0: a correct cold fallback, not a GPU fault).
+    failed_restore: u64 = 0,
+    /// A peer could not resume a state, so it was forgotten here.
+    failed_peer_forget: u64 = 0,
+};
 
 /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
 pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
@@ -175,6 +190,7 @@ pub const Store = struct {
     pub fn forget(s: *Store, prompt: []const u32, at: u32) void {
         for (s.entries.items, 0..) |e, i| if (e.at == at and e.tokens.len <= prompt.len and std.mem.eql(u32, e.tokens, prompt[0..e.tokens.len])) {
             s.counts.failed += 1;
+            s.counts.failed_peer_forget += 1;
             return s.remove(i);
         };
     }
@@ -209,6 +225,7 @@ pub const Store = struct {
         const i = std.mem.indexOfScalar(*Entry, s.entries.items, e) orelse return;
         if (!ok) {
             s.counts.failed += 1;
+            s.counts.failed_restore += 1;
             return s.remove(i);
         }
         s.clock += 1;
@@ -363,11 +380,14 @@ pub const Store = struct {
     /// One log line after a prompt pass: where it resumed, how many states it kept, and what the store holds.
     pub fn report(s: *const Store, prompt: usize, from: u32, kept: u64) void {
         if (@import("builtin").is_test) return;
-        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d})", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed });
+        std.log.info("prompt cache: {d} tokens, resumed at {d}, kept {d}; {d} states, {d} MiB and {d} MiB spare of {d} MiB (hits {d}, misses {d}, evicted {d}, refused {d}, failed {d}: keep {d}, restore {d}, peer {d})", .{ prompt, from, kept, s.entries.items.len, s.held >> 20, s.spare() >> 20, s.budget >> 20, s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.refused, s.counts.failed, s.counts.failed_keep, s.counts.failed_restore, s.counts.failed_peer_forget });
     }
 
     fn fail(s: *Store, at: u32, err: anyerror) bool {
-        defer s.counts.failed += 1;
+        defer {
+            s.counts.failed += 1;
+            s.counts.failed_keep += 1;
+        }
         note("keeping {d} tokens failed ({s}); a later turn prefills them", .{ at, @errorName(err) });
         return false;
     }

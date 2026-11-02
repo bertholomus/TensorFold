@@ -65,6 +65,10 @@ pub const Loaded = struct {
     lone: ?LoneRun = null,
     /// Kept prompt states for the host's prompt cache (core/prompt_cache Snapshots: `ptr` and its functions).
     snaps: ?Snaps = null,
+    /// A copied account of the shared position pool (the host's /health.live.cache pool group), CPU metadata only.
+    observe: ?*const fn (*anyopaque, *lanes.cache.Pool) bool = null,
+    /// Where the family publishes that account at allocator mutations; the host passes its own publish hook.
+    attach: ?*const fn (*anyopaque, ?*const fn (?*anyopaque) void, ?*anyopaque) void = null,
     /// Images in requests (the server renders their placeholders; the tower runs on this rank).
     vision: ?lanes.stream.Vision = null,
 };
@@ -159,7 +163,18 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
     const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn };
-    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .vision = if (st.vision) |v| v.hook() else null };
+    return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .observe = observePoolFn, .attach = attachPoolFn, .vision = if (st.vision) |v| v.hook() else null };
+}
+
+/// The family's pool account, in the shared cache contract (the interval math is core/lanes/cache.zig).
+fn observePoolFn(ctx: *anyopaque, out: *lanes.cache.Pool) bool {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    return st.lanes.accountPool(out);
+}
+
+fn attachPoolFn(ctx: *anyopaque, publish: ?*const fn (?*anyopaque) void, host: ?*anyopaque) void {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    st.lanes.mutate = if (publish) |p| .{ .ctx = host, .publish = p } else null;
 }
 
 fn deinitFn(ptr: *anyopaque) void {

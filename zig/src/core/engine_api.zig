@@ -179,6 +179,13 @@ pub const MemorySource = struct {
     read: *const fn (ctx: ?*anyopaque, reset_peak: bool) ?Memory,
 };
 
+/// The cache-observability contract (core/lanes/cache.zig), re-exported: the pool's four disjoint categories, the
+/// prompt-state store's storage and counters, the additive status group and the backend's observe hook.
+pub const CachePool = lanes.cache.Pool;
+pub const CacheStore = lanes.cache.Store;
+pub const CacheStatus = lanes.cache.Status;
+pub const Observe = lanes.cache.Observe;
+
 pub const Status = struct {
     /// Requests in prefill or decode, and those waiting for a lane.
     running: u32 = 0,
@@ -192,6 +199,8 @@ pub const Status = struct {
     streams: usize = 0,
     /// Generated tokens held by live streams, excluding their prompts.
     generation_tokens: u64 = 0,
+    /// The cache account, when the engine exposes one (null: absent, not zero).
+    cache: ?CacheStatus = null,
 };
 
 pub const SubmitError = error{ Closed, Busy };

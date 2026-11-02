@@ -255,6 +255,8 @@ test "a failed copy keeps nothing and a failed restore prefills from the start" 
     _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
     try std.testing.expectEqual(@as(usize, 0), s.entries.items.len);
     try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
+    try std.testing.expectEqual(@as(u64, 1), s.counts.failed_keep); // the legacy aggregate's stage: keeping it failed
+    try std.testing.expectEqual(@as(u64, 0), s.counts.failed_restore);
     f.fail_save = false;
     _ = f.pass(&s, &t1, try s.begin(a, &t1, 4, &.{}, &.{}, null));
     try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
@@ -263,6 +265,9 @@ test "a failed copy keeps nothing and a failed restore prefills from the start" 
     const p = try s.begin(a, &t2, 6, &.{}, &.{}, null);
     try std.testing.expectEqual(@as(u32, 0), p.from);
     try std.testing.expectEqual(@as(usize, 0), s.entries.items.len); // the entry that failed is gone
+    try std.testing.expectEqual(@as(u64, 2), s.counts.failed);
+    try std.testing.expectEqual(@as(u64, 1), s.counts.failed_restore);
+    try std.testing.expectEqual(@as(u64, 1), s.counts.failed_keep);
     try std.testing.expectEqual(fresh(&t2), f.pass(&s, &t2, p));
 }
 
@@ -399,6 +404,8 @@ test "a state a peer cannot resume is forgotten: the next prompt misses instead 
     try std.testing.expectEqual(@as(u32, 4), plan.from);
     s.forget(&t2, plan.from); // the peer's answer: it lacks that state
     try std.testing.expectEqual(@as(u64, 1), s.counts.failed);
+    try std.testing.expectEqual(@as(u64, 1), s.counts.failed_peer_forget);
+    try std.testing.expectEqual(@as(u64, 0), s.counts.failed_keep + s.counts.failed_restore);
     try std.testing.expectEqual(@as(?*pc.Entry, null), s.find(&t2, &.{}));
     try std.testing.expectEqual(s.entries.items.len, f.live);
 }
