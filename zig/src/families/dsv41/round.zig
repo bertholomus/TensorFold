@@ -33,7 +33,7 @@ const Chunk = prompt.Chunk;
 const Caches = prompt.Caches;
 
 /// kernels.ROUND_ROWS (TF_DS_ROUND_ROWS unset: TF_DS_DECODE_ROWS, 16): a round's rows at most.
-pub const max_rows = 48; // the most rows any round-row setting (Engine.round_rows) gives a round
+pub const max_rows = 64; // the most rows any round-row setting (Engine.round_rows) gives a round
 /// The served round-row bound when TF_DS_ROUND_ROWS is unset (kernels.DECODE_ROWS); the four-node lane serves 48.
 pub const default_rows = 16;
 /// graph.py BUCKET_MIN (TF_DS_BUCKET_MIN unset).

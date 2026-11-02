@@ -44,7 +44,7 @@ pub const ring_extra = 16;
 pub const max_stages = 4;
 pub const max_block = 8;
 /// absorb_many's rows at most: every drafting stream's verify window (16 rows a round).
-pub const max_absorb = 48; // a round's drafting rows at most (round.max_rows)
+pub const max_absorb = 64; // a round's drafting rows at most (round.max_rows)
 
 /// DraftPool: one ring plane a stage, bf16 [slots * ring, head_dim]; slot s's rows [s * ring, (s + 1) * ring). Positions
 /// below `absorbed[s]` are in slot s's rings.
