@@ -156,7 +156,7 @@ const Window = struct {
         const i: usize = ex.down_k;
         const ig: usize = ex.width;
         const dn: usize = ex.down_n;
-        if (r == 0 or r >= X.exact_rows or r > sc.rows) return error.NotADecodeWindow;
+        if (r == 0 or r > X.exact_rows or r > sc.rows) return error.NotADecodeWindow; // X.decodeLaunches: up to a 64-row round
         const cgu = try X.config(d, i, true);
         const cd = try X.config(i, d, false);
         if (cgu[0] != 8 or cgu[1] != 4 or cd[0] != 8 or cd[1] != 4 or cd[2] != 1) return error.UnsupportedShape;
@@ -458,7 +458,8 @@ test "a 2D node's decode scratch and windows" {
     var ex: weights.Experts = .{ .trellis = 0, .gate_ptr = 0, .up_ptr = 0, .down_ptr = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .count = 385, .dims = 5120, .width = 640, .down_k = 1152, .down_n = 2560, .k2_gu = .{ 6, 10 }, .k2_d = .{ 6, 10 } };
     try std.testing.expectEqual([13]usize{ 4587520, 4587520, 573440, 9175040, 4587520, 7700, 5120, 4, 1540, 1540, 1540, 4, 197120 }, try decodeSizes(64, 7, ex));
     const sc: X.DecodeScratch = .{ .rows = 64, .slots = 7, .xg = 0, .xu = 0, .xd = 0, .z = 0, .y = 0, .cnt_gu = 0, .cnt_d = 0, .epoch = 0, .ready = 0, .ready_cnt = 0, .ids = 0, .count = 0, .members = 0 };
-    for ([_]usize{ 0, 64, 65 }) |r| try std.testing.expectError(error.NotADecodeWindow, gateUpLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
+    for ([_]usize{ 0, 65 }) |r| try std.testing.expectError(error.NotADecodeWindow, gateUpLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
+    _ = try gateUpLaunches(ex, sc, 0, 5120, 0, 0, 0, 64, 10); // a 64-row round
     _ = try gateUpLaunches(ex, sc, 0, 5120, 0, 0, 0, 63, 10);
     ex.width = 512;
     try std.testing.expectEqual([13]usize{ 4587520, 4587520, 458752, 7340032, 4587520, 6160, 5120, 4, 1540, 1540, 1540, 4, 197120 }, try decodeSizes(64, 7, ex));
