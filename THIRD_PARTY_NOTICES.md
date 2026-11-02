@@ -157,6 +157,10 @@ module (`experts_grouped.cuh` of the Python line, whose header credits ExLlamaV3
 Turboderp, text below), its arithmetic unchanged; the file's header says so. The branch's ATTRIBUTION.md lists every
 outside source of the family.
 
+One of the branch's commits is tonyd2wild's patch (`TF_SEED_RANDOM` and `TF_TOP_K_MAX` in
+`zig/src/server/server.zig`), MIT License, Copyright (c)
+2026 Tech2wild, kept under their author's name; the license is included in `LICENSES/tonyd2wild-MIT.txt`.
+
 Its structured output and forced tool calls (`zig/src/server/tool_grammar.zig` and the family's grammar rounds) run
 on libtfgrammar, described below; a deployment's kernel kit carries it built for aarch64 Linux
 (`grammar/libtfgrammar.so`, with xgrammar's and dlpack's licenses and xgrammar's notice beside it; not in this
