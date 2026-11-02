@@ -1,7 +1,128 @@
 # What's new in TensorFold
 
-`tensorfold update` prints the sections below that are newer than the version you had. Each release's page on
-GitHub has the full notes and the measurements behind them.
+Each release's page on GitHub has its notes and measurements. See [the 1.0.0 release notes](RELEASE-NOTES-1.0.0.md) for the native binary's supported models and migration details.
+
+## 1.0.2
+
+- GLM-5.3-Flash serves several requests at once on its two Macs. Eight concurrent requests decode at 199 tokens a second in total, against 100 in 1.0.1, and each stream equals its solo run.
+- GLM's two Macs split the attention heads, the dense layers and the vocab head as well as the experts. One stream decodes plain at 91 tokens a second, from 83. With drafts it decodes 114 to 131 tokens a second on prose and 138 to 148 on code, each reply equal to its plain one. A fresh 7,300-token prompt reaches its first token in 4.4 seconds instead of 6.5.
+- GLM keeps prompt states between requests. A resumed prompt equals a fresh one token for token, and a 7,300-token conversation resumes in 0.18 seconds.
+- A new conversation that starts with the same system prompt and tools resumes all of that shared prefix: its first token came in 0.06 seconds after a 4,700-token system prompt.
+- `--learn` keeps those shared prefixes on disk. After a restart, the first new conversation on a known system prompt reached its first token in 0.64 seconds instead of 4.43. An upgrade keeps them when a startup check finds its prompt passes give the same bits. `--learn-gib` caps their disk, 32 GiB by default. GLM only for now.
+
+## 1.0.1
+
+- The shipped binary has `tensorfold models`, `tensorfold info MODEL` and `tensorfold pull REPO`. In 1.0.0 they were built into the development CLI only, so a Homebrew install didn't have them.
+
+## 1.0.0
+
+- TensorFold is a native Zig server. The shipped engine loads checkpoints, tokenizes requests, renders chat templates and serves HTTP without a Python engine. Python 0.6.6 remains on `python-0.6` and the `v0.6.6` tag.
+- Four model families are qualified for this release: Nemotron 3.5 Lightning on Metal from M1 through M5 and on NVIDIA GB10 CUDA, greedy and sampled; Qwen3.8 Flash Next on M5 Ultra Metal; GLM-5.3-Flash across two M5 Ultra Macs; and Qwen3.5-2B on M5 Max Metal.
+- Flash Next loads its checkpoint directly. Serving it no longer requires a Python kernel recording. The native loader builds the layouts it needs from the checkpoint and uses the embedded Metal sources.
+- Native server interfaces: OpenAI chat/completion routes, Anthropic Messages and token counting, tools, streaming, tokenization, health, metrics and the optional dashboard. `capabilities --json` and `serve MODEL --help` describe the binary's supported options.
+- Opt-in context compaction (`--compact-at`, `--compact-keep`, `--compact-memory`) compacts a conversation that would overflow instead of refusing it. Nemotron runs concurrent requests in shared rounds on Metal and CUDA.
+- Metal runtime fixes: `--keep-warm` controls idle GPU keepalive, and a load-time probe selects a prebuilt packed-kernel library when the runtime compiler refuses that kernel on macOS 26.3.
+- Native release archives target macOS arm64 and Linux aarch64 for the GB10, with the executable and bundled license notices. CUDA deployment still needs its qualified kernel assets and NVIDIA driver; paired Metal serving needs the documented transport setup.
+- CUDA GB10 qualification is greedy. Sampled requests do not yet honor the seed, `top_k: 0` fails on that path, and health/metrics do not yet report CUDA device and pinned-memory usage. Those fixes are planned for 1.0.1.
+- Qwen3.8-27B is excluded: drafted/plain equality passes, but its paired served decode and cold-prefill measurements remain slower than Python 0.6.6. Bonsai, Gemma 4, Qwen3.6 and DeepSeek-V4 remain ports for 1.0.x, subject to their model gates.
+- Contributor credits: all 145 public contributors are listed in [RELEASE-NOTES-1.0.0.md](RELEASE-NOTES-1.0.0.md).
+
+Earlier entries document the Python release line.
+
+## 0.6.5 (3 Oct 2026)
+
+- **Qwen3.6-35B-A3B drafts with its own MTP layer on Macs,** as on CUDA. Chains of up to four drafts are verified in
+  the lane rounds, alone or with other streams, and each round's depth comes from the Mac's measured costs, with plain
+  rounds where drafts do not pay. Replies equal `"draft": false`. On an M3 Ultra it decodes 1.5-2.1x `--no-drafts` on
+  short prompts, thinking on or off, and 1.3x at a 28,400-token prompt with the same time to first token: 1.5-1.7x
+  mlx-vlm 0.7.4 with its MTP drafter. DFlash v1 stays available with `--drafter z-lab/Qwen3.6-35B-A3B-DFlash`.
+- **Nemotron on CUDA drafts as deep as its rows pay for.** The MTP head drafts up to 15 levels, one CUDA graph each,
+  and a chain stops where the next verify row would cost more time than its draft is expected to save. Window and
+  level costs are measured at startup on each GPU. Against 0.6.4's default this decodes about 6% faster on one DGX
+  Spark and on two, and 7% faster on an RTX PRO 6000, with replies equal to `"draft": false`. `--mtp-confidence` sets
+  a fixed floor instead.
+- **Nemotron verify windows on M5 Macs read each routed expert once from two rows** (eight before). One stream decodes
+  1-3% faster at three to five lanes, with the same tokens.
+- **API keys on both servers:** `--api-key` (repeatable), `--api-key-file` (one key, or `label: key`, a line; reread on
+  `SIGHUP`) or `TENSORFOLD_API_KEY`. Requests send `Authorization: Bearer` or `x-api-key`. `/health` stays open;
+  `/metrics` needs a key unless `--metrics-open`.
+- **Thinking stays the chat template's default, and the server says so:** one startup line names `--no-thinking`, and
+  a reply that reaches `max_tokens` before it leaves its think block (empty `content`, all `reasoning_content`) gets a
+  warning line.
+- The test suite collects on Macs that have PyTorch but not Triton.
+
+## 0.6.4 (3 Oct 2026)
+
+- **Flash Next on two DGX Sparks serves concurrent requests.** `--parallel N` with two CUDA ranks runs every stream
+  in shared lane rounds, and drafted replies still equal one-token decoding (#141, #180, #219, closes #123). The two
+  ranks now share one communicator interface, so a faster transport can plug in without touching the engines.
+  Thanks to @BHCC2025, @jschmied, @plotarmordev and @jayleaton.
+- **Startup memory on Macs:** prompt chunks are probed smallest first, and a larger probe runs only when its worst
+  case fits the memory budget (#271). Thanks to @boxabirds for the report.
+- **`tensorfold plan`** prints the model and context budget before any weights load (#281), and both `/metrics`
+  routes report the process memory footprint (#277). Thanks to @akol1.
+- Flash Next on CUDA builds its extensions before loading weights (#202) and gathers prompt n-gram rows before
+  waiting on earlier copies (#201). Thanks to @mcclanahanaman.
+- Flash Next on CUDA rereads EXL3 n-gram tables after warm-up and pins their page runs (#254). Thanks to
+  @grearjake-star.
+- `--decode-share` takes effect on Flash Next CUDA: shared prompt rows are sized from completed stand-alone passes
+  (#248, closes #230). Thanks to @simon-lin88.
+- CUDA tree attention folds its partial sums in fp32 groups. Precision is unchanged, but long replies can differ
+  from 0.6.3 in the last bits (#268). Thanks to @Arminova.
+- Flash Next on CUDA refuses cards below sm_120 at startup, before loading weights, and its CUDA tests skip there
+  (#261). Thanks to @mcclanahanaman for the report.
+- `docs/recipes/README.md` lists the minimum card and Mac memory for each family (#139). Thanks to @tomByrer for
+  asking.
+- Benchmark helpers fail early on Python below 3.11 (#276). Thanks to @akol1.
+- Tests collect without the optional MLX or terminal-interface dependencies (#288), and the docs say `--alias`
+  works on the CUDA server too (#289). Thanks to @plotarmordev.
+
+## 0.6.3 (2 Oct 2026)
+
+- **Nemotron on M5 Macs: copied text verifies up to 64 tokens a round.** A lone stream's copy window grows from 16 to
+  64 rows while each lands whole, a window attends in one call, and wide windows keep their Mamba states every 8th
+  row. On an M5 Max, one stream editing code decodes about 1.4x faster (550 to 760 tok/s, and up to 1,000 on a cool
+  machine), prose and code writing gain 1.6-3.3%, and drafted replies still equal one-token decoding.
+- **Anthropic Messages API.** `/v1/messages` and `count_tokens` on the Mac and CUDA servers, with streaming, tools,
+  thinking and cache usage (#223, closes #168). Thanks to @kky42.
+- **Control Room.** `tensorfold service` runs a model as a launchd service, and `tensorfold tui` shows its decode and
+  prefill speed and its connections live.
+- **Flash Next on Macs before M5:** `TF_FLASH_DENSE=matrix` runs every dense projection on the matrix units, and the
+  fused DeltaNet stack uses the matrix kernel by default (#149). Thanks to @gilby.
+- **Vision:** `--vision-offload` keeps the CUDA image tower in host RAM between images (#187, closes #185); image
+  parts are accepted inside tool results (#235); `--vision-image-tokens` lets many images share a larger budget
+  (#239); Flash Next on CUDA takes video (#240). Thanks to @barelyworkingcode and @MiaAI-Lab.
+- **CUDA:** `/v1/decisions` on Flash Next scores labels from the prompt's last logits, the questions filling in one
+  pass (#232); `TENSORFOLD_PREFILL_ROWS` sets the prompt piece rows (#238); NVFP4 and FP8 prompt rows add a tile's K
+  slices in one block, with the same bits (#242); `TENSORFOLD_MEMORY_RESERVE_GIB` moves the memory floor the startup
+  keeps free, by default a tenth of the pool and at least 4 GiB as before (#165); Flash Next's chain kernel takes
+  5-17% less time at 2 to 8 rows, with the same bits. Thanks to @Mirrdhyn, @MiaAI-Lab, @jschmied and @eleqtrizit.
+- **Server:** chunked request bodies are decoded before JSON parsing (#244); `/tokenize` and `/detokenize` carry
+  vLLM's fields (#237); `chat_template_kwargs.thinking` is heard as `enable_thinking`, and GLM-5.3 keeps earlier
+  turns' reasoning (#236); streaming usage gets its own chunk when `stream_options.include_usage` asks for it (#216);
+  malformed tool-call history renders safely (#233); `/metrics` times each request's decode (#269); `/health` carries
+  the live decode and prefill speed. Thanks to @JordiPosthumus, @MiaAI-Lab, @salmanarshad321 and @sxuff.
+- **Fixes:** an EXL3 layer with no bias no longer faults in the split-K reduction (#186); an 8-bit `lm_head` keeps its
+  format in Qwen3.6's MTP draft head on CUDA (#270); a lone Flash Next stream's cache growth on CUDA stays inside the
+  explicit memory budget; two ranks refuse to start with different prompt rows. Thanks to @barelyworkingcode and
+  @BHCC2025.
+- **Models moved to the TensorFold Hugging Face org.** `Vontra/<name>` ids redirect, and the tree now names
+  `TensorFold/<name>`.
+- **Contributing.** `CONTRIBUTING.md` says what a pull request needs to land and how it lands, and new pull requests
+  open with a receipt template.
+
+## 0.6.2 (2 Oct 2026)
+
+- **Flash Next on Macs at 64k-128k.** On an M3 Ultra, one stream runs 1.2-3.4% faster at 64k and 3.9-5.5% at 128k,
+  with the same tokens: a window's n-gram ids are hashed on the GPU, and the chain's first step is built while the
+  GPU verifies.
+- **27B with several streams on CUDA.** The GDN tree kernel takes 8-35% less time with the same bits. On an RTX PRO
+  6000 at its 250 W limit, 4 and 8 streams of the NVFP4 27B decode 1.1-4.2% faster.
+- **Fixes:** the config check accepts the FP8 n-gram table in NVIDIA's MIXED_PRECISION Flash Next export; GLM-5.3
+  on CUDA counts its drafts in `/health`, `/metrics` and replies, and names a mixed-bit EXL3 checkpoint when it
+  refuses one; a client that leaves is noticed past file descriptor 1023; the CUDA server prints a line a request, as
+  the Mac server does; a failed snapshot write no longer leaves its partial file; Gemma 4's QKV kernel reserves its
+  1024 threads for M1, M2 and macOS VMs, and a VM's GPU is no longer taken for an M5.
 
 ## 0.6.1 (1 Oct 2026)
 
@@ -320,7 +441,7 @@ GitHub has the full notes and the measurements behind them.
 ## 0.3.2 (26 Sep 2026)
 
 - `tensorfold update` installs the newest release.
-- GLM-5.3-Flash reads Mia-AiLab's EXL3 weights on two DGX Sparks (experimental).
+- GLM-5.3-Flash reads Brandon M. Music's EXL3/TR3 weights (re-hosted by Mia-AiLab) on two DGX Sparks (experimental).
 
 ## 0.3.1 (26 Sep 2026)
 

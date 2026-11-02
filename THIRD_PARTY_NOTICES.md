@@ -76,6 +76,38 @@ checked bit for bit against ExLlamaV3's dequantization.
 
 Flash Next's optional int8 and int4 KV caches (`families/qwen4_exp/cuda/kvcache.py`) follow the cache quantization scheme of [ExLlamaV3](https://github.com/turboderp-org/exllamav3) `-cq 8` and `-cq 4` (MIT License, Copyright (c) 2025 Turboderp, text below): groups of 32, one fp16 absmax scale per group, the group rotated by a 32-point Hadamard, midpoint-grid codes, `compand_a == 0`. 8-bit stores each code as a signed int8 (`q - 128`). 4-bit stores two unsigned codes per byte, low nibble first (the same bits as ExLlamaV3's little-endian packing, a uint8 tensor rather than their uint32 words). Their dequantizer folds another `1/sqrt(32)` into the scale and applies the unnormalized butterfly on the way out; this cache applies the normalized H32 to the query and to the merged output instead, and leaves the stored codes rotated. Scales match their quantizer bit for bit. Reconstructed values agree within fp16/bf16 rounding (under 0.01 on random groups), not bit for bit. The quantizer and the attention dequant are written for TensorFold and checked against an independent reference of that arithmetic.
 
+## DeepSeek-V4.1-Flash on CUDA (Zig)
+
+The DeepSeek-V4.1-Flash family in `zig/src/families/dsv41/` and its tools in `tools/dsv41-zig/` port this project's own
+DeepSeek-V4.1 TP2 family of the Python line. Its model math (compressed attention and its indexer, mHC mixes, Engram,
+the DSpark draft blocks, Markov head and confidence head) follows the DeepSeek-V4.1-Flash reference, MIT License,
+Copyright (c) 2023 DeepSeek, without including that source. It runs on TensorFold 1.0's native engine (Apache-2.0),
+launches the Python family's Triton kernels (Triton, MIT) from their captured binaries, and reads EXL3 weights through
+the shared EXL3 module described above (ExLlamaV3's format, MIT, Copyright © 2025 Turboderp). The token list of its
+cached Markov rows (`markov_tokens.zig`) is a frequency ranking generated from ExLlamaV3's calibration text (MIT). Its
+target sampler follows the keyed draws of TensorFold's `tensorfold.engine.exact_sampling`. The Zig 0.17.0 toolchain
+(MIT) is used at build time only.
+
+Its image path (`picture.zig`, `vit.zig`, `vision.zig`, `cublaslt.zig`, `fmha.zig`) follows the same reference's image
+processor, vision tower and aligner (MIT, as above). Pictures decode and resample as Pillow's `convert("RGB")` and 8-bit
+BICUBIC `resize` compute them (Pillow, MIT-CMU License, Copyright © 1997-2011 Secret Labs AB, Copyright © 1995-2011
+Fredrik Lundh and contributors, Copyright © 2010 Jeffrey 'Alex' Clark and contributors; `LICENSES/Pillow-MIT-CMU.txt`),
+written for TensorFold without including Pillow's source; images in formats other than PNG are decoded by the
+runtime's own Pillow, called in a `python3` child process (`pil.zig`), which TensorFold does not bundle. The tower's attention launches PyTorch's memory-efficient
+attention kernel (`fmha_cutlassF_f32_aligned_64x64_rf_sm80`) from its sm_120 binary, extracted from the served image's
+`libtorch_cuda.so` into a deployment's kernel kit (`vision/torch_fmha_sm120.cubin`, not in this repository); that kernel
+is PyTorch's, BSD-3-Clause (`LICENSES/PyTorch-BSD-3-Clause.txt`), built on NVIDIA CUTLASS, BSD-3-Clause, Copyright (c)
+2017 - 2025 NVIDIA CORPORATION & AFFILIATES (`LICENSES/CUTLASS-BSD-3-Clause.txt`). Its bias GEMMs call cuBLASLt as
+PyTorch's `gemm_and_bias` does. The image routing bias (`gate_bias_vl.safetensors` in the kit) holds the checkpoint's own
+`ffn.gate.bias_vl` tensors (MIT).
+
+On four nodes (`TF_TP_WORLD=4`: `prompt2d.zig`, `round2d.zig`, `draft2d.zig`, `ring2d.zig`, `exl3_experts2d.zig`) the
+family splits each layer over two pairs of nodes. Its one-launch gate / up for the balanced experts split
+(`zig/kernels/cuda/dsv41/experts_par.cu`) copies the device code of the grouped expert kernel of TensorFold's EXL3
+module (`experts_grouped.cuh` of the Python line, whose header credits ExLlamaV3, MIT License, Copyright (c) 2025
+Turboderp, text below), its arithmetic unchanged; the file's header says so. The branch's ATTRIBUTION.md lists every
+outside source of the family.
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from

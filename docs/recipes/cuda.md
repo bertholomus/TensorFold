@@ -4,7 +4,7 @@ CUDA families read supported checkpoints through PyTorch loaders and execute fam
 CUDA kernels. Use the [runbook](../../RUNBOOK.md#nvidia-gpus) for the container and two-rank setup.
 
 Native Windows is experimental, one GPU a process and not yet run on Windows hardware: see the
-[runbook](../../RUNBOOK.md#win-nvidia).
+[runbook](../../RUNBOOK.md#windows-with-an-nvidia-card).
 
 | Family | CUDA execution |
 | --- | --- |
@@ -30,12 +30,13 @@ the checkpoint you name; it picks none by itself.
 | --- | --- | --- | --- |
 | Qwen3.8-27B | `nvidia/Qwen3.8-27B-NVFP4`, one rank | `turboderp/Qwen3.8-27B-exl3`, one rank | one or two ranks |
 | Flash Next | `Mia-AiLab/Qwen3.8-Flash-Next-NVFP4` (a mirror of local-inference-lab's), `local-inference-lab/Qwen3.8-Flash-Next-NVFP4`, `RadixArk/Qwen3.8-Flash-Next-NVFP4`, one rank | `turboderp/Qwen3.8-Flash-Next-exl3`, one rank | one or two ranks |
-| GLM-5.3-Flash | not read | `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`, two ranks (experimental) | two ranks |
+| GLM-5.3-Flash | not read | `brandonmusic/GLM-5.3-Flash-tr3-4bpw` (Brandon M. Music's; re-hosted as `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw`), two ranks (experimental) | two ranks |
 | Qwen3.6-35B-A3B | not read yet | not read yet | one rank |
 | Nemotron 3.5 Lightning | not read yet | not read yet | one or two ranks |
 
 Mia-AiLab's checkpoints on Hugging Face (30 Sep 2026):
-- Loaded and served here: `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (two Sparks) and
+- Loaded and served here: `Mia-AiLab/GLM-5.3-Flash-EXL3-TR3-4bpw` (two Sparks; a byte-identical re-host of Brandon M.
+  Music's `brandonmusic/GLM-5.3-Flash-tr3-4bpw`, under his ShapleyMCG License 1.0) and
   `Mia-AiLab/Qwen3.8-Flash-Next-NVFP4` (found by its `model_type`, `qwen3_8_flash_next`).
 - Not tried yet: `Mia-AiLab/Qwen3.8-27B-EXL3`, `Mia-AiLab/Qwen3.8-27B-EXL3-2.0bpw`,
   `Mia-AiLab/Qwen3.8-27B-EXL3-3.5bpw`, `Mia-AiLab/Qwen3.8-27B-DFlash2-EXL3-5.0bpw` (a drafter),
@@ -54,11 +55,30 @@ format ([prompt precision](#prompt-precision)):
   back at FP8's precision. Flash Next's, GLM's and Nemotron's MLX 4-bit prompts were already bf16, so nothing
   changes for them.
 
+## Native prompt controls
+
+The native `tensorfold run` command accepts `--device N` to choose a CUDA ordinal. If
+the flag is absent, it uses `TF_CUDA_DEVICE`, then device 0. `--segments N` enables
+staggered prompt work for 1 through 4 whole 2,048-row chunks; without the flag it
+uses `TF_CUDA_SEGMENTS`, then 1. The `tensorfold segments` command compares the
+available segment counts and can profile the serial chunk parts.
+
+CUDA capture and packing use the repository's Triton manifest tool. It records
+Triton and extension launches, maps them to cached kernels and metadata, and
+checks the packed manifest on CPU before a CUDA run.
+
 ## Arithmetic and state
 
 Each engine defines its own serial reference. A verify row uses the same group order, K split and
 rounding as that row alone. Attention partitions depend on absolute key position; router ties use a
 stable ID order. Recurrent commits replay the accepted path with the same update routine.
+
+A two-rank engine opens its communicator with `tensorfold.cuda.comm.open_comm`: NCCL, wrapped by a registered
+transport (a `Transport` subclass) when `TF_COMM_BACKEND` names one; NCCL stays the control channel, and the ranks
+refuse to start with different transports. A model exchange calls `fast_gather`, which takes the transport's
+`all_gather_fast` where there is one; `exchange` trades tensors with a peer (an NCCL send / receive group), and
+`check` raises a transport's recorded failure after a synchronizing exchange. A transport moves bytes, so a reply
+never depends on it.
 
 The default two-rank decode paths gather fp32 partials and add them in rank order. The dense Qwen
 prefill path gathers bf16 partials and adds them in fp32. Rank 0 chooses the window and both ranks
@@ -67,16 +87,16 @@ CUDA graphs replay the same kernels using stable buffers; changing capture shape
 
 ## Shared kernels and prefill
 
-`tensorfold/cuda/kernels/qmm.py` packs 4-bit weights for the shared CUDA matmul. Its decode kernel fixes
+`src/tensorfold/cuda/kernels/qmm.py` packs 4-bit weights for the shared CUDA matmul. Its decode kernel fixes
 the K split by weight shape, while the prompt kernel (`qmm_prefill.cu`) rounds each weight once to bf16 and adds
 every product over K in one fp32 chain, the arithmetic of MLX's prompt matmul. NVFP4, FP8 and MXFP8 weights take
-`nvfp4/prompt.cu`, where each weight is exact in bf16. Prompts run in chunks of up to 4,096 tokens with bf16
+`src/tensorfold/cuda/nvfp4/prompt.cu`, where each weight is exact in bf16. Prompts run in chunks of up to 4,096 tokens with bf16
 activations, as decode does. A row's bits never depend on its chunk or the kernel's tile, so a resumed prompt
 equals a fresh one; they differ from decode's, so the engines retain prompt-end states and prefill replies
 again on a follow-up.
 
-`tensorfold/cuda/kernels/gdn.py` and `attention.py` support several streams in one call. Each stream
-supplies its own tree, cache offsets and accepted path. `tensorfold/cuda/experts.py` groups routed
+`src/tensorfold/cuda/kernels/gdn.py` and `attention.py` support several streams in one call. Each stream
+supplies its own tree, cache offsets and accepted path. `src/tensorfold/cuda/experts.py` groups routed
 row/expert pairs so the MLX 4-bit formats of Flash Next, GLM and Nemotron share expert kernels, with
 separate prefill and decode forms. A shared call must preserve each row's arithmetic and each stream's cache.
 
@@ -187,18 +207,23 @@ whose rows never depend on their chunk; an EXL3 27B's prompt bits change with it
 ## Requests and memory
 
 CUDA `--parallel auto` serves one request at a time. Set an explicit `--parallel N` above one for shared
-Qwen3.8-27B rounds on one or two ranks, or Flash Next on one rank. Flash Next rejects this setting with
-`--tp 2`; Nemotron, GLM and Qwen3.6 remain serialized. The shared scheduler admits requests between decode
-rounds, then verifies each active stream's drafts together and commits each stream independently. On the 27B,
-a new prompt prefills 1,024 tokens a round while the other streams keep decoding, and its state is kept at
-message starts (the second message and the last assistant turn), so prompts that share a system prompt or
-extend a conversation resume there with a fresh prefill's bits.
+Qwen3.8-27B or Flash Next rounds on one or two ranks; Nemotron, GLM and Qwen3.6 remain serialized. The shared
+scheduler admits requests between decode rounds, then verifies each active stream's drafts together and commits
+each stream independently. On the 27B, a new prompt prefills 1,024 tokens a round while the other streams keep
+decoding, and its state is kept at message starts (the second message and the last assistant turn), so prompts that
+share a system prompt or extend a conversation resume there with a fresh prefill's bits.
 
 Cache capacity is fixed at startup and bounds prompt plus reply.
 A positive context that exceeds the startup budget is refused; automatic capacity is an estimate.
-Unified-memory GPUs share physical RAM with host buffers and file-backed model data. Admission uses
-available host memory, including reclaimable page cache, and considers mapped-table residency when sizing
-an automatic window. It accounts for stream count and retained caches where concurrency is enabled.
+The budget grants a discrete card its free memory less a floor of a tenth of the card, at least 4 GiB, for the
+CUDA context and workspace memory the estimate does not count. `TENSORFOLD_MEMORY_RESERVE_GIB` moves that floor
+(at least 2 GiB), and `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` caps the grant from above in GiB, an absolute budget like
+the MLX one. A floor close to the smallest can end requests with CUDA errors mid-reply
+(`PYTORCH_CUDA_ALLOC_CONF` `=` `expandable_segments:True` reduces fragmentation near the cap).
+Unified-memory GPUs share physical RAM with host buffers and file-backed model data. Admission uses the
+host's available memory, reclaimable page cache included, less a floor of a tenth of RAM (at least 4 GiB) that
+`TENSORFOLD_MEMORY_RESERVE_GIB` can move, and considers mapped-table residency when sizing an automatic
+window. It accounts for stream count and retained caches where concurrency is enabled.
 
 Two-rank Flash Next, Nemotron and GLM requests finish on both ranks after a client disconnects, keeping the
 collective sequence aligned. MLX disk snapshots and cache-budget flags do not configure these CUDA

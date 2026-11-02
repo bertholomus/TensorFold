@@ -6,3 +6,37 @@ TensorFold is licensed under the Apache License, Version 2.0 (LICENSE) from 0.6.
 Releases up to 0.5.0 were MIT-licensed, and code written before 0.6.0 keeps its
 MIT notice in LICENSES/MIT.txt. Third-party code and its licenses are listed in
 THIRD_PARTY_NOTICES.md.
+
+DeepSeek-V4.1-Flash on NVIDIA GB10 nodes: branch deepseek-v41-zig-tp4 of this fork
+Copyright 2026 BertholomusAI (Albert Lee, https://github.com/bertholomus)
+
+This branch adds a DeepSeek-V4.1-Flash family to TensorFold's native engine, under the same Apache License,
+Version 2.0 (LICENSE), and runs it on two or four GB10 nodes. Its new files are under zig/src/families/dsv41/,
+zig/kernels/cuda/dsv41/ (with zig/kernels/cuda/dsv41_ops.cu and dsv41_torch.cu) and tools/dsv41-zig/, plus
+zig/src/server/effort_values_test.zig, zig/src/server/reply_parity.zig, ATTRIBUTION.md and three license texts in
+LICENSES/ (PyTorch, CUTLASS, Pillow) that THIRD_PARTY_NOTICES.md refers to. ATTRIBUTION.md lists every outside source
+the family uses and what it took from each. The branch changes these upstream files:
+  README.md
+  THIRD_PARTY_NOTICES.md
+  zig/build/cuda.zig
+  zig/src/core/engine_api.zig
+  zig/src/core/lane_host.zig
+  zig/src/core/lane_host_test.zig
+  zig/src/core/lanes/fake.zig
+  zig/src/core/lanes/stream.zig
+  zig/src/cuda/driver.zig
+  zig/src/cuda/kernels.zig
+  zig/src/cuda/launch.zig
+  zig/src/cuda/nccl.zig
+  zig/src/native/cuda.zig
+  zig/src/server/chat.zig
+  zig/src/server/hf_text.zig
+  zig/src/server/messages.zig
+  zig/src/server/model_text.zig
+  zig/src/server/openai.zig
+  zig/src/server/prompt.zig
+  zig/src/server/reply_text.zig
+  zig/src/server/root.zig
+  zig/src/server/server.zig
+  zig/src/server/tool_parse.zig
+  zig/src/server/tool_parse_test.zig
