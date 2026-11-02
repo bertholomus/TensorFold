@@ -370,7 +370,9 @@ pub fn decodeLaunches(ex: weights.Experts, sc: DecodeScratch, x: u64, x_stride: 
     const i: usize = ex.width;
     const e: usize = ex.count;
     const slots = sc.slots;
-    if (r == 0 or r >= exact_rows or r > sc.rows) return error.NotADecodeWindow;
+    // a window holds up to exact_rows rows (the scratch's): the callers send chunks of fewer than exact_rows rows here
+    // (routed()), and a round of round.max_rows = exact_rows rows (4 member tiles, as 49..63; maxm <= 128 threads)
+    if (r == 0 or r > exact_rows or r > sc.rows) return error.NotADecodeWindow;
     // routed()'s gate of the fused path: GLM's tiles for gate / up (8 n tiles, 4 warps) and down (one split), 128-column
     // blocks, at most 32 slots; and every trellis 16-byte aligned (weights packs each at a multiple of 16 bytes)
     const cgu = try config(d, i, true);
@@ -451,10 +453,11 @@ test "a TP2 DeepSeek-V4.1 rank's decode scratch and windows" {
     // a decoder layer (D 5120, I 1152, 385 experts, 7 slots) and an MTP layer (129 experts, 4 slots), 64 rows
     try std.testing.expectEqual([13]usize{ 4587520, 4587520, 1032192, 16515072, 9175040, 13860, 10240, 4, 1540, 1540, 1540, 4, 197120 }, try DecodeScratch.sizes(64, 7, 5120, 1152, 385));
     try std.testing.expectEqual([13]usize{ 2621440, 2621440, 589824, 9437184, 5242880, 4644, 10240, 4, 516, 516, 516, 4, 66048 }, try DecodeScratch.sizes(64, 4, 5120, 1152, 129));
-    // 1 to 63 rows (no more than the scratch holds); 64 and more are prompt chunks
+    // 1 to 64 rows (no more than the scratch holds; 64: a round of round.max_rows); chunks of 64 and more take the prompt path
     const ex: weights.Experts = .{ .trellis = 0, .gate_ptr = 0, .up_ptr = 0, .down_ptr = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .count = 385, .dims = 5120, .width = 1152, .down_k = 1152, .down_n = 5120, .k2_gu = .{ 6, 10 }, .k2_d = .{ 6, 10 } };
     const sc: DecodeScratch = .{ .rows = 64, .slots = 7, .xg = 0, .xu = 0, .xd = 0, .z = 0, .y = 0, .cnt_gu = 0, .cnt_d = 0, .epoch = 0, .ready = 0, .ready_cnt = 0, .ids = 0, .count = 0, .members = 0 };
-    for ([_]usize{ 0, 64, 65 }) |r| try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
+    for ([_]usize{ 0, 65 }) |r| try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, r, 10));
+    _ = try decodeLaunches(ex, sc, 0, 5120, 0, 0, 0, 64, 10); // a 64-row round
     var small = sc;
     small.rows = 8;
     try std.testing.expectError(error.NotADecodeWindow, decodeLaunches(ex, small, 0, 5120, 0, 0, 0, 9, 10));
