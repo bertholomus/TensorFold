@@ -570,9 +570,7 @@ test "a message's own text holding the image placeholder is escaped" {
     var cx: Cx = .{ .a = arena.allocator() };
     const ph = "<\u{ff5c}deepseek_image\u{ff5c}>";
     var images: Images = .{ .placeholder = ph };
-    const messages = (try json.parseText(cx.a,
-        "[{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"see <\u{ff5c}deepseek_image\u{ff5c}> above\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,aGVsbG8=\"}}]}]"
-    )).ok;
+    const messages = (try json.parseText(cx.a, "[{\"role\": \"user\", \"content\": [{\"type\": \"text\", \"text\": \"see <\u{ff5c}deepseek_image\u{ff5c}> above\"}, {\"type\": \"image_url\", \"image_url\": {\"url\": \"data:image/png;base64,aGVsbG8=\"}}]}]")).ok;
     const out = try normalizeImages(&cx, messages, "system", false, &images);
     const text = out.array[0].get("content").?.string;
     // the image part's own placeholder stays; the text's is escaped to plain ASCII bars
