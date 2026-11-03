@@ -28,6 +28,7 @@ const cuda = @import("cuda");
 const be = lanes.backend;
 const Model = model.Model;
 const max_streams = model.max_streams;
+const pass_rows = 128; // a drafter pass's rows at most (prompt.grouped's decode window)
 const max_rows = round.max_rows;
 
 /// A window of the pending row and the drafter's block: the widest one the gates checked row for row.
@@ -990,30 +991,37 @@ pub const Lanes = struct {
             n += 1;
         }
         if (n == 0) return;
-        if (try self.begin(.pass)) {
-            try self.wire.int(gpa, u32, @intCast(n));
-            try self.wire.int(gpa, u32, @intCast(steps));
-            for (0..n) |i| {
-                try self.wire.int(gpa, i64, tokens[i]);
-                try self.wire.int(gpa, i64, q0[i]);
-                try self.wire.int(gpa, i64, slots[i]);
+        // a pass runs block rows a stream through the decode window's linears (prompt.grouped: 128 rows at most), so
+        // more streams than 128 / block (25 at the 5-row block) draft in passes of that many, each its own wire message
+        const per = @max(1, pass_rows / block);
+        var g0: usize = 0;
+        while (g0 < n) : (g0 += per) {
+            const g1 = @min(n, g0 + per);
+            if (try self.begin(.pass)) {
+                try self.wire.int(gpa, u32, @intCast(g1 - g0));
+                try self.wire.int(gpa, u32, @intCast(steps));
+                for (g0..g1) |i| {
+                    try self.wire.int(gpa, i64, tokens[i]);
+                    try self.wire.int(gpa, i64, q0[i]);
+                    try self.wire.int(gpa, i64, slots[i]);
+                }
+                try self.flush();
             }
-            try self.flush();
-        }
-        const t0 = m.now();
-        try m.pass(tokens[0..n], q0[0..n], slots[0..n], steps);
-        if (self.prof) |*p| {
-            p.pass += m.now() - t0;
-            p.passes += 1;
-            p.pass_streams += n;
-        }
-        const d = &m.dr.?;
-        for (asked[0..n], depths[0..n], 0..) |l, k, i| {
-            for (0..k) |j| {
-                l.held[j] = @intCast(d.drafts[i][j]);
-                l.confs[j] = d.confs[i][j];
+            const t0 = m.now();
+            try m.pass(tokens[g0..g1], q0[g0..g1], slots[g0..g1], steps);
+            if (self.prof) |*p| {
+                p.pass += m.now() - t0;
+                p.passes += 1;
+                p.pass_streams += g1 - g0;
             }
-            l.nheld = k;
+            const d = &m.dr.?;
+            for (asked[g0..g1], depths[g0..g1], 0..) |l, k, i| {
+                for (0..k) |j| {
+                    l.held[j] = @intCast(d.drafts[i][j]);
+                    l.confs[j] = d.confs[i][j];
+                }
+                l.nheld = k;
+            }
         }
     }
 
