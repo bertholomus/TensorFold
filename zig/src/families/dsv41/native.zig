@@ -14,7 +14,7 @@
 //!   TF_DS_WINDOW                                the streams' shared pool of positions (unset: --context; the
 //!                                               four-node lane's 2,097,152 with requests of up to --context)
 //!   TF_DS_ROUND_ROWS, TF_DS_STREAMS             a round's rows at most (16; the four-node lane's 48) and the pool's
-//!                                               streams (4; its 16): --parallel at most the streams. Every rank
+//!                                               streams (4; its 32): --parallel at most the streams. Every rank
 //!                                               the same (the followers: --round-rows, --streams, or these variables):
 //!                                               a rank that differs from rank 0 stops at the start
 //!   TF_RDMA_DEVICES                             the decode gathers over the RDMA ring on these devices (else NCCL)
@@ -214,7 +214,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.NoKit => "set TF_DS_KIT to the kernel kit (cubins/, the RoPE tables, engram.json)",
         error.NoFreeSlot => "this engine serves TF_DS_STREAMS streams at once (default 4): --parallel at most that",
         error.BadRoundRows => "TF_DS_ROUND_ROWS: a round's rows at most, 16 .. 64",
-        error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 16",
+        error.BadStreams => "TF_DS_STREAMS: the pool's streams, 1 .. 32",
         error.BadPassRows => "TF_DS_PASS_ROWS: a multiple of 2,048 from 2,048 to the build's pass rows; TF_DS_PASS_FROM: a position",
         error.BadFill => "TF_FILL_CHUNKS, TF_FILL_FIRST and TF_FILL_ROUNDS: whole numbers (a prompt piece's chunks of 2,048 tokens, the first piece's, the other streams' rounds between two pieces)",
         error.BadWindow => "TF_DS_WINDOW: the streams' shared positions, at least --context",
