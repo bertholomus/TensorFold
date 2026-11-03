@@ -155,6 +155,11 @@ test "an engine's effort numbers: every name passes as asked and the template he
     // no effort: the template's own default; none: thinking off
     try expectHeard(srv, &backend, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}", "thinking=true effort=-\n");
     try expectHeard(srv, &backend, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"none\"}", "thinking=false effort=-\n");
+    try expectHeard(srv, &backend, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"100\"}", "thinking=true effort=100\n");
+    try expectHeard(srv, &backend, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"chat_template_kwargs\":{\"reasoning_effort\":37}}", "thinking=true effort=37\n");
+    try expectHeard(srv, &backend, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"chat_template_kwargs\":{\"enable_thinking\":true,\"reasoning_effort\":\"16\"}}", "thinking=true effort=16\n");
+    try std.testing.expectEqual(@as(u16, 400), try post(srv, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"0\"}"));
+    try std.testing.expectEqual(@as(u16, 400), try post(srv, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":101}"));
 }
 
 test "without effort numbers the template hears the nearest name it quotes, as before" {
@@ -171,4 +176,5 @@ test "without effort numbers the template hears the nearest name it quotes, as b
     const want = try std.fmt.allocPrint(std.testing.allocator, "thinking=true effort={s}\n", .{coerced});
     defer std.testing.allocator.free(want);
     try expectHeard(srv, &backend, body, want);
+    try std.testing.expectEqual(@as(u16, 400), try post(srv, "{\"model\":\"m\",\"max_tokens\":2,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"reasoning_effort\":\"100\"}"));
 }

@@ -48,7 +48,7 @@ fn sendError(conn: *Conn, a: Allocator, message: []const u8, status: u16) void {
 
 /// Rendered like the chat route renders, without generating: the prompt's token count.
 fn countTokens(srv: *Server, cx: *Cx, chat: Value) errors.Refused!usize {
-    const thinking = try fields.thinkingFields(cx, chat, srv.effort_levels);
+    const thinking = try fields.thinkingFields(cx, chat, srv.effort_levels, srv.effort_values.len > 0);
     const on = thinking.enable orelse srv.config.enable_thinking;
     const tools = try tool_specs.active(cx, chat.get("tools"), chat.get("tool_choice"));
     const msgs = try messages_mod.normalize(cx, chat.get("messages"), "system", srv.needs_user_after_tool);

@@ -196,7 +196,7 @@ fn thinkingSwitch(v: ?Value) ?bool {
 pub const Thinking = struct { effort: ?[]const u8 = null, enable: ?bool = null };
 
 /// ``thinking_fields``: a request's effort and thinking switch where it sets them.
-pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.Refused!Thinking {
+pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8, numeric: bool) errors.Refused!Thinking {
     var out: Thinking = .{};
     const raw = body.get("chat_template_kwargs");
     const kwargs: ?Value = if (raw != null and raw.?.truthy()) raw.? else null;
@@ -211,15 +211,34 @@ pub fn thinkingFields(cx: *Cx, body: Value, levels: []const []const u8) errors.R
         effort = k.field("reasoning_effort");
     };
     if (effort) |e| {
-        if (e != .string or !isEffort(e.string)) return cx.refuse("reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
-        out.effort = coerceEffort(e.string, levels);
-        out.enable = !std.mem.eql(u8, e.string, "none");
+        if (numeric) if (effortNumber(e)) |n| {
+            out.effort = try std.fmt.allocPrint(cx.a, "{d}", .{n});
+            out.enable = true;
+        };
+        if (out.effort == null) {
+            if (e != .string or !isEffort(e.string)) return cx.refuse(if (numeric) "reasoning_effort must be an integer 1-100 or none, minimal, low, medium, high, xhigh or max" else "reasoning_effort must be none, minimal, low, medium, high, xhigh or max");
+            out.effort = coerceEffort(e.string, levels);
+            out.enable = !std.mem.eql(u8, e.string, "none");
+        }
     }
     if (kw_object) if (enable) |on| {
         out.enable = on.truthy();
         if (out.enable.? and out.effort != null and std.mem.eql(u8, out.effort.?, "none")) out.effort = null;
     };
     return out;
+}
+
+/// An effort given as a number (a JSON integer or a string of digits) from 1 to 100, else null.
+pub fn effortNumber(v: Value) ?i64 {
+    const text = switch (v) {
+        .int => |t| t,
+        .string => |t| std.mem.trim(u8, t, " \t\r\n"),
+        else => return null,
+    };
+    if (text.len == 0 or text.len > 3) return null;
+    for (text) |c| if (!std.ascii.isDigit(c)) return null;
+    const n = std.fmt.parseInt(i64, text, 10) catch return null;
+    return if (n >= 1 and n <= 100) n else null;
 }
 
 fn isEffort(s: []const u8) bool {
@@ -306,6 +325,10 @@ test "efforts and numbers" {
     try std.testing.expectEqualStrings("xhigh", coerceEffort("high", &levels));
     try std.testing.expectEqualStrings("low", coerceEffort("minimal", &levels));
     try std.testing.expectEqualStrings("xhigh", coerceEffort("max", &.{}));
+    try std.testing.expectEqual(@as(?i64, 100), effortNumber(.{ .string = "100" }));
+    try std.testing.expectEqual(@as(?i64, 37), effortNumber(.{ .int = "37" }));
+    try std.testing.expect(effortNumber(.{ .string = "0" }) == null and effortNumber(.{ .int = "101" }) == null);
+    try std.testing.expect(effortNumber(.{ .string = "max" }) == null and effortNumber(.{ .string = "-5" }) == null);
     try std.testing.expectEqual(@as(?f64, 1000.5), pyFloat(" 1_000.5 "));
     try std.testing.expect(pyFloat("1__0") == null and pyFloat(".") == null);
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);

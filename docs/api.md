@@ -90,7 +90,7 @@ For decisions, `chat_template_kwargs` may be omitted, null, or an object contain
 | `response_format`, `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`, `structured_outputs` | A JSON schema, any JSON object, a regex, a choice or an EBNF grammar the reply must match | Both |
 | `ignore_eos` | Disable model end-of-sequence stopping; the reply limit still applies | Both |
 | `stop` | Stop at a string or any string in a list; omit the matched text from the response | Both |
-| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | Both |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max`; for a family whose template takes numbers (DeepSeek-V4.1), also an integer 1-100, as a number or a string of digits | Both |
 | `thinking_budget` | Token-count limit inside reasoning | Both |
 | `priority` | `background` yields to foreground requests | Both |
 
@@ -210,7 +210,8 @@ On both backends, `reasoning_effort: none` disables thinking; other effort value
 template. The server also reads it from `chat_template_kwargs.reasoning_effort`, where vLLM's clients send it; the
 top-level field wins. An unnamed level maps to the nearest level the template names, and a tie takes
 the higher one. GLM-5.3 lists `low`, `high` and `max`, so `max` stays `max`, `medium` is heard as `high`
-and `minimal` as `low`. Qwen3.8 lists `low`, `medium` and `xhigh`, so `high` and `max` are heard as `xhigh`.
+and `minimal` as `low`. DeepSeek-V4.1's template takes a number: each name is heard as its number (minimal 25, low 50,
+medium 62, high 75, xhigh 88, max 100) and an integer 1-100 is heard as given. Qwen3.8 lists `low`, `medium` and `xhigh`, so `high` and `max` are heard as `xhigh`.
 `xhigh` stays `xhigh`. GLM-5.3 renders `xhigh` and `max` as Max. A template that names no level hears `max` as
 `xhigh`. `--reasoning-effort` uses the same rule. An omitted effort, with no startup flag, stays
 the template's own default. An explicit `chat_template_kwargs.enable_thinking` takes
