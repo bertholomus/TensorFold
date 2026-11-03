@@ -132,6 +132,7 @@ pub const Server = struct {
     pub fn effortValue(srv: *const Server, effort: ?[]const u8) ?i64 {
         const e = effort orelse return null;
         for (srv.effort_values) |v| if (std.mem.eql(u8, v.name, e)) return v.value;
+        if (srv.effort_values.len > 0) return fields.effortNumber(.{ .string = e });
         return null;
     }
 
