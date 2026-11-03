@@ -17,7 +17,7 @@ pub const bn = 64;
 pub const sub = 4;
 /// markov.BC: vocabulary entries a scoring program.
 pub const bc = 1024;
-/// markov.NP: rows a launch at most (tl.dot's smallest N); a step's rows are its streams.
+/// markov.NP: _bias rows a launch at most (tl.dot's smallest N); a step's rows are its streams (localBest runs NP-row pieces).
 pub const np = 16;
 /// markov.CACHE_ROWS: the cached bias rows (TF_DS_MARKOV_CACHE unset in the served lane: 256).
 pub const cache_rows = 256;
@@ -107,12 +107,14 @@ pub const Markov = struct {
 
     /// Markov.local_best: step i of out [N, steps + 1] int64 (row stride ts) on this rank's columns: out[:, i + 1], or the returned send [N, 4] (split).
     pub fn localBest(m: Markov, t: Tri, lg: u64, out: u64, ts: usize, n: usize, block: usize, i: usize, sc: Scratch) !?u64 {
-        if (n > np) return error.TooManyRows;
         const nc = m.n_cols;
         const lw = if (m.lg_w != 0) m.lg_w else nc; // the logits' row width
         const l_seg = if (m.lg_w != 0) nc else n * block * nc; // a segment's offset in them
         const tok = out + 8 * i;
-        try m.bias(t, tok, ts, m.slot, sc.stage, m.cols, n);
+        // _bias takes NP rows a launch (its tl.dot's N): a step of more streams runs it in NP-row pieces, as fill does;
+        // a row's bias is its own (the rows of one launch never mix), so the pieces give the same bits as one launch
+        var r0: usize = 0;
+        while (r0 < n) : (r0 += np) try m.bias(t, tok + 8 * r0 * ts, ts, m.slot, sc.stage + 2 * r0 * m.cols, m.cols, @min(np, n - r0));
         try t.run("_score", .{ u(m.s_tiles), u(m.segs), 1 }, &.{
             p("LG", "*fp32", lg + 4 * i * lw), int("l_seg", l_seg),       int("l_row", block * lw),     p("TOK", "*i64", tok),
             int("t_stride", ts),               p("SLOT", "*i32", m.slot), p("CACHE", "*fp16", m.cache), int("c_row", m.cols),
