@@ -37,6 +37,7 @@ pub fn opened(e: *Engine, s: *Stream) !void {
     const drawn = try e.drawFirst(s, position);
     var feed: Feed = .{ .handle = drawn };
     if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+    if (s.call_gate) |gate| feed = try gate.feed(e.arena.allocator(), e.gpa, &s.force, e.backend, feed);
     var asked: ?u32 = null;
     if (e.cfg.family_mtp and s.drafts) {
         // the head reads the prompt's last row and the first token, and drafts the one after it

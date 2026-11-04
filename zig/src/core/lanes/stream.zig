@@ -1,6 +1,7 @@
 //! One stream (Python LaneStream) and the round loop's state for it (Python's dicts keyed by stream id).
 const std = @import("std");
 const grammar = @import("grammar.zig");
+pub const CallGate = @import("call_gate.zig");
 const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const Allocator = std.mem.Allocator;
@@ -150,6 +151,7 @@ pub const Spec = struct {
     think_open: ?bool = null, // null: open when a budget is set (the server's rule)
     loop_guard: bool = false,
     loop_windows: u32 = 0, // the guard's novelty signal: this many dry windows in a row close thinking (0: cycles only)
+    call_gate: ?CallGate.Hook = null,
     chunks: []const u32 = &.{}, // where prefill chunks start after 0 (Python's PrefillPlan); empty: the backend's step
     history_len: u32 = 0, // prompt prefix lengths a backend may keep for a later turn: the rendered history,
     shared_prefixes: []const u32 = &.{}, // then shared system blocks
@@ -183,6 +185,7 @@ pub const Stream = struct {
     think_end: i64,
     think_open: bool,
     loop_guard: bool,
+    call_gate: ?CallGate.Hook,
     loop_period: ?u32 = null,
     novelty: ?Novelty = null, // the guard's novelty signal (Spec.loop_windows)
     loop_novelty: ?f64 = null, // the dry window's share of new grams, when that signal closed the think block
@@ -259,6 +262,7 @@ pub const Stream = struct {
             .think_open = spec.think_open orelse (spec.think_budget > 0 or (spec.loop_guard and spec.think_end >= 0)),
             .loop_guard = spec.loop_guard,
             .novelty = if (spec.loop_guard and spec.loop_windows > 0) .{ .windows = spec.loop_windows } else null,
+            .call_gate = spec.call_gate,
             .chunks = spec.chunks,
             .history_len = spec.history_len,
             .shared_prefixes = spec.shared_prefixes,
@@ -424,6 +428,7 @@ pub const Stream = struct {
         var ended = false; // a novelty window ended in this batch: only its first end may fire, as loopCut reads it
         for (tokens, 0..) |t, i| {
             if (s.finished) break;
+            if (s.call_gate) |gate| try gate.observe(gate.ptr, t);
             try s.context.append(gpa, t);
             if (rows.len > 0) try s.rows.append(gpa, rows[i]);
             landed += 1;
