@@ -22,13 +22,16 @@
 > next turn do not tokenize the whole conversation again. The recipe's v0.7.4 adds tonyd2wild's patch (MIT, kept
 > under its author's name), both settings off unless set: `TF_SEED_RANDOM=1` gives a request that names no `seed` a
 > random one, so identical requests sample differently (a request's own `seed` is kept exactly), and `TF_TOP_K_MAX=N`
-> cuts a request's top_k above N to N (DeepSeek-V4.1's sampler takes 56) and reads 0 or below as the server default.
+> cuts a request's top_k above N to N (DeepSeek-V4.1's sampler takes 56) and reads 0 or below as the server default. The recipe's
+> v0.7.5 serves rounds of up to 64 rows (`TF_DS_ROUND_ROWS` 16..64, a 64-row decode window, rows 49-64 on the kit's
+> `_rowmm_parts` cubins) and pools of up to 32 streams (a Markov step of more than NP streams runs `_bias` in NP-row
+> pieces; a drafter pass of more than 128 block rows runs in passes of 128 / block streams).
 > The `dsv41` family adds DeepSeek-V4.1-Flash to TensorFold
 > 1.0.12's native engine: two or four nodes, image input, up to 1,048,576 tokens a request in a shared window
 > (2,097,152 positions in the two-node recipe) with kept-prompt reuse (image turns too), structured output, forced
 > tool calls in DeepSeek's DSML, and exact DSpark speculative decoding. Launch, measured numbers, gates and the kernel
 > kit are in the recipe, [bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10)
-> (v0.7.4); the four-node recipe is [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10).
+> (v0.7.5); the four-node recipe is [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10).
 > An optional [neighbor transport](docs/recipes/deepseek-v41-neighbor.md) supports adjacent-edge RDMA on a physical ring.
 > `tools/dsv41-zig/inputs/` makes each node's weight file and token map from the checkpoint; `tools/dsv41-zig/kit/`
 > makes and checks the kit's generated files. Contributions: Lucas Peters ([@lucas-peters](https://github.com/lucas-peters), #4),
