@@ -27,6 +27,36 @@ _DSML_PARAM_RE = re.compile(rf'<{_DSML} parameter name="([^"]+)"(?: string="(tru
                             re.DOTALL)
 
 
+# Mistral: [TOOL_CALLS]NAME[ARGS]{json}, one after another to the end of the reply, with no closer
+_MISTRAL_OPEN = "[TOOL_CALLS]"
+_MISTRAL_CALL_RE = re.compile(r"\[TOOL_CALLS\]\s*([\w.:-]+)\s*\[ARGS\](.*?)(?=\[TOOL_CALLS\]|\Z)", re.DOTALL)
+
+
+def mistral_to_tool_calls(text: str) -> str:
+    """Rewrite each Mistral call as a ``<tool_call>{json}</tool_call>`` block; arguments that are not JSON stay text."""
+
+    if _MISTRAL_OPEN not in text:
+        return text
+
+    def one(m: re.Match) -> str:
+        try:
+            args = json.loads(m.group(2))
+        except json.JSONDecodeError:
+            return m.group(0)
+        return _CALL_OPEN + json.dumps({"name": m.group(1), "arguments": args}, ensure_ascii=False) + _CALL_CLOSE
+
+    return re.sub(r"\[TOOL_CALLS\]\s*\Z", "", _MISTRAL_CALL_RE.sub(one, text))
+
+
+def before_mistral_calls(text: str, *, finished: bool) -> str:
+    """The text before the first Mistral call, which runs to the end of the reply, holding back a tail that may begin one."""
+
+    cut = text.find(_MISTRAL_OPEN)
+    if cut >= 0:
+        return text[:cut]
+    return text if finished else text[: len(text) - _partial_tag(text, _MISTRAL_OPEN)]
+
+
 def dsml_to_tool_calls(text: str) -> str:
     """Rewrite each complete DSML calls block as ``<tool_call>{json}</tool_call>`` blocks (one per invoke)."""
 
@@ -113,6 +143,7 @@ class StopStrings:
 
 
 def hide_tool_calls(text: str, *, finished: bool) -> str:
+    text = before_mistral_calls(text, finished=finished)
     cut = text.find(_DSML_OPEN)                        # DeepSeek DSML: a calls block is hidden whole
     if cut >= 0:
         head = _hide_tagged(text[:cut], finished=True)
@@ -150,7 +181,7 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
 
     if not tools:
         return text, None
-    text = dsml_to_tool_calls(text)
+    text = mistral_to_tool_calls(dsml_to_tool_calls(text))
     known = {_tool_name(t).lower(): _tool_name(t) for t in tools}
     schemas = parameter_schemas(tools)
     calls: list[dict[str, Any]] = []

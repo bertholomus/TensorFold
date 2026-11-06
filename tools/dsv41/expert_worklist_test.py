@@ -1,8 +1,7 @@
 """Prompt chunks' grouped expert launches over a work list (TF_EXL3_GROUP_LIST, experts.GROUP_LIST) against the
 grids they replace (every expert place x the busiest expert's member groups): the same routed outputs bit for bit on
 one real layer (rank 0's half of a TP2 split), served kernels and kernel "rows", with and without the shared slot in
-the launch; the device-built lists (ext.work_list) equal to the torch reference (experts._work_list) pair for pair, the
-tail all sentinels; then the times.
+the launch; then the times.
 
   python3 tools/dsv41/expert_worklist_test.py --model M [--layer 10] [--rows 2048,1000,64] [--require-faster] [--out F]
 Exits 1 when a check fails.
@@ -66,19 +65,6 @@ def main() -> int:
                     print(json.dumps({key: res["times_ms"][key]}), flush=True)
                 res["checks"][f"R{R} {'with' if shared else 'without'} shared, {kern}: list == grid"] = bool(
                     torch.equal(outs[True], outs[False]))
-            # the lists of the call just made (its counts, places and used count are in the scratch)
-            ids = s.window(R)[0]
-            for grp in (64, 32):
-                total = int(X._groups_per_place(s, ids, grp).sum())
-                ref = X._work_list(s, ids, grp, total)
-                got = torch.empty((X._list_len(R * (cfg.topk + 1), ids.shape[0], grp), 2), dtype=torch.int32,
-                                  device="cuda")
-                X._ext().work_list(s.counts, ids, s.count, got, grp, s.no_work, grp)
-                tail = got[total:]
-                res["checks"][f"R{R} {'with' if shared else 'without'} shared, {grp}-row groups: device list == "
-                              f"torch list ({total} of {got.shape[0]})"] = bool(
-                    torch.equal(got[:total], ref) and bool((tail[:, 0] == 0x7fffffff).all())
-                    and bool((tail[:, 1] == 0).all()))
     X.GROUP_LIST = True
     if a.require_faster:
         R = max(rows)

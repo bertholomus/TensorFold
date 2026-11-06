@@ -50,16 +50,9 @@ MMA_KB6 = os.environ.get("TF_EXL3_MMA_KB6", "0") != "0"
 GROUP_LIST = os.environ.get("TF_EXL3_GROUP_LIST", "1") != "0"
 
 
-def _list_len(P: int, maxu: int, rows: int) -> int:
-    """A work list's length: at most maxu places hold P member slots, so they have at most (P + maxu (rows - 1)) // rows
-    groups of ``rows`` (the shape's alone; ext.work_list fills the tail with pairs no program runs)."""
-
-    return (P + maxu * (rows - 1)) // rows
-
-
 def _work_list(s, ids: torch.Tensor, rows: int, total: int) -> torch.Tensor:
     """(place, group) int32 pairs of the used places' member groups of ``rows`` rows, ``total`` of them (the host
-    read the sum: repeat_interleave then needs no sync). The reference of ext.work_list (tests)."""
+    read the sum: repeat_interleave then needs no sync)."""
 
     maxu = ids.shape[0]
     g = _groups_per_place(s, ids, rows)
@@ -67,6 +60,17 @@ def _work_list(s, ids: torch.Tensor, rows: int, total: int) -> torch.Tensor:
     start = torch.cumsum(g, 0) - g
     group = torch.arange(total, device=ids.device) - start[place]
     return torch.stack([place, group], 1).to(torch.int32).contiguous()
+
+
+def _walk(ext, s, ids: torch.Tensor, rows: int, P: int) -> torch.Tensor:
+    """(place, block) pairs of ``rows`` members, as many as P picks can make; the rest name a place past the last, whose
+    programs return. On the device, so the launch needs no host read."""
+
+    n = P // rows + ids.shape[0]
+    if s.walk is None or s.walk.shape[0] != n:
+        s.walk = torch.empty((n, 2), dtype=torch.int32, device=ids.device)
+    ext.m2_work(s.counts, ids, s.count, s.walk, rows)
+    return s.walk
 
 
 def _groups_per_place(s, ids: torch.Tensor, rows: int) -> torch.Tensor:
@@ -122,7 +126,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v18", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v19", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -177,6 +181,16 @@ class Exl3RoutedExperts:
         return int(self.trellis_bytes[list(ids)].sum())
 
 
+def trellis_bytes(D: int, I: int, gks, uks, dks, device="cuda") -> torch.Tensor:
+    """int64 [E] of each expert's gate+up+down trellis bytes — a stats table for the bench's GB/s
+    math (tools/dsv41/expert_decode_bench.py), never read on ml4's serving path. It used to be built
+    without ``device`` (m2b10): the only CPU-resident field of an otherwise all-CUDA slot, which made
+    m2b6's probe audit refuse the followers' probe ("trellis_bytes@cpu", m2b9's load4)."""
+
+    return torch.tensor([(D * I // 256) * (gks[e] + uks[e] + dks[e]) * 16 for e in range(len(gks))],
+                        dtype=torch.int64, device=device)
+
+
 def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], codebook: int | str,
             device="cuda") -> Exl3RoutedExperts:
     """A layer from per-expert (trellis, suh, svh) triples, trellises referenced in place, each at its own width."""
@@ -211,7 +225,7 @@ def prepare(gate: Sequence[tuple], up: Sequence[tuple], down: Sequence[tuple], c
             out[e].copy_(m[j].reshape(-1))
         return out
 
-    tb = torch.tensor([(D * I // 256) * (gks[e] + uks[e] + dks[e]) * 16 for e in range(E)], dtype=torch.int64)
+    tb = trellis_bytes(D, I, gks, uks, dks, device)
     aligned = all(t.data_ptr() % 16 == 0 for t in keep)
     return Exl3RoutedExperts(gp, upp, dp, gk, uk, dk, stack(gate, 1, D), stack(up, 1, D), stack(gate, 2, I),
                              stack(up, 2, I), stack(down, 1, I), stack(down, 2, D), E, D, I, cb,
@@ -273,6 +287,8 @@ class Scratch:
         zrow = prompt_z(D, I) if prompt else max(2 * self.cfg_gu[2] * I, self.cfg_d[2] * D)
         self.z = torch.zeros((zrow * P,), dtype=torch.float32, device=device)
         self.prompt = prompt
+        self.walk = None              # _walk's pairs
+        self.x8 = None                # mma8's int8 rows and their factors
         self.y = None if prompt else torch.zeros((P, D), dtype=torch.float32, device=device)
         self.no_y = torch.zeros((1,), dtype=torch.float32, device=device)       # a pointer for calls that skip y
         self.no_work = torch.zeros((0,), dtype=torch.int32, device=device)    # grouped launches without a work list
@@ -304,13 +320,14 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
            group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None,
            kernel: str | None = None, decode: str | None = None,
-           before_down: torch.cuda.Event | None = None) -> torch.Tensor:
+           before_down: torch.cuda.Event | None = None, m2_rows: int = 64) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts`` (plus
     ``add`` [R, D] fp32 added last, in the same launch, when given).
 
     Decode windows make no host sync. Prompt chunks (``group`` and R >= EXACT_ROWS) read the busiest expert's row count
     once; with ``prompt`` (default TF_EXL3_PROMPT_TILES) they group in parallel and decode each weight tile once for
-    several member rows (``kernel``, default PROMPT_KERNEL), every row's arithmetic the one-tile launch's (the same
+    several member rows (``kernel``, default PROMPT_KERNEL; ``m2_rows`` 128: "mma2" decodes a tile for 128 rows over a work
+    list, the same sums), every row's arithmetic the one-tile launch's (the same
     bits) for "mma" and "rows"; "mma2" / "mma3" sum in their own order. Decode windows take ``decode`` (default DECODE):
     "fused", "cp" or "old", the same bits.
 
@@ -337,13 +354,14 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         torch.cuda.current_stream().wait_event(before_down)
     fast = chunk and (PROMPT if prompt is None else prompt) and all(
         n % (16 * t[0]) == 0 for n, t in ((I, PROMPT_TILES["gateup"]), (D, PROMPT_TILES["down"])))
+    kern = PROMPT_KERNEL if kernel is None else kernel
+    # mma8 and mma2 at 128 rows walk a work list built on the device: nothing here reads the device
+    walk = fast and m2_rows != 64 and kern in ("mma2", "mma8")
     if fast:
         # a prompt chunk: experts' member counts on the device, the busiest one read back once to size the member
         # groups, then each used expert lists its members (the grouping of any number of rows, in parallel)
         ext.group_count(pick, s.counts, R, slots, E)
-        # the member lists' stride: the busiest expert's count read back, or (work lists: no program walks past an
-        # expert's groups) R itself, no host read; a chunk's shared expert has all R rows, so the stride is the same
-        busiest = R if GROUP_LIST else int(s.counts.max())
+        busiest = R if walk else int(s.counts.max())
         tile = 16 * max(PROMPT_TILES["gateup"][2], PROMPT_TILES["down"][2])
         members = s.members_buf[:ids.shape[0] * max(tile, -(-busiest // tile) * tile)].view(ids.shape[0], -1)
         ext.group_place(pick, s.counts, ids, s.count, members, R, slots, E)
@@ -356,7 +374,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         ext.group(pick, ids, s.count, members, R, slots, E)
     if s.y is None and not (fast and wts is not None):        # prompt buffers: the one-tile path's per-slot outputs
         s.y = torch.zeros((s.rows * slots, D), dtype=torch.float32, device=x.device)
-    kern = PROMPT_KERNEL if kernel is None else kernel
+    if fast and kern == "mma8":
+        return _routed_mma8(ext, x, pick, wts, ex, s, ids, members, R, limit, m2_rows)
     mma2 = (fast and kern in ("mma2", "mma3") and I % 256 == 0 and D % 256 == 0 and
             max(ex.k2_gu[1], ex.k2_d[1]) <= 10)
     mma3 = (mma2 and kern == "mma3" and x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.stride(0) % 4 == 0
@@ -375,14 +394,16 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     work_gu = work_d = s.no_work
     if fast and GROUP_LIST and not (mma2 or mma3):
         # the work lists of the gate / up and the down launches (64-row blocks for the mma kernel, the rows kernel's
-        # member groups): one launch on the device, each list as long as the shape allows (no host read)
+        # member groups), their sizes read back in one host sync
         rows_gu = 64 if mma else 16 * PROMPT_TILES["gateup"][2]
         rows_d = 64 if mma_d else 16 * PROMPT_TILES["down"][2]
-        maxu = ids.shape[0]
-        work_gu = torch.empty((_list_len(P, maxu, rows_gu), 2), dtype=torch.int32, device=x.device)
-        work_d = (work_gu if rows_d == rows_gu else
-                  torch.empty((_list_len(P, maxu, rows_d), 2), dtype=torch.int32, device=x.device))
-        ext.work_list(s.counts, ids, s.count, work_gu, rows_gu, s.no_work if work_d is work_gu else work_d, rows_d)
+        n_gu, n_d = torch.stack([_groups_per_place(s, ids, rows_gu).sum(),
+                                 _groups_per_place(s, ids, rows_d).sum()]).tolist()
+        work_gu = _work_list(s, ids, rows_gu, n_gu)
+        work_d = work_gu if rows_d == rows_gu else _work_list(s, ids, rows_d, n_d)
+    m2_work = s.no_work
+    if mma2 and not mma3 and m2_rows != 64:
+        m2_work = _walk(ext, s, ids, m2_rows, P)
     if getattr(s, "prompt", False):
         # a prompt scratch's z starts at the folded sums' size; a call that writes split partials (gate / up without
         # the fast path, a down written per split) grows it first (eager prompt chunks only: no graph holds it)
@@ -398,7 +419,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     elif mma2:
         # each output one fp32 chain over K: Z [2, P, I] holds whole sums (one split)
         ext.grouped_mma2(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
-                         I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1])
+                         I, P, slots, ex.cb, ex.k2_gu[0], ex.k2_gu[1], m2_rows, m2_work)
     elif mma:
         # every split's chains in one program, their sum from 0 as the epilogue would add them
         ext.grouped_mma(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
@@ -428,7 +449,7 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         return out
     if mma2:
         ext.grouped_mma2(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
-                         I, D, P, slots, ex.cb, ex.k2_d[0], ex.k2_d[1])
+                         I, D, P, slots, ex.cb, ex.k2_d[0], ex.k2_d[1], m2_rows, m2_work)
         dsk = 1
     elif mma_d:
         # one split is written as is; several are folded in order from 0 (down_combine's order) into one
@@ -452,6 +473,31 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     # chunk leaves the per-slot outputs unwritten (453 MB a layer at 2,048 rows that nothing reads)
     ext.down_combine(s.z, pick, ex.svh_d, s.no_y if fast else s.y, wts, s.no_y if add is None else add, out, R, P, D,
                      dsk, slots, E, 0 if fast else 1, int(add is not None))
+    return out
+
+
+def _routed_mma8(ext, x, pick, wts, ex, s, ids, members, R, limit, rows):
+    """A prompt chunk in int8 (experts_grouped.cuh): fp16 sums of the rows' experts, [R, D]."""
+
+    D, I, E, slots = ex.dims, ex.width, ex.count, s.slots
+    P = R * slots
+    assert rows == 128 and ex.cb == codebook_id("mul1") and x.dtype == torch.float16 and x.stride(1) == 1 and wts is not None
+    if s.x8 is None:
+        n, dev = s.rows * slots, x.device
+        s.x8 = (torch.empty((n, D), dtype=torch.int8, device=dev), torch.empty((n, D), dtype=torch.int8, device=dev),
+                torch.empty((n, I), dtype=torch.int8, device=dev), torch.empty((2 * n,), dtype=torch.float32, device=dev),
+                torch.empty((n,), dtype=torch.float32, device=dev))
+    xg, xu, xd, ra, rd = s.x8
+    z = s.z.view(torch.float16)
+    work = _walk(ext, s, ids, rows, P)
+    ext.rot8(x, x.stride(0), pick, ex.suh_g, ex.suh_u, xg, xu, ra, R, D, slots, E)
+    ext.grouped_mma8(xg, xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, z, 2, D, I, P, slots,
+                     ex.k2_gu[0], ex.k2_gu[1], work)
+    ext.gateup_epilogue8(z, pick, ex.svh_g, ex.svh_u, ex.suh_d, ra, xd, rd, P, I, E, float(limit))
+    ext.grouped_mma8(xd, xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, z, 1, I, D, P, slots,
+                     ex.k2_d[0], ex.k2_d[1], work)
+    out = torch.empty((R, D), dtype=torch.float16, device=x.device)
+    ext.down_combine8(z, pick, ex.svh_d, rd, wts, out, R, D, slots, E)
     return out
 
 

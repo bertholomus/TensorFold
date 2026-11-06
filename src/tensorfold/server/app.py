@@ -32,7 +32,7 @@ from tensorfold.server.text import (
     hide_tool_calls,
     is_title_request,
     parse_harmony_output,
-    CHANNEL_MARKERS, reasoning_count, split_thinking, think_markers,
+    reasoning_count, split_thinking, think_markers,
     streaming_visible_text,
     template_late_system,
     strip_trailing_stops,
@@ -420,7 +420,7 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
             if len(visible_text.tokens) and visible_text._read < len(visible_text.tokens):
                 continue                    # a character still split across tokens: wait for the rest
             answer = text
-            if thinking or self.think_markers == CHANNEL_MARKERS:
+            if thinking or self.think_markers[0]:
                 # the prompt opened a think block: reasoning streams as reasoning_content until </think>
                 reasoning_so_far, answer = split_thinking(text, finished=False, markers=self.think_markers)
                 piece = reasoning_so_far[len(streamed_reasoning):]
@@ -443,7 +443,7 @@ class ChatApp(RequestOptions, PromptBlocks, DecisionRequests):
         with self.tokenizer_lock:
             raw_text = self.tokenizer.decode(content_tokens)
             text = stops.visible(raw_text)
-        if thinking or self.think_markers == CHANNEL_MARKERS:
+        if thinking or self.think_markers[0]:
             reasoning_text, content = split_thinking(text, finished=True, markers=self.think_markers)
             reasoning = reasoning_text.strip() or None
         else:

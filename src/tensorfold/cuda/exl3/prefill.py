@@ -48,8 +48,8 @@ def _gemm(X, W, H, SVH, BIAS, OUT, M, o_stride, K: tl.constexpr, N: tl.constexpr
 
 # tiles by shape (matmul's by_shape, default TF_EXL3_PREFILL_TILES=1; GB10, tools/bench_prefill_gemm.py at 1,024 and
 # 2,048 rows: 64-row programs for outputs up to 1,024 wide, 49 -> 70 TFLOPS on GLM-5.3's shared expert gate/up; a
-# 64-wide K step elsewhere, 0-5 %) or 128 / 32 / 8 / 4 for every shape (the default). Either way the shape's alone: a
-# row never depends on its chunk.
+# 64-wide K step elsewhere, 0-5 %) or 128 / 64 / 8 / 4 for every shape (the default: on GB10 8-10 % over a 32-wide K
+# step, same bits). Either way the shape's alone: a row never depends on its chunk.
 TILES_BY_SHAPE = os.environ.get("TF_EXL3_PREFILL_TILES", "0") == "1"
 
 
@@ -57,7 +57,7 @@ def tiles(k: int, n: int, by_shape: bool | None = None) -> tuple[int, int, int, 
     """(rows a program, K step, warps, stages, row blocks a raster group): the shape's alone, so a row never depends on its chunk."""
 
     if not (TILES_BY_SHAPE if by_shape is None else by_shape):
-        return 128, 32, 8, 4, 8
+        return 128, 64, 8, 4, 8
     if n <= 1024:
         return 64, 64, 4, 4, 8
     return 128, 64, 8, 3, 8

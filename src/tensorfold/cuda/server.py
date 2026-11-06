@@ -27,9 +27,9 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
 from tensorfold.cuda import health
 from tensorfold.cuda.chat_template import ChatTemplate
-from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, hide_tool_calls, parse_tool_calls
+from tensorfold.cuda.reply_text import StopStrings, StreamDecoder, before_mistral_calls, hide_tool_calls, parse_tool_calls
 from tensorfold.cuda.turns import Turns, Yield
-from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
+from tensorfold.server.text import is_title_request, reasoning_count, split_thinking, think_markers
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
 
 
@@ -87,6 +87,7 @@ class App:
         self.background_ids = frozenset(background_ids)   # --name-priority ID=background: a default for this id
         self.model_dir = Path(model_dir)
         self.tok = Tokenizer.from_file(str(model_dir / "tokenizer.json"))
+        self.think_markers = think_markers(self.tok)
         self.template = ChatTemplate(model_dir)
         self.default_thinking = default_thinking
         self.reasoning_effort, self.thinking_budget = reasoning_effort, int(thinking_budget)   # the Mac's defaults
@@ -420,12 +421,12 @@ class App:
             # stop strings match the generated text, reasoning included, before it is split (as on the Mac)
             raw = stops.visible(raw, partial=not finished) if stops.strings else raw
             if chat and thinking:
-                reasoning, answer = split_thinking(raw, finished=finished)
+                reasoning, answer = split_thinking(raw, finished=finished, markers=self.think_markers)
             else:
                 reasoning, answer = "", raw
             answer_raw[0] = answer
             if tools:
-                answer = (policy.content(answer, finished=finished) if policy.single
+                answer = (policy.content(before_mistral_calls(answer, finished=finished), finished=finished) if policy.single
                           else hide_tool_calls(answer, finished=finished))
             return reasoning, answer
 
@@ -485,7 +486,7 @@ class App:
         if takes_stop_eos:
             options["stop_eos"] = not prepared.ignore_eos
         shaped = prepared.grammar is not None or prepared.think_budget > 0
-        think_end = self.tok.token_to_id("</think>") if chat and thinking and shaped else None
+        think_end = self.tok.token_to_id(self.think_markers[1]) if chat and thinking and shaped else None
         budget = self._think_budget(prepared, think_end)
         # background: the request's own priority, else --name-priority's default for its id; title requests always
         by_name = "priority" not in body and self.reply_model(body) in getattr(self, "background_ids", ())
@@ -551,7 +552,7 @@ class App:
             final["reasoning_content"] = reasoning[sent["reasoning"]:]
         raw_text = self.tok.decode([t for t in out if t not in ends], skip_special_tokens=False)
         text = stops.visible(raw_text)
-        raw_answer = split_thinking(text, finished=True)[1] if chat and thinking else text
+        raw_answer = split_thinking(text, finished=True, markers=self.think_markers)[1] if chat and thinking else text
         content, calls = parse_tool_calls(raw_answer, tools, max_calls=policy.max_calls) if tools else (answer, None)
         content = policy.content(content) if tools else content
         tail = content[sent["content"]:] if content.startswith(answer[:sent["content"]]) else ""
@@ -572,7 +573,7 @@ class App:
                 "stop_sequence": matched_stop(raw_text, stops.strings),
                 **({"logprobs": logprobs} if logprobs is not None else {}),
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
-                "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
+                "reasoning_tokens": reasoning_count(out, self.tok.token_to_id(self.think_markers[1]) if chat and thinking else None),
                 "stats": stats, "calls_streamed": streamed}
 
     def _turns(self) -> Turns:

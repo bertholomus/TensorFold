@@ -143,59 +143,6 @@ __global__ void __launch_bounds__(PLACE_THREADS) group_place_kernel(const int* _
     for (int j = base + threadIdx.x; j < maxm; j += PLACE_THREADS) members[u * maxm + j] = -1;
 }
 
-// Prompt chunks' work lists (experts.GROUP_LIST): the (expert place, member group) pairs of the used places, groups of
-// rows0 (rows1) member rows, in place order and in group order within a place (the order the grids ran them in), then
-// sentinel pairs (a place past every used one: its programs return at once) up to each list's length n0 (n1), a bound
-// the host takes from the shape alone. One block; no host read of the lists' sizes.
-constexpr int LIST_THREADS = 1024;
-constexpr int LIST_NONE = 0x7fffffff;
-
-__global__ void __launch_bounds__(LIST_THREADS) work_list_kernel(const int* __restrict__ counts,
-                                                                 const int* __restrict__ uids,
-                                                                 const int* __restrict__ ucount, int maxu,
-                                                                 int* __restrict__ work0, int rows0, int n0,
-                                                                 int* __restrict__ work1, int rows1, int n1) {
-    __shared__ int warp_tot[LIST_THREADS / 32];
-    const int nu = ucount[0];
-    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    for (int l = 0; l < (work1 ? 2 : 1); ++l) {
-        int* work = l ? work1 : work0;
-        const int rows = l ? rows1 : rows0, n = l ? n1 : n0;
-        int base = 0;
-        for (int start = 0; start < maxu; start += LIST_THREADS) {
-            const int p = start + threadIdx.x;
-            const int g = (p < maxu && p < nu) ? (counts[uids[p]] + rows - 1) / rows : 0;
-            int inc = g;                              // inclusive scan of the groups in thread (= place) order
-#pragma unroll
-            for (int o = 1; o < 32; o <<= 1) {
-                const int v = __shfl_up_sync(0xffffffffu, inc, o);
-                if (lane >= o) inc += v;
-            }
-            if (lane == 31) warp_tot[warp] = inc;
-            __syncthreads();
-            int prior = 0, total = 0;
-            for (int w = 0; w < LIST_THREADS / 32; ++w) {
-                prior += w < warp ? warp_tot[w] : 0;
-                total += warp_tot[w];
-            }
-            const int first = base + prior + inc - g;
-            for (int j = 0; j < g; ++j) {
-                const int q = first + j;
-                if (q < n) {                          // (always: n bounds every list the counts allow)
-                    work[2 * q] = p;
-                    work[2 * q + 1] = j;
-                }
-            }
-            base += total;
-            __syncthreads();                          // warp_tot is rewritten by the next round
-        }
-        for (int q = base + threadIdx.x; q < n; q += LIST_THREADS) {
-            work[2 * q] = LIST_NONE;
-            work[2 * q + 1] = 0;
-        }
-    }
-}
-
 // Walsh-Hadamard transform of 128 values, 4 a lane, fixed butterfly order (strides 1, 2 in registers, 4..64 across lanes).
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
@@ -233,6 +180,68 @@ __global__ void rot_in_kernel(const TIN* __restrict__ x, int x_stride, const int
     half* o = (mat ? out1 : out0) + (size_t)p * K + blk * 128 + 4 * lane;
 #pragma unroll
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
+// Prompt chunks in int8 (experts_grouped.cuh, mma8): a row's largest value goes to 127. The mma reads 16 columns in the order its
+// k-32 B word has them (decode_tile8): pairs 2 t, 2 t + 1 of the first eight beside the same pair of the second eight. A lane holds
+// columns 4 lane .. + 3 of a 128-block, so lanes c and c ^ 2 of a 16-column group swap a pair and each stores one word.
+constexpr float Z8_UNIT = 64.f * 4.f * 0.00676727294921875f;     // an fp16 Z, in a row's units, as the model's sum
+
+__device__ __forceinline__ void store8(int8_t* row, const float (&v)[4], float s, int lane) {
+    int q[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) q[j] = __float2int_rn(v[j] * s);
+    const uint32_t p0 = (q[0] & 255) | (q[1] & 255) << 8, p1 = (q[2] & 255) | (q[3] & 255) << 8;
+    const int c = lane & 3;
+    const uint32_t got = __shfl_xor_sync(0xffffffffu, (c & 2) ? p0 : p1, 2);
+    const uint32_t word = (c & 2) ? got | p1 << 16 : p0 | got << 16;
+    *reinterpret_cast<uint32_t*>(row + (lane >> 2) * 16 + ((c & 1) * 2 + (c >> 1)) * 4) = word;
+}
+
+__device__ __forceinline__ float block_max(float m, float* sh) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));
+    if (lane == 0) sh[warp] = m;
+    __syncthreads();
+    for (int w = 0; w < (int)(blockDim.x >> 5); ++w) m = fmaxf(m, sh[w]);
+    return m;
+}
+
+// Program (member row, matrix): rot_in's rows for gate and up as int8, ra the factor back. Eight warps, PER 128-blocks each
+template <int PER>
+__global__ void __launch_bounds__(256) rot8_kernel(const half* __restrict__ x, int x_stride, const int* __restrict__ pick,
+                                                   const half* __restrict__ suh0, const half* __restrict__ suh1,
+                                                   int8_t* __restrict__ out0, int8_t* __restrict__ out1, float* __restrict__ ra,
+                                                   int K, int P, int slots, int E) {
+    __shared__ float sh[8];
+    const int p = blockIdx.x, mat = blockIdx.y;
+    const int e = pick[p];
+    if (e < 0 || e >= E) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const half* xr = x + (size_t)(p / slots) * x_stride;
+    const half* su = (mat ? suh1 : suh0) + (size_t)e * K;
+    float v[PER][4], m = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+        const int n = (i * 8 + warp) * 128 + 4 * lane;
+        const uint2 xv = *reinterpret_cast<const uint2*>(xr + n), sv = *reinterpret_cast<const uint2*>(su + n);
+        const half2* xh = reinterpret_cast<const half2*>(&xv);
+        const half2* sh2 = reinterpret_cast<const half2*>(&sv);
+        v[i][0] = __low2float(xh[0]) * __low2float(sh2[0]);
+        v[i][1] = __high2float(xh[0]) * __high2float(sh2[0]);
+        v[i][2] = __low2float(xh[1]) * __low2float(sh2[1]);
+        v[i][3] = __high2float(xh[1]) * __high2float(sh2[1]);
+        fwht128(v[i], lane);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[i][j]));
+    }
+    m = block_max(m, sh);
+    const float s = m > 0.f ? 127.f / m : 0.f;
+    int8_t* o = (mat ? out1 : out0) + (size_t)p * K;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) store8(o + (i * 8 + warp) * 128, v[i], s, lane);
+    if (threadIdx.x == 0) ra[(size_t)mat * P + p] = m * HAD_SCALE / 127.f;
 }
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
@@ -280,6 +289,42 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
     half* o = xd + (size_t)p * N + n;
 #pragma unroll
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
+}
+
+// Program (member row): gateup_epilogue's fp32 SwiGLU from mma8's Z, the rows of down as int8, a warp a 128-block.
+__global__ void __launch_bounds__(1024) gateup_epilogue8_kernel(const half* __restrict__ Z, const int* __restrict__ pick,
+                                                                const half* __restrict__ svh_g, const half* __restrict__ svh_u,
+                                                                const half* __restrict__ suh_d, const float* __restrict__ ra,
+                                                                int8_t* __restrict__ xd, float* __restrict__ rd, int P, int N,
+                                                                int E, float limit) {
+    __shared__ float sh[32];
+    const int p = blockIdx.x;
+    const int e = pick[p];
+    if (e < 0 || e >= E) return;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = warp * 128 + 4 * lane;
+    const float fg = ra[p] * Z8_UNIT * HAD_SCALE, fu = ra[(size_t)P + p] * Z8_UNIT * HAD_SCALE;
+    const uint2 zg = *reinterpret_cast<const uint2*>(Z + (size_t)p * N + n);
+    const uint2 zu = *reinterpret_cast<const uint2*>(Z + ((size_t)P + p) * N + n);
+    const half2* hg = reinterpret_cast<const half2*>(&zg);
+    const half2* hu = reinterpret_cast<const half2*>(&zu);
+    float gv[4] = {__low2float(hg[0]), __high2float(hg[0]), __low2float(hg[1]), __high2float(hg[1])};
+    float uv[4] = {__low2float(hu[0]), __high2float(hu[0]), __low2float(hu[1]), __high2float(hu[1])};
+    fwht128(gv, lane);
+    fwht128(uv, lane);
+    float v[4], m = 0.f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const float gg = fminf(gv[j] * fg * __half2float(svh_g[(size_t)e * N + n + j]), limit);
+        const float uu = fminf(fmaxf(uv[j] * fu * __half2float(svh_u[(size_t)e * N + n + j]), -limit), limit);
+        v[j] = gg / (1.f + expf(-gg)) * uu * __half2float(suh_d[(size_t)e * N + n + j]);
+    }
+    fwht128(v, lane);
+#pragma unroll
+    for (int j = 0; j < 4; ++j) m = fmaxf(m, fabsf(v[j]));
+    m = block_max(m, sh);
+    store8(xd + (size_t)p * N + warp * 128, v, m > 0.f ? 127.f / m : 0.f, lane);
+    if (threadIdx.x == 0) rd[p] = m * HAD_SCALE / 127.f;
 }
 
 // Program (member row, 128-block of the model width): Y = (splits summed in order) @ H * svh_d, fp32.
@@ -364,6 +409,61 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
 #pragma unroll
     for (int j = 0; j < 4; ++j)
         out[(size_t)r * D + n + j] = add ? __fadd_rn(acc[j], add[(size_t)r * D + n + j]) : acc[j];
+}
+
+// down_combine from mma8's Z, a row's sum in fp16.
+__global__ void down_combine8_kernel(const half* __restrict__ Z, const int* __restrict__ pick, const half* __restrict__ svh_d,
+                                     const float* __restrict__ rd, const float* __restrict__ wts, half* __restrict__ out, int D,
+                                     int E, int slots) {
+    __shared__ float4 part[32][32];                 // [slot][lane]: the slot's 4 outputs of the lane
+    const int r = blockIdx.x, blk = blockIdx.y;
+    const int k = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = blk * 128 + 4 * lane;
+    const int p = r * slots + k;
+    const int e = pick[p];
+    float o[4] = {0.f, 0.f, 0.f, 0.f};
+    if (e >= 0 && e < E) {
+        const uint2 zv = *reinterpret_cast<const uint2*>(Z + (size_t)p * D + n);
+        const half2* h = reinterpret_cast<const half2*>(&zv);
+        float v[4] = {__low2float(h[0]), __high2float(h[0]), __low2float(h[1]), __high2float(h[1])};
+        fwht128(v, lane);
+        const float f = rd[p] * Z8_UNIT * HAD_SCALE;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) o[j] = v[j] * f * __half2float(svh_d[(size_t)e * D + n + j]);
+    }
+    part[k][lane] = make_float4(o[0], o[1], o[2], o[3]);
+    __syncthreads();
+    if (k != 0) return;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int q = 0; q < slots; ++q) {
+        const float w = wts[r * slots + q];
+        const float4 u = part[q][lane];
+        acc[0] = fmaf(w, u.x, acc[0]);
+        acc[1] = fmaf(w, u.y, acc[1]);
+        acc[2] = fmaf(w, u.z, acc[2]);
+        acc[3] = fmaf(w, u.w, acc[3]);
+    }
+    half2 lo = __floats2half2_rn(acc[0], acc[1]), hi = __floats2half2_rn(acc[2], acc[3]);
+    uint2 st = make_uint2(*reinterpret_cast<uint32_t*>(&lo), *reinterpret_cast<uint32_t*>(&hi));
+    *reinterpret_cast<uint2*>(out + (size_t)r * D + n) = st;
+}
+
+// A prompt's (place, block of ``rows`` members) pairs in place order, pad pairs past the last: no host read of their number.
+__global__ void m2_work_kernel(const int* __restrict__ counts, const int* __restrict__ ids, const int* __restrict__ ucount, int rows,
+                               int* __restrict__ work, int total, int maxu) {
+    __shared__ int ends[1024];
+    const int used = ucount[0];
+    for (int u = threadIdx.x; u < maxu; u += blockDim.x) ends[u] = u < used ? (counts[ids[u]] + rows - 1) / rows : 0;
+    __syncthreads();
+    if (threadIdx.x == 0)
+        for (int u = 1; u < maxu; ++u) ends[u] += ends[u - 1];
+    __syncthreads();
+    for (int i = threadIdx.x; i < total; i += blockDim.x) {
+        int u = 0;
+        while (u < maxu && ends[u] <= i) ++u;
+        work[2 * i] = u;
+        work[2 * i + 1] = u < maxu ? i - (u ? ends[u - 1] : 0) : 0;
+    }
 }
 
 // out[r][d] = the sum over slots in order of the routed slots' weighted bf16 outputs Y (grouped_down3), fp32, then add.
@@ -626,9 +726,10 @@ void exl3x_grouped_mma_cuda(const at::Tensor& X0, const at::Tensor& X1, const at
 void exl3x_grouped_mma2_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
                              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids,
                              const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z, int64_t mats,
-                             int64_t K, int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi) {
+                             int64_t K, int64_t N, int64_t P, int64_t slots, int64_t cb, int64_t lo, int64_t hi,
+                             int64_t rows, const at::Tensor& work) {
     TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
-    const size_t smem = tf_exl3x::m2_smem_bytes((int)hi);
+    const size_t smem = tf_exl3x::m2_smem_bytes((int)hi, (int)rows);
     int dev = 0, limit = 0;
     C10_CUDA_CHECK(cudaGetDevice(&dev));
     C10_CUDA_CHECK(cudaDeviceGetAttribute(&limit, cudaDevAttrMaxSharedMemoryPerBlockOptin, dev));
@@ -649,11 +750,76 @@ void exl3x_grouped_mma2_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
     a.nexp_max = (int)uids.size(0);
     a.mats = (int)mats; a.nt = tf_exl3x::M2_TILES; a.warps = 8; a.pf = 0;
     a.lo = (int)lo; a.hi = (int)hi;
+    a.m2_rows = (int)rows;
+    a.work = work.numel() ? work.data_ptr<int>() : nullptr;
+    a.nwork = (int)(work.numel() / 2);
     auto stream = at::cuda::getCurrentCUDAStream();
     if (cb == 0) tf_exl3x::grouped_mma2_launch<0>(a, stream);
     else if (cb == 1) tf_exl3x::grouped_mma2_launch<1>(a, stream);
     else if (cb == 2) tf_exl3x::grouped_mma2_launch<2>(a, stream);
     else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_grouped_mma8_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                             const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids,
+                             const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z, int64_t mats,
+                             int64_t K, int64_t N, int64_t P, int64_t slots, int64_t lo, int64_t hi, const at::Tensor& work) {
+    TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
+    tf_exl3x::GroupedArgs a;
+    a.tp0 = TP0.data_ptr<int64_t>();
+    a.tp1 = TP1.data_ptr<int64_t>();
+    a.k2_0 = B0.data_ptr<int>();
+    a.k2_1 = B1.data_ptr<int>();
+    a.uids = uids.data_ptr<int>();
+    a.ucount = ucount.data_ptr<int>();
+    a.members = members.data_ptr<int>();
+    a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = 1; a.maxm = (int)members.size(1); a.slots = (int)slots;
+    a.mats = (int)mats;
+    a.lo = (int)lo; a.hi = (int)hi;
+    a.work = work.data_ptr<int>();
+    a.nwork = (int)(work.numel() / 2);
+    tf_exl3x::grouped_mma8_launch(reinterpret_cast<const int8_t*>(X0.data_ptr()), reinterpret_cast<const int8_t*>(X1.data_ptr()),
+                                  reinterpret_cast<half*>(Z.data_ptr()), a, at::cuda::getCurrentCUDAStream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_rot8_cuda(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0, const at::Tensor& suh1,
+                     at::Tensor& out0, at::Tensor& out1, at::Tensor& ra, int64_t rows, int64_t K, int64_t slots, int64_t E) {
+    TORCH_CHECK(K == 6144, "rot8: 6,144 columns");
+    const dim3 grid((unsigned)(rows * slots), 2u);
+    rot8_kernel<6><<<grid, 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const half*>(x.data_ptr()), (int)x_stride, pick.data_ptr<int>(), reinterpret_cast<const half*>(suh0.data_ptr()),
+        reinterpret_cast<const half*>(suh1.data_ptr()), reinterpret_cast<int8_t*>(out0.data_ptr()),
+        reinterpret_cast<int8_t*>(out1.data_ptr()), ra.data_ptr<float>(), (int)K, (int)(rows * slots), (int)slots, (int)E);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_gateup_epilogue8_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                                 const at::Tensor& suh_d, const at::Tensor& ra, at::Tensor& xd, at::Tensor& rd, int64_t P, int64_t N,
+                                 int64_t E, double limit) {
+    TORCH_CHECK(N % 128 == 0 && N / 128 <= 32, "gateup_epilogue8: a warp a 128-block");
+    gateup_epilogue8_kernel<<<(unsigned)P, (unsigned)(N / 128 * 32), 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const half*>(Z.data_ptr()), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_g.data_ptr()),
+        reinterpret_cast<const half*>(svh_u.data_ptr()), reinterpret_cast<const half*>(suh_d.data_ptr()), ra.data_ptr<float>(),
+        reinterpret_cast<int8_t*>(xd.data_ptr()), rd.data_ptr<float>(), (int)P, (int)N, (int)E, (float)limit);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_down_combine8_cuda(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, const at::Tensor& rd,
+                              const at::Tensor& wts, at::Tensor& out, int64_t rows, int64_t D, int64_t slots, int64_t E) {
+    const dim3 grid((unsigned)rows, (unsigned)(D / 128));
+    down_combine8_kernel<<<grid, (unsigned)(32 * slots), 0, at::cuda::getCurrentCUDAStream()>>>(
+        reinterpret_cast<const half*>(Z.data_ptr()), pick.data_ptr<int>(), reinterpret_cast<const half*>(svh_d.data_ptr()),
+        rd.data_ptr<float>(), wts.data_ptr<float>(), reinterpret_cast<half*>(out.data_ptr()), (int)D, (int)E, (int)slots);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_m2_work_cuda(const at::Tensor& counts, const at::Tensor& ids, const at::Tensor& ucount, at::Tensor& work, int64_t rows) {
+    TORCH_CHECK(ids.size(0) <= 1024, "m2_work: up to 1,024 places");
+    m2_work_kernel<<<1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(counts.data_ptr<int>(), ids.data_ptr<int>(), ucount.data_ptr<int>(),
+                                                                    (int)rows, work.data_ptr<int>(), (int)(work.numel() / 2),
+                                                                    (int)ids.size(0));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -776,15 +942,6 @@ void exl3x_group_place_cuda(const at::Tensor& pick, const at::Tensor& counts, at
     group_place_kernel<<<(unsigned)E, PLACE_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         pick.data_ptr<int>(), counts.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(),
         members.data_ptr<int>(), (int)(R * slots), (int)slots, (int)E, (int)members.size(1));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-}
-
-void exl3x_work_list_cuda(const at::Tensor& counts, const at::Tensor& uids, const at::Tensor& ucount,
-                          at::Tensor& work0, int64_t rows0, at::Tensor& work1, int64_t rows1) {
-    work_list_kernel<<<1, LIST_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
-        counts.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), (int)uids.numel(),
-        work0.data_ptr<int>(), (int)rows0, (int)(work0.numel() / 2),
-        work1.numel() ? work1.data_ptr<int>() : nullptr, (int)rows1, (int)(work1.numel() / 2));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

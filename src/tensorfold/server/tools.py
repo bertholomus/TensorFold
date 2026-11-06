@@ -112,6 +112,8 @@ _GEMMA_KEY_RE = re.compile(r"(?<=[{,])\s*([A-Za-z_][\w-]*)\s*:")
 _DSML_BLOCK_RE = re.compile(r"<｜DSML｜tool_calls>(.*?)</｜DSML｜tool_calls>", re.DOTALL)
 _DSML_INVOKE_RE = re.compile(r'<｜DSML｜invoke name="([^"]*)">(.*?)</｜DSML｜invoke>', re.DOTALL)
 _DSML_PARAM_RE = re.compile(r'<｜DSML｜parameter name="([^"]*)" string="(true|false)">(.*?)</｜DSML｜parameter>', re.DOTALL)
+# Mistral: [TOOL_CALLS]NAME[ARGS]{...}, one after another, to the end of the reply
+_MISTRAL_CALL_RE = re.compile(r"\[TOOL_CALLS\]\s*([\w.:-]+)\s*\[ARGS\](.*?)(?=\[TOOL_CALLS\]|\Z)", re.DOTALL)
 _JSON_FENCE_RE = re.compile(
     r"^\s*```(?:json)?\s*(.*?)\s*```\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -336,7 +338,8 @@ def _envelopes(text: str) -> list[tuple[int, int, str]]:
     found = sorted([(m.start(), m.end(), m.group(1).strip()) for m in _TOOL_CALL_BLOCK_RE.finditer(text)]
                    + [(m.start(), m.end(), m.group(2).strip()) for m in _NAMESPACED_TOOL_CALL_BLOCK_RE.finditer(text)]
                    + [(m.start(), m.end(), m.group(1).strip()) for m in _GEMMA_TOOL_CALL_BLOCK_RE.finditer(text)]
-                   + [(m.start(), m.end(), m.group(0)) for m in _DSML_BLOCK_RE.finditer(text)])
+                   + [(m.start(), m.end(), m.group(0)) for m in _DSML_BLOCK_RE.finditer(text)]
+                   + [(m.start(), m.end(), m.group(0)) for m in _MISTRAL_CALL_RE.finditer(text)])
     kept: list[tuple[int, int, str]] = []
     for envelope in found:
         if not kept or envelope[0] >= kept[-1][1]:
@@ -370,6 +373,9 @@ def parse_tool_calls_from_content(
         try:
             if block.startswith("<｜DSML｜tool_calls>"):
                 parsed = _parse_dsml_calls(_DSML_BLOCK_RE.fullmatch(block).group(1))
+            elif block.startswith("[TOOL_CALLS]"):
+                call = _MISTRAL_CALL_RE.fullmatch(block)
+                parsed = [(call.group(1), _tool_json_object(call.group(2)))]
             else:
                 one = _parse_tool_call_payload(block, schemas, complete=max_calls is not None)
                 parsed = None if one is None else [one]

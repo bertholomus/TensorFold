@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import ctypes
 import ctypes.util
 import glob
 import os
 from collections.abc import Callable
+from functools import lru_cache
+from pathlib import Path
 from typing import Protocol
 
 import torch
@@ -50,6 +53,23 @@ def _library() -> ctypes.CDLL:
     raise RuntimeError("libnccl not found (set TF_NCCL_LIB)")
 
 
+LITTLE_PROXIES = os.environ.get("TF_NCCL_LITTLE", "1") == "1"
+
+
+@lru_cache(maxsize=1)
+def little_cores() -> frozenset:
+    """The slowest cores of a chip with two kinds, else none: a thread that only waits heats a big one about four times as much."""
+
+    speed = {}
+    for c in os.sched_getaffinity(0):
+        try:
+            speed[c] = int(Path(f"/sys/devices/system/cpu/cpu{c}/cpufreq/cpuinfo_max_freq").read_text())
+        except (OSError, ValueError):
+            return frozenset()
+    low = min(speed.values(), default=0)
+    return frozenset(c for c, f in speed.items() if f == low) if len(set(speed.values())) > 1 else frozenset()
+
+
 class NCCL:
     def __init__(self, rank: int, world: int, master: str, port: int, *, timeout_s: float = 600,
                  key: str = "tf_nccl_uid") -> None:
@@ -67,8 +87,12 @@ class NCCL:
         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
                                       ctypes.c_void_p]
         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout_s))
+        self.forks: list = []
+        self._open(key)
+
+    def _open(self, key: str) -> None:
         uid = _UniqueId()
-        if rank == 0:
+        if self.rank == 0:
             self._check(self.lib.ncclGetUniqueId(ctypes.byref(uid)))
             self.store.set(key, bytes(uid.internal))
         else:
@@ -76,7 +100,23 @@ class NCCL:
             ctypes.memmove(ctypes.addressof(uid), raw, 128)
         self.comm = ctypes.c_void_p()
         torch.cuda.current_device()
-        self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), world, uid, rank))
+        keep, little = os.sched_getaffinity(0), little_cores()
+        if little and LITTLE_PROXIES:                         # NCCL's threads start with this thread's cores, and spin there
+            os.sched_setaffinity(0, little)
+        try:
+            self._check(self.lib.ncclCommInitRank(ctypes.byref(self.comm), self.world, uid, self.rank))
+        finally:
+            os.sched_setaffinity(0, keep)
+
+    def fork(self, key: str) -> "NCCL":
+        """A second communicator over the same ranks: NCCL runs one communicator's calls in order, whatever their streams, so
+        a long gather that must not hold up a round's exchanges needs its own. Every rank calls this at the same point."""
+
+        other = copy.copy(self)
+        other.forks = []
+        other._open(key)
+        self.forks.append(other)
+        return other
 
     def _check(self, code: int) -> None:
         if code != 0:
@@ -116,11 +156,7 @@ class NCCL:
             print(f"[tensorfold] rank {self.rank} finished {label}; waiting for rank {missing} ({waited:.0f} s)",
                   flush=True)
 
-    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
-        """One NCCL group with ``peer``: each ``sends[i]`` lands in the peer's ``recvs[i]`` (contiguous tensors)."""
-
-        if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
-            raise ValueError("exchange: one receive per send, with another rank")
+    def _p2p_lib(self) -> ctypes.CDLL:
         lib = self.lib
         if not getattr(self, "_p2p", False):
             for name in ("ncclSend", "ncclRecv"):
@@ -129,6 +165,35 @@ class NCCL:
             lib.ncclGroupStart.argtypes = []
             lib.ncclGroupEnd.argtypes = []
             self._p2p = True
+        return lib
+
+    def alltoall(self, sends: list[torch.Tensor], recvs: list[torch.Tensor]) -> None:
+        """One NCCL group with every peer: ``sends[j]`` lands in rank j's ``recvs[this rank]`` (contiguous tensors; the
+        caller copies its own slot). Sizes may differ per peer and be zero: both sides of a pair must agree on them."""
+
+        if len(sends) != self.world or len(recvs) != self.world:
+            raise ValueError("alltoall: one send and one receive per rank")
+        lib = self._p2p_lib()
+        stream = torch.cuda.current_stream().cuda_stream
+        self._check(lib.ncclGroupStart())
+        try:
+            for j in range(self.world):
+                if j == self.rank:
+                    continue
+                s, r = sends[j], recvs[j]
+                if s.numel():
+                    self._check(lib.ncclSend(s.data_ptr(), s.numel(), _DTYPES[s.dtype], j, self.comm, stream))
+                if r.numel():
+                    self._check(lib.ncclRecv(r.data_ptr(), r.numel(), _DTYPES[r.dtype], j, self.comm, stream))
+        finally:
+            self._check(lib.ncclGroupEnd())
+
+    def exchange(self, sends: list[torch.Tensor], recvs: list[torch.Tensor], peer: int) -> None:
+        """One NCCL group with ``peer``: each ``sends[i]`` lands in the peer's ``recvs[i]`` (contiguous tensors)."""
+
+        if len(sends) != len(recvs) or peer == self.rank or not 0 <= peer < self.world:
+            raise ValueError("exchange: one receive per send, with another rank")
+        lib = self._p2p_lib()
         stream = torch.cuda.current_stream().cuda_stream
         self._check(lib.ncclGroupStart())
         try:
@@ -148,6 +213,8 @@ class NCCL:
         if comm is not None and comm.value:
             self.lib.ncclCommAbort.argtypes = [ctypes.c_void_p]
             self.lib.ncclCommAbort(comm)
+        for other in self.forks:
+            other.abort()
 
     def async_error(self) -> int:
         """NCCL's asynchronous error code for this communicator (0: none; a network failure shows here)."""
@@ -163,6 +230,14 @@ class NCCL:
         x = torch.zeros((1,), dtype=torch.float32, device="cuda")
         y = torch.zeros((self.world,), dtype=torch.float32, device="cuda")
         self.all_gather(x, y)
+        torch.cuda.synchronize()
+
+    def gather_done(self) -> None:
+        """Every collective enqueued on this communicator has LANDED — call before reading a
+        gather's recv buffer on the CPU. NCCL kernels fill it asynchronously on the stream
+        (m2b8, load4: dp4.agree() compared the buffer with no barrier, saw unwritten memory,
+        and raised OutOfStep on ops every rank had digested identically)."""
+
         torch.cuda.synchronize()
 
 

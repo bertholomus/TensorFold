@@ -1,6 +1,8 @@
 """What the lane server streams while a reply is written: reasoning apart from the answer, tool-call
 markup out of the visible text, and nothing ever taken back."""
 
+import json
+
 from tensorfold.server.text import hide_tool_calls, split_thinking
 
 REPLY = ("The user wants the jobs listed. I could call <tool_call> here, but first think.\n</think>\n\n"
@@ -180,3 +182,51 @@ def test_gemma_channel_after_text_streams_monotonically():
         assert "<|channel>" not in answer
         seen = answer
     assert split_thinking(reply, finished=True, markers=C) == ("", "Here is the plan.\n\n")
+
+
+def test_mistral_think_block_and_calls():
+    from tensorfold.server.text import MISTRAL_MARKERS as M, think_markers
+    from tensorfold.server.tools import parse_tool_calls_from_content
+
+    class Tokens:
+        def convert_tokens_to_ids(self, token):
+            return {"[/THINK]": 35}.get(token, 0)
+
+        unk_token_id = 0
+
+    assert think_markers(Tokens()) == M
+    reply = '[THINK]It wants the weather.[/THINK]Checking.[TOOL_CALLS]get_weather[ARGS]{"city": "Tokyo"}[TOOL_CALLS]get_time[ARGS]{}'
+    reasoning, answer = split_thinking(reply, finished=True, markers=M)
+    assert reasoning == "It wants the weather." and answer.startswith("Checking.[TOOL_CALLS]")
+    for n in range(len(reply)):
+        part = split_thinking(reply[:n], finished=False, markers=M)
+        assert "[/THINK" not in part[0] and "[/THINK" not in part[1] and "[THINK" not in part[1]
+    assert hide_tool_calls(answer, finished=True) == "Checking."
+    assert hide_tool_calls("Checking.[TOOL_C", finished=False) == "Checking."
+    tools = [{"type": "function", "function": {"name": n}} for n in ("get_weather", "get_time")]
+    content, calls = parse_tool_calls_from_content(answer, tools)
+    assert content == "Checking." and [c["function"]["name"] for c in calls] == ["get_weather", "get_time"]
+    assert json.loads(calls[0]["function"]["arguments"]) == {"city": "Tokyo"}
+    assert parse_tool_calls_from_content('[TOOL_CALLS]nope[ARGS]{}', tools)[1] is None
+    assert split_thinking("[THINK]Still thinking", finished=True, markers=M) == ("Still thinking", "")
+
+
+def test_mistral_reply_on_the_cuda_path():
+    from tensorfold.cuda.reply_text import before_mistral_calls, hide_tool_calls as hide, parse_tool_calls
+    from tensorfold.server.text import MISTRAL_MARKERS
+
+    tools = [{"type": "function", "function": {"name": "get_time_zone", "parameters": {"type": "object", "properties": {}}}}]
+    reply = '[THINK]Need the zone.[/THINK]Checking.[TOOL_CALLS]get_time_zone[ARGS]{"city": "Kyoto"}[TOOL_CALLS]'
+    sent = ""
+    for n in range(1, len(reply) + 1):
+        reasoning, answer = split_thinking(reply[:n], finished=False, markers=MISTRAL_MARKERS)
+        shown = hide(answer, finished=False)
+        assert shown.startswith(sent) and "[" not in shown, f"taken back or shown at {n}: {sent!r} -> {shown!r}"
+        sent = shown
+    assert reasoning == "Need the zone." and sent == "Checking."
+    assert before_mistral_calls("Checking.[TOOL_C", finished=False) == "Checking."
+    assert before_mistral_calls("a [b] c", finished=True) == "a [b] c"
+    content, calls = parse_tool_calls(answer, tools)
+    assert content == "Checking." and len(calls) == 1
+    assert calls[0]["function"] == {"name": "get_time_zone", "arguments": '{"city":"Kyoto"}'}
+    assert parse_tool_calls('[TOOL_CALLS]get_time_zone[ARGS]{"city"', tools)[1] is None     # cut short: text, not a call

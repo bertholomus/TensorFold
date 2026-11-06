@@ -34,6 +34,7 @@
 #include <infiniband/verbs.h>
 #include <arpa/inet.h>
 #include <pthread.h>
+#include <time.h>
 #include <sched.h>
 #include <sys/mman.h>
 
@@ -292,8 +293,14 @@ void proxy_loop(Gather* gp) {
             if (g.nics[d].qps[p]) owner.push_back({g.nics[d].qps[p]->qp_num, p});
     ibv_wc wc[64];
     const volatile uint64_t* doorbell = g.doorbell;
-    while (g.running.load(std::memory_order_relaxed)) {
+    int quiet = 0;                                            // rounds with nothing to do: a long prompt has no gathers, and a core
+    while (g.running.load(std::memory_order_relaxed)) {       // at full tilt heats the die the GPU is on
+        if (++quiet > 20000) {
+            const timespec nap{0, 100000};
+            nanosleep(&nap, nullptr);
+        }
         const uint64_t ring = *doorbell;
+        if (posted < ring) quiet = 0;
         while (posted < ring) {
             const uint64_t q = posted + 1;
             const int slot = (int)(q % g.slots);
@@ -331,6 +338,7 @@ void proxy_loop(Gather* gp) {
                 fail(g, "ibv_poll_cq failed");
                 return;
             }
+            if (k) quiet = 0;
             for (int i = 0; i < k; ++i) {
                 if (wc[i].status != IBV_WC_SUCCESS) {
                     fail(g, std::string("RDMA completion: ") + ibv_wc_status_str(wc[i].status));

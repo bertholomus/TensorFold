@@ -241,12 +241,20 @@ def _backend(choice: str, family: Any) -> str:
 def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context: int | None = None) -> int:
     """Serve with the family's CUDA engine (``cuda_engine``) behind ``tensorfold.cuda.server``."""
 
+    # Multi-rank serving: TP2 (DS-V4.1 tensor split) and the ML4 EP4+DP4 lane up to CUDA_MAX_RANKS (note D2 §1).
+    # The family-owned cuda_engine dispatches rank/world itself (D1 §Extension points); ranks > 0 never serve
+    # HTTP -- they follow rank 0's step payloads.
     from tensorfold import hub
 
-    if args.tp == 2 and not args.master:
-        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+    max_ranks = int(getattr(family.package, "CUDA_MAX_RANKS", 2))     # DS-V4.1 stays 1-or-2 (refused in its
+    if args.tp > max_ranks:                                           # own cuda_engine too; belt and braces)
+        raise ValueError(f"{family.title} runs on 1 to {max_ranks} ranks, not --tp {args.tp}")
+    if args.tp > 1 and not args.master:
+        raise ValueError(f"--tp {args.tp} needs --master: rank 0's address on the link between the machines")
     if args.tp == 1 and args.rank != 0:
         raise ValueError("--rank 1 needs --tp 2")
+    if args.rank >= args.tp:
+        raise ValueError(f"--rank {args.rank} needs --tp > {args.rank}")
     started = time.perf_counter()
     drafter = "" if args.no_drafts else _drafter(family, args.drafter, "cuda")
     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
@@ -270,7 +278,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
         options["checkpoint_slots"] = int(args.checkpoint_slots)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
-    where = f", rank {args.rank} of 2" if args.tp == 2 else ""
+    where = f", rank {args.rank} of {args.tp}" if args.tp > 1 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
     from tensorfold.cuda import precision, prompt_precision
 
@@ -288,8 +296,9 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         raise ValueError("--prefill-fp8: this checkpoint's prompt matmuls have no FP8 kernel (EXL3 packs, MLX formats "
                          "other than Qwen's 4-bit g64, Flash Next without MXFP8 layers); drop the flag")
     stacks.arm()            # its warmup may have loaded a compiler that took USR1
-    if args.tp == 2 and args.rank == 1:
-        print(f"[tensorfold] rank 1 ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
+    if args.tp > 1 and args.rank > 0:
+        print(f"[tensorfold] rank {args.rank} ready in {time.perf_counter() - started:.1f}s, following rank 0",
+              flush=True)
         engine.follow()
         return 0
     from tensorfold.cuda.server import App, serve

@@ -7,12 +7,13 @@ from typing import Any
 from tensorfold.server.messages import _normalize_tool_call_arguments, late_system_role, normalize_messages
 
 _THINK_END = "</think>"
-# (what a reply writes to open its think block, what closes it): Qwen's prompt opens the block; Gemma 4's reply does
+# (what a reply writes to open its think block, what closes it): Qwen's prompt opens the block; Gemma 4's and Mistral's replies do
 THINK_MARKERS = ("", _THINK_END)
 CHANNEL_MARKERS = ("<|channel>thought", "<channel|>")
-# (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block
+MISTRAL_MARKERS = ("[THINK]", "[/THINK]")
+# (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, Mistral's (no closer: the reply's end)
 _CALLS = (("<tool_call>", "</tool_call>"), ("<|tool_call>", "<tool_call|>"),
-          ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"))
+          ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>"), ("[TOOL_CALLS]", ""))
 
 
 def _partial_tag(text: str, tag: str) -> int:
@@ -66,14 +67,18 @@ def reasoning_count(tokens: list[int], think_end: int | None) -> int:
 
 
 def think_markers(tokenizer: Any) -> tuple[str, str]:
-    """Gemma 4's thought channel when the tokenizer has its ``<channel|>`` token, else Qwen's ``</think>``."""
+    """Gemma 4's thought channel or Mistral's block when the tokenizer has their closing token, else Qwen's ``</think>``."""
 
-    try:
-        close = tokenizer.convert_tokens_to_ids(CHANNEL_MARKERS[1])
-    except Exception:  # noqa: BLE001 - a tokenizer without the lookup: the default markers
-        return THINK_MARKERS
     unk = getattr(tokenizer, "unk_token_id", None)
-    return CHANNEL_MARKERS if isinstance(close, int) and close >= 0 and close != unk else THINK_MARKERS
+    look = getattr(tokenizer, "convert_tokens_to_ids", None) or getattr(tokenizer, "token_to_id", None)
+    for markers in (CHANNEL_MARKERS, MISTRAL_MARKERS):
+        try:
+            close = look(markers[1])
+        except Exception:  # noqa: BLE001 - a tokenizer without the lookup: the default markers
+            return THINK_MARKERS
+        if isinstance(close, int) and close >= 0 and close != unk:
+            return markers
+    return THINK_MARKERS
 
 
 def hide_tool_calls(text: str, *, finished: bool) -> str:
@@ -91,7 +96,7 @@ def hide_tool_calls(text: str, *, finished: bool) -> str:
             return "".join(out)
         start, opener, closer = min(found)
         out.append(text[pos:start])
-        end = text.find(closer, start + len(opener))
+        end = text.find(closer, start + len(opener)) if closer else -1
         if end < 0:
             return "".join(out)
         pos = end + len(closer)

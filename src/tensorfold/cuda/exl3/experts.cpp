@@ -14,10 +14,20 @@ void exl3x_grouped_mma_cuda(const at::Tensor&, const at::Tensor&, const at::Tens
                             const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                             const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&);
+void exl3x_grouped_mma8_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t,
+                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&);
+void exl3x_rot8_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&,
+                     at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3x_gateup_epilogue8_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                                 const at::Tensor&, at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, double);
+void exl3x_down_combine8_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                              at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3x_m2_work_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t);
 void exl3x_grouped_mma2_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
-                             int64_t, int64_t);
+                             int64_t, int64_t, int64_t, const at::Tensor&);
 void exl3x_grouped_mma3_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
@@ -32,8 +42,6 @@ void exl3x_group_cuda(const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, 
 void exl3x_group_count_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 void exl3x_group_place_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t,
                             int64_t, int64_t);
-void exl3x_work_list_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, at::Tensor&,
-                          int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -137,7 +145,7 @@ void grouped_mma(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& T
 void grouped_mma2(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
                   const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                   const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P,
-                  int64_t slots, int64_t cb, int64_t lo, int64_t hi) {
+                  int64_t slots, int64_t cb, int64_t lo, int64_t hi, int64_t rows, const at::Tensor& work) {
     check(X0, at::kHalf, "X0");
     check(X1, at::kHalf, "X1");
     check(TP0, at::kLong, "TP0");
@@ -148,10 +156,84 @@ void grouped_mma2(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& 
     check(ucount, at::kInt, "ucount");
     check(members, at::kInt, "members");
     check(Z, at::kFloat, "Z");
+    check(work, at::kInt, "work");
     TORCH_CHECK(Z.numel() >= mats * P * N, "Z too small");
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
     c10::cuda::CUDAGuard guard(X0.device());
-    exl3x_grouped_mma2_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, slots, cb, lo, hi);
+    exl3x_grouped_mma2_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, slots, cb, lo, hi, rows, work);
+}
+
+void grouped_mma8(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
+                  const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
+                  const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P,
+                  int64_t slots, int64_t lo, int64_t hi, const at::Tensor& work) {
+    check(X0, at::kChar, "X0");
+    check(X1, at::kChar, "X1");
+    check(TP0, at::kLong, "TP0");
+    check(TP1, at::kLong, "TP1");
+    check(B0, at::kInt, "B0");
+    check(B1, at::kInt, "B1");
+    check(uids, at::kInt, "uids");
+    check(ucount, at::kInt, "ucount");
+    check(members, at::kInt, "members");
+    check(Z, at::kHalf, "Z");
+    check(work, at::kInt, "work");
+    TORCH_CHECK(Z.numel() >= mats * P * N, "Z too small");
+    TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
+    c10::cuda::CUDAGuard guard(X0.device());
+    exl3x_grouped_mma8_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, slots, lo, hi, work);
+}
+
+void rot8(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0, const at::Tensor& suh1, at::Tensor out0,
+          at::Tensor out1, at::Tensor ra, int64_t rows, int64_t K, int64_t slots, int64_t E) {
+    check(x, at::kHalf, "x");
+    check(pick, at::kInt, "pick");
+    check(suh0, at::kHalf, "suh0");
+    check(suh1, at::kHalf, "suh1");
+    check(out0, at::kChar, "out0");
+    check(out1, at::kChar, "out1");
+    check(ra, at::kFloat, "ra");
+    TORCH_CHECK(out0.numel() >= rows * slots * K && out1.numel() >= rows * slots * K && ra.numel() >= 2 * rows * slots, "too small");
+    c10::cuda::CUDAGuard guard(x.device());
+    exl3x_rot8_cuda(x, x_stride, pick, suh0, suh1, out0, out1, ra, rows, K, slots, E);
+}
+
+void gateup_epilogue8(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_g, const at::Tensor& svh_u,
+                      const at::Tensor& suh_d, const at::Tensor& ra, at::Tensor xd, at::Tensor rd, int64_t P, int64_t N, int64_t E,
+                      double limit) {
+    check(Z, at::kHalf, "Z");
+    check(pick, at::kInt, "pick");
+    check(svh_g, at::kHalf, "svh_g");
+    check(svh_u, at::kHalf, "svh_u");
+    check(suh_d, at::kHalf, "suh_d");
+    check(ra, at::kFloat, "ra");
+    check(xd, at::kChar, "xd");
+    check(rd, at::kFloat, "rd");
+    TORCH_CHECK(Z.numel() >= 2 * P * N && ra.numel() >= 2 * P && xd.numel() >= P * N && rd.numel() >= P, "too small");
+    c10::cuda::CUDAGuard guard(Z.device());
+    exl3x_gateup_epilogue8_cuda(Z, pick, svh_g, svh_u, suh_d, ra, xd, rd, P, N, E, limit);
+}
+
+void down_combine8(const at::Tensor& Z, const at::Tensor& pick, const at::Tensor& svh_d, const at::Tensor& rd, const at::Tensor& wts,
+                   at::Tensor out, int64_t rows, int64_t D, int64_t slots, int64_t E) {
+    check(Z, at::kHalf, "Z");
+    check(pick, at::kInt, "pick");
+    check(svh_d, at::kHalf, "svh_d");
+    check(rd, at::kFloat, "rd");
+    check(wts, at::kFloat, "wts");
+    check(out, at::kHalf, "out");
+    TORCH_CHECK(Z.numel() >= rows * slots * D && rd.numel() >= rows * slots && out.numel() >= rows * D, "too small");
+    c10::cuda::CUDAGuard guard(Z.device());
+    exl3x_down_combine8_cuda(Z, pick, svh_d, rd, wts, out, rows, D, slots, E);
+}
+
+void m2_work(const at::Tensor& counts, const at::Tensor& ids, const at::Tensor& ucount, at::Tensor work, int64_t rows) {
+    check(counts, at::kInt, "counts");
+    check(ids, at::kInt, "ids");
+    check(ucount, at::kInt, "ucount");
+    check(work, at::kInt, "work");
+    c10::cuda::CUDAGuard guard(counts.device());
+    exl3x_m2_work_cuda(counts, ids, ucount, work, rows);
 }
 
 void grouped_mma3(const at::Tensor& x, int64_t x_stride, const at::Tensor& suh0, const at::Tensor& suh1,
@@ -247,20 +329,6 @@ void group_place(const at::Tensor& pick, const at::Tensor& counts, at::Tensor ui
     TORCH_CHECK(members.size(0) >= uids.numel() && members.size(1) >= 1, "members too small");
     c10::cuda::CUDAGuard guard(pick.device());
     exl3x_group_place_cuda(pick, counts, uids, ucount, members, R, slots, E);
-}
-
-void work_list(const at::Tensor& counts, const at::Tensor& uids, const at::Tensor& ucount, at::Tensor work0,
-               int64_t rows0, at::Tensor work1, int64_t rows1) {
-    check(counts, at::kInt, "counts");
-    check(uids, at::kInt, "uids");
-    check(ucount, at::kInt, "ucount");
-    check(work0, at::kInt, "work0");
-    TORCH_CHECK(!work1.numel() || (work1.is_cuda() && work1.scalar_type() == at::kInt && work1.is_contiguous()),
-                "work1: a contiguous int32 CUDA tensor, or empty");
-    TORCH_CHECK(work0.numel() % 2 == 0 && work1.numel() % 2 == 0 && rows0 > 0 && rows1 > 0,
-                "work lists hold (place, group) pairs; groups hold rows");
-    c10::cuda::CUDAGuard guard(counts.device());
-    exl3x_work_list_cuda(counts, uids, ucount, work0, rows0, work1, rows1);
 }
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
@@ -433,13 +501,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_mma", &grouped_mma);
     m.def("grouped_mma2", &grouped_mma2);
     m.def("grouped_mma3", &grouped_mma3);
+    m.def("grouped_mma8", &grouped_mma8);
+    m.def("rot8", &rot8);
+    m.def("gateup_epilogue8", &gateup_epilogue8);
+    m.def("down_combine8", &down_combine8);
+    m.def("m2_work", &m2_work);
     m.def("grouped_down3", &grouped_down3);
     m.def("combine_y", &combine_y);
     m.def("dequant", &dequant);
     m.def("group", &group);
     m.def("group_count", &group_count);
     m.def("group_place", &group_place);
-    m.def("work_list", &work_list);
     m.def("rot_in", &rot_in);
     m.def("gateup_epilogue", &gateup_epilogue);
     m.def("down_epilogue", &down_epilogue);
