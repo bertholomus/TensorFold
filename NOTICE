@@ -48,3 +48,33 @@ Modified upstream files:
   .gitignore                                   ignores macOS ._* files
 
 The "git log" of this branch and tools/dsv41/ATTRIBUTION.md describe the changes and their sources.
+
+The mistral-large-4-tp4 branch of this fork adds the mistral_large4 model family for Mistral Large 4, over four NVIDIA GB10
+nodes, with the same holder and license.
+
+Added:
+  src/tensorfold/families/mistral_large4/  the model family (engine, kernels, server integration)
+  src/tensorfold/cuda/exl3/load.py         the shard and rank-cache readers as a family-neutral import point
+  tools/ml4/                               serve script, benchmark clients, DESIGN-CP4.md and ATTRIBUTION.md
+  tools/ml4_step4_chat.py, tools/ml4_step6_conc.py, tools/parity/   the chat and tool-call set, a load sweep, parity tools
+  tests/test_ml4_*.py                      tests of the family
+  A "Mistral Large 4 on CUDA (four nodes)" section in THIRD_PARTY_NOTICES.md, and a fork note at the top of README.md.
+
+Modified upstream files, in addition to the list above:
+  src/tensorfold/cli.py                        --tp above 2 for a family that declares it (CUDA_MAX_RANKS)
+  src/tensorfold/cli_args.py                   as above
+  src/tensorfold/cuda/comm.py                  all-to-all, a forked communicator, gather_done, threads on chosen cores
+  src/tensorfold/cuda/exl3/experts_grouped.cuh int8 grouped expert kernels (mma m16n8k32) for prompt rounds
+  src/tensorfold/cuda/exl3/experts.cu          as above; work lists built on the device
+  src/tensorfold/cuda/exl3/experts.cpp         bindings for the added kernels
+  src/tensorfold/cuda/exl3/experts.py          Python entry points for the added kernels
+  src/tensorfold/cuda/exl3/prefill.py          a wider default tile for prompt GEMMs (same bits)
+  src/tensorfold/cuda/rdma_gather.cu           the proxy thread naps on a little core
+  src/tensorfold/cuda/reply_text.py            Mistral tool calls ([TOOL_CALLS]name[ARGS]{json}) and hiding them
+  src/tensorfold/cuda/server.py                think markers from the tokenizer, Mistral tool calls
+  src/tensorfold/server/app.py                 think markers from the tokenizer
+  src/tensorfold/server/text.py                [THINK] markers, Mistral tool-call markup
+  src/tensorfold/server/tools.py               Mistral tool-call markup
+  tests/test_lane_stream_text.py               tests for the above
+
+The "git log" of this branch and tools/ml4/ATTRIBUTION.md describe the changes and their sources.

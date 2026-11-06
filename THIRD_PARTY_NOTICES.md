@@ -97,6 +97,15 @@ This section was added by the fork that adds the `deepseek_v41` family; see `NOT
 - The baseline used in `tools/dsv41/REPORT.md` (a vLLM kit under AGPL-3.0) was only run as a black box over HTTP. None
   of its code was read or included. `tools/dsv41/ATTRIBUTION.md` lists every source in full.
 
+## Mistral Large 4 on CUDA (four nodes)
+
+The `mistral_large4` family of this fork (`src/tensorfold/families/mistral_large4/`, `tools/ml4/`) is new code under the
+repository's license. It re-implements the model's math; no model code was copied. It does not contain or redistribute
+model weights. The weights it serves are a derivative of
+[mistralai/Mistral-Large-4-1T-A52B](https://huggingface.co/mistralai/Mistral-Large-4-1T-A52B) under the Mistral Ecosystem
+Open-Weight License (Attribution notice: 2026 - Mistral), which travels with them. `tools/ml4/ATTRIBUTION.md` lists every
+outside source.
+
 ## Vendored code and weights
 
 `src/tensorfold/drafters/vendor/z_lab_dflash/model_mlx.py` is the unmodified `dflash/model_mlx.py` from

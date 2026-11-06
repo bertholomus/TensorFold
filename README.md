@@ -1,5 +1,14 @@
 # TensorFold
 
+> **This branch adds the `mistral_large4` family**: Mistral Large 4 (EXL3) on four NVIDIA GB10 (DGX Spark) nodes, with the
+> model's full 1,048,576-token context on one stream. The family is in `src/tensorfold/families/mistral_large4/`, its
+> design, tools and attribution in `tools/ml4/` (`DESIGN-CP4.md`, `ATTRIBUTION.md`). The launch steps and the measured
+> numbers are in [bertholomus/mistral-large-4-tensorfold-tp4-4xgb10](https://github.com/bertholomus/mistral-large-4-tensorfold-tp4-4xgb10).
+>
+> Weights: [bertholomus/Mistral-Large-4-1T-A52B-EXL3-2.5bpw](https://huggingface.co/bertholomus/Mistral-Large-4-1T-A52B-EXL3-2.5bpw),
+> an EXL3 quant of [mistralai/Mistral-Large-4-1T-A52B](https://huggingface.co/mistralai/Mistral-Large-4-1T-A52B) under the
+> Mistral Ecosystem Open-Weight License. This fork is not affiliated with or endorsed by Mistral AI.
+>
 > **This is a fork of TensorFold 0.6.6**, not the upstream project. It adds the `deepseek_v41` family: DeepSeek-V4.1-Flash
 > (EXL3), tensor-parallel over two NVIDIA GB10 (DGX Spark) nodes. The family is in
 > `src/tensorfold/families/deepseek_v41/`, its design, report and attribution in `tools/dsv41/`
