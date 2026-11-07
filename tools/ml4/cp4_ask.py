@@ -21,10 +21,11 @@ def main() -> None:
     ap.add_argument("--text-file", default="")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--effort", default="low")
+    ap.add_argument("--temperature", type=float, default=0.0)
     a = ap.parse_args()
     text = open(a.text_file).read() if a.text_file else a.text
     body = json.dumps({"model": "ml4", "messages": [{"role": "user", "content": text}], "max_tokens": a.max_tokens,
-                       "temperature": 0, "reasoning_effort": a.effort, "stream": True,
+                       "temperature": a.temperature, "reasoning_effort": a.effort, "stream": True,
                        "stream_options": {"include_usage": True}})
     t0 = time.time()
     print(f"[ask] {len(text)} characters, {len(body)} bytes sent at {time.strftime('%H:%M:%S')}", flush=True)

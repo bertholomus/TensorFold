@@ -19,6 +19,7 @@ from .tp_kernels import (add_norm, key_row, keep_rows, kth_rows, kv_row, layer_n
                          select_ready, top8)
 
 F16, F32 = torch.float16, torch.float32
+SCORE_FLOATS = SCORE_BYTES // 32 * 9                                      # a tile's scores and largests
 SLICE_ROWS = int(os.environ.get("TF_ML4_CP_SLICE_ROWS") or 1024)          # a round's queries a slice: its exchange runs beside the next's kernels; 0: none
 ONE = cp4.Stripe(1, 1)                                                    # a prompt's copy: a row number is a position
 PAIR = int(os.environ.get("TF_ML4_CP_PAIR") or 0)                         # a longer round goes as two, this many rows and the rest; 0: never
@@ -141,7 +142,8 @@ class FusedCp(cp4.Ml4Cp):
         self.side = torch.cuda.Stream(priority=-1) if SLICE_ROWS else None
         self.slots: Slots | None = None
         self.lag: torch.cuda.Event | None = None
-        self.scores = torch.empty(SCORE_BYTES // 32 * 9, dtype=F32, device=pool.device) if SCORE8 else None   # a tile's scores and largests
+        if SCORE8:
+            self.ops.arena(SCORE_FLOATS * 4)
 
     def open_slots(self, rows: int) -> None:
         """Room for a prompt of ``rows`` tokens to run over all its rows without a copy of them; every rank calls this at the same point."""
@@ -165,6 +167,8 @@ class FusedCp(cp4.Ml4Cp):
             p = torch.arange(start, start + PAIR)
             cut = int((seq.stripe.rank(p) == self.rank).sum())
             f = Pair(self._one(seq, start, PAIR, tokens[:cut], None, copy), self._one(seq, start + PAIR, n - PAIR, tokens[cut:], last, copy))
+            if copy is not None and copy is self.slots:          # one slot a layer: b's last layer reads a's keys in it
+                f.a.rnd.spare = f.b.rnd.spare
         else:
             f = self._one(seq, start, n, tokens, last, copy)
         if copy is self.slots and copy is not None:
@@ -175,6 +179,10 @@ class FusedCp(cp4.Ml4Cp):
 
     def _one(self, seq: cp4.Seq, start: int, n: int, tokens: torch.Tensor, last: int | None, copy) -> cp4.Flight:
         f = super().begin(seq, start, n, tokens, last)
+        f.rnd.spare = seq.tail_only and last is None and (seq.window is None or start + n <= seq.window.first)
+        if seq.window is not None:
+            p = torch.arange(start, start + n)
+            f.rnd.keep = seq.window.round(p[seq.stripe.rank(p) == self.rank])
         if copy is not None:
             p = torch.arange(start, start + n)
             own = p[seq.stripe.rank(p) == self.rank]
@@ -226,11 +234,12 @@ class FusedCp(cp4.Ml4Cp):
         if narrow:
             q8, qw = (score4_rows(q, w32), None) if four else score8_query(q, w32)
             wide = (n + 7) // 8 * 8
+            scores = self.ops.arena(SCORE_FLOATS * 4)[:SCORE_FLOATS * 4].view(F32)
         for c0 in range(0, Q, tile):
             c1 = min(Q, c0 + tile)
             if narrow:
-                s = self.scores[:(c1 - c0) * wide].view(c1 - c0, wide)
-                top = self.scores[(c1 - c0) * wide:(c1 - c0) * wide * 9 // 8].view(c1 - c0, wide // 8)
+                s = scores[:(c1 - c0) * wide].view(c1 - c0, wide)
+                top = scores[(c1 - c0) * wide:(c1 - c0) * wide * 9 // 8].view(c1 - c0, wide // 8)
                 if four:
                     score4(q8, c0, keys, part.vis[c0:c1], n, s, top)
                 else:
@@ -424,13 +433,18 @@ class FusedCp(cp4.Ml4Cp):
         self._landed(rnd)
         x, xn, x16 = add_norm(rnd.pending, x, lay.attn_norm, c.eps)
         rnd.pending = None
+        if rnd.keep is not None:
+            rnd.keep.put(L, x)
         if lay.kv_source == L and n:
             kv_row(small(lay.kv_a, xn), lay.kv_a_norm, rnd.own, rnd.own_rows, inv, pool.lat[L], c.eps, c.kv_lora, rope_w)
         if lay.indexer == "full" and n:
             key_row(small(lay.idx_wk, xn), lay.idx_k_norm, lay.idx_k_norm_b, rnd.own, rnd.own_rows, inv, pool.keys[L],
                     c.index_norm_eps, c.idx_dim, rope_w)
-        shared = self._share(L, lay, rnd) if rnd.mine is not None else None
-        q = ops.lin(lay.q, x16)
+        ends = rnd.spare and L == c.n_layers - 1
+        shared = self._share(L, lay, rnd) if rnd.mine is not None and not (ends and deep) else None
+        if ends:
+            return x
+        q = ops.lin8(lay.q, x16)
         qi = wts = None
         if lay.indexer == "full" and not (deep and L in REUSE):
             qi = ops.mat(lay.idx_wq_b, layer_norm16(xn, lay.idx_q_norm, lay.idx_q_norm_b, c.index_norm_eps))
@@ -439,10 +453,12 @@ class FusedCp(cp4.Ml4Cp):
             rnd.copy.wait(L)
         if shared is not None:
             torch.cuda.current_stream().wait_event(shared)
-        y = ops.lin(lay.o, (self._copied if rnd.mine is not None else self._sliced if rnd.parts else self._whole)(L, lay, q, qi, wts, rnd))
+        y = ops.lin8(lay.o, (self._copied if rnd.mine is not None else self._sliced if rnd.parts else self._whole)(L, lay, q, qi, wts, rnd))
         x, xn, x16 = add_norm(y[None], x, lay.ffn_norm, c.eps)
         if lay.dense:
-            act = F.silu(ops.lin(lay.dense_gate, x16).float()) * ops.lin(lay.dense_up, x16).float()
+            act, up = ops.lin(lay.dense_gate, x16), ops.lin(lay.dense_up, x16)
+            for a in range(0, act.shape[0], 256):                # fp32 only a slice at a time: a round's would be the prompt's peak
+                act[a:a + 256] = F.silu(act[a:a + 256].float()) * up[a:a + 256].float()
             rnd.pending = ops.lin(lay.dense_down, act)[None]
         else:
             w, idx = route_softmax(ops.router(lay.gate_w, xn), c.topk)
@@ -486,7 +502,7 @@ class FusedCp(cp4.Ml4Cp):
                 b.x = self._front(L, b.x, b.rnd)
             if slots is not None:
                 slots.done()
-                if L + 1 < end:
+                if L + 1 < end - (b or a).rnd.spare:
                     slots.fetch(L + 1, self.w.layers[L + 1], f.rnd.seq, f.old)
             self._back(a.rnd)
             if b is not None:
@@ -523,4 +539,6 @@ class FusedCp(cp4.Ml4Cp):
         if f.rnd.pending is not None:
             f.x = add_norm(f.rnd.pending, f.x, self.w.norm, self.cfg.eps)[0]
             f.rnd.pending = None
+        if f.rnd.keep is not None:
+            f.rnd.keep.put(self.cfg.n_layers, f.x)
         return super().finish(f)

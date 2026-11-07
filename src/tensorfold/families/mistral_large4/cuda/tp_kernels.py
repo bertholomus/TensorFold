@@ -14,7 +14,7 @@ import triton.language as tl
 
 from .cp4_kernels import _lat_part
 
-ATTEND_PROGRAMS = int(os.environ.get("TF_ML4_ATTEND_PROGRAMS") or 32)     # a step's attention programs a layer, a power of two
+ATTEND_SPLIT = int(os.environ.get("TF_ML4_ATTEND_SPLIT") or 8)            # a row's selection in this many parts, whatever the rows: its bits stay the same
 D_BLOCK = 8192                                                 # the next power of two over the model width
 
 
@@ -48,6 +48,54 @@ def add_norm(every: torch.Tensor | None, x: torch.Tensor, weight: torch.Tensor, 
     _add_norm[(R,)](every if every is not None else x, x, weight, x, n32, n16, R, D=d, W=w, EPS=eps, BLOCK=D_BLOCK,
                     HAS_E=every is not None, num_warps=8)
     return x, n32, n16
+
+
+@triton.jit
+def _own_rows(IDS, TABLE, OUT, first, V, D: tl.constexpr, BLOCK: tl.constexpr):
+    """Row r of OUT: token IDS[r]'s row if this rank's part of the table holds it, zeros if not."""
+
+    r = tl.program_id(0)
+    i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    at = tl.load(IDS + r) - first
+    tl.store(OUT + r * D + i, tl.load(TABLE + at * D + i, mask=(at >= 0) & (at < V), other=0.0))
+
+
+def own_rows(ids: torch.Tensor, table: torch.Tensor, first: int) -> torch.Tensor:
+    d = table.shape[1]
+    out = torch.empty((ids.numel(), d), dtype=table.dtype, device=table.device)
+    _own_rows[(ids.numel(), d // 1024)](ids, table, out, first, table.shape[0], D=d, BLOCK=1024, num_warps=4)
+    return out
+
+
+@triton.jit
+def _rows_of(E, IDS, X, R, V, D: tl.constexpr, BLOCK: tl.constexpr):
+    r = tl.program_id(0)
+    i = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    who = tl.load(IDS + r) // V
+    tl.store(X + r * D + i, tl.load(E + (who * R + r) * D + i).to(tl.float32))
+
+
+def rows_of(every: torch.Tensor, ids: torch.Tensor, per_rank: int) -> torch.Tensor:
+    """x [R, d] fp32 of ``own_rows``'s parts from every rank, [W, R, d]: each row from the rank that holds its token."""
+
+    _, R, d = every.shape
+    x = torch.empty((R, d), dtype=torch.float32, device=every.device)
+    _rows_of[(R, d // 1024)](every, ids, x, R, per_rank, D=d, BLOCK=1024, num_warps=4)
+    return x
+
+
+@triton.jit
+def _fill_rows(T, DRAFTS, OUT, n, BLOCK: tl.constexpr):
+    i = tl.arange(0, BLOCK)
+    ok = i < n
+    t = tl.load(T + i, mask=ok, other=0)
+    tl.store(OUT + i, tl.where(t < 0, tl.load(DRAFTS + (-1 - t), mask=ok & (t < 0), other=0), t), mask=ok)
+
+
+def fill_rows(tokens: torch.Tensor, drafted: torch.Tensor, out: torch.Tensor) -> None:
+    """A step's tokens: those that are -1 - a place in ``drafted`` from there, the rest as they are."""
+
+    _fill_rows[(1,)](tokens, drafted, out, tokens.numel(), BLOCK=64, num_warps=1)
 
 
 @triton.jit
@@ -371,7 +419,7 @@ def attend_step(every: torch.Tensor, heads: int, rd: int, rows: torch.Tensor, cn
     plane the layer's uint8 rows. out [W, stride] fp16: rank k's block holds what k merges."""
 
     W, R, T = every.shape
-    S = max(1, ATTEND_PROGRAMS // (W * R))
+    S = ATTEND_SPLIT
     po = torch.empty((W * R * S * heads * 512,), dtype=torch.float32, device=every.device)
     pm = torch.empty((W * R * S * 2 * heads,), dtype=torch.float32, device=every.device)
     _attend_part[(W, R, S)](every, rows, cnt, base, plane, po, pm, sm, rows.stride(0), R * T, T, heads * 512, plane.stride(0),
@@ -434,7 +482,7 @@ def silu_mul(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
 def _select():
     from tensorfold.cuda.build import load
 
-    return load(name="tensorfold_ml4_select_v2", sources=[str(Path(__file__).parent / "select_step.cu")],
+    return load(name="tensorfold_ml4_select_v4", sources=[str(Path(__file__).parent / "select_step.cu")],
                 extra_cuda_cflags=["-O3"], verbose=False)
 
 

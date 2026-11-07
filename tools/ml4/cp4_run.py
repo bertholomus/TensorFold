@@ -32,6 +32,37 @@ from tensorfold.families.mistral_large4.cuda.tp_cuda import FusedTp, fast_comm
 from tensorfold.families.mistral_large4.cuda.weights import load
 
 
+def row_check(a, lane, seq, st, w, total, first) -> None:
+    """A verify step's rows against the same tokens one step each: the residual stream at every layer and the logits, bit for bit."""
+
+    n, L = a.rowcheck, w.cfg.n_layers
+    lane.taps = torch.zeros((L + 1, n, w.cfg.dim), dtype=torch.float32, device="cuda")
+    lane.tap_at = {i: i for i in range(L + 1)}
+    graphs = tp.Graphs(lane)
+    toks = [first] + torch.randint(1000, 100000, (n - 1,), generator=torch.Generator().manual_seed(1)).tolist()
+    ps = [total + a.tp + i for i in range(n)]
+
+    def rows(idx):
+        return tp.make_rows([seq] * len(idx), [ps[i] for i in idx], a.rank, "cuda", n=tp.width(st, ps[-1] + 1, a.world, w.cfg.idx_topk),
+                            k=w.cfg.idx_topk, scratch=a.rows)
+
+    one = []
+    for i in range(n):
+        _, logits = graphs.run(torch.tensor([toks[i]], dtype=torch.long, device="cuda"), rows([i]))
+        one.append((logits[0].clone(), lane.taps[:, 0].clone()))
+    _, logits = graphs.run(torch.tensor(toks, dtype=torch.long, device="cuda"), rows(list(range(n))))
+    for i in range(n):
+        x = lane.taps[:, i]
+        bad = (x != one[i][1]).flatten(1).any(1).nonzero().flatten().tolist()
+        diff = float((logits[i] - one[i][0]).abs().max())
+        if a.rank == 0:
+            at = bad[0] if bad else -1
+            gap = float((x[at] - one[i][1][at]).abs().max()) if bad else 0.0
+            print(f"[cp4] rowcheck row {i}: {len(bad)} of {L + 1} layers differ, first {at} by {gap:.3g}; logits differ by {diff:.3g}, "
+                  f"argmax {int(logits[i].argmax())} {int(one[i][0].argmax())}", flush=True)
+    lane.taps, lane.tap_at = None, {}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("pack")
@@ -51,6 +82,7 @@ def main() -> None:
     ap.add_argument("--prof", type=int, default=0)
     ap.add_argument("--tp", type=int, default=0)
     ap.add_argument("--streams", default="")
+    ap.add_argument("--rowcheck", type=int, default=0, help="rows of one step against that many steps of one row: where they part")
     ap.add_argument("--nll", type=int, default=0)
     ap.add_argument("--out", default="")
     a = ap.parse_args()
@@ -333,6 +365,8 @@ def main() -> None:
                                     k=w.cfg.idx_topk, scratch=a.rows)
                 tt = torch.tensor([first], dtype=torch.long, device="cuda")
                 kernels(lambda: graphs.run(tt, rows), "fused step", a.rank, top=44)
+            if a.rowcheck:
+                row_check(a, fused, seq, st, w, total, first)
             for n in (int(x) for x in a.streams.split(",") if x):
                 tokens = torch.randint(1000, 100000, (n,), generator=torch.Generator().manual_seed(n)).cuda()
 
@@ -351,6 +385,14 @@ def main() -> None:
                 dt = (time.time() - t1) / a.tp
                 if a.rank == 0:
                     print(f"[cp4] tp {n} streams: {dt * 1e3:.1f} ms a step, {n / dt:.1f} tok/s in all, {1 / dt:.1f} a stream", flush=True)
+                if os.environ.get("STEP_TRACE") == str(n):
+                    from torch.profiler import ProfilerActivity, profile
+
+                    rows = rows_at(4 + a.tp)
+                    with profile(activities=[ProfilerActivity.CUDA]) as p:
+                        graphs.run(tokens, rows)
+                        torch.cuda.synchronize()
+                    p.export_chrome_trace(f"{a.out}.r{a.rank}.json")
                 if a.prof and n == max(int(x) for x in a.streams.split(",")):
                     rows = rows_at(4 + a.tp)
                     kernels(lambda: graphs.run(tokens, rows), f"fused step {n}", a.rank, top=30)

@@ -270,7 +270,7 @@ class Scratch:
     """
 
     def __init__(self, ex: Exl3RoutedExperts, rows: int, slots: int, cfg_gu=None, cfg_d=None, device="cuda",
-                 prompt: bool = False) -> None:
+                 prompt: bool = False, half: bool = False, arena=None) -> None:
         D, I = ex.dims, ex.width
         self.cfg_gu = cfg_gu or default_config(D, I, True)
         self.cfg_d = cfg_d or default_config(I, D, False)
@@ -279,13 +279,18 @@ class Scratch:
         # never needs them: 1.8 GB at 8,192 rows)
         self.xg = None if prompt else torch.zeros((P, D), dtype=torch.float16, device=device)
         self.xu = None if prompt else torch.zeros((P, D), dtype=torch.float16, device=device)
-        self.xd = torch.zeros((P, I), dtype=torch.float16, device=device)
+        # ``half``: prompt chunks go through mma8, whose sums are fp16 and whose rows are int8 (x8)
+        self.xd = None if half else torch.zeros((P, I), dtype=torch.float16, device=device)
         # gate and up write 2 * splits * P * I partials, down splits * P * D. Prompt chunks' grouped launches fold the
         # splits (gate / up: one sum each; mma3's bf16 down outputs after them), so a prompt scratch starts at that
         # size and routed() grows it for a call that needs the splits (TF_EXL3_PROMPT_TILES=0, shapes the tiles do not
         # divide): 528 -> 294 MB at 2048 rows of a TP2 DeepSeek-V4.1 rank
         zrow = prompt_z(D, I) if prompt else max(2 * self.cfg_gu[2] * I, self.cfg_d[2] * D)
-        self.z = torch.zeros((zrow * P,), dtype=torch.float32, device=device)
+        # ``arena(bytes)``: mma8's sums and rows live there, a block the caller uses for other things between routed()'s calls
+        n = zrow * P // (2 if half else 1)
+        self.block = arena(n * 4 + 2 * P * D) if arena is not None and half else None
+        self.z = (self.block[:n * 4].view(torch.float32) if self.block is not None else
+                  torch.zeros((n,), dtype=torch.float32, device=device))
         self.prompt = prompt
         self.walk = None              # _walk's pairs
         self.x8 = None                # mma8's int8 rows and their factors
@@ -376,6 +381,8 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         s.y = torch.zeros((s.rows * slots, D), dtype=torch.float32, device=x.device)
     if fast and kern == "mma8":
         return _routed_mma8(ext, x, pick, wts, ex, s, ids, members, R, limit, m2_rows)
+    if s.xd is None:
+        s.xd = torch.zeros((s.rows * slots, I), dtype=torch.float16, device=x.device)
     mma2 = (fast and kern in ("mma2", "mma3") and I % 256 == 0 and D % 256 == 0 and
             max(ex.k2_gu[1], ex.k2_d[1]) <= 10)
     mma3 = (mma2 and kern == "mma3" and x.dtype == torch.bfloat16 and x.stride(1) == 1 and x.stride(0) % 4 == 0
@@ -477,25 +484,33 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
 
 
 def _routed_mma8(ext, x, pick, wts, ex, s, ids, members, R, limit, rows):
-    """A prompt chunk in int8 (experts_grouped.cuh): fp16 sums of the rows' experts, [R, D]."""
+    """A prompt chunk in int8 (experts_grouped.cuh): fp16 sums of the rows' experts, [R, D]. Experts of 2.5 bits decode in the
+    kernel, a tile for ``rows`` rows; a last expert of 5 bits, a shared one with every row, decodes here once for all of them."""
 
     D, I, E, slots = ex.dims, ex.width, ex.count, s.slots
     P = R * slots
-    assert rows == 128 and ex.cb == codebook_id("mul1") and x.dtype == torch.float16 and x.stride(1) == 1 and wts is not None
+    assert rows in (128, 192) and ex.k2_gu[0] == ex.k2_d[0] == 5 and ex.k2_gu[1] == ex.k2_d[1]
+    assert ex.cb == codebook_id("mul1") and x.dtype == torch.float16 and x.stride(1) == 1 and wts is not None
     if s.x8 is None:
         n, dev = s.rows * slots, x.device
-        s.x8 = (torch.empty((n, D), dtype=torch.int8, device=dev), torch.empty((n, D), dtype=torch.int8, device=dev),
+        rows8 = (s.block[s.z.numel() * 4:].view(torch.int8)[:2 * n * D].view(2, n, D) if s.block is not None else
+                 torch.empty((2, n, D), dtype=torch.int8, device=dev))
+        s.x8 = (rows8[0], rows8[1],
                 torch.empty((n, I), dtype=torch.int8, device=dev), torch.empty((2 * n,), dtype=torch.float32, device=dev),
-                torch.empty((n,), dtype=torch.float32, device=dev))
-    xg, xu, xd, ra, rd = s.x8
+                torch.empty((n,), dtype=torch.float32, device=dev), torch.empty((3, D * I), dtype=torch.int8, device=dev))
+    xg, xu, xd, ra, rd, frags = s.x8
     z = s.z.view(torch.float16)
     work = _walk(ext, s, ids, rows, P)
+    plain = E - 1 if ex.k2_gu[1] > 5 else -1
+    if plain >= 0:
+        for ptr, f in zip((ex.gate_ptr, ex.up_ptr, ex.down_ptr), frags):
+            ext.m8_expand(ptr, plain, f, ex.k2_gu[1], D * I // 256)
     ext.rot8(x, x.stride(0), pick, ex.suh_g, ex.suh_u, xg, xu, ra, R, D, slots, E)
-    ext.grouped_mma8(xg, xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, z, 2, D, I, P, slots,
-                     ex.k2_gu[0], ex.k2_gu[1], work)
+    ext.grouped_mma8(xg, xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, z, 2, D, I, P, slots, rows,
+                     work, frags[0], frags[1], plain)
     ext.gateup_epilogue8(z, pick, ex.svh_g, ex.svh_u, ex.suh_d, ra, xd, rd, P, I, E, float(limit))
-    ext.grouped_mma8(xd, xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, z, 1, I, D, P, slots,
-                     ex.k2_d[0], ex.k2_d[1], work)
+    ext.grouped_mma8(xd, xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, z, 1, I, D, P, slots, rows,
+                     work, frags[2], frags[2], plain)
     out = torch.empty((R, D), dtype=torch.float16, device=x.device)
     ext.down_combine8(z, pick, ex.svh_d, rd, wts, out, R, D, slots, E)
     return out

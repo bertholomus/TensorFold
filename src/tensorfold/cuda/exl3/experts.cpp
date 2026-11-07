@@ -14,9 +14,11 @@ void exl3x_grouped_mma_cuda(const at::Tensor&, const at::Tensor&, const at::Tens
                             const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                             const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
                             int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&);
+void exl3x_m8_expand_cuda(const at::Tensor&, int64_t, at::Tensor&, int64_t, int64_t);
 void exl3x_grouped_mma8_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                              const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t,
-                             int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&);
+                             int64_t, int64_t, int64_t, int64_t, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                             int64_t);
 void exl3x_rot8_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&,
                      at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_gateup_epilogue8_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -166,7 +168,10 @@ void grouped_mma2(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& 
 void grouped_mma8(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
                   const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids, const at::Tensor& ucount,
                   const at::Tensor& members, at::Tensor Z, int64_t mats, int64_t K, int64_t N, int64_t P,
-                  int64_t slots, int64_t lo, int64_t hi, const at::Tensor& work) {
+                  int64_t slots, int64_t rows, const at::Tensor& work, const at::Tensor& F0, const at::Tensor& F1,
+                  int64_t plain) {
+    check(F0, at::kChar, "F0");
+    check(F1, at::kChar, "F1");
     check(X0, at::kChar, "X0");
     check(X1, at::kChar, "X1");
     check(TP0, at::kLong, "TP0");
@@ -181,7 +186,15 @@ void grouped_mma8(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& 
     TORCH_CHECK(Z.numel() >= mats * P * N, "Z too small");
     TORCH_CHECK(X0.numel() >= P * K && X1.numel() >= P * K, "X too small");
     c10::cuda::CUDAGuard guard(X0.device());
-    exl3x_grouped_mma8_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, slots, lo, hi, work);
+    exl3x_grouped_mma8_cuda(X0, X1, TP0, TP1, B0, B1, uids, ucount, members, Z, mats, K, N, P, slots, rows, work, F0, F1, plain);
+}
+
+void m8_expand(const at::Tensor& TP, int64_t e, at::Tensor F, int64_t k2, int64_t tiles) {
+    check(TP, at::kLong, "TP");
+    check(F, at::kChar, "F");
+    TORCH_CHECK(F.numel() >= tiles * 256, "F too small");
+    c10::cuda::CUDAGuard guard(F.device());
+    exl3x_m8_expand_cuda(TP, e, F, k2, tiles);
 }
 
 void rot8(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0, const at::Tensor& suh1, at::Tensor out0,
@@ -502,6 +515,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("grouped_mma2", &grouped_mma2);
     m.def("grouped_mma3", &grouped_mma3);
     m.def("grouped_mma8", &grouped_mma8);
+    m.def("m8_expand", &m8_expand);
     m.def("rot8", &rot8);
     m.def("gateup_epilogue8", &gateup_epilogue8);
     m.def("down_combine8", &down_combine8);

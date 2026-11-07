@@ -1078,6 +1078,54 @@ def test_trace_comm_numbers_pairing():
     assert isinstance(engines[0].comm, DP.TraceComm), "world>1 engines must trace by default (mandate 2)"
 
 
+def _cp_prompt(rounds, sid, n):
+    s = DP.Stream(sid, list(range(n)), 4, -1)
+    s.cp = True
+    rounds.add(s)
+    return s
+
+
+def test_cp_slice_shortest_first():
+    rounds = DP.RoundBuilder()
+    _cp_prompt(rounds, 0, 8192)
+    _cp_prompt(rounds, 1, 2048)
+    got = [rounds.cp_slice(1024, 4, 8)[2] for _ in range(5)]
+    assert got == [1, 1, 1, 1, 0], got             # the short one's two rounds of two slices, then the long one
+    narrow = _cp_prompt(rounds, 2, 256)
+    op = rounds.cp_slice(1024, 4, 8)
+    assert op[2] == narrow.sid and op[7] == 8 and not narrow.left, op      # overtakes between two slices; a narrow round takes more layers
+    return {"slices": got}
+
+
+def test_cp_slice_oldest_prompt_gets_its_turn():
+    """A steady run of shorter prompts never lets the long one in by size alone; its turn every ``oldest`` slices does,
+    every one of its rows goes through once and in order, and a short prompt still overtakes it between two of those turns."""
+
+    def run(oldest, cap):
+        rounds, width, total = DP.RoundBuilder(), 1024, 4
+        long = _cp_prompt(rounds, 0, 8192)
+        short, sid, mine, count = _cp_prompt(rounds, 1, 2048), 2, [], 0
+        for count in range(1, cap + 1):
+            op = rounds.cp_slice(width, 1, total, oldest)
+            if op[2] == long.sid:
+                mine.append(op)
+                if not long.needs_fill and not long.left:
+                    return count, mine
+            if not short.needs_fill and not short.left:
+                short, sid = _cp_prompt(rounds, sid, 2048), sid + 1
+        return None, mine
+
+    count, mine = run(0, 4000)
+    assert count is None and not mine, (count, len(mine))
+    count, mine = run(8, 4000)
+    assert 8 * 8 * 3 < count <= 8 * 8 * 4, count       # 8 rounds of 4 layers, a layer every 8 slices until its tail is the shortest
+    starts = [op[3] for op in mine if op[5]]
+    assert starts == [i * 1024 for i in range(8)], starts
+    assert all(op[4] == 1024 and op[7] == 1 for op in mine), mine[:2]
+    assert sum(len(op[5]) for op in mine) == 8192
+    return {"slices to finish": count}
+
+
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
 
 if __name__ == "__main__":

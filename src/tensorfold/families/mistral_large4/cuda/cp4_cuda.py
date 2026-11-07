@@ -27,14 +27,16 @@ SCORE_BYTES = int(os.environ.get("TF_ML4_CP_SCORE_MB") or 256) << 20      # one 
 MAX_PICKS = int(os.environ.get("TF_ML4_CP_MAX_PICKS") or 5120)            # picks per expert launch: 85 KB of scratch each
 WS_KEEP = 6144 * 8192                                                     # q and o's decoded size; the dense layer's goes back
 PROMPT_KERNEL = os.environ.get("TF_ML4_PROMPT_KERNEL") or "mma2"          # 1.45x mma on a layer's experts at 4,096 picks
-M2_ROWS = int(os.environ.get("TF_ML4_M2_ROWS") or 128)                    # rows a weight tile is decoded for (64: exl3's default)
+M2_ROWS = int(os.environ.get("TF_ML4_M2_ROWS") or 192)                    # rows a weight tile is decoded for (64: exl3's default)
+LIN8 = os.environ.get("TF_ML4_CP_LIN8", "0") == "1"                       # a round's q and o in int8, as its experts
 
 
 def trim_host() -> None:
     """Hand back what the load and the JIT left in malloc's arenas: on GB10 host pages are GPU memory."""
 
     try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
+        libc = ctypes.CDLL("libc.so.6")
+        libc.malloc_trim(0)
     except OSError:
         pass
 
@@ -84,6 +86,16 @@ def exl3_part(m: Exl3Linear, k0: int, k1: int, c0: int, c1: int) -> Exl3Part:
     return Exl3Part(words, m.suh[k0:k1], m.svh[c0:c1], None, m.bits, m.codebook, k1 - k0, c1 - c0, m.layout, None, (ks, nbs))
 
 
+def own_part(m: Exl3Linear, c0: int, c1: int) -> Exl3Part:
+    """Columns c0..c1 of ``m`` in words of their own, for a rank that needs no more of it. Its strips are one run."""
+
+    assert m.layout == "strips", m.layout
+    p = exl3_part(m, 0, m.k, c0, c1)
+    nbs = m.strides[1]
+    words = m.words.view(-1)[c0 // 128 * nbs:c1 // 128 * nbs].clone()
+    return Exl3Part(words[:p.words.numel()], p.suh, p.svh.clone(), None, p.bits, p.codebook, p.k, p.n, p.layout, None, p.whole)
+
+
 def shared_linears(ex) -> tuple:
     """The shared expert (the last of ``ex``) as three Exl3Linears over its stored trellises."""
 
@@ -126,6 +138,15 @@ class CudaOps(cp4.Ops):
         self.ws = exl3_prefill.Workspace()
         self.scratch: dict = {}
         self.lut: dict = {}
+        self.block: torch.Tensor | None = None
+
+    def arena(self, nbytes: int) -> torch.Tensor:
+        """What a round's scores and its experts' rows use in turn: one stream, and neither lasts past its call."""
+
+        if self.block is None or self.block.numel() < nbytes:
+            self.block = None
+            self.block = torch.empty((nbytes,), dtype=torch.uint8, device=self.device)
+        return self.block
 
     def prepare(self, w) -> None:
         """kv_b as fp16, once, in place of the bf16 copy (bf16 fits fp16 down to its subnormals, 2^-14 here): the two
@@ -158,10 +179,20 @@ class CudaOps(cp4.Ops):
             return torch.zeros((0, mod.n), dtype=F16, device=x.device)
         if m <= 128:
             return mod(x, out_dtype=F16)
+        if mod.k * mod.n > WS_KEEP:                              # the dense layer's, no experts in it: its 288 MB in the arena
+            self.ws.w = self.arena(mod.k * mod.n * 2).view(F16)
         out = exl3_prefill.matmul(mod, x, torch.empty((m, mod.n), dtype=F16, device=x.device), self.ws)
-        if self.ws.w.numel() > WS_KEEP:                          # one layer a round: its 288 MB can serve other transients
+        if self.ws.w.numel() > WS_KEEP:
             self.ws.w = None
         return out
+
+    def lin8(self, mod, x: torch.Tensor) -> torch.Tensor:
+        """``lin`` of a round's rows: q and o, their W_q decoded once for a pair of rounds; in int8 with TF_ML4_CP_LIN8=1."""
+
+        if x.shape[0] <= 128:
+            return self.lin(mod, x)
+        x, out = x.to(F16).contiguous(), torch.empty((x.shape[0], mod.n), dtype=F16, device=x.device)
+        return exl3_prefill.matmul8(mod, x, out, self.ws) if LIN8 else exl3_prefill.matmul(mod, x, out, self.ws, keep=True)
 
     def mat(self, mat: torch.Tensor | Fp8Block, x: torch.Tensor) -> torch.Tensor:
         if isinstance(mat, Fp8Block):                            # idx_wq_b, the one big plain matrix
@@ -284,7 +315,7 @@ class CudaOps(cp4.Ops):
     # -- experts -----------------------------------------------------------------------------------------------------
 
     def _routed(self, ex, x: torch.Tensor, pick: torch.Tensor, w: torch.Tensor, slots: int,
-                add: torch.Tensor | None = None) -> torch.Tensor:
+                add: torch.Tensor | None = None, before_down: torch.cuda.Event | None = None) -> torch.Tensor:
         """One scratch for all layers (their experts have one shape); prompt sizes grow it, decode keeps its own."""
 
         R = x.shape[0]
@@ -295,14 +326,15 @@ class CudaOps(cp4.Ops):
             self.scratch.pop(key, None)
             del s
             s = exl3_experts.Scratch(ex, rows=max(R, MAX_PICKS if prompt and slots == 1 else 64), slots=slots, device=x.device,
-                                     prompt=prompt)
+                                     prompt=prompt, half=prompt and PROMPT_KERNEL == "mma8", arena=self.arena)
             self.scratch[key] = s
         return exl3_experts.routed(x.contiguous(), pick.contiguous(), w.contiguous(), ex, s, None, R,
-                                   act_mode=exl3_experts.ACT_F32, add=add, kernel=PROMPT_KERNEL, m2_rows=M2_ROWS)
+                                   act_mode=exl3_experts.ACT_F32, add=add, kernel=PROMPT_KERNEL, m2_rows=M2_ROWS,
+                                   before_down=before_down)
 
     def _routed_add(self, ex, x: torch.Tensor, pick: torch.Tensor, w: torch.Tensor, slots: int,
-                    add: torch.Tensor) -> torch.Tensor:
-        return self._routed(ex, x, pick, w, slots, add)
+                    add: torch.Tensor, before_down: torch.cuda.Event | None = None) -> torch.Tensor:
+        return self._routed(ex, x, pick, w, slots, add, before_down)
 
     def _flat(self, ex, x: torch.Tensor, pick: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """A prompt's picks, one per row, at most MAX_PICKS a launch."""

@@ -24,6 +24,7 @@ ATTN_WARPS = int(os.environ.get("TF_ML4_CP_ATTN_WARPS") or 8)
 ATTN = os.environ.get("TF_ML4_CP_ATTN") or "hand"               # "hand": mla_rows.cu; "triton": _sparse_mla
 SCORE8 = int(os.environ.get("TF_ML4_CP_SCORE8", "256"))        # a part's queries from which the indexer runs in e4m3 (0: never)
 SCORE4_ROW = 80                                                # bytes of a row in FP4, score4.cu's
+FP8_STAGES = int(os.environ.get("TF_ML4_FP8_STAGES") or 4)      # few rows: a tile's bytes are few, so more of them in flight
 FP8_FEW = 16                                                   # up to here: many programs, each weight byte read once
 FP8_WIDE = int(os.environ.get("TF_ML4_CP_FP8_WIDE") or 256)    # from here: the weight widened to fp16 for cuBLAS; 0: never
 FP8_BM = int(os.environ.get("TF_ML4_CP_FP8_BM") or 64)
@@ -197,7 +198,7 @@ def small_mat(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     assert k % 128 == 0 and n % 4 == 0 and w.is_contiguous() and x.is_contiguous(), f"small_mat: {x.shape} {w.shape}"
     out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
     bk = next(b for b in (1024, 512, 256, 128) if k % b == 0)
-    bn, warps = (2, 4) if rows < 8 else (4, 8)              # best of a sweep on GB10 at K 6144, N 32 to 576
+    bn, warps = 2, 4                                         # best of a sweep on GB10 at K 6144, N 32 to 576; one tile keeps a row's bits at any R
     _small_mat[(n // bn,)](x, w, out, n, K=k, R=rows, BN=bn, BK=bk, num_warps=warps, num_stages=2)
     return out
 
@@ -278,7 +279,7 @@ def _sparse_mla(QL, QP, ROWS, CNT, PLANE, OUT, LSE, sm, ks, qh, qr, ph, pr, oh, 
 def _mla():
     from tensorfold.cuda.build import load
 
-    return load(name="tensorfold_ml4_mla_v1", sources=[str(Path(__file__).parent / "mla_rows.cu")],
+    return load(name="tensorfold_ml4_mla_v3", sources=[str(Path(__file__).parent / "mla_rows.cu")],
                 extra_cuda_cflags=["-O3", "-lineinfo"], verbose=False)
 
 
@@ -345,7 +346,7 @@ def fp8_linear(x: torch.Tensor, w: torch.Tensor, scale: torch.Tensor) -> torch.T
         _fp8_widen[(n // 128, k // 128)](w, scale, wide, K=k, sk=scale.stride(0), num_warps=8)
         return F.linear(x, wide)
     out = torch.empty((m, n), dtype=torch.float16, device=x.device)
-    bm, bn, warps = (16, 32, 4) if m <= FP8_FEW else (FP8_BM, FP8_BN, FP8_WARPS)
+    bm, bn, warps, stages = (16, 32, 4, FP8_STAGES) if m <= FP8_FEW else (FP8_BM, FP8_BN, FP8_WARPS, 2)
     _fp8_linear[(n // bn, triton.cdiv(m, bm))](x, w, scale, out, m, n, K=k, sk=scale.stride(0), BM=bm, BN=bn, BK=128,
-                                               num_warps=warps, num_stages=2)
+                                               num_warps=warps, num_stages=stages)
     return out

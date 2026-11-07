@@ -18,6 +18,7 @@ Everything a step reads that moves is in ``Rows``' device tensors, so ``Graphs``
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import torch
@@ -27,6 +28,7 @@ from .cp4 import alltoall, filter_selection, kth_key, merge_partials
 from .model import gptj_rotate, layer_norm_bias, rms_norm, rotate_leading, route_softmax, softcap, ssmax_apply
 
 F32 = torch.float32
+HELD_ROWS = 64                        # past any step's rows or a draft's tokens
 
 
 @dataclass
@@ -43,10 +45,10 @@ class Rows:
     indexed: bool                     # False: every row's context fits the budget, so all its rows are selected
 
 
-def make_rows(seqs: list, positions: list, rank: int, device, n: int | None = None, indexed: bool | None = None,
-              k: int = 0, scratch: int = 0, pad: int = 0) -> Rows:
-    """``seqs[i]`` at ``positions[i]``, host-side. Rows past the real ones, up to ``pad``, repeat the first and write nowhere:
-    a capture has a fixed row count, and a repeated row picks the same experts."""
+def plan_rows(seqs: list, positions: list, rank: int, n: int | None = None, indexed: bool | None = None,
+              k: int = 0, scratch: int = 0, pad: int = 0) -> tuple:
+    """``seqs[i]`` at ``positions[i]``, host-side: (pos, wr, base, vis, n, indexed). Rows past the real ones, up to ``pad``, repeat
+    the first and write nowhere: a capture has a fixed row count, and a repeated row picks the same experts."""
 
     wr, base, vis = [], [], []
     for s, p in zip(seqs, positions):
@@ -58,10 +60,18 @@ def make_rows(seqs: list, positions: list, rank: int, device, n: int | None = No
     n = max(vis) if n is None else n
     indexed = max(positions) + 1 > k if indexed is None else indexed
     extra = max(0, pad - len(positions))
-    positions = positions + positions[:1] * extra
-    wr, base, vis = wr + [scratch] * extra, base + base[:1] * extra, vis + vis[:1] * extra
-    return Rows(torch.tensor(positions, device=device), torch.tensor(wr, device=device), torch.tensor(base, device=device),
+    return positions + positions[:1] * extra, wr + [scratch] * extra, base + base[:1] * extra, vis + vis[:1] * extra, n, indexed
+
+
+def rows_on(plan: tuple, device) -> Rows:
+    pos, wr, base, vis, n, indexed = plan
+    return Rows(torch.tensor(pos, device=device), torch.tensor(wr, device=device), torch.tensor(base, device=device),
                 torch.tensor(vis, dtype=torch.int32, device=device), n, indexed)
+
+
+def make_rows(seqs: list, positions: list, rank: int, device, n: int | None = None, indexed: bool | None = None,
+              k: int = 0, scratch: int = 0, pad: int = 0) -> Rows:
+    return rows_on(plan_rows(seqs, positions, rank, n, indexed, k, scratch, pad), device)
 
 
 def width(st: cp4.Stripe, total: int, world: int, k: int) -> int:
@@ -101,7 +111,9 @@ class Ml4Tp:
         self.layers = [self._slices(lay) for lay in self.w.layers]
         head = self.w.head if self.w.head is not None else self.w.head_bf16
         self.vl = c.vocab // W
-        self.head = self.ops.split_mat(head, r * self.vl, (r + 1) * self.vl)
+        self.head = head if getattr(head, "n", 0) == self.vl else self.ops.split_mat(head, r * self.vl, (r + 1) * self.vl)
+        self.table = None
+        self.taps, self.tap_at = None, {}                        # dspark.py's: rows of the residual stream its context is made of
 
     def _slices(self, lay) -> TpLayer:
         c, W, r, ops = self.cfg, self.world, self.rank, self.ops
@@ -119,6 +131,42 @@ class Ml4Tp:
         return t
 
     # -- pieces --------------------------------------------------------------------------------------------------------
+
+    def tap(self, at: int, x: torch.Tensor) -> None:
+        """The residual stream entering layer ``at`` (past the last: the last layer's output), when the draft head reads it."""
+
+        t = self.tap_at.get(at)
+        if t is not None:
+            self.taps[t, :x.shape[0]].copy_(x)
+
+    def rows(self, ids: torch.Tensor) -> torch.Tensor:
+        """Tokens ids [R] on the GPU: their rows [R, d], each from the rank whose part of the table holds it. The whole table stays
+        in the pack's map: an unseen row from there is a read of the disk, about .4 ms."""
+
+        at = ids - self.rank * self.vl
+        mine = (at >= 0) & (at < self.vl)
+        return self._total(torch.where(mine[:, None], self.part_of_table()[at.clamp(0, self.vl - 1)].float(), 0.0))
+
+    def part_of_table(self) -> torch.Tensor:
+        if self.table is None:                                   # a mapped file's rows reach the GPU only through a host copy
+            first = self.rank * self.vl
+            self.table = self.w.embed[first:first + self.vl].clone().to(self.pool.device)
+        return self.table
+
+    def head_logits(self, h: torch.Tensor) -> torch.Tensor:
+        """Normed rows h: this rank's softcapped slice of their logits."""
+
+        return softcap(self.ops.logits(self.head, h), self.cfg.softcap)
+
+    def last_logits(self, h: torch.Tensor | None) -> torch.Tensor | None:
+        """A round's last row, h [1, d] on its owner and None on the others, through every rank's slice of the head: logits [V] on
+        the owner. The others send zeros, so the sum is the row."""
+
+        row = self._total(torch.zeros((1, self.cfg.dim), dtype=F32, device=self.pool.device) if h is None else h.float())
+        part = self.head_logits(row).contiguous()
+        every = torch.empty((self.world, *part.shape), dtype=part.dtype, device=part.device)
+        self.comm.all_gather(part.view(-1), every.view(-1))
+        return None if h is None else every.view(-1)
 
     def _total(self, part: torch.Tensor) -> torch.Tensor:
         """All ranks' fp32 partials added in rank order, the same bits on every rank."""
@@ -234,9 +282,10 @@ class Ml4Tp:
 
         sel = None
         for L in range(self.cfg.n_layers):
+            self.tap(L, x)
             x, sel = self._layer(L, x, s, sel)
-        h = rms_norm(x, self.w.norm, self.cfg.eps)
-        return softcap(self.ops.logits(self.head, h), self.cfg.softcap)
+        self.tap(self.cfg.n_layers, x)
+        return self.head_logits(rms_norm(x, self.w.norm, self.cfg.eps))
 
     def best(self, logits: torch.Tensor) -> torch.Tensor:
         """Greedy ids [R] from every rank's slice, the lowest id on a tie (argmax over the whole vocabulary)."""
@@ -265,42 +314,65 @@ class Ml4Tp:
         return self.forward(self.ops.embed(self.w, tokens), s)
 
 
+class Held:
+    """Pinned memory of a step behind its draft: its tokens and row numbers on their way in, the tokens with the drafts in them on
+    their way out. A step ends before the next one writes any of these."""
+
+    def __init__(self) -> None:
+        self.ints = torch.zeros((4, HELD_ROWS), dtype=torch.long, pin_memory=True)
+        self.vis = torch.zeros((HELD_ROWS,), dtype=torch.int32, pin_memory=True)
+        self.back = torch.zeros((HELD_ROWS,), dtype=torch.long, pin_memory=True)
+
+
 class Graphs:
     """One capture per (rows, score width, indexed), the ids out of it. A capture's collectives run when it is replayed, so
     every rank must replay the same captures in the same order: the serving loop's ops already are that order."""
 
     def __init__(self, lane: Ml4Tp) -> None:
-        self.lane, self.caps, self.pool = lane, {}, None
+        self.lane, self.caps, self.pool, self.held = lane, {}, None, None
+        self.mark = lambda name: None
 
     def _capture(self, key: tuple, like: Rows):
         R, n, indexed = key
         lane, dev = self.lane, like.pos.device
-        x = torch.zeros((R, lane.cfg.dim), dtype=F32, device=dev)
+        tok = torch.zeros((R,), dtype=torch.long, device=dev)
         s = Rows(torch.zeros_like(like.pos), torch.zeros_like(like.wr), torch.zeros_like(like.base),
                  torch.zeros_like(like.vis), n, indexed)
         for b, v in zip((s.pos, s.wr, s.base, s.vis), (like.pos, like.wr, like.base, like.vis)):
             b.copy_(v)
-        x.copy_(lane.ops.embed(lane.w, torch.zeros((R,), dtype=torch.long, device=dev)))
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):                            # the Triton kernels compile and the buffers exist
-            lane.best(lane.forward(x, s))
+            lane.best(lane.forward(lane.rows(tok), s))
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=self.pool):
-            logits = lane.forward(x, s)
+            logits = lane.forward(lane.rows(tok), s)
             ids = lane.best(logits)
         self.pool = self.pool or g.pool()
-        self.caps[key] = (g, x, s, ids, logits)
+        self.caps[key] = (g, tok, s, ids, logits)
+        from .cp4_cuda import trim_host
+
+        trim_host()                                              # a capture's host side, about .1 GiB of the floor
+        self.note(key)
         return self.caps[key]
+
+    def note(self, key: tuple) -> None:
+        """What a capture cost (TF_ML4_STEP_LOG): the host's MemAvailable and what the allocator holds, after it."""
+
+        if os.environ.get("TF_ML4_STEP_LOG") and self.lane.rank == 0:
+            with open("/proc/meminfo") as f:
+                free = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable")) / 2 ** 20
+            print(f"[ml4-cap] {key}: MemAvailable {free:.2f} GiB, reserved {torch.cuda.memory_reserved() / 2 ** 30:.2f}, allocated "
+                  f"{torch.cuda.memory_allocated() / 2 ** 30:.2f}, peak {torch.cuda.max_memory_allocated() / 2 ** 30:.2f}", flush=True)
 
     def run(self, tokens: torch.Tensor, rows: Rows) -> tuple:
         """(ids [R], this rank's logits slice [R, V / W]) of a replay; the two are the capture's own buffers."""
 
         key = (tokens.numel(), rows.n, rows.indexed)
-        g, x, s, ids, logits = self.caps.get(key) or self._capture(key, rows)
-        x.copy_(self.lane.ops.embed(self.lane.w, tokens))
+        g, tok, s, ids, logits = self.caps.get(key) or self._capture(key, rows)
+        tok.copy_(tokens)
         s.pos.copy_(rows.pos)
         s.wr.copy_(rows.wr)
         s.base.copy_(rows.base)
@@ -308,3 +380,28 @@ class Graphs:
         g.replay()
         return ids, logits
 
+    def ready(self, tokens: list, plan: tuple) -> bool:
+        return (len(tokens), plan[4], plan[5]) in self.caps
+
+    def run_behind(self, tokens: list, plan: tuple, drafted: torch.Tensor | None) -> tuple:
+        """``run`` behind whatever is on the GPU, nothing here waiting for it. A row can be a draft the host has not seen, -1 - its
+        place in ``drafted``. (ids, logits, the tokens once the ids are in)."""
+
+        from .tp_kernels import fill_rows
+
+        pos, wr, base, vis, n, indexed = plan
+        R = len(tokens)
+        g, tok, s, ids, logits = self.caps[R, n, indexed]
+        h = self.held = self.held or Held()
+        h.ints[:, :R] = torch.tensor([tokens, pos, wr, base])
+        h.vis[:R] = torch.tensor(vis, dtype=torch.int32)
+        for b, v in zip((s.pos, s.wr, s.base, s.vis), (h.ints[1, :R], h.ints[2, :R], h.ints[3, :R], h.vis[:R])):
+            b.copy_(v, non_blocking=True)
+        if min(tokens) < 0:
+            fill_rows(h.ints[0, :R].to(tok.device, non_blocking=True), drafted, tok)
+        else:
+            tok.copy_(h.ints[0, :R], non_blocking=True)
+        h.back[:R].copy_(tok, non_blocking=True)
+        g.replay()
+        self.mark("slaunch")
+        return ids, logits, h.back[:R]

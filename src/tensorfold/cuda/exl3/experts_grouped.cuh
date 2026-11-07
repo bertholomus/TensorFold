@@ -1001,20 +1001,23 @@ __device__ __forceinline__ void m8_tile(const uint32_t* ts, const LaneMap<K2>& m
 
 // Rows and trellis words come through a ring as in m2_slice, but a warp runs one k-32 step behind its decode: the mma of step s
 // have the next step's four tiles between them, so the tensor pipe and the integer pipes run together, and a stage's barrier sees
-// the stage after it landed. FULL: all R rows live, the mma with no branch between them.
+// the stage after it landed. FULL: all R rows live, the mma with no branch between them. K2 0: T holds m8_expand's fragments, a
+// tile's B words 8 bytes a lane, read straight into the registers a step ahead.
 template <int K2, int R, bool FULL>
 __device__ __forceinline__ void m8_run(const uint32_t* __restrict__ T, int NTILES, int KT, int nt0,
                                        const int8_t* __restrict__ X, int K, const int* rows_sh, int live, int warp, int lane,
                                        unsigned char* As, uint32_t* Ts, int (&acc)[R / 16][4][4]) {
     constexpr int S = M8_S, KB = M8_KB, LD = M8_LD;
-    constexpr int TW = Fmt<K2>::TW;
+    constexpr int RT = R / 16, EVERY = RT / 4;                // row tiles; a tile of decode every EVERY of them
+    constexpr int TW = Fmt<K2 ? K2 : 5>::TW;
     constexpr int CPR = KB;                                   // 16-byte chunks a row a stage
     constexpr int TCH = M2_TILES * TW / 4;                    // 16-byte chunks of a k tile's words for the program
     constexpr int KW = M2_TILES * TW;                         // words a k tile
-    static_assert(KB == 4 && S >= 3 && R == 128, "two k-32 steps a stage, a tile of decode every two row tiles");
-    const LaneMap<K2> map(lane);
+    static_assert(KB == 4 && S >= 3 && RT % 4 == 0, "two k-32 steps a stage, four tiles of decode a step");
+    const LaneMap<K2 ? K2 : 5> map(lane);
     const int NS = KT / KB;
     const uint32_t* tsrc = T + (size_t)nt0 * TW;
+    const uint2* frags = reinterpret_cast<const uint2*>(T) + (size_t)(nt0 + 2 * warp) * 32 + lane;
     // ldmatrix: lane l reads row (l & 7) + 8 ((l >> 3) & 1) of a 16-row tile, bytes 16 (l >> 4) of a k-32 step
     const unsigned char* lrow = As + (size_t)((lane & 7) + ((lane >> 3) & 1) * 8) * LD + (lane >> 4) * 16;
 
@@ -1027,27 +1030,42 @@ __device__ __forceinline__ void m8_run(const uint32_t* __restrict__ T, int NTILE
             const int p = rows_sh[r];
             cp_async16(as + r * LD + q * 16, X + (size_t)(p < 0 ? 0 : p) * K + kb + q * 16, p >= 0);
         }
-        uint32_t* ts = Ts + (size_t)slot * KB * KW;
-        for (int c = threadIdx.x; c < KB * TCH; c += 256) {
-            const int kk = c / TCH, q = c % TCH;
-            cp_async16(ts + kk * KW + q * 4, tsrc + ((size_t)(st * KB + kk) * NTILES) * TW + q * 4, true);
+        if constexpr (K2 != 0) {
+            uint32_t* ts = Ts + (size_t)slot * KB * KW;
+            for (int c = threadIdx.x; c < KB * TCH; c += 256) {
+                const int kk = c / TCH, q = c % TCH;
+                cp_async16(ts + kk * KW + q * 4, tsrc + ((size_t)(st * KB + kk) * NTILES) * TW + q * 4, true);
+            }
         }
     };
     auto words = [&](int st) { return Ts + (size_t)(st % S) * KB * KW + (size_t)(2 * warp) * TW; };
-    // mma of the step whose B words are f and rows start at ``off``, the next step's tiles (at w) decoding into g
-    auto step = [&](const unsigned char* as, const uint32_t (&f)[4][2], const uint32_t* w, uint32_t (&g)[4][2]) {
+    auto fetch = [&](int s, uint32_t (&g)[4][2]) {            // k-32 step s's tiles from m8_expand's fragments
+#pragma unroll
+        for (int t = 0; t < 4; ++t) {
+            const int h = t >> 1, j = t & 1;
+            const uint2 v = __ldg(frags + ((size_t)(2 * s + h) * NTILES + j) * 32);
+            g[2 * j][h] = v.x;
+            g[2 * j + 1][h] = v.y;
+        }
+    };
+    // mma of the step whose B words are f and rows start at ``off``, the next step's tiles (at w, or step ``next`` of the
+    // fragments) coming into g
+    auto step = [&](const unsigned char* as, const uint32_t (&f)[4][2], const uint32_t* w, int next, uint32_t (&g)[4][2]) {
         uint32_t a[2][4];
+        if constexpr (K2 == 0) fetch(next, g);
         ldmatrix_x4(a[0], as);
 #pragma unroll
-        for (int i = 0; i < R / 16; ++i) {
-            if (FULL ? i + 1 < R / 16 : i + 1 < live) ldmatrix_x4(a[(i + 1) & 1], as + (size_t)(16 * (i + 1)) * LD);
+        for (int i = 0; i < RT; ++i) {
+            if (FULL ? i + 1 < RT : i + 1 < live) ldmatrix_x4(a[(i + 1) & 1], as + (size_t)(16 * (i + 1)) * LD);
             if (FULL || i < live) {
 #pragma unroll
                 for (int q = 0; q < 4; ++q) mma16832(acc[i][q], a[i & 1], f[q]);
             }
-            if (i & 1) {                                      // tiles (k 0, n 0), (k 0, n 1), (k 1, n 0), (k 1, n 1)
-                const int t = i >> 1, h = t >> 1, j = t & 1;
-                m8_tile<K2>(w + h * KW + j * TW, map, lane, g[2 * j][h], g[2 * j + 1][h]);
+            if constexpr (K2 != 0) {
+                if ((i + 1) % EVERY == 0) {                   // tiles (k 0, n 0), (k 0, n 1), (k 1, n 0), (k 1, n 1)
+                    const int t = i / EVERY, h = t >> 1, j = t & 1;
+                    m8_tile<K2>(w + h * KW + j * TW, map, lane, g[2 * j][h], g[2 * j + 1][h]);
+                }
             }
         }
     };
@@ -1059,10 +1077,14 @@ __device__ __forceinline__ void m8_run(const uint32_t* __restrict__ T, int NTILE
     cp_async_wait<S - 3>();
     __syncthreads();
     uint32_t f0[4][2], f1[4][2];
+    if constexpr (K2 == 0) {
+        fetch(0, f0);
+    } else {
 #pragma unroll
-    for (int t = 0; t < 4; ++t) {
-        const int h = t >> 1, j = t & 1;
-        m8_tile<K2>(words(0) + h * KW + j * TW, map, lane, f0[2 * j][h], f0[2 * j + 1][h]);
+        for (int t = 0; t < 4; ++t) {
+            const int h = t >> 1, j = t & 1;
+            m8_tile<K2>(words(0) + h * KW + j * TW, map, lane, f0[2 * j][h], f0[2 * j + 1][h]);
+        }
     }
     for (int st = 0; st < NS; ++st) {
         if (st) {
@@ -1072,8 +1094,8 @@ __device__ __forceinline__ void m8_run(const uint32_t* __restrict__ T, int NTILE
         if (st + S - 1 < NS) load(st + S - 1);
         cp_async_commit();
         const unsigned char* as = lrow + (size_t)(st % S) * R * LD;
-        step(as, f0, words(st) + 2 * KW, f1);
-        step(as + 32, f1, words(st + 1), f0);                 // past the last stage it decodes what is there, unused
+        step(as, f0, words(st) + 2 * KW, 2 * st + 1, f1);
+        step(as + 32, f1, words(st + 1), st + 1 < NS ? 2 * st + 2 : 2 * st + 1, f0);   // past the last stage it takes what is there, unused
     }
     cp_async_wait<0>();
 }
@@ -1086,12 +1108,13 @@ __device__ __forceinline__ void m8_slice(const uint32_t* __restrict__ T, int NTI
     else m8_run<K2, R, false>(T, NTILES, KT, nt0, X, K, rows_sh, live, warp, lane, As, Ts, acc);
 }
 
-template <int LO, int HI, int R>
+template <int R>
 __global__ void __launch_bounds__(256, 1) grouped_mma8_kernel(
     const int8_t* __restrict__ X0, const int8_t* __restrict__ X1, const int64_t* __restrict__ TP0,
     const int64_t* __restrict__ TP1, const int* __restrict__ K2_0, const int* __restrict__ K2_1,
     const int* __restrict__ uids, const int* __restrict__ ucount, const int* __restrict__ members,
-    half* __restrict__ Z, int K, int N, int P, int maxm, int slots, int nexp, const int* __restrict__ work) {
+    half* __restrict__ Z, int K, int N, int P, int maxm, int slots, int nexp, const int* __restrict__ work,
+    const uint32_t* __restrict__ F0, const uint32_t* __restrict__ F1, int plain) {
     const int zz = blockIdx.z % nexp;
     const int u = work[2 * zz];
     if (u >= ucount[0]) return;
@@ -1131,20 +1154,9 @@ __global__ void __launch_bounds__(256, 1) grouped_mma8_kernel(
 #pragma unroll
             for (int c = 0; c < 4; ++c) acc[i][q][c] = 0;
 
-    switch (k2) {
-#define TF_EXL3X_CASE(K2_)                                                                                      \
-    case K2_:                                                                                                   \
-        if constexpr (K2_ >= LO && K2_ <= HI)                                                                   \
-            m8_slice<K2_, R>(T, N >> 4, K >> 4, nt0, X, K, rows_sh, live, warp, lane, m2_smem, Ts, acc);        \
-        else                                                                                                    \
-            __trap();                                                                                           \
-        break;
-        TF_EXL3X_CASE(5)
-        TF_EXL3X_CASE(10)
-#undef TF_EXL3X_CASE
-        default:
-            __trap();
-    }
+    if (e == plain) m8_slice<0, R>(mat ? F1 : F0, N >> 4, K >> 4, nt0, X, K, rows_sh, live, warp, lane, m2_smem, Ts, acc);
+    else if (k2 == 5) m8_slice<5, R>(T, N >> 4, K >> 4, nt0, X, K, rows_sh, live, warp, lane, m2_smem, Ts, acc);
+    else __trap();
     // Z [mats, P, N] fp16: rows g8 and g8 + 8 of each 16-row tile, columns 8 q + 2 t of the warp's 32
     auto pair = [](int a, int b) {
         return __floats2half2_rn(fminf(fmaxf(a * Z8_SHIFT, -65000.f), 65000.f), fminf(fmaxf(b * Z8_SHIFT, -65000.f), 65000.f));
@@ -2098,17 +2110,41 @@ void grouped_mma2_launch(const GroupedArgs& a, cudaStream_t stream) {
 }
 
 // grouped_mma8_kernel: R member rows, 256 columns of an expert's matrix a program, walking ``work``. 2.5 and 5 bits a weight
-inline size_t m8_smem_bytes() { return m8_rows_bytes<128>() + m2_words_bytes<M8_S, M8_KB>(10); }
-
-inline void grouped_mma8_launch(const int8_t* x0, const int8_t* x1, half* z, const GroupedArgs& a, cudaStream_t stream) {
-    TORCH_CHECK(a.N % M2_COLS == 0 && a.K % 64 == 0 && a.work, "prompt mma8: N a multiple of ", M2_COLS, ", K of 64, a work list");
-    TORCH_CHECK(a.lo >= 5 && a.hi <= 10, "prompt mma8: 2.5 and 5 bits a weight, not ", a.lo / 2.0, " to ", a.hi / 2.0);
+template <int R>
+inline void m8_launch_one(const int8_t* x0, const int8_t* x1, half* z, const uint32_t* f0, const uint32_t* f1, int plain,
+                          const GroupedArgs& a, cudaStream_t stream) {
     const dim3 grid(1u, (unsigned)(a.N / M2_COLS), (unsigned)(a.nwork * a.mats));
-    const size_t smem = m8_smem_bytes();
-    auto fn = grouped_mma8_kernel<5, 10, 128>;
+    const size_t smem = m8_rows_bytes<R>() + m2_words_bytes<M8_S, M8_KB>(5);
+    auto fn = grouped_mma8_kernel<R>;
     C10_CUDA_CHECK(cudaFuncSetAttribute(fn, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
     fn<<<grid, 256, smem, stream>>>(x0, x1, a.tp0, a.tp1, a.k2_0, a.k2_1, a.uids, a.ucount, a.members, z, a.K, a.N, a.P, a.maxm,
-                                    a.slots, a.nwork, a.work);
+                                    a.slots, a.nwork, a.work, f0, f1, plain);
+}
+
+inline void grouped_mma8_launch(const int8_t* x0, const int8_t* x1, half* z, const uint32_t* f0, const uint32_t* f1, int plain,
+                                const GroupedArgs& a, cudaStream_t stream) {
+    TORCH_CHECK(a.N % M2_COLS == 0 && a.K % 64 == 0 && a.work, "prompt mma8: N a multiple of ", M2_COLS, ", K of 64, a work list");
+    if (a.m2_rows == 192) m8_launch_one<192>(x0, x1, z, f0, f1, plain, a, stream);
+    else m8_launch_one<128>(x0, x1, z, f0, f1, plain, a, stream);
+}
+
+// A matrix's trellis as grouped_mma8's fragments: a warp a tile, in the trellis's tile order, 8 bytes a lane.
+template <int K2>
+__global__ void __launch_bounds__(256) m8_expand_kernel(const int64_t* __restrict__ TP, int e, uint2* __restrict__ F, int tiles) {
+    const int t = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (t >= tiles) return;
+    const uint32_t* ts = reinterpret_cast<const uint32_t*>(TP[e]) + (size_t)t * Fmt<K2>::TW;
+    const LaneMap<K2> map(lane);
+    uint32_t b0, b1;
+    m8_tile<K2>(ts, map, lane, b0, b1);
+    F[(size_t)t * 32 + lane] = make_uint2(b0, b1);
+}
+
+inline void m8_expand_launch(const int64_t* tp, int e, uint32_t* f, int k2, int tiles, cudaStream_t stream) {
+    TORCH_CHECK(k2 == 5 || k2 == 10, "m8_expand: 2.5 and 5 bits a weight, not ", k2 / 2.0);
+    const unsigned blocks = (unsigned)((tiles + 7) / 8);
+    if (k2 == 5) m8_expand_kernel<5><<<blocks, 256, 0, stream>>>(tp, e, reinterpret_cast<uint2*>(f), tiles);
+    else m8_expand_kernel<10><<<blocks, 256, 0, stream>>>(tp, e, reinterpret_cast<uint2*>(f), tiles);
 }
 
 // bytes of shared memory grouped_mma2_launch takes for the widest trellis

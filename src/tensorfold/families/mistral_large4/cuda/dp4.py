@@ -109,6 +109,9 @@ class Extents:
 
 # -- the step message and the digest agreement ----------------------------------------------------------------------
 
+AGREE_EVERY = 16
+
+
 def pack_step(seq: int, bucket: int, rows_by_rank: list[list]) -> list:
     """``["step", seq, bucket, rows_by_rank]``; a row is ``[sid, kind, pos, tokens...]`` with kind
     0 = decode (one token) and 1 = prefill (a chunk). JSON like multi.py's ops: the digest is the
@@ -119,9 +122,10 @@ def pack_step(seq: int, bucket: int, rows_by_rank: list[list]) -> list:
 
 def continues(op: list) -> bool:
     """A slice past a round's first: its tokens went with the first and the socket keeps the order, so nothing to agree on, and
-    no reason to drain the GPU between two slices."""
+    no reason to drain the GPU between two slices. Decode steps too, but for one in ``AGREE_EVERY``: a digest and a small gather
+    are 1.2 ms the GPU spends idle, and a step's sequence number is in what the next check agrees on."""
 
-    return op[0] == "cp" and len(op) > 7 and not op[5]
+    return (op[0] == "cp" and len(op) > 7 and not op[5]) or (op[0] == "tp" and op[1] % AGREE_EVERY != 0)
 
 
 def step_digest(op: list) -> int:
@@ -380,6 +384,8 @@ class Stream:
         self.started = 0.0                    # when that round began
         self.box = None                       # served: its tokens go here, its request's thread takes them out
         self.halt = False                     # ... and says here that the client is gone or a stop string came
+        self.slot: int | None = None          # its place in dspark.py's rings, if it drafts
+        self.drafts: list[int] = []           # what its next step checks
 
     @property
     def needs_fill(self) -> bool:
@@ -398,6 +404,7 @@ class RoundBuilder:
         self.streams: dict[int, Stream] = {}
         self.turn: dict[int, int] = {}        # rank -> next stream index among that rank's decoders
         self.next_row = 0                     # tp_rows' place in the ready streams
+        self.slices = 0                       # cp_slice's count, for the oldest prompt's turn
 
     def add(self, stream: Stream) -> None:
         self.streams[stream.sid] = stream
@@ -416,14 +423,20 @@ class RoundBuilder:
         self.next_row += len(take)
         return [[s.sid, len(s.prompt) + len(s.out) - 1, s.pending] for s in take]
 
-    def cp_slice(self, width: int, layers: int, total: int) -> list | None:
+    def cp_slice(self, width: int, layers: int, total: int, oldest: int = 0) -> list | None:
         """The next ``layers`` layers of a prompt's round, ``["cp", 0, sid, start, n, tokens, last, layers]``, the shortest
-        prompt first: a short prompt overtakes a long one between two of its slices. A round's tokens ride its first slice."""
+        prompt first: a short prompt overtakes a long one between two of its slices. Every ``oldest``-th slice goes to the
+        prompt that came first instead: shorter prompts that keep arriving would hold a long one back for good. A round's
+        tokens ride its first slice."""
 
         filling = [s for s in self.live() if s.cp and (s.needs_fill or s.left)]
         if not filling:
             return None
-        s = min(filling, key=lambda s: len(s.prompt) - s.filled + (s.flight[1] if s.left else 0))
+        self.slices += 1
+        if oldest and self.slices % oldest == 0:
+            s = filling[0]
+        else:
+            s = min(filling, key=lambda s: len(s.prompt) - s.filled + (s.flight[1] if s.left else 0))
         toks: list = []
         if not s.left:
             take = min(width - s.filled % width, len(s.prompt) - s.filled)

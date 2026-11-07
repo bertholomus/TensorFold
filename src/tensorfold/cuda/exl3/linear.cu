@@ -182,6 +182,24 @@ __global__ void __launch_bounds__(32) unpack_kernel(const uint32_t* __restrict__
     }
 }
 
+// W_q [N, K] int8 from mul1's words: a value at the round((S - 510.27) / 4) of experts_grouped.cuh's cb_i8, a row of K in order.
+template <int K2>
+__global__ void __launch_bounds__(32) unpack8_kernel(const uint32_t* __restrict__ T, int8_t* __restrict__ W, int K,
+                                                     int64_t stride_k, int64_t stride_nb) {
+    const int kt = blockIdx.x, nt = blockIdx.y, lane = threadIdx.x;
+    uint32_t w[lane_words<K2>()];
+    ldg_lane_words<K2>(T + kt * stride_k + (nt >> 3) * stride_nb + (nt & 7) * tile_words<K2>(), lane, w);
+    uint32_t b[2][2];
+    decode_lane<K2, 2>(w, lane, b[0], b[1]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const uint32_t v = b[j >> 2][(j >> 1) & 1];
+        const unsigned short h = (j & 1) ? (unsigned short)(v >> 16) : (unsigned short)(v & 0xffffu);
+        W[(size_t)(nt * 16 + value_col(lane, j)) * K + kt * 16 + value_row(lane, j)] =
+            (int8_t)__float2int_rn(__half2float(__ushort_as_half(h)) * (1.f / (4.f * 0.00676727294921875f)));
+    }
+}
+
 int dtype_of(const at::Tensor& t) {
     return t.scalar_type() == at::kFloat ? F32 : t.scalar_type() == at::kBFloat16 ? BF16 : F16;
 }
@@ -225,6 +243,23 @@ void exl3_linear_cuda(const at::Tensor& xh, const at::Tensor& T, int64_t stride_
     TF_EXL3_ALL(TF_LAUNCH)
 #undef TF_LAUNCH
     TORCH_CHECK(false, "unsupported EXL3 width/codebook: K2=", K2, " codebook=", cb);
+}
+
+void exl3_unpack8_cuda(const at::Tensor& T, at::Tensor& W, int64_t stride_k, int64_t stride_nb, int64_t K2) {
+    const int N = (int)W.size(0), K = (int)W.size(1);
+    dim3 grid((unsigned)(K / 16), (unsigned)(N / 16));
+    auto stream = at::cuda::getCurrentCUDAStream();
+#define TF_LAUNCH(K2_, CB_)                                                                                         \
+    if (K2 == K2_ && CB_ == 2) {                                                                                 \
+        unpack8_kernel<K2_><<<grid, 32, 0, stream>>>(reinterpret_cast<const uint32_t*>(T.data_ptr()),             \
+                                                     reinterpret_cast<int8_t*>(W.data_ptr()), K, stride_k,        \
+                                                     stride_nb);                                                  \
+        C10_CUDA_KERNEL_LAUNCH_CHECK();                                                                          \
+        return;                                                                                                  \
+    }
+    TF_EXL3_ALL(TF_LAUNCH)
+#undef TF_LAUNCH
+    TORCH_CHECK(false, "unsupported EXL3 width for mul1: K2=", K2);
 }
 
 void exl3_unpack_cuda(const at::Tensor& T, at::Tensor& W, int64_t stride_k, int64_t stride_nb, int64_t K2,

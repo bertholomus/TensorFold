@@ -7,6 +7,7 @@ time includes its wait for the slowest rank.
 from __future__ import annotations
 
 import json
+import os
 import time
 
 import torch
@@ -108,6 +109,8 @@ def kernels(step, what: str, rank: int, top: int = 28) -> None:
         step()
         torch.cuda.synchronize()
     wall = time.time() - t0
+    if os.environ.get("KERNEL_TRACE"):
+        p.export_chrome_trace(f"{os.environ['KERNEL_TRACE']}.{what.replace(' ', '-')}.r{rank}.json")
     ev = [e for e in p.key_averages() if e.self_device_time_total > 0]
     busy = sum(e.self_device_time_total for e in ev) / 1e3
     print(f"[prof] rank {rank} {what} kernels: {len(ev)} kinds, {sum(e.count for e in ev)} launches, busy {busy:.1f} ms of "

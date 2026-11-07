@@ -6,6 +6,7 @@ void exl3_linear_cuda(const at::Tensor&, const at::Tensor&, int64_t, int64_t, co
                       const c10::optional<at::Tensor>&, at::Tensor&, const c10::optional<at::Tensor>&, at::Tensor&,
                       int64_t, int64_t, int64_t, int64_t);
 void exl3_unpack_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
+void exl3_unpack8_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t);
 int exl3_glinear_max();
 void exl3_rot_many_cuda(const std::vector<at::Tensor>&, const std::vector<at::Tensor>&, const std::vector<at::Tensor>&,
                         bool);
@@ -196,10 +197,21 @@ void unpack(const at::Tensor& T, at::Tensor W, int64_t stride_k, int64_t stride_
     exl3_unpack_cuda(T, W, stride_k, stride_nb, K2, cb);
 }
 
+// W [N, K] int8 = W_q of a mul1 matrix, a row of K in order; tiles as unpack's.
+void unpack8(const at::Tensor& T, at::Tensor W, int64_t stride_k, int64_t stride_nb, int64_t K2) {
+    check(T, at::kInt, "T");
+    check(W, at::kChar, "W");
+    TORCH_CHECK(W.dim() == 2 && W.size(0) % 128 == 0 && W.size(1) % 128 == 0, "W must be [N, K], multiples of 128");
+    TORCH_CHECK(T.numel() == W.numel() * K2 / 64, "T must hold K * N * bits / 32 words");
+    c10::cuda::CUDAGuard guard(T.device());
+    exl3_unpack8_cuda(T, W, stride_k, stride_nb, K2);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("rot_in", &rot_in);
     m.def("linear", &linear);
     m.def("unpack", &unpack);
+    m.def("unpack8", &unpack8);
     m.def("glinear", &glinear, py::arg("xhs"), py::arg("Ts"), py::arg("stride_k"), py::arg("stride_nb"),
           py::arg("svhs"), py::arg("biases"), py::arg("ys"), py::arg("Z"), py::arg("counters"), py::arg("SK"),
           py::arg("K2"), py::arg("cb"), py::arg("WK"), py::arg("pdl"),

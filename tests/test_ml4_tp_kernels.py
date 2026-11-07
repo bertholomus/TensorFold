@@ -364,6 +364,122 @@ def test_merge_rows():
     assert rel(got, ref) < 2e-3, "merge_rows"
 
 
+def test_rows(R=5, W=4, V=64):
+    table = rnd(W * V, D, seed=8).to(torch.bfloat16)
+    ids = torch.tensor([0, V - 1, V, 3 * V + 7, W * V - 1], device=DEV)
+    every = torch.stack([K.own_rows(ids, table[w * V:(w + 1) * V].contiguous(), w * V) for w in range(W)])
+    assert torch.equal(K.rows_of(every, ids, V), table[ids].float())
+    assert int((every != 0).any(-1).sum()) == R
+    out = torch.zeros(4, dtype=torch.long, device=DEV)
+    K.fill_rows(torch.tensor([9, -1, -3, 11], device=DEV), torch.tensor([20, 21, 22], device=DEV), out)
+    assert out.tolist() == [9, 20, 22, 11]
+
+
+def test_fused_draft():
+    """dspark_cuda's draft against dspark's on one rank, at the real head widths with fewer rows of everything else: the same rings,
+    near the same hidden rows, the same tokens."""
+
+    if INTERP:
+        return
+    from types import SimpleNamespace
+
+    from tensorfold.families.mistral_large4.cuda import dspark as P
+    from tensorfold.families.mistral_large4.cuda import dspark_cuda as Q
+
+    BF16 = torch.bfloat16
+    c = SimpleNamespace(dim=1024, n_heads=8, kv_lora=512, rd=64, nope=64, qk_head=128, v_head=128, eps=1e-5, sm_scale=128 ** -0.5,
+                        vocab=8192, rope_theta=10000.0, rope_factor=2048.0, orig_len=512, n_layers=6, softcap=30.0)
+    hid, mk, taps = 2048, 512, 5
+    g = torch.Generator().manual_seed(4)
+
+    def r(*shape, s=None):
+        return (torch.randn(*shape, generator=g) * (s or shape[-1] ** -0.5)).to(BF16)
+
+    def n(size):
+        return (1 + 0.1 * torch.randn(size, generator=g)).to(BF16)
+
+    d, nv = c.dim, c.nope + c.v_head
+    w = {"backbone.target_projection.weight": r(d, taps * d), "backbone.target_norm.weight": n(d), "backbone.final_norm.weight": n(d),
+         "backbone.mask_embedding": r(2, d, s=1.0), "autoregressive_head.embedding.weight": r(c.vocab, mk, s=1.0),
+         "autoregressive_head.joint_proj.weight": r(3 * mk, 2 * mk + d), "autoregressive_head.joint_proj.bias": r(3 * mk, s=0.1),
+         "autoregressive_head.output.weight": r(c.vocab, mk, s=1.0)}
+    for i in range(2):
+        p = f"backbone.layers.{i}."
+        w |= {p + "attention_norm.weight": n(d), p + "ffn_norm.weight": n(d), p + "attention.kv_a_norm.weight": n(c.kv_lora),
+              p + "attention.wq.weight": r(c.n_heads * c.qk_head, d), p + "attention.wkv_a_with_mqa.weight": r(c.kv_lora + c.rd, d),
+              p + "attention.wkv_b.weight": r(c.n_heads * nv, c.kv_lora), p + "attention.wo.weight": r(d, c.n_heads * c.v_head),
+              p + "feed_forward.w1.weight": r(hid, d), p + "feed_forward.w3.weight": r(hid, d), p + "feed_forward.w2.weight": r(d, hid)}
+    w = {f"mtp_dspark.{k}": v for k, v in w.items()}
+
+    class Source:
+        keys = staticmethod(lambda: list(w))
+        shape = staticmethod(lambda name: list(w[name].shape))
+
+        @staticmethod
+        def get(name, rows=slice(None), cols=slice(None)):
+            return w[name][rows, cols] if w[name].dim() > 1 else w[name][rows]
+
+    class Comm:
+        @staticmethod
+        def all_gather(src, dst):
+            dst.copy_(src)
+
+    head = rnd(c.vocab, d, scale=0.05, seed=5).to(F16)
+
+    class Lane:
+        cfg, rank, world, vl, comm, pool = c, 0, 1, c.vocab, Comm, SimpleNamespace(device=torch.device(DEV))
+
+        @staticmethod
+        def head(h, out_dtype):
+            return F.linear(h.to(F16), head).to(out_dtype)
+
+        @staticmethod
+        def head_logits(h):
+            return M.softcap(Lane.head(h, F32), c.softcap)
+
+        @staticmethod
+        def _everyone(parts):
+            return parts
+
+        @staticmethod
+        def _total(x):
+            return x
+
+        @staticmethod
+        def _gather(send):
+            return send[None].contiguous()
+
+        @staticmethod
+        def best(x):
+            return x.argmax(-1)
+
+    wide, Q.FP8 = Q.FP8, set()
+    a, b = P.Drafter(Lane, Source, 16, taps=(2, 3, 4, 5)), Q.FusedDrafter(Lane, Source, 16, taps=(2, 3, 4, 5))
+    Q.FP8 = wide
+    slot, seen, B = 2, 300, 2
+    rows = rnd(seen, taps * d, seed=6).to(BF16)
+    pos = torch.arange(seen, device=DEV)
+    dst = slot * P.ROWS + pos % P.WINDOW
+    a.absorb(rows, pos, dst)
+    b.absorb(rows, pos, dst)
+    assert rel(b.ring[:, dst], a.ring[:, dst]) < 5e-2
+    a.ring[:, (slot + 1) * P.ROWS:(slot + 2) * P.ROWS] = a.ring[:, slot * P.ROWS:(slot + 1) * P.ROWS]
+    b.ring.copy_(a.ring)
+    x = torch.zeros((B * P.DEPTH, d), dtype=F32, device=DEV)
+    x.view(B, P.DEPTH, -1)[:, 1:] = a.mask
+    x.view(B, P.DEPTH, -1)[:, 0] = rnd(B, d, scale=0.02, seed=7)
+    bpos = (seen + torch.arange(P.DEPTH, device=DEV)).repeat(B)
+    slots = torch.tensor([slot, slot + 1], device=DEV)
+    brow = (slots * P.ROWS + P.WINDOW)[:, None].add(torch.arange(P.DEPTH, device=DEV)).reshape(-1)
+    sees = torch.tensor([seen, seen - 7], device=DEV)
+    ha, hb = a.block(x.clone(), bpos, brow, slots, sees), b.block(x.clone(), bpos, brow, slots, sees)
+    assert F.cosine_similarity(ha.float().flatten(), hb.float().flatten(), 0) > 0.999
+    anchor = torch.tensor([17, 4000], device=DEV)
+    pa, pb = a.pick(ha, anchor), b.pick(ha.to(F16), anchor)
+    assert pa.tolist() == pb.tolist(), f"{pa.tolist()} {pb.tolist()}"
+    assert int(pb.max()) >= Q.TOP_BLOCK, "a token past the first block"
+
+
 def main() -> int:
     bad = 0
     for name, t in sorted(globals().items()):

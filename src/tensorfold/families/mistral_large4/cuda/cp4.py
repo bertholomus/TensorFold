@@ -137,6 +137,8 @@ class Seq:
     rows: int = 0
     rep: int | None = None            # a prompt's copy: all its rows from here, in position order, on every rank
     rep_rows: int = 0
+    window: object = None             # dspark.py's: what a prompt's rounds leave for the first draft
+    tail_only: bool = False           # FusedCp: past the last layer's keys only a prompt's last row and window are read
 
 
 @dataclass
@@ -159,6 +161,8 @@ class Round:
     moe: tuple | None = None          # FusedCp: a layer's experts, their rows on the way
     ready: object = None              # FusedCp: when ``pending`` has landed, and what its exchange reads till then
     held: object = None
+    keep: object = None               # FusedCp: this round's share of ``Seq.window``
+    spare: bool = False               # FusedCp: nothing reads this round's rows past the last layer's keys
 
     @property
     def nmax(self) -> int:
@@ -483,6 +487,7 @@ class Ml4Cp:
 
     def __init__(self, w, comm, pool: KvPool, ops: Ops | None = None) -> None:
         self.w, self.cfg, self.comm, self.pool = w, w.cfg, comm, pool
+        self.split_head = None                                  # tp.py's: a round's last row through every rank's slice of the head
         self.ops = ops or Ops()
         self.rank = comm.rank if comm is not None else 0
         self.world = comm.world if comm is not None else 1
@@ -651,14 +656,16 @@ class Ml4Cp:
         pass
 
     def finish(self, f: Flight) -> torch.Tensor | None:
-        """Logits [V] of position ``last`` on its owner, else None."""
+        """Logits [V] of position ``last`` on its owner, else None. A split head needs every rank here."""
 
         if f.last is None:
             return None
         at = (f.rnd.own == f.last).nonzero()
-        if at.numel() == 0:
+        h = rms_norm(f.x[int(at[0, 0]):int(at[0, 0]) + 1], self.w.norm, self.cfg.eps) if at.numel() else None
+        if self.split_head is not None:
+            return self.split_head(h)
+        if h is None:
             return None
-        h = rms_norm(f.x[int(at[0, 0]):int(at[0, 0]) + 1], self.w.norm, self.cfg.eps)
         head = self.w.head if self.w.head is not None else self.w.head_bf16
         return softcap(self.ops.logits(head, h), self.cfg.softcap)[0]
 

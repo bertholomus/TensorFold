@@ -37,7 +37,8 @@ from typing import Any, Callable
 import torch
 
 PREFILL_CHUNK = int(os.environ.get("TF_ML4_PREFILL_CHUNK") or 512)      # D2 §4(a) chunk cap, tune in phase B
-MEM_FLOOR_GIB = float(os.environ.get("TF_ML4_MEM_FLOOR_GIB") or 10.0)   # D2 §6 OS floor (warn under 8 — GB10 OOM)
+MEM_FLOOR_GIB = float(os.environ.get("TF_ML4_MEM_FLOOR_GIB") or 10.0)   # D2 §6 OS floor (warn under 5 — GB10 OOM)
+MEM_CEILING_GIB = float(os.environ.get("TF_ML4_MEM_CEILING_GIB") or 0)    # the allocator's cap outright: MemAvailable at load moves with the page cache
 KV_HEADROOM_GIB = float(os.environ.get("TF_ML4_KV_HEADROOM_GIB") or 7.0)  # D2 §6 fallback when no probe (m2b6)
 HEADROOM_GIB = float(os.environ.get("TF_ML4_HEADROOM_GIB") or 0.0)     # >0 overrides the probe (m2b6; 0 = measured)
 POOL_SAFETY_GIB = float(os.environ.get("TF_ML4_POOL_SAFETY_GIB") or 2.0)   # margin behind a forced TF_ML4_KV_TOKENS
@@ -51,6 +52,10 @@ COPY_ROWS = int(os.environ.get("TF_ML4_CP_COPY", "163840"))             # a prom
 TP_ROWS = int(os.environ.get("TF_ML4_TP_ROWS") or 8)                    # decode rows in one step
 SLICE = int(os.environ.get("TF_ML4_CP_SLICE") or 12)                    # a prompt round's layers between two looks at the queue
 STEPS = int(os.environ.get("TF_ML4_TP_STEPS") or 2)                     # decode steps between two slices
+OLDEST = int(os.environ.get("TF_ML4_CP_OLDEST") or 8)                   # every so many slices go to the prompt that came first
+STEP_LOG = int(os.environ.get("TF_ML4_STEP_LOG") or 0)                  # > 0: a step's host times every so many steps
+DRAFT = os.environ.get("TF_ML4_DRAFT") or ""                            # the draft head's tensors (dspark.py); empty: no drafts
+DRAFT_LOG = int(os.environ.get("TF_ML4_DRAFT_LOG") or 0)                # > 0: what the steps kept, every so many steps
 LOOK = 1.0                                                              # s between two looks at a waiting request's client
 
 
@@ -178,6 +183,8 @@ class Ml4Engine:
         self.dp_limit = min(self.limit, DP_LIMIT)
         self.fwd, self.seqs, self.extents, self._cp_turn = None, {}, None, False
         self.lane, self.graphs = None, None                   # tp.py's step: every stream striped, decode on all ranks
+        self.draft, self.draft_rows, self.free_slots = None, 1, []   # dspark.py's head: a step checks each stream's drafts
+        self.plan = None                                       # ... and the rows its next draft op takes, until a step carries it
         self.flights: dict = {}                               # rounds between their layers, by stream
         self._steps = 0                                       # decode steps since the last slice
         if self.fast:
@@ -200,7 +207,7 @@ class Ml4Engine:
         # admits while another thread's generate runs the rounds). Without this lock the socket
         # can carry admit2 before step1 while the comm sees step1's gather first — the digests
         # then pair across ops and the lane dies at its first model collective (load4,
-        # 2026-11-06; t6's log: rank 1 "admit@2 mismatch, then step@1 mismatch"). The lock makes
+        # 2026-11-06; the log: rank 1 "admit@2 mismatch, then step@1 mismatch"). The lock makes
         # rank 0's (send, gather) pairs a total order, which is what agree() and the followers'
         # FIFO digests assume. Followers have one follow thread; nothing to lock there.
         self._bcast_lock = threading.RLock()
@@ -227,10 +234,13 @@ class Ml4Engine:
         from . import cp4
 
         if self.device == "cuda":
-            from .cp4_cuda import CudaOps
+            from .cp4_cuda import CudaOps, own_part
 
             self.ops = CudaOps(self._dev)
             self.ops.prepare(self.w)
+            if self.world > 1 and TP and self.w.head is not None:
+                vl = self.w.cfg.vocab // self.world           # a rank reads its slice of the head: .7 GiB back
+                self.w.head = own_part(self.w.head, self.rank * vl, (self.rank + 1) * vl)
             torch.cuda.empty_cache()
         else:
             self.ops = cp4.Ops()
@@ -258,10 +268,25 @@ class Ml4Engine:
                 from .tp_cuda import FusedTp
 
                 self.lane = FusedTp(self.fwd)
+                self.fwd.split_head = self.lane.last_logits
                 self.graphs = tp.Graphs(self.lane)
+                self.graphs.mark = self._mark
             else:
                 self.lane = tp.Ml4Tp(self.fwd)
             self.lane.use(cp4.Stripe(self.world, cp4.BLOCK))
+            if DRAFT:
+                from .dspark import DEPTH, SLOTS, Drafter, Source
+
+                if self.device == "cuda" and not os.environ.get("TF_ML4_DRAFT_PLAIN"):
+                    from .dspark_cuda import FusedDrafter as Drafter
+
+                self.draft, self.draft_rows = Drafter(self.lane, Source(DRAFT), TP_ROWS, self.graphs), DEPTH + 1
+                self.draft.mark = self._mark
+                self.free_slots = list(range(SLOTS))
+                if self.device == "cuda":
+                    from .cp4_cuda import trim_host
+
+                    trim_host()                               # the head's file came through the heap: .5 GiB
         log(f"[ml4-engine] rank {self.rank}: fast path, {kind} pool {pool.nbytes() / 2 ** 30:.2f} GiB, "
             f"MemAvailable now {(read_mem_avail() or 0) / 2 ** 30:.2f} GiB")
 
@@ -366,7 +391,7 @@ class Ml4Engine:
         NCCL for ranks already gone): the body first device-audits, then runs on a daemon thread
         joined with a bounded wait (TF_ML4_PROBE_TIMEOUT, default 120 s) — ANY failure, including
         a stuck collective, lands on the 7 GiB fallback instead of wedging the load. Honest caveat
-        for t6: a thread abandoned inside ncclAllGather leaves that comm suspect; the timeout turns
+        a thread abandoned inside ncclAllGather leaves that comm suspect; the timeout turns
         a permanent hang into a bounded stall + a loud line, it does not un-poison a desynced
         comm — restart a lane whose probe timed out (or run TF_ML4_PROBE=0)."""
 
@@ -447,8 +472,8 @@ class Ml4Engine:
         else:
             reserve, src = KV_HEADROOM_GIB, "D2 §6 default"
         self._reserve = (reserve, src)                          # m2b10: _budget_check reads this back
-        if MEM_FLOOR_GIB < 8.0:
-            log(f"[ml4-engine] rank {self.rank}: WARNING floor {MEM_FLOOR_GIB} GiB < 8 — the GB10 OOM'd "
+        if MEM_FLOOR_GIB < 5.0:
+            log(f"[ml4-engine] rank {self.rank}: WARNING floor {MEM_FLOOR_GIB} GiB < 5 — the GB10 OOM'd "
                 f"below that in the dsv41 runs (D2 §6); run this low only with eyes on the lane")
         if self._snap is not None:
             avail = self._snap[0]                               # m2b10: the SAME snapshot the ceiling got
@@ -505,7 +530,7 @@ class Ml4Engine:
         torch.cuda.synchronize()
         total = torch.cuda.mem_get_info()[1]
         resident = torch.cuda.memory_reserved()
-        growth = max(0, avail - int(MEM_FLOOR_GIB * 2 ** 30))
+        growth = max(0, int(MEM_CEILING_GIB * 2 ** 30) - resident if MEM_CEILING_GIB else avail - int(MEM_FLOOR_GIB * 2 ** 30))
         ceiling = resident + growth
         self._snap = (avail, total, resident, growth)
         torch.cuda.set_per_process_memory_fraction(max(0.05, min(1.0, ceiling / total)) if total else 1.0)
@@ -556,9 +581,14 @@ class Ml4Engine:
 
         from . import cp4
 
-        world, block, bases, rows, copy = place
+        world, block, bases, rows, copy, slot, prompt = place
         if bases[self.rank] is not None:
-            self.seqs[sid] = cp4.Seq(cp4.Stripe(world, block), bases[self.rank], rows, *((copy[0][self.rank], copy[1]) if copy else ()))
+            seq = self.seqs[sid] = cp4.Seq(cp4.Stripe(world, block), bases[self.rank], rows, *((copy[0][self.rank], copy[1]) if copy else ()))
+            seq.tail_only = True
+            if slot is not None:
+                from .dspark import Window
+
+                seq.window = Window(seq.stripe, self.rank, prompt, slot, self.draft)
 
     def _step_fast(self, rows: list) -> list:
         """A DP round: this rank's row as a group of one; a rank without a row still serves the expert all-to-alls."""
@@ -622,6 +652,9 @@ class Ml4Engine:
                 self.flights[sid] = f
                 return []
             logits = self.fwd.finish(f)
+            if last is not None and seq.window is not None:
+                self.draft.close(seq.window)
+                seq.window = None
         return [] if logits is None else [[sid, self._pick(sid, logits, last)]]
 
     def tp_step(self, op: list) -> list:
@@ -629,22 +662,40 @@ class Ml4Engine:
 
         from . import tp
 
-        _, _, rows, sampled = op
+        _, _, rows, sampled = op[:4]
+        t0 = time.perf_counter()
+        drafted = None
+        if len(op) > 4 and op[4] is not None:
+            with torch.inference_mode():
+                drafted = self.draft.step(op[4], op[5], wait=False)
+            self._mark("dlaunch")
         k = self.w.cfg.idx_topk
         seqs = [self.seqs[int(r[0])] for r in rows]
         positions = [int(r[1]) for r in rows]
         width = max(tp.width(s.stripe, p + 1, self.world, k) for s, p in zip(seqs, positions))
         padded = 1 << (len(rows) - 1).bit_length()
-        s = tp.make_rows(seqs, positions, self.rank, self._dev, n=width, k=k, scratch=self.pool_tokens, pad=padded)
+        plan = tp.plan_rows(seqs, positions, self.rank, n=width, k=k, scratch=self.pool_tokens, pad=padded)
         tokens = [int(r[2]) for r in rows] + [int(rows[0][2])] * (padded - len(rows))
-        tokens = torch.tensor(tokens, dtype=torch.long, device=self._dev)
         with torch.inference_mode():
-            if self.graphs is not None:
-                ids, logits = self.graphs.run(tokens, s)
+            if self.graphs is not None and self.graphs.ready(tokens, plan):
+                ids, logits, tokens = self.graphs.run_behind(tokens, plan, drafted)
             else:
-                logits = self.lane.step(tokens, s)
-                ids = self.lane.best(logits)
+                s = tp.rows_on(plan, self._dev)
+                tokens = torch.tensor(tokens, dtype=torch.long, device=self._dev)
+                if drafted is not None and op[5]:
+                    tokens = torch.where(tokens < 0, drafted.reshape(-1)[(-1 - tokens).clamp_(min=0)], tokens)
+                if self.graphs is not None:
+                    ids, logits = self.graphs.run(tokens, s)
+                else:
+                    logits = self.lane.step(tokens, s)
+                    ids = self.lane.best(logits)
+            t1 = time.perf_counter()
             got = [[int(r[0]), int(t)] for r, t in zip(rows, ids.tolist())]
+            if drafted is not None and self.rank == 0:
+                for r, t in zip(rows, tokens.tolist()):
+                    r[2] = t
+            if STEP_LOG:
+                self._times(len(rows), t0, t1, time.perf_counter())
             if sampled:
                 every = torch.empty((self.world, *logits.shape), dtype=logits.dtype, device=logits.device)
                 self.comm.all_gather(logits.reshape(-1), every.view(-1))
@@ -652,6 +703,29 @@ class Ml4Engine:
                     for i, r in enumerate(rows):
                         got[i][1] = self._pick(int(r[0]), every[:, i].reshape(-1), int(r[1]))
         return got
+
+    def _mark(self, name: str) -> None:
+        """Where the time between two steps goes (TF_ML4_STEP_LOG): ms since the last mark, in ``_times``'s line."""
+
+        if STEP_LOG:
+            t = time.perf_counter()
+            a = self.__dict__.setdefault("_marks", {})
+            a[name] = a.get(name, 0.0) + t - getattr(self, "_marked", t)
+            self._marked = t
+
+    def _times(self, n: int, t0: float, t1: float, t2: float) -> None:
+        a = self.__dict__.setdefault("_steps_seen", {}).setdefault(n, [0.0, 0.0, 0.0, 0])
+        a[0] += t0 - getattr(self, "_step_end", t0)
+        a[1] += t1 - t0
+        a[2] += t2 - t1
+        a[3] += 1
+        self._step_end = t2
+        if a[3] == STEP_LOG:
+            marks = " ".join(f"{k} {v / a[3] * 1e3:.2f}" for k, v in self.__dict__.get("_marks", {}).items())
+            print(f"[ml4-steps] rank {self.rank}: {n} rows, {STEP_LOG} steps: between {a[0] / a[3] * 1e3:.2f} ms, launch "
+                  f"{a[1] / a[3] * 1e3:.2f}, wait {a[2] / a[3] * 1e3:.2f}; {marks}", flush=True)
+            a[:] = [0.0, 0.0, 0.0, 0]
+            self.__dict__.get("_marks", {}).clear()
 
     def step(self, rows: list) -> list:
         from .model import new_cache
@@ -720,10 +794,13 @@ class Ml4Engine:
                         agree(self.comm, "step", op, self._dev)
                     link.send_back(["tokens", op[1], self.cp_step(op)])
                 elif kind == "tp":
-                    from .dp4 import agree
+                    from .dp4 import agree, continues
 
-                    agree(self.comm, "step", op, self._dev)
+                    if not continues(op):
+                        agree(self.comm, "step", op, self._dev)
                     self.tp_step(op)
+                elif kind == "draft":
+                    self.draft_step(op)
                 elif kind == "step":
                     from .dp4 import agree
 
@@ -750,7 +827,7 @@ class Ml4Engine:
                     owner, place = self._place(total, session, len(prompt))
                     s = Stream(self.next_sid, prompt, int(count), owner, sampling=sampling, on_tokens=on_tokens,
                                stop_eos=stop_eos)
-                    s.place, s.cp, s.box = place, owner < 0, box
+                    s.place, s.cp, s.box, s.slot = place, owner < 0, box, place[5]
                     self.next_sid += 1
                     self._open(s.sid, place)
                     # followers only need the rows: the step ops carry the tokens, so a 1M prompt is not sent twice
@@ -788,7 +865,8 @@ class Ml4Engine:
                              f"free runs {[e.runs for e in self.extents]}")
             for r in range(self.world):
                 self.ledgers.reserve(r, rows)
-            return -1, [self.world, st.block, bases, rows, self._take_copy(prompt)]
+            slot = self.free_slots.pop() if self.free_slots else None
+            return -1, [self.world, st.block, bases, rows, self._take_copy(prompt), slot, prompt]
         owner = self.placement.assign(total, session)          # D2 §5: least-loaded, sticky by session
         base = self.extents[owner].take(total)
         if base is None:
@@ -797,7 +875,7 @@ class Ml4Engine:
         self.ledgers.reserve(owner, total)
         bases: list = [None] * self.world
         bases[owner] = base
-        return owner, [1, cp4.BLOCK, bases, total, None]
+        return owner, [1, cp4.BLOCK, bases, total, None, None, prompt]
 
     def _take_copy(self, rows: int) -> list | None:
         """A prompt's copy on every rank, ``[bases, rows]``: a stripe's rows are enough for it to run without, so None when
@@ -841,7 +919,7 @@ class Ml4Engine:
         socket send, the digest gather, the model step's a2a and the back channel must form ONE
         uninterrupted segment of rank 0's activity — a concurrent admission from another server
         thread landing between the send and the gather made the comm pair rank 0's step digest
-        against a follower's admission digest (t6: "rank 1 agreed admit@2 mismatched, then
+        against a follower's admission digest ("rank 1 agreed admit@2 mismatched, then
         step@1 mismatched"). One follower thread already gives that total order on its side."""
 
         from .dp4 import agree, pack_step
@@ -892,12 +970,15 @@ class Ml4Engine:
         rows = self.rounds.tp_rows(TP_ROWS) if self._steps < STEPS else None
         cp = None
         if rows is None:
-            cp = self.rounds.cp_slice(self.cp_width, SLICE, self.w.cfg.n_layers)
+            cp = self.rounds.cp_slice(self.cp_width, SLICE, self.w.cfg.n_layers, OLDEST)
             self._steps = 0
             if cp is None:
                 rows = self.rounds.tp_rows(TP_ROWS)
         if cp is None and rows is None:
+            self._drafts_now()
             return False
+        if cp is not None:
+            self._drafts_now()
         self.seq += 1
         t0 = time.time()
         if cp is not None:
@@ -905,14 +986,27 @@ class Ml4Engine:
             op = cp
         else:
             self._steps += 1
+            plan, self.plan = self.plan, None
+            if self.draft is not None:
+                rows = self._drafted(rows, plan)
             op = ["tp", self.seq, rows, any(self.rounds.streams[int(r[0])].sampling is not None for r in rows)]
+            if plan is not None:
+                op += plan[:2]
+        self._mark("plan")
         if self.world > 1:
             if self.link is not None:
                 self.link.send(op)
+            self._mark("send")
             if not continues(op):
                 agree(self.comm, "step", op, self._dev)
+            self._mark("agree")
         if cp is None:
-            for sid, tok in self.tp_step(op):
+            got = self.tp_step(op)
+            self._mark("step")
+            if self.draft is not None:
+                self._checked(rows, got)
+                return True
+            for sid, tok in got:
                 self._emit(self.rounds.streams[sid], tok)
             return True
         s = self.rounds.streams[int(cp[2])]
@@ -926,6 +1020,82 @@ class Ml4Engine:
         self._apply_cp(op, got, t0)
         return True
 
+    def _drafted(self, rows: list, plan: tuple | None) -> list:
+        """Each stream's row, then its drafts at the rows after it: those it can still use, and only as many as fit in a step of
+        ``TP_ROWS`` rows. A wider step costs more than its drafts bring. Drafts of ``plan`` are made
+        just before this step and stay on the device: a row names its place in them, -1 - place."""
+
+        out, room = [], TP_ROWS - len(rows)
+        now = {s.sid: b for b, s in enumerate(plan[2])} if plan is not None and plan[1] else {}
+        for i, r in enumerate(rows):
+            s = self.rounds.streams[int(r[0])]
+            out.append(r)
+            b = now.get(s.sid)
+            k = min(len(s.drafts) if b is None else self.draft_rows - 1, s.count - len(s.out) - 1,
+                    (room + len(rows) - 1 - i) // len(rows))
+            if b is None:
+                out += [[r[0], r[1] + 1 + j, d] for j, d in enumerate(s.drafts[:k])]
+            else:
+                out += [[r[0], r[1] + 1 + j, -1 - (b * (self.draft_rows - 1) + j)] for j in range(k)]
+        return out
+
+    def _checked(self, rows: list, got: list) -> None:
+        """A step's answers: a stream keeps its drafts up to the first the target would not have said, then the target's own
+        next token. The rows it kept join its draft context, and its next drafts start from that token."""
+
+        plan, who, i = [], [], 0
+        while i < len(rows):
+            sid, at = int(rows[i][0]), int(rows[i][1])
+            s = self.rounds.streams[sid]
+            end, n = i + 1, 0
+            while end < len(rows) and int(rows[end][0]) == sid:
+                end += 1
+            while i + n + 1 < end and got[i + n][1] == rows[i + n + 1][2]:
+                n += 1
+            self._kept(end - i - 1, n)
+            for _, tok in got[i:i + n + 1]:
+                if not s.done:
+                    self._emit(s, tok)
+            if s.slot is not None and not s.done:
+                plan.append([s.slot, i, n + 1, at, s.pending])
+                who.append(s)
+            i = end
+        self._mark("emit")
+        for s in who:
+            s.drafts = []
+        if plan:
+            self.plan = (plan, sum(s.cp and not s.needs_fill for s in self.rounds.live()) < TP_ROWS, who)
+
+    def _drafts_now(self) -> None:
+        """No step comes next to take its drafts with it: the draft op alone, and its tokens to the host."""
+
+        if self.plan is None:
+            return
+        (plan, drafts, who), self.plan = self.plan, None
+        self.seq += 1
+        op = ["draft", self.seq, plan, drafts]
+        if self.world > 1 and self.link is not None:
+            self.link.send(op)
+        for s, d in zip(who, self.draft_step(op)):
+            s.drafts = d
+
+    def _kept(self, tried: int, n: int) -> None:
+        if not DRAFT_LOG or not tried:
+            return
+        a = self.__dict__.setdefault("_keeps", [0] * (self.draft_rows + 1))
+        a[n] += 1
+        a[-1] += 1
+        if a[-1] == DRAFT_LOG:
+            shown = " ".join(f"{k}:{v}" for k, v in enumerate(a[:-1]))
+            self.log(f"[ml4-draft] {a[-1]} checks kept {shown}: {sum(k * v for k, v in enumerate(a[:-1])) / a[-1] + 1:.2f} tokens a step")
+            a[:] = [0] * len(a)
+
+    def draft_step(self, op: list) -> list:
+        """Every rank: the kept rows into the rings, and each stream's next drafts."""
+
+        with torch.inference_mode():
+            return self.draft.step(op[2], op[3])
+
     def _apply_cp(self, op: list, got: list, t0: float) -> None:
         _, seq, sid, start, n, _, last = op[:7]
         s = self.rounds.streams[int(sid)]
@@ -935,6 +1105,8 @@ class Ml4Engine:
             dt = time.time() - (s.started or t0)
             self.log(f"[ml4-cp] stream {sid} round {seq}: {start + n}/{len(s.prompt)} prompt tokens, {dt:.1f} s, "
                      f"{n / max(dt, 1e-9):.0f} tok/s")
+            if STEP_LOG and self.graphs is not None:
+                self.graphs.note(("prompt", start + n))
         s.started = 0.0
         if last is not None:
             assert len(got) == 1, f"striped round {seq}: {len(got)} answers for one row"
@@ -975,7 +1147,9 @@ class Ml4Engine:
             self.ledgers.release(s.owner, len(s.prompt) + s.count)
             return
         self._give_copy(s)
-        _, _, bases, rows, _ = s.place
+        if s.slot is not None:
+            self.free_slots.append(s.slot)
+        bases, rows = s.place[2:4]
         for r, base in enumerate(bases):
             if base is not None:
                 self.extents[r].give(base, rows)

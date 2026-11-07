@@ -8,6 +8,7 @@
 
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
+#include <cuda_bf16.h>
 #include <cstdint>
 
 namespace {

@@ -745,7 +745,6 @@ def _load(sh, index: PackIndex, cfg: Cfg, codebook: str, model_dir: Path, rank: 
             kv_b=nq(i, "self_attn.kv_b_proj.weight"),
             ssmax_s=nq(i, "self_attn.softmax_scaling.scale"), ssmax_b=nq(i, "self_attn.softmax_scaling.bias"))
         if cfg.is_full_indexer(i):
-            lay.idx_wq_b = nq(i, "self_attn.indexer.wq_b.weight")     # fp8 -> fp16 (dequant_fp8_block)
             lay.idx_wk = nq(i, "self_attn.indexer.wk.weight")
             lay.idx_proj = nq(i, "self_attn.indexer.weights_proj.weight")
             lay.idx_k_norm = nq(i, "self_attn.indexer.k_norm.weight")
@@ -786,6 +785,10 @@ def _load(sh, index: PackIndex, cfg: Cfg, codebook: str, model_dir: Path, rank: 
         if i % 6 == 5 or i == cfg.n_layers - 1:
             log(f"[ml4-load] rank {rank}: layers 0..{i} loaded ({time.time() - t0:.0f} s, "
                 f"{torch.cuda.memory_allocated() / 2**30:.1f} GiB)")
+
+    for i, lay in enumerate(w.layers):                       # together, after the rest: cp4_cuda.wq_b_from_pack frees half of what they hold
+        if cfg.is_full_indexer(i):
+            lay.idx_wq_b = nq(i, "self_attn.indexer.wq_b.weight")     # fp8 -> fp16 (dequant_fp8_block)
 
     moe = [lay for lay in w.layers if lay.expert_ids]
     assert all(lay.expert_ids == tuple(ids) for lay in moe), \

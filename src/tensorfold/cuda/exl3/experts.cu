@@ -764,7 +764,8 @@ void exl3x_grouped_mma2_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
 void exl3x_grouped_mma8_cuda(const at::Tensor& X0, const at::Tensor& X1, const at::Tensor& TP0, const at::Tensor& TP1,
                              const at::Tensor& B0, const at::Tensor& B1, const at::Tensor& uids,
                              const at::Tensor& ucount, const at::Tensor& members, at::Tensor& Z, int64_t mats,
-                             int64_t K, int64_t N, int64_t P, int64_t slots, int64_t lo, int64_t hi, const at::Tensor& work) {
+                             int64_t K, int64_t N, int64_t P, int64_t slots, int64_t rows, const at::Tensor& work,
+                             const at::Tensor& F0, const at::Tensor& F1, int64_t plain) {
     TORCH_CHECK(P * K < (int64_t)1 << 31, "rows x K must fit 32-bit offsets");
     tf_exl3x::GroupedArgs a;
     a.tp0 = TP0.data_ptr<int64_t>();
@@ -776,11 +777,19 @@ void exl3x_grouped_mma8_cuda(const at::Tensor& X0, const at::Tensor& X1, const a
     a.members = members.data_ptr<int>();
     a.K = (int)K; a.N = (int)N; a.P = (int)P; a.SK = 1; a.maxm = (int)members.size(1); a.slots = (int)slots;
     a.mats = (int)mats;
-    a.lo = (int)lo; a.hi = (int)hi;
+    a.m2_rows = (int)rows;
     a.work = work.data_ptr<int>();
     a.nwork = (int)(work.numel() / 2);
     tf_exl3x::grouped_mma8_launch(reinterpret_cast<const int8_t*>(X0.data_ptr()), reinterpret_cast<const int8_t*>(X1.data_ptr()),
-                                  reinterpret_cast<half*>(Z.data_ptr()), a, at::cuda::getCurrentCUDAStream());
+                                  reinterpret_cast<half*>(Z.data_ptr()), reinterpret_cast<const uint32_t*>(F0.data_ptr()),
+                                  reinterpret_cast<const uint32_t*>(F1.data_ptr()), (int)plain, a,
+                                  at::cuda::getCurrentCUDAStream());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_m8_expand_cuda(const at::Tensor& TP, int64_t e, at::Tensor& F, int64_t k2, int64_t tiles) {
+    tf_exl3x::m8_expand_launch(TP.data_ptr<int64_t>(), (int)e, reinterpret_cast<uint32_t*>(F.data_ptr()), (int)k2, (int)tiles,
+                               at::cuda::getCurrentCUDAStream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

@@ -104,13 +104,19 @@ __global__ void __launch_bounds__(T, 1) mla_rows_kernel(const __half* __restrict
     __syncthreads();
 
     const int tiles = (cnt + BN - 1) / BN;
-    auto fetch = [&](int t) {
-        uint8_t* dst = raw + (t & 1) * S::RAW;
-        for (int c = tid; c < BN * S::CHUNKS; c += T) {
+    // A share of tile t's rows: one 16-byte piece a thread, ``piece`` of a tile's ceil(BN * CHUNKS / T).
+    auto fetch_piece = [&](int t, int piece) {
+        const int c = tid + piece * T;
+        if (c < BN * S::CHUNKS) {
             const int r = c / S::CHUNKS, part = c % S::CHUNKS, i = t * BN + r;
             const bool ok = i < cnt;
-            cp_async16(dst + r * S::ROW + part * 16, PLANE + (ok ? (int64_t)ids[i] : 0) * row_bytes + part * 16, ok);
+            cp_async16(raw + (t & 1) * S::RAW + r * S::ROW + part * 16, PLANE + (ok ? (int64_t)ids[i] : 0) * row_bytes + part * 16, ok);
         }
+    };
+    constexpr int PIECES = (BN * S::CHUNKS + T - 1) / T;
+    auto fetch = [&](int t) {
+#pragma unroll
+        for (int i = 0; i < PIECES; i++) fetch_piece(t, i);
         cp_async_commit();
     };
     fetch(0);
@@ -129,23 +135,21 @@ __global__ void __launch_bounds__(T, 1) mla_rows_kernel(const __half* __restrict
         qf[j][3] = *reinterpret_cast<const uint32_t*>(b1 + t2 + 8);
     }
 
-    // Widen tile t: a thread takes 8 values of each 128-value group of one row, and a 16-byte piece of its k_pe.
+    // Widen tile t: a thread takes 8 values of each 128-value group of one row, and a 16-byte piece of its k_pe. A group at a
+    // time, between the MMAs of the tile before it, as the fetches: spread out, they cost the tensor cores nothing.
     const int wr = tid >> 4, wc = tid & 15;
-    auto widen = [&](int t) {
+    auto widen_group = [&](int t, int i) {
         const uint8_t* src = raw + (t & 1) * S::RAW + wr * S::ROW;
         __half* dst = tile + (t & 1) * (BN * S::LD) + wr * S::LD;
-#pragma unroll
-        for (int i = 0; i < 4; i++) {
-            const uint2 w = *reinterpret_cast<const uint2*>(src + i * 128 + wc * 8);
-            const float s = *reinterpret_cast<const float*>(src + C + i * 4);
-            uint4 o;
-            o.x = widen2(w.x, s);
-            o.y = widen2(w.x >> 16, s);
-            o.z = widen2(w.y, s);
-            o.w = widen2(w.y >> 16, s);
-            *reinterpret_cast<uint4*>(dst + i * 128 + wc * 8) = o;
-        }
-        if (RD && wc < RD / 8)
+        const uint2 w = *reinterpret_cast<const uint2*>(src + i * 128 + wc * 8);
+        const float s = *reinterpret_cast<const float*>(src + C + i * 4);
+        uint4 o;
+        o.x = widen2(w.x, s);
+        o.y = widen2(w.x >> 16, s);
+        o.z = widen2(w.y, s);
+        o.w = widen2(w.y >> 16, s);
+        *reinterpret_cast<uint4*>(dst + i * 128 + wc * 8) = o;
+        if (RD && i == 3 && wc < RD / 8)
             *reinterpret_cast<uint4*>(dst + C + wc * 8) = *reinterpret_cast<const uint4*>(src + C + 16 + wc * 16);
     };
 
@@ -157,7 +161,8 @@ __global__ void __launch_bounds__(T, 1) mla_rows_kernel(const __half* __restrict
 
     cp_async_wait_all();
     __syncthreads();
-    widen(0);
+#pragma unroll
+    for (int i = 0; i < 4; i++) widen_group(0, i);
     const int krow = (lane & 7) + ((lane >> 4) << 3), kcol = ((lane >> 3) & 1) << 3;
     const int vrow = lane & 15, vcol = (lane >> 4) << 3;
     float4* mine = sx + ((h * 4 + m) * 2) * 32 + lane;
@@ -166,19 +171,21 @@ __global__ void __launch_bounds__(T, 1) mla_rows_kernel(const __half* __restrict
     for (int t = 0; t < tiles; t++) {
         cp_async_wait_all();                                      // tile t + 1 has landed, this thread's part of it
         __syncthreads();                                          // ... and everyone's; tile t is wide, tile t - 1 is read
-        if (t + 2 < tiles) fetch(t + 2);
         const __half* tl = tile + (t & 1) * (BN * S::LD);
 
         float s[2][4] = {{0.0f, 0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f, 0.0f}};
+        const bool more = t + 1 < tiles;
+        auto kcol_of = [&](int j) { return j < 16 ? h * 256 + j * 16 : C + h * (RD / 2) + (j - 16) * 16; };
+        uint32_t b[2][4];
+        ldsm4(b[0], tl + (krow)*S::LD + kcol_of(0) + kcol);
 #pragma unroll
         for (int j = 0; j < S::KS; j++) {
-            const int col = j < 16 ? h * 256 + j * 16 : C + h * (RD / 2) + (j - 16) * 16;
-            uint32_t b[4];
-            ldsm4(b, tl + (krow)*S::LD + col + kcol);
-            mma(s[0], qf[j], b[0], b[1]);
-            mma(s[1], qf[j], b[2], b[3]);
+            if (j + 1 < S::KS) ldsm4(b[(j + 1) & 1], tl + (krow)*S::LD + kcol_of(j + 1) + kcol);
+            mma(s[0], qf[j], b[j & 1][0], b[j & 1][1]);
+            mma(s[1], qf[j], b[j & 1][2], b[j & 1][3]);
+            if (t + 2 < tiles && (j & 3) == 1 && (j >> 2) < PIECES) fetch_piece(t + 2, j >> 2);
         }
-        if (t + 1 < tiles) widen(t + 1);
+        if (t + 2 < tiles) cp_async_commit();
 
         mine[0] = make_float4(s[0][0], s[0][1], s[0][2], s[0][3]);
         mine[32] = make_float4(s[1][0], s[1][1], s[1][2], s[1][3]);
@@ -220,12 +227,13 @@ __global__ void __launch_bounds__(T, 1) mla_rows_kernel(const __half* __restrict
             p[2] = pack(p10, p11);
             p[3] = pack(p12, p13);
         }
+        ldsm4t(b[0], tl + vrow * S::LD + h * 256 + vcol);
 #pragma unroll
         for (int j = 0; j < 16; j++) {
-            uint32_t b[4];
-            ldsm4t(b, tl + vrow * S::LD + h * 256 + j * 16 + vcol);
-            mma(o[2 * j], p, b[0], b[1]);
-            mma(o[2 * j + 1], p, b[2], b[3]);
+            if (j + 1 < 16) ldsm4t(b[(j + 1) & 1], tl + vrow * S::LD + h * 256 + (j + 1) * 16 + vcol);
+            mma(o[2 * j], p, b[j & 1][0], b[j & 1][1]);
+            mma(o[2 * j + 1], p, b[j & 1][2], b[j & 1][3]);
+            if (more && (j & 3) == 1) widen_group(t + 1, j >> 2);
         }
     }
 
