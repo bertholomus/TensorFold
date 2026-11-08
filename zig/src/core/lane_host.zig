@@ -58,11 +58,6 @@ pub const LaneHost = struct {
     memory_lanes: ?usize = null, // lanes the backend had memory for at its last LaneMemory, until a job ends
     warm_quiet: u64 = 0, // ns a warm pass waits for other work before its first chunk (0: none), set by its family
     disk: rows_host.Disk = .{}, // the Mac app's questions about kept states, and the disk writer's quiet
-    // the request at the queue's front waits for room in the backend's pool (its prompt pass refused ContextFull while
-    // other streams ran): admitted again once fewer than this many streams are active, or at full_retry (a backend
-    // may refuse for a while to keep its kept states, waiting for one stream, and then place it)
-    full_wait: ?usize = null,
-    full_retry: i96 = 0,
     // after a long prompt pass (the whole pass runs inside its admission, no round meanwhile), the streams within
     // finish_left tokens of their max_tokens decode before the next admission, finish_ns at most: such a stream ends
     // and frees its extent (its kept state then resumes in place) instead of waiting out every queued pass, as the
@@ -96,6 +91,9 @@ pub const LaneHost = struct {
         kept0: u64 = 0, // the store's kept count when the job looked it up
         seq: u64 = 0, // its admission's number
         waits_since: ?u64 = null, // the admissions count when it first waited at the head for pool room
+        // A refused placement waits for occupancy to fall or its deadline; other queued jobs may still fit.
+        full_wait: ?usize = null,
+        full_retry: i96 = 0,
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
@@ -313,14 +311,6 @@ pub const LaneHost = struct {
             h.unlock();
             return false;
         }
-        if (h.full_wait) |n| {
-            const active = h.core.activeCount();
-            if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
-                h.unlock();
-                return false;
-            }
-            h.full_wait = null;
-        }
         if (h.finish_until) |t| {
             if (std.Io.Clock.awake.now(h.io).toNanoseconds() < t and h.nearEnd()) {
                 h.unlock();
@@ -333,6 +323,7 @@ pub const LaneHost = struct {
             return false;
         };
         const job = h.queued.orderedRemove(at);
+        job.full_wait = null;
         job.seq = h.admissions;
         h.admissions += 1;
         h.admitted.append(h.gpa, job) catch {
@@ -525,7 +516,8 @@ pub const LaneHost = struct {
     /// A request whose prompt pass the backend's pool cannot hold while other streams run (error.ContextFull, before
     /// anything of it was placed) goes back to the queue's front and waits until one of them ends, as the Python
     /// lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
-    /// false: nothing more is admitted now.
+    /// false: decoding gets a turn before another admission. Only this job waits; it keeps queue-front priority
+    /// once its retry is due, while other queued requests may still fit during its backoff.
     fn requeueFull(h: *LaneHost, job: *Job) bool {
         h.core.discard(&job.stream);
         h.lock();
@@ -538,8 +530,8 @@ pub const LaneHost = struct {
             h.finish(job, .failed, "out of memory");
             return true;
         };
-        h.full_wait = h.core.activeCount();
-        h.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
+        job.full_wait = h.core.activeCount();
+        job.full_retry = std.Io.Clock.awake.now(h.io).toNanoseconds() + full_retry_ns;
         h.unlock();
         job.fill_on.store(false, .release); // off the lists before the teardown, as requeue does
         job.reported(); // the entry it looked up goes back: its next admission looks it up again
@@ -676,4 +668,16 @@ fn depthsOf(s: *const lanes.Stream) [api.draft_depths]api.DraftDepth {
 
 test {
     _ = @import("lane_host_test.zig");
+}
+
+test "ContextFull backoff lets fitting warm work progress without losing the blocked job" {
+    try @import("lane_host_full_test.zig").exercise(LaneHost.admitOne, .progress);
+}
+
+test "ContextFull backoff retries the head at its deadline and cancels only that queued job" {
+    try @import("lane_host_full_test.zig").exercise(LaneHost.admitOne, .deadline);
+}
+
+test "ContextFull backoff retries the head when occupancy falls before its deadline" {
+    try @import("lane_host_full_test.zig").exercise(LaneHost.admitOne, .occupancy);
 }
