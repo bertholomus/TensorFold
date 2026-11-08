@@ -514,6 +514,13 @@ pub const Model = struct {
         m.watch.stop();
     }
 
+    /// A mirrored snapshot failure cannot be recovered by one rank alone. Closing this process's
+    /// links lets the existing peer watch stop the other ranks without waiting on a stuck GPU.
+    pub fn snapshotFatal(err: anyerror) noreturn {
+        std.log.err("dsv41: mirrored snapshot failed: {s}", .{@errorName(err)});
+        std.c._exit(1);
+    }
+
     /// Whether this rank's GPU context has failed for good: after a fault in a kernel (an illegal address, a trap)
     /// every later call returns that fault, the stream's query too (which logs it); a context that survived a failed
     /// call answers done or busy.
@@ -535,21 +542,60 @@ pub const Model = struct {
         m.ahead = null;
     }
 
-    /// A kept prompt state's own bytes (the prompt cache's snapshots; the compressed plane stays in the stream's
-    /// extent): one slot's window ring of every layer and positional stores of every ratio-2 layer.
-    pub fn snapBytes(m: *const Model) usize {
+    /// A complete kept prompt: fixed slot state plus independent, byte-exact packed prefix planes.
+    /// The prompt cache charges this position-dependent allocation before either rank saves it.
+    pub fn snapBytes(m: *const Model, positions: usize) usize {
         const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
         var n: usize = m.rings.len * m.eng.ringBytes();
         for (m.caches.raw_kv[0..m.eng.c.layers], m.caches.raw_score[0..m.eng.c.layers]) |k, sc| {
             if (k != 0) n += pb;
             if (sc != 0) n += pb;
         }
+        for (m.eng.w.layers) |lay| {
+            if (lay.comp_wkv == null) continue;
+            const rows = positions / @as(usize, lay.ratio);
+            n += rows * (m.eng.c.head_dim / 2 + m.eng.c.head_dim / 16);
+            if (lay.idx_wk != null) n += rows * (m.eng.c.index_head_dim / 2 + m.eng.c.index_head_dim / 32);
+        }
         return n;
     }
 
-    /// Slot `slot`'s own state into `buf` (save: true) or back from it, in the stream's order (no wait): with the
-    /// extent's compressed rows, the state a prompt pass stands in at a chunk end.
-    pub fn snapCopy(m: *Model, slot: usize, buf: u64, save: bool) !void {
+    /// Validate the complete snapshot's view before allocation or any device copy.
+    pub fn snapView(m: *const Model, slot: usize, base: usize, positions: usize) !void {
+        if (slot >= m.streams) return error.BadSlot;
+        if (base > m.pool_cap or positions > m.pool_cap - base) return error.BadView;
+        for (m.eng.w.layers) |lay| {
+            if (lay.comp_wkv == null) continue;
+            const ratio: usize = lay.ratio;
+            if (ratio == 0 or base % ratio != 0 or positions % ratio != 0) return error.BadView;
+        }
+    }
+
+    /// Save/restore the slot and full packed prefix in stream order, without requantization.
+    /// Restore always reads independent backing, even when its old working extent has the same base.
+    pub fn snapCopy(m: *Model, slot: usize, base: usize, positions: usize, buf: u64, save: bool) !void {
+        try m.snapView(slot, base, positions);
+        if (save) try m.snapSlotCopy(slot, buf, true);
+        var at = buf + m.snapBytes(0);
+        const c = m.eng.c;
+        for (m.eng.w.layers, 0..) |lay, i| {
+            if (lay.comp_wkv == null) continue;
+            const ratio: usize = lay.ratio;
+            const rows = positions / ratio;
+            const planes = [_]u64{ m.caches.comp_codes[i], m.caches.comp_scales[i], m.caches.idx_codes[i], m.caches.idx_scales[i] };
+            const widths = [_]usize{ c.head_dim / 2, c.head_dim / 16, c.index_head_dim / 2, c.index_head_dim / 32 };
+            const count: usize = if (lay.idx_wk != null) 4 else 2;
+            for (planes[0..count], widths[0..count]) |plane, width| {
+                const bytes = rows * width;
+                if (bytes > 0) try m.copyState(plane + base / ratio * width, at, bytes, save);
+                at += bytes;
+            }
+        }
+        std.debug.assert(at - buf == m.snapBytes(positions));
+        if (!save) try m.snapSlotCopy(slot, buf, false);
+    }
+
+    fn snapSlotCopy(m: *Model, slot: usize, buf: u64, save: bool) !void {
         const rb = m.eng.ringBytes();
         const pb = prompt.raw_rows * m.eng.c.head_dim * 4;
         var at = buf;
@@ -874,3 +920,160 @@ pub const Model = struct {
         try dr.pass(&m.eng, &m.ch, pool, tokens, q0, slots, steps, null);
     }
 };
+
+// Appended only to isolated CPU test copies. These call the real model copy path with host-backed CUDA pointers.
+const PrefixCpu = struct {
+    fn copy(dst: u64, src: u64, count: usize, _: cuda.abi.Stream) callconv(.c) c_int {
+        const to: [*]u8 = @ptrFromInt(dst);
+        const from: [*]const u8 = @ptrFromInt(src);
+        @memcpy(to[0..count], from[0..count]);
+        return 0;
+    }
+
+    fn bytes(m: *const Model, at: usize) usize {
+        return if (@hasDecl(Model, "snapView")) m.snapBytes(at) else m.snapBytes();
+    }
+
+    fn transfer(m: *Model, slot: usize, base: usize, at: usize, buf: u64, save: bool) !void {
+        if (@hasDecl(Model, "snapView")) {
+            try m.snapCopy(slot, base, at, buf, save);
+        } else {
+            // The selected preimage restores from its old working extent, which the fixture deliberately overwrites.
+            if (!save and base != 0) try m.copyExtent(0, base, at);
+            try m.snapCopy(slot, buf, save);
+        }
+    }
+};
+
+test "full prefix: overwrite restores same-base and relocated codes scales raw and rings on both ranks" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (0..2) |rank| {
+        var driver: cuda.Driver = undefined;
+        driver.api.cuMemcpyDtoDAsync_v2 = PrefixCpu.copy;
+        const context: cuda.Context = .{ .d = &driver, .device = 0, .handle = null };
+        var cfg: Config = undefined;
+        cfg.layers = 3;
+        cfg.head_dim = 32;
+        cfg.index_head_dim = 32;
+        cfg.window = 2;
+        const linear: weights.Linear = .{ .words = 1, .suh = 0, .svh = 0, .k = 1, .n = 1, .k2 = 1 };
+        var layers = [_]weights.Layer{
+            .{ .idx = 0, .ratio = 2, .comp_wkv = linear, .idx_wk = linear },
+            .{ .idx = 1, .ratio = 1, .comp_wkv = linear },
+            .{ .idx = 2, .ratio = 1 },
+        };
+        var w: weights.Weights = undefined;
+        w.layers = &layers;
+        var m: Model = undefined;
+        m.ctx = &context;
+        m.stream = .{ .d = &driver, .handle = null };
+        m.streams = 2;
+        m.pool_cap = 8;
+        m.eng.c = &cfg;
+        m.eng.w = &w;
+        m.caches = .{};
+        var all: std.ArrayList([]u8) = .empty;
+        const rb = m.eng.ringBytes();
+        const pb = prompt.raw_rows * cfg.head_dim * 4;
+        const ring_pointers = try a.alloc(u64, cfg.layers);
+        var fixed_expected: std.ArrayList(u8) = .empty;
+        for (ring_pointers, 0..) |*ptr, index| {
+            const storage = try a.alloc(u8, 2 * rb);
+            for (storage, 0..) |*byte, j| byte.* = @truncate(j + 31 * index + 7 * rank);
+            ptr.* = @intFromPtr(storage.ptr);
+            try all.append(a, storage);
+            try fixed_expected.appendSlice(a, storage[0..rb]);
+        }
+        m.rings = ring_pointers;
+        for (0..2) |raw| {
+            const storage = try a.alloc(u8, 2 * pb);
+            for (storage, 0..) |*byte, j| byte.* = @truncate(j * 3 + raw + 17 * rank);
+            if (raw == 0) m.caches.raw_kv[0] = @intFromPtr(storage.ptr) else m.caches.raw_score[0] = @intFromPtr(storage.ptr);
+            try all.append(a, storage);
+            try fixed_expected.appendSlice(a, storage[0..pb]);
+        }
+        var planes: std.ArrayList(struct { live: []u8, expected: []u8, ratio: usize, width: usize }) = .empty;
+        const widths = [_]usize{ cfg.head_dim / 2, cfg.head_dim / 16, cfg.index_head_dim / 2, cfg.index_head_dim / 32 };
+        for (layers[0..2], 0..) |layer, i| {
+            const count: usize = if (layer.idx_wk != null) 4 else 2;
+            for (widths[0..count], 0..) |width, plane| {
+                const storage = try a.alloc(u8, (m.pool_cap / layer.ratio + 2) * width);
+                for (storage, 0..) |*byte, j| byte.* = @truncate(j * 5 + 13 * i + 19 * plane + 23 * rank);
+                const ptr = @intFromPtr(storage.ptr);
+                switch (plane) {
+                    0 => m.caches.comp_codes[i] = ptr,
+                    1 => m.caches.comp_scales[i] = ptr,
+                    2 => m.caches.idx_codes[i] = ptr,
+                    3 => m.caches.idx_scales[i] = ptr,
+                    else => unreachable,
+                }
+                try planes.append(a, .{ .live = storage, .expected = try a.dupe(u8, storage[0 .. 4 / layer.ratio * width]), .ratio = layer.ratio, .width = width });
+                try all.append(a, storage);
+            }
+        }
+        const saved = try a.alloc(u8, PrefixCpu.bytes(&m, 4));
+        try PrefixCpu.transfer(&m, 0, 0, 4, @intFromPtr(saved.ptr), true);
+        for ([_]usize{ 0, 4 }) |destination| {
+            for (all.items) |storage| @memset(storage, 0xa5);
+            try PrefixCpu.transfer(&m, 1, destination, 4, @intFromPtr(saved.ptr), false);
+            // This is the real baseline failure: old snapshots cannot recover overwritten packed bytes.
+            for (planes.items) |plane| {
+                const start = destination / plane.ratio * plane.width;
+                try std.testing.expectEqualSlices(u8, plane.expected, plane.live[start..][0..plane.expected.len]);
+                for (plane.live[0..start]) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+                for (plane.live[start + plane.expected.len ..]) |byte| try std.testing.expectEqual(@as(u8, 0xa5), byte);
+            }
+            var offset: usize = 0;
+            for (ring_pointers) |ptr| {
+                const data: [*]const u8 = @ptrFromInt(ptr + rb);
+                try std.testing.expectEqualSlices(u8, fixed_expected.items[offset..][0..rb], data[0..rb]);
+                offset += rb;
+            }
+            for ([_]u64{ m.caches.raw_kv[0], m.caches.raw_score[0] }) |ptr| {
+                const data: [*]const u8 = @ptrFromInt(ptr + pb);
+                try std.testing.expectEqualSlices(u8, fixed_expected.items[offset..][0..pb], data[0..pb]);
+                offset += pb;
+            }
+        }
+        if (@hasDecl(Model, "snapView")) {
+            try std.testing.expectError(error.BadSlot, m.snapView(2, 0, 4));
+            try std.testing.expectError(error.BadView, m.snapView(0, 1, 4));
+            try std.testing.expectError(error.BadView, m.snapView(0, 0, 3));
+            try std.testing.expectError(error.BadView, m.snapView(0, 6, 4));
+            var packed_bytes: usize = 0;
+            for (planes.items) |plane| packed_bytes += plane.expected.len;
+            try std.testing.expectEqual(fixed_expected.items.len + packed_bytes, m.snapBytes(4));
+            try std.testing.expectEqual(fixed_expected.items.len, m.snapBytes(0));
+        }
+    }
+}
+
+test "full prefix: illustrative loaded layout charges fixed state plus every packed plane" {
+    if (!@hasDecl(Model, "snapView")) return;
+    var cfg: Config = undefined;
+    cfg.layers = 40;
+    cfg.head_dim = 512;
+    cfg.index_head_dim = 128;
+    cfg.window = 128;
+    const linear: weights.Linear = .{ .words = 1, .suh = 0, .svh = 0, .k = 1, .n = 1, .k2 = 1 };
+    var layers = [_]weights.Layer{
+        .{ .idx = 0, .ratio = 2, .comp_wkv = linear, .idx_wk = linear },
+        .{ .idx = 1, .ratio = 2, .comp_wkv = linear, .idx_wk = linear },
+        .{ .idx = 2, .ratio = 2, .comp_wkv = linear, .idx_wk = linear },
+        .{ .idx = 3, .ratio = 1, .comp_wkv = linear, .idx_wk = linear },
+    };
+    var w: weights.Weights = undefined;
+    w.layers = &layers;
+    var m: Model = undefined;
+    m.eng.c = &cfg;
+    m.eng.w = &w;
+    m.caches = .{};
+    var rings: [40]u64 = @splat(0);
+    m.rings = &rings;
+    for (0..3) |i| { m.caches.raw_kv[i] = 1; m.caches.raw_score[i] = 1; }
+    try std.testing.expectEqual(@as(usize, 6684672), m.snapBytes(0));
+    try std.testing.expectEqual(@as(usize, 157856512), m.snapBytes(169856));
+    try std.testing.expectEqual(@as(usize, 890 * 128), m.snapBytes(169984) - m.snapBytes(169856));
+}

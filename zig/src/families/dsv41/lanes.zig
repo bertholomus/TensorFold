@@ -98,6 +98,34 @@ pub const Reader = struct {
     }
 };
 
+/// Both snapshot operations describe the complete independent buffer on every rank.
+const SnapshotView = struct {
+    id: u64,
+    slot: u32,
+    base: u64,
+    at: u64,
+    bytes: u64,
+
+    fn write(v: SnapshotView, wire: *Wire, gpa: std.mem.Allocator) !void {
+        try wire.int(gpa, u64, v.id);
+        try wire.int(gpa, u32, v.slot);
+        try wire.int(gpa, u64, v.base);
+        try wire.int(gpa, u64, v.at);
+        try wire.int(gpa, u64, v.bytes);
+    }
+
+    fn read(reader: *Reader) !SnapshotView {
+        return .{ .id = try reader.int(u64), .slot = try reader.int(u32), .base = try reader.int(u64),
+            .at = try reader.int(u64), .bytes = try reader.int(u64) };
+    }
+
+    fn validate(v: SnapshotView, m: *const Model) !void {
+        if (v.at == 0) return error.BadSnapshot;
+        try m.snapView(v.slot, @intCast(v.base), @intCast(v.at));
+        if (v.bytes != m.snapBytes(@intCast(v.at))) return error.BadSnapshot;
+    }
+};
+
 /// A window of a round as both ranks build it: its stream's slot and extent, its first position, whether its rows'
 /// taps go into the drafter, its rows' ids.
 pub const Win = struct { slot: usize, base: usize, end: usize, start: usize, absorb: bool, ids: []const i32 };
@@ -328,16 +356,15 @@ const Lane = struct {
 
 extern "c" fn exp(x: f64) f64;
 
-/// A kept prompt state (the prompt cache's saved state, kept at a chunk end the prompt pass reached before its
-/// replay): the slot's own part on the device (Model.snapCopy), and the extent its compressed rows stay in,
-/// [base, base + at), held back from placement while it lives. Stale: a placement needed that room (its restore fails
-/// and the prompt runs from 0).
+/// A prompt-cache state before replay. Production saves own the slot and packed prefix in buf;
+/// base/end describe their former working extent. Resident-only fixtures retain their stale/pinning controls.
 pub const Snap = struct {
     id: u64,
     at: usize,
     base: usize,
     buf: cuda.DeviceBuffer,
-    stale: bool = false,
+    stale: bool = false, // loss of resident-only working rows, not independent backing
+    backed: bool = false, // every production save owns the complete prefix
     wanted: u64 = 0, // when a request first waited for the live stream that holds these rows (placeKept; 0: none)
     end: usize = 0, // the extent end of the stream that kept it (placement holds [base, end) back while room allows)
 };
@@ -746,7 +773,7 @@ pub const Lanes = struct {
             sn.wanted = 0;
             if (!moved) sn.end = @max(sn.end, base + size); // its extent now: the next resume in place finds it held
         }
-        if (kept) |sn| if (moved and sn.stale) { // the placement needed the kept rows' room: the prompt runs from 0
+        if (kept) |sn| if (moved and sn.stale and !sn.backed) { // resident-only state lost its rows
             if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} found no room to move to ({d} positions); the prompt runs from 0", .{ sn.at, sn.base, size });
             kept = null;
             s.reuse_failed = true;
@@ -813,16 +840,15 @@ pub const Lanes = struct {
         const replay = len -| m.cfg.window;
         var start: usize = 0;
         if (kept) |sn| {
-            if (try self.begin(.snap_restore)) {
-                try self.wire.int(gpa, u64, sn.id);
-                try self.wire.int(gpa, u32, @intCast(slot));
-                try self.wire.int(gpa, u64, sn.base);
-                try self.wire.int(gpa, u64, base);
-                try self.wire.int(gpa, u64, sn.at);
-                try self.flush();
+            if (!sn.backed) return error.BadSnapshot;
+            if (self.peer != null) {
+                self.wire.begin(gpa, .snap_restore, self.step) catch |err| Model.snapshotFatal(err);
+                (SnapshotView{ .id = sn.id, .slot = @intCast(slot), .base = base,
+                    .at = sn.at, .bytes = sn.buf.len }).write(&self.wire, gpa) catch |err| Model.snapshotFatal(err);
+                self.flush() catch |err| Model.snapshotFatal(err);
+                self.step += 1;
             }
-            if (base != sn.base) try m.copyExtent(sn.base, base, sn.at);
-            try m.snapCopy(slot, sn.buf.ptr, false);
+            m.snapCopy(slot, base, sn.at, sn.buf.ptr, false) catch |err| Model.snapshotFatal(err);
             start = sn.at;
             s.cached = @intCast(sn.at);
         }
@@ -1052,7 +1078,7 @@ pub const Lanes = struct {
     /// pass of this prompt runs them).
     fn refusal(self: *const Lanes, sn: *const Snap, len: usize) ?Refusal {
         if (std.mem.indexOfScalar(*Snap, self.snaps.items, @constCast(sn)) == null) return .dropped;
-        if (sn.stale) return .stale;
+        if (sn.stale and !sn.backed) return .stale;
         if (sn.at == 0 or sn.at >= len) return .short;
         if (sn.at % model.resume_rows != 0) return .off_chunk;
         if (sn.at > len -| self.m.cfg.window) return .near_end;
@@ -1074,12 +1100,12 @@ pub const Lanes = struct {
         defer kept.deinit(gpa);
         var rows: std.ArrayList([2]usize) = .empty;
         defer rows.deinit(gpa);
-        const held = if (source) |sn| !sn.stale and clashes(live, sn.base, sn.base + sn.at) else false;
+        const held = if (source) |sn| !sn.backed and !sn.stale and clashes(live, sn.base, sn.base + sn.at) else false;
         while (true) {
             kept.clearRetainingCapacity();
             rows.clearRetainingCapacity();
             try rows.appendSlice(gpa, live);
-            for (self.snaps.items) |sn| if (!sn.stale) {
+            for (self.snaps.items) |sn| if (!sn.backed and !sn.stale) {
                 try kept.append(gpa, .{ sn.base, sn.at, sn.end });
                 try rows.append(gpa, .{ sn.base, sn.base + sn.at });
             };
@@ -1089,9 +1115,10 @@ pub const Lanes = struct {
                 return if (try roomAfter(gpa, rows.items, b, size, self.m.pool_cap)) b else error.ContextFull;
             }
             if (got) |b| return b;
+            if (place(live, size, self.m.pool_cap) == null) return error.ContextFull;
             const victim = for (self.snaps.items) |sn| {
-                if (!sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
-            } else if (source) |sn| (if (!sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
+                if (!sn.backed and !sn.stale and sn != source and !clashes(live, sn.base, sn.base + sn.at)) break sn;
+            } else if (source) |sn| (if (!sn.backed and !sn.stale and !clashes(live, sn.base, sn.base + sn.at)) sn else return error.ContextFull) else return error.ContextFull;
             noteStale(victim, "a placement needed its room (oldest first)");
             victim.stale = true;
         }
@@ -1099,7 +1126,7 @@ pub const Lanes = struct {
 
     /// Whether a kept state other than `except` and its shorter siblings has rows in [lo, hi); a longer one may be another conversation's.
     fn keptOver(self: *const Lanes, lo: usize, hi: usize, except: *const Snap) bool {
-        for (self.snaps.items) |sn| if (sn != except and !sn.stale and (sn.base != except.base or sn.at > except.at) and sn.base < hi and lo < sn.base + sn.at) return true;
+        for (self.snaps.items) |sn| if (!sn.backed and sn != except and !sn.stale and (sn.base != except.base or sn.at > except.at) and sn.base < hi and lo < sn.base + sn.at) return true;
         return false;
     }
 
@@ -1112,7 +1139,7 @@ pub const Lanes = struct {
 
     /// Kept states with rows in [lo, hi) go stale (a stream writes there), `except` aside.
     fn staleOver(self: *Lanes, lo: usize, hi: usize, except: ?*Snap) void {
-        for (self.snaps.items) |sn| if (sn != except and sn.base < hi and lo < sn.base + sn.at) {
+        for (self.snaps.items) |sn| if (!sn.backed and sn != except and sn.base < hi and lo < sn.base + sn.at) {
             if (!sn.stale) noteStale(sn, "a stream writes over its rows");
             sn.stale = true;
         };
@@ -1120,28 +1147,36 @@ pub const Lanes = struct {
 
     /// The prompt cache's Snapshots functions (native.zig hands them to the CUDA host).
     pub fn snapBytesFn(ptr: *anyopaque, at: u32) u64 {
-        _ = at;
-        return of(ptr).m.snapBytes();
+        return of(ptr).m.snapBytes(at);
     }
 
-    /// The live state at `at` (the pass stands at that chunk end): the slot's own part copied, the extent's rows kept.
+    /// Publish complete backing only after all recoverable local work succeeds.
     pub fn snapSaveFn(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
         const self = of(ptr);
         const s: *const lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
         const l = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (at == 0 or at % model.resume_rows != 0 or at > s.prompt_len -| self.m.cfg.window) return error.NotAChunkEnd;
+        try self.m.snapView(l.slot, l.base, at);
         const sn = try self.gpa.create(Snap);
         errdefer self.gpa.destroy(sn);
-        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes()) };
+        sn.* = .{ .id = self.next_snap, .at = at, .base = l.base, .end = l.end, .backed = true,
+            .buf = try cuda.DeviceBuffer.alloc(self.m.ctx.d, self.m.snapBytes(at)) };
         errdefer sn.buf.free();
-        try self.snaps.append(self.gpa, sn);
-        self.next_snap += 1;
-        if (try self.begin(.snap_save)) {
-            try self.wire.int(self.gpa, u64, sn.id);
-            try self.wire.int(self.gpa, u32, @intCast(l.slot));
-            try self.flush();
+        try self.snaps.ensureUnusedCapacity(self.gpa, 1);
+        // Build the frame without consuming a step; allocation/copy refusal leaves no published pointer.
+        if (self.peer != null) {
+            try self.wire.begin(self.gpa, .snap_save, self.step);
+            try (SnapshotView{ .id = sn.id, .slot = @intCast(l.slot), .base = l.base,
+                .at = at, .bytes = sn.buf.len }).write(&self.wire, self.gpa);
         }
-        try self.m.snapCopy(l.slot, sn.buf.ptr, true);
+        try self.m.snapCopy(l.slot, l.base, at, sn.buf.ptr, true);
+        try self.m.stream.synchronize(); // deferred local copy errors must precede peer publication
+        if (self.peer != null) {
+            self.flush() catch |err| Model.snapshotFatal(err); // delivery may already have reached some peers
+            self.step += 1;
+        }
+        self.snaps.appendAssumeCapacity(sn);
+        self.next_snap += 1;
         return sn;
     }
 
@@ -1158,21 +1193,21 @@ pub const Lanes = struct {
         return false;
     }
 
-    /// Whether a kept state still holds its rows: one a stream wrote over leaves the prompt cache.
+    /// Independent backing remains live after its former working rows are overwritten.
     pub fn snapLiveFn(ptr: *anyopaque, saved: *anyopaque) bool {
         const sn: *Snap = @ptrCast(@alignCast(saved));
-        return std.mem.indexOfScalar(*Snap, of(ptr).snaps.items, sn) != null and !sn.stale;
+        return std.mem.indexOfScalar(*Snap, of(ptr).snaps.items, sn) != null and (sn.backed or !sn.stale);
     }
 
     pub fn snapDropFn(ptr: *anyopaque, saved: *anyopaque) void {
         const self = of(ptr);
         const sn: *Snap = @ptrCast(@alignCast(saved));
         const i = std.mem.indexOfScalar(*Snap, self.snaps.items, sn) orelse return;
-        _ = self.snaps.orderedRemove(i);
-        if (self.begin(.snap_drop) catch false) {
-            self.wire.int(self.gpa, u64, sn.id) catch {};
-            self.flush() catch |err| std.log.err("dsv41: rank 1 kept a dropped prompt state: {s}", .{@errorName(err)});
+        if (self.begin(.snap_drop) catch |err| Model.snapshotFatal(err)) {
+            self.wire.int(self.gpa, u64, sn.id) catch |err| Model.snapshotFatal(err);
+            self.flush() catch |err| Model.snapshotFatal(err); // peer buffers must not escape head accounting
         }
+        _ = self.snaps.orderedRemove(i);
         sn.buf.free();
         self.gpa.destroy(sn);
     }
@@ -1226,10 +1261,11 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     var slot: usize = 0;
     var img_rows: std.ArrayList(u8) = .empty; // a prompt's image rows as their pieces come
     defer img_rows.deinit(gpa);
-    var kept: std.AutoHashMapUnmanaged(u64, cuda.DeviceBuffer) = .empty; // rank 0's kept states, this rank's part
+    const Kept = struct { buf: cuda.DeviceBuffer, at: usize };
+    var kept: std.AutoHashMapUnmanaged(u64, Kept) = .empty; // complete mirrored prefix backing
     defer {
         var ki = kept.valueIterator();
-        while (ki.next()) |b| b.free();
+        while (ki.next()) |value| value.buf.free();
         kept.deinit(gpa);
     }
     while (true) {
@@ -1339,33 +1375,27 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 }
             },
             .snap_save => {
-                const id = try r.int(u64);
-                const s: usize = try r.int(u32);
-                if (s >= max_streams) return error.BadSlot;
-                var b = try cuda.DeviceBuffer.alloc(m.ctx.d, m.snapBytes());
-                m.snapCopy(s, b.ptr, true) catch |err| {
-                    b.free();
-                    try refused(m, err);
-                    continue;
-                };
-                try kept.put(gpa, id, b);
+                const view = SnapshotView.read(&r) catch |err| Model.snapshotFatal(err);
+                view.validate(m) catch |err| Model.snapshotFatal(err);
+                if (kept.contains(view.id) or r.at != r.b.len) Model.snapshotFatal(error.BadSnapshot);
+                const b = cuda.DeviceBuffer.alloc(m.ctx.d, @intCast(view.bytes)) catch |err| Model.snapshotFatal(err);
+                m.snapCopy(view.slot, @intCast(view.base), @intCast(view.at), b.ptr, true) catch |err| Model.snapshotFatal(err);
+                m.stream.synchronize() catch |err| Model.snapshotFatal(err);
+                kept.put(gpa, view.id, .{ .buf = b, .at = @intCast(view.at) }) catch |err| Model.snapshotFatal(err);
             },
             .snap_restore => {
-                const id = try r.int(u64);
-                const s: usize = try r.int(u32);
-                if (s >= max_streams) return error.BadSlot;
-                const from: usize = @intCast(try r.int(u64));
-                const to: usize = @intCast(try r.int(u64));
-                const at: usize = @intCast(try r.int(u64));
-                const b = kept.get(id) orelse return error.UnknownSnapshot; // rank 0 restores only states both ranks keep
-                if (from != to) m.copyExtent(from, to, at) catch |err| try refused(m, err);
-                m.snapCopy(s, b.ptr, false) catch |err| try refused(m, err);
+                const view = SnapshotView.read(&r) catch |err| Model.snapshotFatal(err);
+                view.validate(m) catch |err| Model.snapshotFatal(err);
+                if (r.at != r.b.len) Model.snapshotFatal(error.BadSnapshot);
+                const saved = kept.get(view.id) orelse Model.snapshotFatal(error.UnknownSnapshot);
+                if (saved.at != view.at or saved.buf.len != view.bytes) Model.snapshotFatal(error.BadSnapshot);
+                m.snapCopy(view.slot, @intCast(view.base), @intCast(view.at), saved.buf.ptr, false) catch |err| Model.snapshotFatal(err);
             },
             .snap_drop => {
                 const id = try r.int(u64);
                 if (kept.fetchRemove(id)) |kv| {
-                    var b = kv.value;
-                    b.free();
+                    var saved = kv.value;
+                    saved.buf.free();
                 }
             },
             .done => {
@@ -1620,4 +1650,107 @@ test "passCap: resume_rows below pass_from, then pass_rows" {
     try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(0));
     try std.testing.expectEqual(@as(usize, model.resume_rows), ln.passCap(3 * model.resume_rows));
     try std.testing.expectEqual(@as(usize, model.chunk_rows), ln.passCap(4 * model.resume_rows));
+}
+
+test "full prefix: backed snapshots survive overwrite and never pin live placement" {
+    var m: Model = undefined;
+    m.cfg.window = model.chunk_rows;
+    m.pool_cap = 16 * model.chunk_rows;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer ln.snaps.deinit(std.testing.allocator);
+    var backed: Snap = .{ .id = 0, .at = 6 * model.chunk_rows, .base = 0,
+        .end = 12 * model.chunk_rows, .buf = undefined, .backed = true };
+    try ln.snaps.append(std.testing.allocator, &backed);
+    ln.staleOver(0, m.pool_cap, null);
+    try std.testing.expect(!backed.stale);
+    backed.stale = true; // loss of the old working copy is irrelevant to independent backing
+    try std.testing.expect(ln.refusal(&backed, 8 * model.chunk_rows) == null);
+    try std.testing.expect(Lanes.snapLiveFn(&ln, &backed));
+    try std.testing.expect(Lanes.snapResumesFn(&ln, &backed, 8 * model.chunk_rows));
+    try std.testing.expect(!ln.keptOver(0, m.pool_cap, &backed));
+    const live = [_][2]usize{.{ 8 * model.chunk_rows, 16 * model.chunk_rows }};
+    try std.testing.expectEqual(@as(usize, 0), try ln.placeKept(&live, 8 * model.chunk_rows, &backed));
+    try std.testing.expectEqual(@as(u64, 0), backed.wanted);
+    try std.testing.expectError(error.ContextFull, ln.placeKept(&live, 10 * model.chunk_rows, &backed));
+    try std.testing.expect(ln.refusal(&backed, 8 * model.chunk_rows) == null);
+    try std.testing.expect(Lanes.snapLiveFn(&ln, &backed));
+    try std.testing.expect(Lanes.snapResumesFn(&ln, &backed, 8 * model.chunk_rows));
+}
+
+test "full prefix: complete snapshot frames preserve base position and byte count" {
+    const view: SnapshotView = .{ .id = 0xabc, .slot = 7, .base = 172032, .at = 169856, .bytes = 157856512 };
+    for ([_]Kind{ .snap_save, .snap_restore }) |kind| {
+        var wire: Wire = .{};
+        defer wire.deinit(std.testing.allocator);
+        try wire.begin(std.testing.allocator, kind, 49);
+        try view.write(&wire, std.testing.allocator);
+        var reader: Reader = .{ .b = wire.buf.items };
+        try std.testing.expectEqual(@backingInt(kind), try reader.int(u8));
+        try std.testing.expectEqual(@as(u64, 49), try reader.int(u64));
+        const result = try SnapshotView.read(&reader);
+        try std.testing.expectEqualDeep(view, result);
+        try std.testing.expectEqual(reader.b.len, reader.at);
+        reader.b = reader.b[0 .. reader.b.len - 1];
+        reader.at = 9;
+        try std.testing.expectError(error.ShortFrame, SnapshotView.read(&reader));
+    }
+}
+
+const SaveRefusalCpu = struct {
+    var buffer: [65536]u8 = undefined;
+    var allocations: usize = 0;
+    var frees: usize = 0;
+
+    fn allocate(out: *u64, bytes: usize) callconv(.c) c_int {
+        std.debug.assert(bytes <= buffer.len);
+        out.* = @intFromPtr(&buffer);
+        allocations += 1;
+        return 0;
+    }
+    fn free(_: u64) callconv(.c) c_int { frees += 1; return 0; }
+    fn refuseCopy(_: u64, _: u64, _: usize, _: cuda.abi.Stream) callconv(.c) c_int { return 600; }
+};
+
+test "full prefix: refused local save releases allocation without publishing pointer or wire step" {
+    var driver: cuda.Driver = undefined;
+    driver.api.cuMemAlloc_v2 = SaveRefusalCpu.allocate;
+    driver.api.cuMemFree_v2 = SaveRefusalCpu.free;
+    driver.api.cuMemcpyDtoDAsync_v2 = SaveRefusalCpu.refuseCopy;
+    const context: cuda.Context = .{ .d = &driver, .device = 0, .handle = null };
+    var cfg: @import("config.zig").Config = undefined;
+    cfg.layers = 1;
+    cfg.head_dim = 32;
+    cfg.window = 128;
+    var weights: @import("weights.zig").Weights = undefined;
+    weights.layers = &.{};
+    var m: Model = undefined;
+    m.ctx = &context;
+    m.stream = .{ .d = &driver, .handle = null };
+    m.streams = 2;
+    m.pool_cap = 8192;
+    m.cfg = cfg;
+    m.eng.c = &cfg;
+    m.eng.w = &weights;
+    m.caches = .{};
+    var rings = [_]u64{1}; // no copy dereferences this address: the fake driver refuses first
+    m.rings = &rings;
+    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
+    defer ln.snaps.deinit(std.testing.allocator);
+    defer ln.streams.deinit(std.testing.allocator);
+    const ids = try std.testing.allocator.alloc(u32, 4096);
+    defer std.testing.allocator.free(ids);
+    @memset(ids, 1);
+    var stream = try lanes.Stream.init(std.testing.allocator, .{ .id = "synthetic-save-refusal", .prompt = ids, .max_new = 400, .drafts = false });
+    defer stream.deinit(std.testing.allocator);
+    try ln.streams.put(std.testing.allocator, &stream, .{ .slot = 0, .base = 0, .end = 8192 });
+    SaveRefusalCpu.allocations = 0;
+    SaveRefusalCpu.frees = 0;
+    const before_id = ln.next_snap;
+    const before_step = ln.step;
+    try std.testing.expectError(error.NotReady, Lanes.snapSaveFn(&ln, &stream, 2048));
+    try std.testing.expectEqual(@as(usize, 1), SaveRefusalCpu.allocations);
+    try std.testing.expectEqual(@as(usize, 1), SaveRefusalCpu.frees);
+    try std.testing.expectEqual(@as(usize, 0), ln.snaps.items.len);
+    try std.testing.expectEqual(before_id, ln.next_snap);
+    try std.testing.expectEqual(before_step, ln.step);
 }
