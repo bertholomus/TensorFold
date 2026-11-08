@@ -82,6 +82,8 @@ pub const Pages = struct {
 
 /// What a family's states depend on beyond their position.
 pub const Rules = struct {
+    /// Reserve before the pass when a peer receives snapshot drops only with the next request.
+    reserve_before_pass: bool = true,
     /// Tokens past the position a state read (Flash Next's MTP head keys row at-1 with token at: 1).
     lookahead: u32 = 0,
     /// Prompt kernels that change arithmetic with a chunk's rows: resume and keep only at the request's chunk starts.
@@ -271,7 +273,7 @@ pub const Store = struct {
         };
         const from = if (ok) e.at else 0;
         s.resumed(e, prompt, ok);
-        s.reserve(prompt, @intCast(prompt.len), null, l.marks, spans); // restored: the state it resumed may go too (a peer restores before it drops)
+        if (s.rules.reserve_before_pass) s.reserve(prompt, @intCast(prompt.len), null, l.marks, spans);
         return .{ .from = from, .marks = l.marks };
     }
 
@@ -303,7 +305,7 @@ pub const Store = struct {
             const at = if (s.rules.planned) s.startAt(starts, w) else w;
             for (marks_) |m| if (m == at or (m < at and !s.rules.planned and prompt.len < s.rules.min_prompt)) s.noteShared(prompt[0 .. m + s.rules.lookahead]);
         }
-        s.reserve(prompt, born, e, marks_, spans);
+        if (s.rules.reserve_before_pass) s.reserve(prompt, born, e, marks_, spans);
         if (e) |entry| entry.borrowers += 1;
         return .{ .entry = e, .marks = marks_ };
     }

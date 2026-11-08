@@ -677,3 +677,11 @@ fn depthsOf(s: *const lanes.Stream) [api.draft_depths]api.DraftDepth {
 test {
     _ = @import("lane_host_test.zig");
 }
+
+test "rejected admission preserves snapshots with immediate drops" {
+    try @import("lane_host_cache_reserve_test.zig").check(LaneHost.admitOne, true);
+}
+
+test "successful admission keeps snapshots within the save-time budget" {
+    try @import("lane_host_cache_reserve_test.zig").check(LaneHost.admitOne, false);
+}

@@ -430,7 +430,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     if (h.store == null and cache > 0) if (@hasField(@TypeOf(loaded), "snaps")) if (loaded.snaps) |sn| {
         h.snap_vt = .{ .bytes = sn.bytes, .save = sn.save, .restore = sn.restore, .drop = sn.drop, .resumes = if (@hasField(@TypeOf(sn), "resumes")) sn.resumes else null, .live = if (@hasField(@TypeOf(sn), "live")) sn.live else null };
         const store = try gpa.create(api.prompt_cache.Store);
-        store.* = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{}, cache);
+        store.* = api.prompt_cache.Store.init(gpa, .{ .ptr = sn.ptr, .vtable = &h.snap_vt }, .{
+            .reserve_before_pass = if (@hasField(@TypeOf(sn), "reserve_before_pass")) sn.reserve_before_pass else true,
+        }, cache);
         h.store = store;
     };
     errdefer if (h.store) |store| {
