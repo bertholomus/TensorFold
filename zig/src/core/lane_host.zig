@@ -422,11 +422,14 @@ pub const LaneHost = struct {
 
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
     /// A pass that began waits out Info.fill_rounds of those rounds between two of its steps (none when none decodes).
-    fn fillOne(h: *LaneHost) void {
-        if (h.filling.items.len == 0) return;
+    fn fillOne(h: *LaneHost, drained: *usize) bool {
+        if (h.filling.items.len == 0) return false;
         const at = fill.next(h);
         const job = h.filling.items[at];
-        if (job.fill_began and h.fill_since < h.info_.fill_rounds and h.core.activeCount() > 0) return;
+        const rows = @max(1, job.stream.prompt_len -| job.stream.cached);
+        // drained: this turn's whole-pass rows; past the first, only a new pass within Info.fill_drain rows runs
+        if (drained.* > 0 and (job.fill_began or drained.* + rows > h.info_.fill_drain)) return false;
+        if (job.fill_began and h.fill_since < h.info_.fill_rounds and h.core.activeCount() > 0) return false;
         h.fill_since = 0;
         const first = !job.fill_began;
         job.fill_began = true;
@@ -444,12 +447,16 @@ pub const LaneHost = struct {
                 } else h.drop(job, h.words(e)),
                 else => h.drop(job, h.words(e)),
             };
-            return;
+            return false;
         };
-        if (!done) return;
+        if (!done) return false;
         _ = h.filling.orderedRemove(at);
         h.prefilled(job, job.began);
         _ = h.deliver(job);
+        if (!first) return false;
+        drained.* += rows;
+        // true: this pass went in whole at its first step, so another new one may follow it before the round
+        return h.info_.fill_drain > 0;
     }
 
     /// A reply's grammar from the server's compiler (Info.structures engines get requests that carry one).
@@ -615,7 +622,12 @@ pub const LaneHost = struct {
             rows_host.answer(h);
             learn.refuse(h);
             while (h.admitOne()) {}
-            h.fillOne();
+            // a burst of short prompts goes in before the next round, Info.fill_drain rows of them at most
+            var drained: usize = 0;
+            while (h.fillOne(&drained)) {
+                // a backend that holds one pass at a time admits the next once the last went in
+                while (h.admitOne()) {}
+            }
             status.noteLive(h);
             h.lock();
             if (h.closing) {

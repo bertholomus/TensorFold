@@ -267,6 +267,8 @@ pub const Info = struct {
     /// The live streams' rounds the lane host runs between two steps of a prompt pass (0: a step every turn of its
     /// loop, a round between); none waits while no stream decodes.
     fill_rounds: u32 = 0,
+    /// Rows of whole one-step passes the lane host starts back to back before a round (0: one a turn, a round between).
+    fill_drain: u32 = 0,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
     /// The policy the engine runs under, one line (`/health` shows it); empty: none.

@@ -294,3 +294,78 @@ test "a pass that began waits out fill_rounds of the live streams' rounds betwee
     for (seen.at[0..3], seen.at[1..4]) |a, b| try std.testing.expect(b - a >= 3); // the first stream's rounds between
     try std.testing.expectEqualSlices(Id, &.{ 1, 2 }, &order.prefilled);
 }
+
+/// The replies a burst's requests finished (Passes keeps two prefill ids; a burst has three).
+const Finished = struct {
+    mutex: std.Io.Mutex = .init,
+    done: usize = 0,
+    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+        const o: *@This() = @ptrCast(@alignCast(ctx));
+        o.mutex.lockUncancelable(std.testing.io);
+        defer o.mutex.unlock(std.testing.io);
+        switch (e.*) {
+            .finished => o.done += 1,
+            else => {},
+        }
+    }
+    fn wait(o: *@This(), n: usize) void {
+        while (true) {
+            o.mutex.lockUncancelable(std.testing.io);
+            const d = o.done;
+            o.mutex.unlock(std.testing.io);
+            if (d == n) return;
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+    }
+};
+
+/// The core's rounds run before each of three 4-token prompts' one-step passes, all waiting before the host starts.
+fn burstSteps(one_pass: bool, fill_drain: u32) ![3]u64 {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 1 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, if (one_pass) target.steppedOne() else target.stepped(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 4, .fill_rounds = 4, .fill_drain = fill_drain });
+    const Seen = struct {
+        core: *lanes.Engine,
+        at: [3]u64 = @splat(0),
+        steps: usize = 0,
+        fn call(ctx: *anyopaque, _: *lanes.Stream, _: usize) void {
+            const a: *@This() = @ptrCast(@alignCast(ctx));
+            if (a.steps < a.at.len) a.at[a.steps] = a.core.steps;
+            a.steps += 1;
+        }
+    };
+    var seen: Seen = .{ .core = &core };
+    target.prefill_hook = Seen.call;
+    target.prefill_hook_ctx = &seen;
+    var order: Finished = .{};
+    const prompts = [3][4]u32{ .{ 2, 7, 1, 8 }, .{ 3, 1, 4, 1 }, .{ 1, 6, 1, 8 } };
+    var requests: [3]Request = undefined;
+    const e = host.engine();
+    for (&requests, &prompts, 1..) |*r, *p, id| {
+        r.* = .{ .prompt = p, .max_tokens = 4 };
+        try e.submit(@intCast(id), r, .{ .ctx = &order, .event = Finished.event });
+    }
+    try host.start();
+    defer host.stop();
+    order.wait(3);
+    try std.testing.expectEqual(@as(usize, 3), seen.steps);
+    return seen.at;
+}
+
+test "without fill_drain a burst of short prompts starts a round apart" {
+    const at = try burstSteps(false, 0);
+    try std.testing.expect(at[0] < at[1] and at[1] < at[2]);
+}
+
+test "fill_drain starts a burst of short prompts before the next round, as many rows of them as it allows" {
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, 0 }, &(try burstSteps(false, 64)));
+    try std.testing.expectEqualSlices(u64, &.{ 0, 0, 0 }, &(try burstSteps(true, 64))); // one pass at a time: admitted after
+    const at = try burstSteps(false, 8); // two 4-token passes fit, the third waits for the next turn
+    try std.testing.expect(at[0] == at[1] and at[2] > at[1]);
+}
