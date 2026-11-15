@@ -446,9 +446,9 @@ pub const Round = struct {
     fn mark(rd: *Round, e: *const Engine, p: PhaseTimer.Phase) !void {
         if (rd.clk != 0 and rd.clk_marks and (rd.clk_ratio == null or rd.clk_ratio.? == rd.cur_ratio)) {
             const now = cuda.launch.count;
-            rd.launches[@intFromEnum(p)] += now -% rd.launch_mark;
+            rd.launches[@backingInt(p)] += now -% rd.launch_mark;
             rd.launch_mark = now;
-            try rd.clock(e, @intFromEnum(p));
+            try rd.clock(e, @backingInt(p));
         }
         if (rd.timer) |t| try t.mark(e.s, p);
     }
@@ -801,7 +801,6 @@ fn linearBytes(l: weights.Linear) [2]u64 {
     return .{ l.words, @as(u64, l.k) * l.n * l.k2 / 16 };
 }
 
-
 /// A measurement's L2 prefetches left out (TF_DS_L2_SKIP, read at Model.open: bit 1 the "attn" fork after q, 2 the "moe"
 /// fork after wo_b, 4 the "next" fork after the experts); 0 in service.
 pub var l2_skip: u8 = 0;
@@ -919,11 +918,7 @@ pub const Graphs = struct {
         const start = cy.*;
         try cuda.graph.beginCapture(e.s, .thread_local);
         stretch(e, rd, ch, cs, rings, cy, li, end, null) catch |err| {
-            if (cuda.graph.endCapture(e.s)) |got| {
-                var x = got;
-                x.deinit();
-            } else |_| {}
-            return err;
+            return endAbortedCapture(e, rd, err);
         };
         var graph = try cuda.graph.endCapture(e.s);
         defer graph.deinit();
@@ -933,6 +928,20 @@ pub const Graphs = struct {
         try exec.launchOn(e.s);
     }
 };
+
+/// Closes an aborted stretch capture: joins the side/prefetch forks the body opened before its error struck (a no-op
+/// per fork when none is open), ends the capture discarding its graph, and returns the body's own error. Without the
+/// joins, cuStreamEndCapture reports 904 (unjoined work) instead of err — the reported 904 masks the real cause, and
+/// the stuck fork then breaks every later request's waits.
+fn endAbortedCapture(e: *const Engine, rd: *Round, err: anyerror) anyerror {
+    rd.joinSide(e) catch {};
+    rd.joinPrefetch(e) catch {};
+    if (cuda.graph.endCapture(e.s)) |got| {
+        var x = got;
+        x.deinit();
+    } else |_| {}
+    return err;
+}
 
 /// A round of these rows through every layer and the head: rd.logits [R, vocab] and rd.taps. The caches (ring, the
 /// compressed rows, the positional store) are the prompt's, extended by the rows; eh: the Engram host (the rows' n-grams
@@ -1175,4 +1184,54 @@ test "context buckets as graph.py makes them" {
 fn notPorted(src: std.builtin.SourceLocation) error{NotPortedYet} {
     std.debug.print("{{\"not_ported\": \"{s}:{d}\"}}\n", .{ src.file, src.line });
     return error.NotPortedYet;
+}
+
+var t_waits: usize = 0;
+var t_end_at: usize = 0;
+
+fn tWait(_: cuda.abi.Stream, _: cuda.abi.Event, _: c_uint) callconv(.c) cuda.abi.Result {
+    t_waits += 1;
+    return cuda.abi.success;
+}
+
+/// An end that fails must not mask err either.
+fn tEnd(_: cuda.abi.Stream, _: *cuda.abi.Graph) callconv(.c) cuda.abi.Result {
+    t_end_at = t_waits;
+    return cuda.abi.error_not_ready;
+}
+
+fn tErrName(_: cuda.abi.Result, s: *?[*:0]const u8) callconv(.c) cuda.abi.Result {
+    s.* = "stub";
+    return cuda.abi.success;
+}
+
+fn tErrStr(_: cuda.abi.Result, s: *?[*:0]const u8) callconv(.c) cuda.abi.Result {
+    s.* = "stub";
+    return cuda.abi.success;
+}
+
+test "an aborted stretch capture closes joined: the body's error survives" {
+    // The issue's 904: a stretch that errors after a mix or a prefetch forked work (HC_SIDE /
+    // L2_PREFETCH) used to reach cuStreamEndCapture with that fork unjoined, so the driver
+    // reported UNJOINED (904) instead of the body's own error, and the stuck fork then broke
+    // every later request's waits. The stub driver counts the waits: both forks must be
+    // joined BEFORE the capture ends, the fork flags cleared, and err returned untouched.
+    var d: cuda.Driver = .{ .lib = undefined, .api = undefined };
+    d.api.cuStreamWaitEvent = tWait;
+    d.api.cuStreamEndCapture = tEnd;
+    d.api.cuGetErrorName = tErrName;
+    d.api.cuGetErrorString = tErrStr;
+    var e: Engine = undefined;
+    e.s = .{ .d = &d, .handle = null };
+    var rd: Round = undefined;
+    rd.side_out = true; // as mix's defer leaves it when the error struck after a mix
+    rd.join = .{ .d = &d, .handle = null };
+    rd.pf_out = true; // as prefetch leaves it when the error struck after a prefetch
+    rd.pf_join = .{ .d = &d, .handle = null };
+    t_waits = 0;
+    t_end_at = 0;
+    try std.testing.expectEqual(@as(anyerror, error.Failed), endAbortedCapture(&e, &rd, error.Failed));
+    try std.testing.expectEqual(@as(usize, 2), t_waits);
+    try std.testing.expectEqual(@as(usize, 2), t_end_at); // both joins ran before the end
+    try std.testing.expect(!rd.side_out and !rd.pf_out);
 }
