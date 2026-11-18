@@ -82,6 +82,8 @@ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True)
         "number": lambda v: type(v) in (int, float),
         "null": lambda v: v is None,
     }[kind]
+    # an integer written as an integral number (17.0, as a template that types integers as number invites) is that integer
+    integral = lambda v: int(v) if kind == "integer" and type(v) is float and v.is_integer() else v
     # a model can end an object or array value one closer short (#87): the value closed is what it meant
     for text in (value, closed_json(value) if kind in ("array", "object") else None):
         if text is None:
@@ -91,6 +93,7 @@ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True)
             json.dumps(parsed, allow_nan=False)
         except (ValueError, TypeError):
             continue
+        parsed = integral(parsed)
         return parsed if valid(parsed) else value
     # not JSON: Python's spelling (True, None, single-quoted strings), as vLLM's Qwen parsers also accept
     if not python:
@@ -100,4 +103,5 @@ def decode_parameter(value: str, schema: dict[str, Any], *, python: bool = True)
         json.dumps(parsed, allow_nan=False)
     except (ValueError, TypeError):
         return value
+    parsed = integral(parsed)
     return parsed if valid(parsed) else value
