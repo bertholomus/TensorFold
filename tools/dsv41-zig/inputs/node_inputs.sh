@@ -1,12 +1,14 @@
 #!/bin/bash
 # node_inputs.sh MODEL_DIR CACHE_DIR RANK [WORLD]: one node's run-time inputs for the DeepSeek-V4.1-Flash lane, built
-# from the EXL3 checkpoint alone (Mia-AiLab/DeepSeek-V4.1-Flash-EXL3-2.9bpw), no GPU:
+# from the EXL3 checkpoint alone (the DeepSeek-V4.1-Flash EXL3 pack the lane serves), no GPU:
 #   CACHE_DIR/rank-cache/rank<RANK>of<WORLD>-<hash>.bin  the node's weight file (TF_DS_RANK_CACHE): its slices of the
 #       checkpoint in the loader's order, by tf-dsv41-rank-cache; on four nodes the split with the balanced experts
 #       (TF_DS_2D_GU=parity) that the served launch runs;
 #   CACHE_DIR/dsv41_token_map.json  Engram's compressed token map (TF_DS_TOKEN_MAP), by make_token_map.py.
-# WORLD is 4 unless given (RANK 0-3, in the order of the recipe's NODES). CACHE_DIR/rank-cache must not hold another
-# file of this rank. On four nodes the weight file is about 56 GB a node; the checkpoint is read a tensor at a time.
+# WORLD is 4 unless given (RANK 0-3, in the order of the recipe's NODES). On two nodes pass 2 (RANK 0 or 1), as the
+# two-node recipe's `scripts/serve.sh inputs` does; the four-node expert split (--parity) is used only when WORLD is 4.
+# CACHE_DIR/rank-cache must not hold another file of this rank. The weight file is about 56 GB a node on four nodes
+# and about 93 GB a node on two; the checkpoint is read a tensor at a time.
 #
 # Environment:
 #   RANK_CACHE_BIN  tf-dsv41-rank-cache; default: the one next to this script, else this checkout's zig-out/bin (zig
