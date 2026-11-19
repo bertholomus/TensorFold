@@ -304,7 +304,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
     // a family split over hosts holds only its rank's share (GLM-5.3-Flash's TP); one split over GPUs gives its own
     const whole = budget.weightBytes(io, o.dir);
-    const weights = if (@hasDecl(F, "weightShare")) F.weightShare(a, io, o.dir, whole) else if (@hasDecl(F, "weightBytes")) F.weightBytes(io, o.dir) else whole;
+    const weights = if (@hasDecl(F, "weightShare")) F.weightShare(a, io, o.dir, whole) else budget.familyWeights(F, io, o.dir, o.drafts, whole);
     const held0 = cuda.usage(false).device;
     // a family over hosts reads every rank's room after its load, by this budget, and admits by the smallest
     const Probe = struct {
