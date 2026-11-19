@@ -207,6 +207,12 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0, .fill_drain = if (st.lanes.fill_chunks > 0) fill_drain else 0 };
 }
 
+/// This rank's failed graph captures, each run eagerly (/metrics on rank 0; rank 1 only logs); null without graphs.
+pub fn graphFallbacks(ctx: *anyopaque) ?*const std.atomic.Value(u64) {
+    const st: *State = @ptrCast(@alignCast(ctx));
+    return if (st.m.graphs != null) &st.m.graph_fallbacks else null;
+}
+
 fn deinitFn(ptr: *anyopaque) void {
     const st: *State = @ptrCast(@alignCast(ptr));
     st.lanes.deinit(); // rank 1 hears done
@@ -274,4 +280,16 @@ test "rank 0's charge: the whole file with drafts, the file less the drafter's e
     try std.testing.expectEqual(size, rankBytes(std.testing.allocator, io, tmp.dir, 2, true));
     try std.testing.expectEqual(size - 16, rankBytes(std.testing.allocator, io, tmp.dir, 2, false));
     try std.testing.expectEqual(@as(u64, 0), rankBytes(std.testing.allocator, io, tmp.dir, 4, false)); // no file
+}
+
+test "an engine with graphs counts the failed graph captures; one without reports no count" {
+    var m: model.Model = undefined;
+    m.graphs = null;
+    m.graph_fallbacks = .init(0);
+    var st: State = undefined;
+    st.m = &m;
+    try std.testing.expect(graphFallbacks(&st) == null);
+    m.graphs = round.Graphs.init(std.testing.allocator);
+    defer m.graphs.?.deinit();
+    try std.testing.expect(graphFallbacks(&st).? == &m.graph_fallbacks);
 }
