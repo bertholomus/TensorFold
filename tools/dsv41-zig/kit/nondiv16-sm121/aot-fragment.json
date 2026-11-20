@@ -1,0 +1,186 @@
+{
+ "kernels": [
+  {
+   "fn": "_index_score",
+   "hash": "052d6c1ceb0c0134932d80c70ab723b84d5d13784d79962cbb47a4560c82c02d",
+   "name": "_index_score",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 10240,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": true,
+   "params": [
+    {
+     "name": "Q",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "K",
+     "type": "*u8",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "KS",
+     "type": "*u8",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "Wt",
+     "type": "*bf16",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "VIS",
+     "type": "*i64",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "n",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "KB",
+     "type": "*i64",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "CAND",
+     "type": "*i64",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "cs",
+     "type": "i32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "TMAX",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "nt",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "IH": {
+     "int": 32
+    },
+    "ID": {
+     "int": 128
+    },
+    "BN": {
+     "int": 64
+    },
+    "PACKED": {
+     "int": 1
+    },
+    "HAS_BASE": {
+     "int": 1
+    },
+    "PDL": {
+     "int": 1
+    },
+    "HAS_CAND": {
+     "int": 0
+    },
+    "CB": {
+     "int": 8
+    },
+    "KEYS": {
+     "int": 0
+    },
+    "HAS_TMAX": {
+     "int": 0
+    },
+    "SKIP_DEAD": {
+     "int": 1
+    },
+    "DEAD_PAD": {
+     "int": 0
+    }
+   }
+  },
+  {
+   "fn": "_score_keys",
+   "hash": "9ab1ce45d139729e01bf8351bd87df01bed63459cd2c0d8072656fd178e6e88f",
+   "name": "_score_keys",
+   "num_warps": 4,
+   "num_ctas": 1,
+   "shared": 256,
+   "global_scratch": 0,
+   "global_align": 1,
+   "profile_scratch": 0,
+   "pdl": true,
+   "params": [
+    {
+     "name": "S",
+     "type": "*fp32",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "OUT",
+     "type": "*i64",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "n",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    },
+    {
+     "name": "TMAX",
+     "type": "*i64",
+     "div16": true,
+     "nospec": false
+    },
+    {
+     "name": "nt",
+     "type": "i32",
+     "div16": false,
+     "nospec": false
+    }
+   ],
+   "consts": {
+    "BN": {
+     "int": 1024
+    },
+    "PDL": {
+     "int": 1
+    },
+    "HAS_TMAX": {
+     "int": 1
+    },
+    "TB": {
+     "int": 64
+    }
+   }
+  }
+ ]
+}
