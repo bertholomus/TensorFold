@@ -55,6 +55,7 @@ test {
     // every declaration of every file, so functions no test calls are still compiled
     const refAll = @import("std").testing.refAllDecls;
     refAll(@import("config.zig"));
+    _ = @import("logprob_rows.zig");
     refAll(native);
     refAll(rank_cache);
     refAll(plan);

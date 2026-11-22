@@ -28,7 +28,7 @@
 > pieces; a drafter pass of more than 128 block rows runs in passes of 128 / block streams).
 > The `dsv41` family adds DeepSeek-V4.1-Flash to TensorFold
 > 1.0.12's native engine: two or four nodes, image input, up to 1,048,576 tokens a request in a shared window
-> (2,097,152 positions in the two-node recipe) with kept-prompt reuse (image turns too), structured output, forced
+> (2,097,152 positions in the two-node recipe) with kept-prompt reuse (image turns too), structured output, `logprobs`, forced
 > tool calls in DeepSeek's DSML, and exact DSpark speculative decoding. Launch, measured numbers, gates and the kernel
 > kit are in the recipe, [bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10)
 > (v0.7.5); the four-node recipe is [bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp4-4xgb10).

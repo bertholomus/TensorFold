@@ -22,6 +22,7 @@ const model = @import("model.zig");
 const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
+const logprob_rows = @import("logprob_rows.zig");
 const link = @import("link.zig");
 const cuda = @import("cuda");
 
@@ -321,6 +322,7 @@ const Lane = struct {
     base: usize,
     end: usize,
     first: u64 = 0, // the prompt's draw (a handle)
+    first_lp: ?lanes.logprob.Row = null, // a stream with logprobs: its first token's row, from the prompt's last row
     held: [draft.max_block]u32 = undefined,
     confs: [draft.max_block]f32 = undefined,
     nheld: usize = 0,
@@ -486,6 +488,7 @@ pub const Lanes = struct {
         .draft = draftFn,
         .probabilities = probabilitiesFn,
         .first_masked = firstMaskedFn,
+        .first_row = firstRowFn,
         .held = heldFn,
         .release = releaseFn,
     };
@@ -694,7 +697,10 @@ pub const Lanes = struct {
             std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
         }
         const token = try draw(logits, done.len, s.sampling);
-        self.streams.getPtr(s).?.first = self.take(token);
+        const l = self.streams.getPtr(s).?;
+        l.first = self.take(token);
+        // kept on the stream: another pass may end before the lane core asks for it (TF_FILL_MANY)
+        l.first_lp = if (s.logprobs) |k| logprob_rows.row(logits, token, k) else null;
         // a stream with a grammar: the row stays for its first token's draw among the grammar's tokens
         if (s.grammar != null) {
             self.first_row = try self.gpa.realloc(self.first_row, logits.len);
@@ -846,7 +852,17 @@ pub const Lanes = struct {
         _ = self.streams.getPtr(s) orelse return error.UnknownStream;
         if (position != s.prompt_len) return error.PositionMismatch;
         if (self.first_of != s) return error.NoPromptRow;
-        return self.take(try self.drawAllowed(self.first_row, position, s.sampling, mask));
+        const token = try self.drawAllowed(self.first_row, position, s.sampling, mask);
+        // the masked draw's own row: its logprob under the raw row, though no unmasked best may hold it
+        if (s.logprobs) |k| self.streams.getPtr(s).?.first_lp = logprob_rows.row(self.first_row, token, k);
+        return self.take(token);
+    }
+
+    /// The first token's logprob row, made when the prompt pass ended (or the grammar's draw replaced the token).
+    fn firstRowFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!lanes.logprob.Row {
+        const self = of(ptr);
+        const l = self.streams.getPtr(s) orelse return error.UnknownStream;
+        return l.first_lp orelse error.NoPromptRow;
     }
 
     /// The held drafts as host tokens in window order (a grammar walks them): draft holds them when its pass ends.
@@ -917,12 +933,14 @@ pub const Lanes = struct {
         const rows = try self.built.build(gpa, &self.seqs, wins[0..windows.len]);
         try m.verify(rows, self.built.absorb[0..windows.len]);
         const t2 = m.now();
-        // every row greedy and none masked: the device's argmax (R tokens back); else the logits for the host's draws
+        // every row greedy, none masked and no logprobs asked: the device's argmax (R tokens back); else the logits for
+        // the host's draws (argmax's on the host is the device's: the first largest) and rows
         var greedy = !masked;
         for (windows) |w| {
             if (w.stream.sampling) |sm| if (sm.temperature > 0) {
                 greedy = false;
             };
+            if (w.stream.logprobs != null) greedy = false;
         }
         const tokens: []const u32 = if (greedy) try m.roundArgmax(rows.ids.len) else &.{};
         const logits: []const f32 = if (greedy) &.{} else try m.roundLogits(rows.ids.len);
@@ -944,6 +962,10 @@ pub const Lanes = struct {
                 try self.drawAllowed(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling, w.masks[r * words ..][0..words])
             else
                 try draw(logits[(row0 + r) * V ..][0..V], w.positions[r], w.stream.sampling);
+            // each row's logprobs under the raw row, the drawn token's gathered even when a mask chose it
+            if (o.rows.len > 0) for (0..w.rows()) |r| {
+                o.rows[r] = logprob_rows.row(logits[(row0 + r) * V ..][0..V], o.sampled[r], w.stream.logprobs.?);
+            };
             const l = self.streams.getPtr(w.stream).?;
             @memcpy(o.drafts[0..w.held], l.held[0..w.held]);
             @memcpy(o.drafts[w.held..][0..w.tokens.len], w.tokens);
@@ -1593,6 +1615,47 @@ test "a stream with a grammar draws its first token from the kept prompt row, an
     // a released stream's row is no one's
     b.release(&s);
     try std.testing.expect(ln.first_of == null);
+}
+
+test "a stream with logprobs: the first row is its own, kept until asked, and a grammar's draw gets its own row" {
+    const gpa = std.testing.allocator;
+    var ln: Lanes = .{ .gpa = gpa, .m = undefined, .peer = null };
+    defer ln.deinit();
+    const b = ln.backend();
+    try std.testing.expect(b.vtable.first_row != null); // the native server offers logprobs on this
+    var s = try lanes.Stream.init(gpa, .{ .id = "s", .prompt = &.{ 1, 2, 3 }, .max_new = 8, .logprobs = 5 });
+    defer s.deinit(gpa);
+    try ln.streams.put(gpa, &s, .{ .slot = 0, .base = 0, .end = model.chunk_rows });
+    ln.used[0] = true;
+    var row: [1000]f32 = undefined;
+    testRow(&row);
+    // no prompt pass ended for it: no row
+    try std.testing.expectError(error.NoPromptRow, b.firstRow(&s));
+    // the pass's row, as prefillPart keeps it; another stream's pass ending after leaves it alone
+    const token = try draw(&row, 3, s.sampling);
+    ln.streams.getPtr(&s).?.first_lp = logprob_rows.row(&row, token, 5);
+    var other: [1000]f32 = undefined;
+    for (&other, row) |*o, v| o.* = -v;
+    ln.first_row = try gpa.dupe(f32, &other);
+    const got = try b.firstRow(&s);
+    try std.testing.expectEqual(token, got.token);
+    try std.testing.expectEqual(@as(u8, 5), got.count);
+    try std.testing.expectEqual(token, got.ids[0]); // greedy: the pick is the best
+    // a grammar's draw from the kept row: that token's row, its logprob gathered though it is not among the best
+    ln.first_row = try gpa.realloc(ln.first_row, row.len);
+    @memcpy(ln.first_row, &row);
+    ln.first_of = &s;
+    var worst: usize = 0;
+    for (row, 0..) |v, i| if (v < row[worst]) {
+        worst = i;
+    };
+    var mask: [maskWords(1000)]u32 = @splat(0);
+    mask[worst / 32] |= @as(u32, 1) << @intCast(worst % 32);
+    try std.testing.expectEqual(@as(u32, @intCast(worst)), try b.read(try b.vtable.first_masked.?(b.ptr, &s, 3, &mask)));
+    const masked = try b.firstRow(&s);
+    try std.testing.expectEqual(@as(u32, @intCast(worst)), masked.token);
+    try std.testing.expectEqual(logprob_rows.row(&row, @intCast(worst), 5).logprob, masked.logprob);
+    try std.testing.expect(!std.math.isNan(masked.logprob) and masked.logprob < got.logprob);
 }
 
 test "a window's masks are none or every row's bits" {
