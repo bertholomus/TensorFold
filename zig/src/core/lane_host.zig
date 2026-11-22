@@ -50,6 +50,7 @@ pub const LaneHost = struct {
     recall: ?*lanes.recall_store.Store = null, // Recall's record: drafts from earlier requests (lane_host_recall.zig)
     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
+    graph_fallbacks: ?*const std.atomic.Value(u64) = null, // the backend's failed graph captures (read at any time)
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
     learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
     lessons: std.ArrayList(Lesson) = .empty, // learn requests waiting for an idle engine
