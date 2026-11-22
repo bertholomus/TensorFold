@@ -130,6 +130,7 @@ fn prepare(r: *Rows, q: Queued) !?*Job {
     try image.ownRanges(parts, e.at, r.keying.block, &own, gpa);
     const j = try gpa.create(Job);
     j.* = .{ .entry = e, .starts = q.starts, .name = name, .parts = parts, .wants = &.{}, .own = &.{}, .began = nowNs() };
+    if (r.family.vtable.tag_disk) |t| t(r.family.ptr, e.saved, std.mem.readInt(u64, name[0..8], .little));
     j.wants = wants.toOwnedSlice(gpa) catch |err| {
         gpa.destroy(j);
         return err;

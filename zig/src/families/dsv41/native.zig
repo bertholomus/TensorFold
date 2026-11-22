@@ -53,6 +53,8 @@ const round = @import("round.zig");
 const link = @import("link.zig");
 const rank_cache = @import("rank_cache.zig");
 const vision_mod = @import("vision.zig");
+const disk_mod = @import("disk.zig");
+const api = @import("engine_api");
 
 pub const model_type = "deepseek_v41";
 pub const formats: []const []const u8 = &.{"exl3-mul1"};
@@ -102,6 +104,9 @@ pub const Snaps = struct {
     /// Whether a kept state restores for a prompt of this many tokens, and whether it still holds its rows.
     resumes: *const fn (*anyopaque, *anyopaque, u32) bool,
     live: *const fn (*anyopaque, *anyopaque) bool,
+    /// --learn-conversations: the state's disk image, and the rows key stamped for a peer's half file.
+    rows: ?*const api.prompt_cache.rows.Image = null,
+    tag_disk: ?*const fn (*anyopaque, *anyopaque, u64) void = null,
 };
 
 /// The rank's model and the backend over it (what `open` hands the server, freed by `deinit`).
@@ -212,7 +217,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     st.lanes.vision = st.vision;
     // the pool is the model's (preallocated): a stream takes no device memory of its own
     const L = lanes_mod.Lanes;
-    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .resumes = L.snapResumesFn, .live = L.snapLiveFn };
+    const snaps: Snaps = .{ .ptr = &st.lanes, .bytes = L.snapBytesFn, .save = L.snapSaveFn, .restore = L.snapRestoreFn, .drop = L.snapDropFn, .resumes = L.snapResumesFn, .live = L.snapLiveFn, .rows = &disk_mod.image, .tag_disk = L.snapTagDiskFn };
     // a follower that stops stops this server too, with a line that names it, instead of a wait on it for good
     st.m.watchPeers() catch |err| std.log.warn("dsv41: rank 0 cannot watch its followers: {s}", .{@errorName(err)});
     return .{ .backend = st.lanes.backend(), .facts = st.lanes.facts(), .rows = @intCast(st.m.eng.round_rows), .stream_bytes = 0, .ctx = st, .deinit = deinitFn, .snaps = snaps, .lane_vision = if (st.vision) |v| v.hook() else null, .fill_rounds = if (st.lanes.fill_chunks > 0) fill_rounds else 0, .fill_drain = if (st.lanes.fill_chunks > 0) fill_drain else 0 };

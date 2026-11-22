@@ -23,6 +23,7 @@ const round = @import("round.zig");
 const draft = @import("draft.zig");
 const sampling = @import("sampling.zig");
 const link = @import("link.zig");
+const disk_mod = @import("disk.zig");
 const cuda = @import("cuda");
 
 const be = lanes.backend;
@@ -41,7 +42,7 @@ pub const image_piece = 32 << 10;
 pub var logits_sha = false;
 
 /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10 };
+pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_switch = 10, snap_persist = 11 };
 
 /// A frame being written.
 pub const Wire = struct {
@@ -105,6 +106,7 @@ const SnapshotView = struct {
     base: u64,
     at: u64,
     bytes: u64,
+    disk_id: u64 = 0, // the rows store key of a state read back from disk (0: resident only)
 
     fn write(v: SnapshotView, wire: *Wire, gpa: std.mem.Allocator) !void {
         try wire.int(gpa, u64, v.id);
@@ -112,11 +114,12 @@ const SnapshotView = struct {
         try wire.int(gpa, u64, v.base);
         try wire.int(gpa, u64, v.at);
         try wire.int(gpa, u64, v.bytes);
+        try wire.int(gpa, u64, v.disk_id);
     }
 
     fn read(reader: *Reader) !SnapshotView {
         return .{ .id = try reader.int(u64), .slot = try reader.int(u32), .base = try reader.int(u64),
-            .at = try reader.int(u64), .bytes = try reader.int(u64) };
+            .at = try reader.int(u64), .bytes = try reader.int(u64), .disk_id = try reader.int(u64) };
     }
 
     fn validate(v: SnapshotView, m: *const Model) !void {
@@ -365,6 +368,8 @@ pub const Snap = struct {
     buf: cuda.DeviceBuffer,
     stale: bool = false, // loss of resident-only working rows, not independent backing
     backed: bool = false, // every production save owns the complete prefix
+    disk_id: u64 = 0, // the rows store's key stamped when the state heads for disk (0: not bound for it)
+    persisted: bool = false, // the peer already heard its half's disk key (one snap_persist a state)
     wanted: u64 = 0, // when a request first waited for the live stream that holds these rows (placeKept; 0: none)
     end: usize = 0, // the extent end of the stream that kept it (placement holds [base, end) back while room allows)
 };
@@ -844,9 +849,14 @@ pub const Lanes = struct {
             if (self.peer != null) {
                 self.wire.begin(gpa, .snap_restore, self.step) catch |err| Model.snapshotFatal(err);
                 (SnapshotView{ .id = sn.id, .slot = @intCast(slot), .base = base,
-                    .at = sn.at, .bytes = sn.buf.len }).write(&self.wire, gpa) catch |err| Model.snapshotFatal(err);
+                    .at = sn.at, .bytes = sn.buf.len, .disk_id = sn.disk_id }).write(&self.wire, gpa) catch |err| Model.snapshotFatal(err);
                 self.flush() catch |err| Model.snapshotFatal(err);
                 self.step += 1;
+                if (sn.disk_id != 0) { // the peer's half comes off its disk: it answers whether it could load it
+                    var ack: [1]u8 = .{0};
+                    const got = self.peer.?.recvSpin(&ack, 120 * std.time.ns_per_s) catch |err| Model.snapshotFatal(err);
+                    if (got.len != 1 or ack[0] != 1) return error.DiskRestoreRefused;
+                }
             }
             m.snapCopy(slot, base, sn.at, sn.buf.ptr, false) catch |err| Model.snapshotFatal(err);
             start = sn.at;
@@ -1212,6 +1222,23 @@ pub const Lanes = struct {
         self.gpa.destroy(sn);
     }
 
+    /// The peer writes its half of a state bound for disk, named by the rows store's key (once a state).
+    pub fn publishPersist(self: *Lanes, sn: *Snap) !void {
+        sn.persisted = true;
+        if (try self.begin(.snap_persist)) {
+            try self.wire.int(self.gpa, u64, sn.id);
+            try self.wire.int(self.gpa, u64, sn.disk_id);
+            try self.flush();
+        }
+    }
+
+    /// The rows store's key of the state heading for disk, for the peer half's file name.
+    pub fn snapTagDiskFn(ptr: *anyopaque, saved: *anyopaque, name: u64) void {
+        _ = ptr;
+        const sn: *Snap = @ptrCast(@alignCast(saved));
+        sn.disk_id = name;
+    }
+
     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
         const self = of(ptr);
         if (self.fillOf(s)) |f| {
@@ -1250,6 +1277,12 @@ pub var follow_prof: struct { rounds: u64 = 0, enqueue: u64 = 0, forward: u64 = 
 /// Rank 1 (each of ranks 1-3 on the four-node split): the primitives rank 0 sends, run in order until it says done.
 pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
     const peer = m.peer();
+    // the peer half's spill files under TF_DS_SPILL_DIR (its LRU by mtime, TF_DS_SPILL_GIB at most)
+    const spill_dir: ?[]const u8 = if (std.c.getenv("TF_DS_SPILL_DIR")) |v| if (std.mem.span(v).len > 0) std.mem.span(v) else null else null;
+    const spill_cap: u64 = blk: {
+        const v = std.c.getenv("TF_DS_SPILL_GIB") orelse break :blk 64 << 30;
+        break :blk (std.fmt.parseInt(u64, std.mem.span(v), 10) catch 64) << 30;
+    };
     const buf = try gpa.alloc(u8, (m.pool_cap + 1) * 4 + (1 << 16));
     defer gpa.free(buf);
     var seqs: [max_streams]std.ArrayList(i32) = @splat(.empty);
@@ -1283,6 +1316,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
             8 => .fill_images,
             9 => .done,
             10 => .fill_switch,
+            11 => .snap_persist,
             else => return error.BadFrame,
         };
         if (try r.int(u64) != step) return error.OutOfStep;
@@ -1387,9 +1421,29 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
                 const view = SnapshotView.read(&r) catch |err| Model.snapshotFatal(err);
                 view.validate(m) catch |err| Model.snapshotFatal(err);
                 if (r.at != r.b.len) Model.snapshotFatal(error.BadSnapshot);
-                const saved = kept.get(view.id) orelse Model.snapshotFatal(error.UnknownSnapshot);
-                if (saved.at != view.at or saved.buf.len != view.bytes) Model.snapshotFatal(error.BadSnapshot);
-                m.snapCopy(view.slot, @intCast(view.base), @intCast(view.at), saved.buf.ptr, false) catch |err| Model.snapshotFatal(err);
+                var saved = kept.get(view.id);
+                if (saved == null and view.disk_id != 0 and spill_dir != null) {
+                    const b = loadHalf(gpa, m, spill_dir.?, view.disk_id, view.bytes) catch {
+                        peer.send(&.{0}) catch {};
+                        continue;
+                    };
+                    kept.put(gpa, view.id, .{ .buf = b, .at = @intCast(view.at) }) catch |err| Model.snapshotFatal(err);
+                    peer.send(&.{1}) catch |err| Model.snapshotFatal(err); // rank 0 waits on it before its own copy
+                    saved = .{ .buf = b, .at = @intCast(view.at) };
+                }
+                const sv = saved orelse Model.snapshotFatal(error.UnknownSnapshot);
+                if (sv.at != view.at or sv.buf.len != view.bytes) Model.snapshotFatal(error.BadSnapshot);
+                m.snapCopy(view.slot, @intCast(view.base), @intCast(view.at), sv.buf.ptr, false) catch |err| Model.snapshotFatal(err);
+            },
+            .snap_persist => {
+                const snap_id = try r.int(u64);
+                const disk_id = try r.int(u64);
+                if (r.at != r.b.len) Model.snapshotFatal(error.BadFrame);
+                if (spill_dir) |dir| if (kept.get(snap_id)) |kh| {
+                    persistHalf(gpa, kh.buf, dir, disk_id, kh.at) catch |err|
+                        std.log.warn("dsv41: the peer half for {x} went unwritten: {s}", .{ disk_id, @errorName(err) });
+                    disk_mod.trimDir(gpa, dir, spill_cap, disk_id);
+                };
             },
             .snap_drop => {
                 const id = try r.int(u64);
@@ -1753,4 +1807,23 @@ test "full prefix: refused local save releases allocation without publishing poi
     try std.testing.expectEqual(@as(usize, 0), ln.snaps.items.len);
     try std.testing.expectEqual(before_id, ln.next_snap);
     try std.testing.expectEqual(before_step, ln.step);
+}
+
+/// A disk half of `key` under `dir` into new device storage (rank 1's part of a state rank 0 reads back).
+fn loadHalf(gpa: std.mem.Allocator, m: *Model, dir: []const u8, key: u64, bytes: u64) !cuda.DeviceBuffer {
+    var b = try cuda.DeviceBuffer.alloc(m.ctx.d, @intCast(bytes));
+    errdefer b.free();
+    const host = try gpa.alloc(u8, @intCast(bytes));
+    defer gpa.free(host);
+    try disk_mod.readFile(dir, key, host);
+    try b.upload(0, host);
+    return b;
+}
+
+/// This rank's `buf` of `at` tokens as `key`'s spill file under `dir`.
+fn persistHalf(gpa: std.mem.Allocator, buf: cuda.DeviceBuffer, dir: []const u8, key: u64, at: usize) !void {
+    const host = try gpa.alloc(u8, buf.len);
+    defer gpa.free(host);
+    try buf.download(0, host);
+    try disk_mod.writeFile(dir, key, at, host);
 }
