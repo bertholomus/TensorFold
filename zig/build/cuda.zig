@@ -252,6 +252,7 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     // the RDMA ring's verbs (rdma.zig)
     dsv41.addImport("fabric", b.createModule(.{ .root_source_file = b.path("zig/src/fabric/fabric.zig"), .target = target, .optimize = optimize, .link_libc = true }));
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    dsv41.addImport("engine_api", api);
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,

@@ -2,6 +2,7 @@
 const std = @import("std");
 const api = @import("engine_api");
 const nemotron = @import("nemotron");
+const dsv41 = @import("dsv41");
 
 /// Flags refused whatever the family; null when `o` may open.
 pub fn backend(o: api.Open) ?[]const u8 {
@@ -22,7 +23,7 @@ const lfm2_vision = "--vision: LFM2 reads the checkpoint's images through its ow
 /// A family takes --drafter only if it says so, and --learn-conversations only as Nemotron; null: `o` may open `F`.
 pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
     if (o.drafter != null and !(@hasDecl(F, "takes_drafter") and F.takes_drafter)) return "--drafter loads a separate drafter, and this CUDA family drafts with its own MTP head: serve without --drafter";
-    if (o.learn_conversations and F != nemotron.native) return "--learn-conversations keeps conversation states on disk for Nemotron only on CUDA: serve this model without it";
+    if (o.learn_conversations and F != nemotron.native and F != dsv41.native) return "--learn-conversations keeps conversation states on disk for Nemotron only on CUDA: serve this model without it";
     return null;
 }
 

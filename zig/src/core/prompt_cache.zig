@@ -60,6 +60,8 @@ pub const Snapshots = struct {
         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
         /// --learn-conversations: the state's image as rows and parts, and copies out of and into kept states.
         rows: ?*const rows.Image = null,
+        /// A disk state's rows key stamped on `saved` so the family can name a peer's half file (null: none).
+        tag_disk: ?*const fn (ptr: *anyopaque, saved: Saved, name: u64) void = null,
     };
 };
 

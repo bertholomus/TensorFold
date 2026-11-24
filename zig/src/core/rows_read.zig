@@ -21,6 +21,7 @@ pub fn read(r: *Rows, i: usize) !pc.Saved {
     defer wants.deinit(r.gpa);
     try r.blockNames(r.gpa, parts, s.tokens, s.spans, s.starts, s.at, &wants);
     const saved = try r.img.blank(r.family.ptr, s.at);
+    if (r.family.vtable.tag_disk) |t| t(r.family.ptr, saved, std.mem.readInt(u64, s.name[0..8], .little));
     errdefer f.drop(r.family.ptr, saved);
     var ranges: std.ArrayList(image.Range) = .empty;
     defer ranges.deinit(r.gpa);
